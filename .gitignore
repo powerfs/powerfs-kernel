@@ -1,0 +1,118 @@
+# ========== 1. 内核编译自动生成中间文件（你的 .powerfs_mod.o.cmd 在这里）
+vm/
+*.o
+*.o.cmd
+*.ko
+*.ko.cmd
+*.mod.c
+*.mod.cmd
+*.symtypes
+*.order
+*.markers
+*.d
+*.d.tmp
+*.lst
+*.i
+*.s
+*.symvers
+*.unsigned
+*.gz
+*.xz
+*.zst
+*.lzma
+*.elf
+*.bin
+*.dtb
+*.dtbo
+*.dtb.S
+*.dtbo.S
+
+# 编译临时文件夹
+.tmp_versions/
+modules.order
+modules.builtin
+modules.builtin.modinfo
+Module.symvers
+vmlinux
+vmlinux.o
+bzImage
+zImage
+uImage
+Image
+xImage
+System.map
+modules.alias
+modules.alias.bin
+modules.dep
+modules.dep.bin
+modules.devname
+modules.softdep
+modules.softdep.bin
+modules.no-debug
+
+# kbuild 隐藏命令文件（重点：过滤你遇到的 xxx.o.cmd）
+*.cmd
+
+# ========== 2. PowerFS 自定义产物（你的 vm/initramfs 打包目录）
+# initramfs 输出镜像、编译产出
+powerfs/kernel/vm/output/
+*.cpio
+*.cpio.gz
+*.img
+*.iso
+
+# 模块编译临时目录（如果你的模块单独构建）
+powerfs/build/
+powerfs/out/
+powerfs/.build/
+
+# ========== 3. 调试、gdb、qemu 运行产物
+*.log
+*.trace
+/tmp/
+*.dump
+core.*
+vgcore.*
+
+# qemu 临时快照、磁盘镜像
+*.qcow2
+*.raw
+*.vmdk
+
+# ========== 4. 源码版本控制无关文件
+# 编辑器、系统隐藏文件
+*~
+\#*#
+.#*
+.DS_Store
+.thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# 编译配置缓存
+.config.old
+.config.tmp
+defconfig
+*.config
+cscope.*
+tags
+TAGS
+gtags*
+GPATH GRTAGS GSYMS GTAGS
+
+# ========== 5. 内核工具链、交叉编译缓存
+ccache/
+*.a
+*.so
+*.pyc
+__pycache__/
+
+# ========== 6. 备份目录、二进制产物
+powerfs_mod_backup_*/
+powerfs_proxy/powerfs_proxy
+tests/concurrent_test
+powerfs_mod/powerfs.mod
