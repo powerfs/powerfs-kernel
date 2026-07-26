@@ -75,6 +75,14 @@ struct powerfs_dir_file_info {
     struct mutex lock;
 };
 
+/* 目录项结构 (用于本地 readdir) */
+struct powerfs_dir_entry {
+    struct list_head list;          /* 链表节点 */
+    u64 ino;                        /* inode 号 */
+    unsigned int type;              /* 文件类型 (DT_REG, DT_DIR, 等) */
+    char name[POWERFS_MAX_NAME_LEN]; /* 文件名 */
+};
+
 /* ========== Inode 扩展结构 (参考 ceph_inode_info) ========== */
 
 struct powerfs_inode_info {
@@ -95,6 +103,10 @@ struct powerfs_inode_info {
     
     /* 目录 complete 标志 (目录内容缓存完整) */
     bool dir_complete;
+    
+    /* 目录项链表 (用于本地 readdir, 由 dir_mutex 保护) */
+    struct list_head dir_entries;
+    struct mutex dir_mutex;  /* 保护目录项链表 (使用mutex因为readdir可能睡眠) */
 };
 
 /* Cap 位 (简化版) */

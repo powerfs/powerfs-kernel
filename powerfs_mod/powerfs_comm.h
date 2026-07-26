@@ -105,7 +105,7 @@ struct powerfs_ioctl_req {
 #define POWERFS_COMM_MAGIC     0x50575243  /* "PWRC" */
 #define POWERFS_COMM_VERSION   1
 
-#define POWERFS_MAX_REQUESTS   64    /* 最大请求数 */
+#define POWERFS_MAX_REQUESTS   256   /* 最大请求数 (增大以支持高并发) */
 #define POWERFS_MAX_DATA_SIZE  4096  /* 单条消息最大数据 */
 
 /*

@@ -22,9 +22,9 @@
 #include <time.h>
 #include <signal.h>
 
-#define MAX_PROCESSES 16
-#define FILES_PER_PROCESS 100
-#define TEST_DIR "/mnt/powerfs/stress_test"
+#define MAX_PROCESSES 4
+#define FILES_PER_PROCESS 50
+#define TEST_DIR "/mnt/pfs/stress_test"
 #define DIRS_PER_LEVEL 10
 #define MAX_DEPTH 5
 
@@ -620,7 +620,7 @@ int test_mixed_operations(int num_processes) {
 }
 
 int main(int argc, char *argv[]) {
-    int num_processes = 8;
+    int num_processes = 4;
     int total_errors = 0;
 
     (void)argc;

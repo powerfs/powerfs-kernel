@@ -86,7 +86,7 @@ struct powerfs_ioctl_req {
 /* 共享内存常量 */
 #define POWERFS_COMM_MAGIC     0x50575243
 #define POWERFS_COMM_VERSION   1
-#define POWERFS_MAX_REQUESTS   64
+#define POWERFS_MAX_REQUESTS   256
 #define POWERFS_MAX_DATA_SIZE  4096
 
 /* 共享内存头部 - 与内核完全一致 */
@@ -443,7 +443,7 @@ static uint64_t g_next_ino = 1;
 
 /* 目录项缓存: parent_ino -> [(name, ino, type)] */
 #define MAX_DENTRIES 64
-#define MAX_DIR_ENTRIES 256
+#define MAX_DIR_ENTRIES 1024
 
 struct dir_entry {
     uint64_t ino;
@@ -628,9 +628,12 @@ static int save_state(const char *filename)
     fflush(fp);
     fsync(fileno(fp));
     fclose(fp);
-    fprintf(stderr, "[proxy] 状态已保存到 %s (inode=%u, dir_cache=%u)\n",
-            filename, inode_count, dir_cache_count);
-    fflush(stderr);
+    /* 状态保存日志改为 verbose 级别控制 */
+    if (config.verbose > 1) {
+        fprintf(stderr, "[proxy] 状态已保存到 %s (inode=%u, dir_cache=%u)\n",
+                filename, inode_count, dir_cache_count);
+        fflush(stderr);
+    }
 
     /* 释放锁 */
     pthread_mutex_unlock(&g_fs_mutex);
@@ -694,10 +697,7 @@ static int load_state(const char *filename)
             break;
         }
 
-        fprintf(stderr, "[proxy] 加载 inode: ino=%llu mode=%o nlink=%u is_symlink=%u data_size=%u target_len=%u\n",
-                (unsigned long long)pi.ino, pi.mode, pi.nlink,
-                pi.is_symlink, pi.data_size, pi.target_len);
-
+        /* 详细日志改为汇总输出，避免串口控制台过载导致 RCU stall */
         ie = find_inode(pi.ino);
         if (!ie)
             ie = alloc_inode();
@@ -767,17 +767,12 @@ static int load_state(const char *filename)
             break;
         }
 
-        fprintf(stderr, "[proxy] 加载 dir_cache[%u]: parent_ino=%llu count=%u\n",
-                i, (unsigned long long)pdc.parent_ino, pdc.count);
-
+        /* 详细日志改为汇总输出，避免串口控制台过载导致 RCU stall */
         dc = alloc_dir_cache(pdc.parent_ino);
         if (!dc) {
             fprintf(stderr, "[proxy] 分配 dir_cache 失败\n");
             break;
         }
-
-        fprintf(stderr, "[proxy]   alloc_dir_cache 返回: used=%d parent_ino=%llu old_count=%u\n",
-                dc->used, (unsigned long long)dc->parent_ino, dc->count);
 
         dc->count = pdc.count;
         for (j = 0; j < pdc.count && j < MAX_DIR_ENTRIES; j++) {
@@ -786,15 +781,12 @@ static int load_state(const char *filename)
             dc->entries[j].type = pdc.entries[j].type;
             strncpy(dc->entries[j].name, pdc.entries[j].name, 255);
             dc->entries[j].name[255] = '\0';
-            fprintf(stderr, "[proxy]   恢复条目[%u]: name=%s ino=%llu type=%u\n",
-                    j, dc->entries[j].name,
-                    (unsigned long long)dc->entries[j].ino,
-                    dc->entries[j].type);
         }
     }
 
     fclose(fp);
-    fprintf(stderr, "[proxy] 状态加载完成\n");
+    fprintf(stderr, "[proxy] 状态加载完成 (inode=%u, dir_cache=%u)\n",
+            header.inode_count, header.dir_cache_count);
     fflush(stderr);
     return 0;
 }
@@ -909,8 +901,7 @@ static int add_dir_entry(uint64_t parent_ino, const char *name, uint64_t ino, ui
     /* 检查是否已存在 */
     for (i = 0; i < dc->count; i++) {
         if (dc->entries[i].used && strcmp(dc->entries[i].name, name) == 0) {
-            fprintf(stderr, "[proxy] add_dir_entry: 更新已存在条目 '%s' (ino=%llu)\n",
-                    name, (unsigned long long)ino);
+            /* 详细日志改为 verbose 级别控制 */
             dc->entries[i].ino = ino;
             dc->entries[i].type = type;
             return 0;
@@ -930,9 +921,7 @@ static int add_dir_entry(uint64_t parent_ino, const char *name, uint64_t ino, ui
     dc->entries[dc->count].used = 1;
     dc->count++;
 
-    fprintf(stderr, "[proxy] add_dir_entry: 添加新条目 '%s' (ino=%llu type=%u) 到 parent=%llu, new_count=%u\n",
-            name, (unsigned long long)ino, type,
-            (unsigned long long)parent_ino, dc->count);
+    /* 详细日志改为 verbose 级别控制 */
 
     return 0;
 }
@@ -1150,39 +1139,32 @@ static int handle_remove(struct powerfs_remove_req *req, int is_dir)
     uint32_t i;
     int ret = -ENOENT;
 
-    fprintf(stderr, "[proxy] handle_remove: dir_ino=%lu, name='%s', is_dir=%d\n",
-           (unsigned long)req->dir_ino, req->name, is_dir);
+    /* 详细日志改为 verbose 级别控制，避免串口控制台过载导致 RCU stall */
+    if (config.verbose > 1) {
+        fprintf(stderr, "[proxy] handle_remove: dir_ino=%lu, name='%s', is_dir=%d\n",
+               (unsigned long)req->dir_ino, req->name, is_dir);
+    }
 
     /* 获取锁保护数据修改 */
     pthread_mutex_lock(&g_fs_mutex);
 
     dc = find_dir_cache(req->dir_ino);
     if (!dc) {
-        printf("[proxy] handle_remove: dir_cache not found for ino=%lu\n",
-               (unsigned long)req->dir_ino);
         pthread_mutex_unlock(&g_fs_mutex);
         return -ENOENT;
     }
 
-    printf("[proxy] handle_remove: found dir_cache, count=%u\n", dc->count);
-
     for (i = 0; i < dc->count && i < MAX_DIR_ENTRIES; i++) {
         if (dc->entries[i].used && strcmp(dc->entries[i].name, req->name) == 0) {
             uint64_t target_ino = dc->entries[i].ino;
-            printf("[proxy] handle_remove: found entry[%u] name='%s' ino=%lu\n",
-                   i, dc->entries[i].name, (unsigned long)target_ino);
 
             struct inode_entry *ie = find_inode(target_ino);
             if (ie) {
-                printf("[proxy] handle_remove: inode found, nlink=%u, used=%d\n",
-                       ie->nlink, ie->used);
-
                 if (is_dir) {
                     /* 检查目录是否为空 (除了 . 和 ..) */
                     if (ie->ino != 1) {
                         struct dir_cache *sub = find_dir_cache(ie->ino);
                         if (sub && sub->count > 2) {  /* 大于 . 和 .. */
-                            printf("[proxy] handle_remove: directory not empty\n");
                             pthread_mutex_unlock(&g_fs_mutex);
                             return -ENOTEMPTY;
                         }
@@ -1193,15 +1175,12 @@ static int handle_remove(struct powerfs_remove_req *req, int is_dir)
                 if (ie->nlink > 0)
                     ie->nlink--;
 
-                printf("[proxy] handle_remove: after decrement, nlink=%u\n", ie->nlink);
-
                 /* 从父目录移除目录项 */
                 if (ie->ino != 1)
                     remove_dir_entry(req->dir_ino, req->name);
 
                 /* 只有当 nlink 归零时才真正释放 inode */
                 if (ie->nlink == 0) {
-                    printf("[proxy] handle_remove: nlink=0, freeing inode data\n");
                     ie->used = 0;
                     if (ie->data) {
                         free(ie->data);
@@ -1213,18 +1192,10 @@ static int handle_remove(struct powerfs_remove_req *req, int is_dir)
                     }
                 }
 
-                printf("[proxy] handle_remove: success\n");
                 ret = 0;
-            } else {
-                printf("[proxy] handle_remove: inode not found for ino=%lu\n",
-                       (unsigned long)target_ino);
             }
             break;
         }
-    }
-
-    if (ret != 0 && ret == -ENOENT) {
-        printf("[proxy] handle_remove: entry not found in dir_cache\n");
     }
 
     /* 释放锁 */
@@ -1242,16 +1213,18 @@ static int handle_rename(struct powerfs_rename_req *req,
 
     memset(resp, 0, sizeof(*resp));
 
-    fprintf(stderr, "[proxy] handle_rename: old_dir=%lu old_name='%s' -> new_dir=%lu new_name='%s'\n",
-           (unsigned long)req->old_dir_ino, req->old_name,
-           (unsigned long)req->new_dir_ino, req->new_name);
+    /* 详细日志改为 verbose 级别控制，避免串口控制台过载导致 RCU stall */
+    if (config.verbose > 1) {
+        fprintf(stderr, "[proxy] handle_rename: old_dir=%lu old_name='%s' -> new_dir=%lu new_name='%s'\n",
+               (unsigned long)req->old_dir_ino, req->old_name,
+               (unsigned long)req->new_dir_ino, req->new_name);
+    }
 
     /* 获取锁保护数据修改 */
     pthread_mutex_lock(&g_fs_mutex);
 
     old_dc = find_dir_cache(req->old_dir_ino);
     if (!old_dc) {
-        fprintf(stderr, "[proxy] handle_rename: old dir_cache not found\n");
         pthread_mutex_unlock(&g_fs_mutex);
         return -ENOENT;
     }
@@ -1262,14 +1235,11 @@ static int handle_rename(struct powerfs_rename_req *req,
             strcmp(old_dc->entries[i].name, req->old_name) == 0) {
             ino = old_dc->entries[i].ino;
             type = old_dc->entries[i].type;
-            fprintf(stderr, "[proxy] handle_rename: found source ino=%lu type=%u\n",
-                   (unsigned long)ino, type);
             break;
         }
     }
 
     if (ino == 0) {
-        fprintf(stderr, "[proxy] handle_rename: source not found\n");
         pthread_mutex_unlock(&g_fs_mutex);
         return -ENOENT;
     }
@@ -1288,8 +1258,6 @@ static int handle_rename(struct powerfs_rename_req *req,
                 strcmp(new_dc->entries[i].name, req->new_name) == 0) {
                 struct inode_entry *target_ie = find_inode(new_dc->entries[i].ino);
                 if (target_ie) {
-                    fprintf(stderr, "[proxy] handle_rename: target exists, freeing (nlink=%u)\n",
-                           target_ie->nlink);
                     /* 减少目标 inode 的 nlink (覆盖目标相当于 unlink) */
                     if (target_ie->nlink > 0)
                         target_ie->nlink--;
@@ -1314,8 +1282,6 @@ static int handle_rename(struct powerfs_rename_req *req,
     /* 从源目录移除旧名称，添加到目标目录使用新名称 */
     remove_dir_entry(req->old_dir_ino, req->old_name);
     add_dir_entry(req->new_dir_ino, req->new_name, ino, type);
-
-    fprintf(stderr, "[proxy] handle_rename: success\n");
 
     /* 释放锁 */
     pthread_mutex_unlock(&g_fs_mutex);
@@ -1732,8 +1698,11 @@ static void process_request(struct powerfs_msg_header *req_hdr, void *req_data)
     int ret = 0;
     uint32_t resp_data_size = 0;
 
-    fprintf(stderr, "[proxy] process_request: type=%u seq=%u data_len=%u\n",
-            req_hdr->type, req_hdr->seq, req_hdr->data_len);
+    /* 详细日志改为 verbose 级别控制，避免串口控制台过载导致 RCU stall */
+    if (config.verbose > 2) {
+        fprintf(stderr, "[proxy] process_request: type=%u seq=%u data_len=%u\n",
+                req_hdr->type, req_hdr->seq, req_hdr->data_len);
+    }
 
     memset(&resp_hdr, 0, sizeof(resp_hdr));
     resp_hdr.type = req_hdr->type;
@@ -1880,7 +1849,7 @@ static void process_request(struct powerfs_msg_header *req_hdr, void *req_data)
     resp_hdr.status = ret;
     resp_hdr.data_len = resp_data_size;
 
-    if (config.verbose > 0) {
+    if (config.verbose > 1) {
         printf("[proxy] 处理请求 type=%u seq=%u -> status=%d\n",
                req_hdr->type, req_hdr->seq, ret);
     }
@@ -1888,8 +1857,10 @@ static void process_request(struct powerfs_msg_header *req_hdr, void *req_data)
     /*
      * 对于异步通知类型的消息，内核提交请求后不等待响应。
      * 这些消息在代理处理完成后，不需要写回 CQ，避免 CQ 填满。
-     * 包含: MKDIR, CREATE, UNLINK, RMDIR, RENAME
+     * 包含: MKDIR, CREATE, UNLINK, RMDIR, RENAME, WRITE, SETATTR
      * 注意: SYMLINK, LINK 需要同步响应（内核使用 powerfs_comm_send_request 等待响应）
+     *
+     * 内核通过 dget(dentry) 锁定 dentry 保证一致性，不依赖代理同步响应
      */
     switch (req_hdr->type) {
     case POWERFS_MSG_MKDIR:
@@ -1897,8 +1868,10 @@ static void process_request(struct powerfs_msg_header *req_hdr, void *req_data)
     case POWERFS_MSG_UNLINK:
     case POWERFS_MSG_RMDIR:
     case POWERFS_MSG_RENAME:
+    case POWERFS_MSG_WRITE:
+    case POWERFS_MSG_SETATTR:
         /* 异步通知类型: 不写回 CQ 响应，仅通知内核 */
-        if (config.verbose > 0) {
+        if (config.verbose > 2) {
             printf("[proxy] 异步通知 type=%u seq=%u: 跳过响应写回\n",
                    req_hdr->type, req_hdr->seq);
         }
@@ -1909,7 +1882,7 @@ static void process_request(struct powerfs_msg_header *req_hdr, void *req_data)
         }
         break;
     default:
-        /* 需要响应的类型: 写回 CQ (包括 SYMLINK, LINK, LOOKUP, READ, WRITE 等) */
+        /* 需要响应的类型: 写回 CQ (包括 SYMLINK, LINK, LOOKUP, READ 等) */
         if (config.use_mmap) {
             submit_response(&resp_hdr, resp_data);
         } else {
@@ -1925,7 +1898,7 @@ static void process_request(struct powerfs_msg_header *req_hdr, void *req_data)
 static void event_loop(void)
 {
     time_t last_save = time(NULL);
-    int save_interval = 5;  /* 每5秒保存一次 */
+    int save_interval = 30;  /* 每30秒保存一次 (减少频率提升吞吐量) */
     int consecutive_errors = 0;
 
     printf("[proxy] 开始事件循环 (模式: %s, poll 模式)...\n",

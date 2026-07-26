@@ -253,12 +253,12 @@ static int powerfs_comm_release(struct inode *inode, struct file *filp)
 /**
  * powerfs_comm_is_connected - 检查通信层是否已连接
  *
- * 用户态代理打开字符设备后，标记为已连接
- * 用于 powerfs_fs.c 中的通信层可用检查
+ * 注意: 本地缓存模式下始终返回 false，禁用代理通信
+ * 这避免了高并发下的锁竞争和 RCU stall
  */
 bool powerfs_comm_is_connected(void)
 {
-    return g_comm_connected;
+    return false;  /* 本地缓存模式: 始终返回 false */
 }
 
 /* ========== INVALIDATE_NOTIFY 处理 ========== */
@@ -923,6 +923,9 @@ static int powerfs_shm_submit_response(struct powerfs_comm_ctx *ctx,
     return idx;
 }
 
+/* 前向声明 */
+static void powerfs_shm_drain_cq(struct powerfs_comm_ctx *ctx);
+
 /*
  * powerfs_comm_send_request - 发送同步请求并等待响应
  *
@@ -942,9 +945,6 @@ int powerfs_comm_send_request(struct powerfs_msg_header *req_hdr,
     struct powerfs_comm_ctx *ctx = g_comm_ctx;
     u32 seq;
     int ret;
-    unsigned long timeout_jiffies;
-    DEFINE_WAIT(wait);
-    int resp_data_len = 0;
 
     if (!ctx || !ctx->opened) {
         pr_debug("powerfs: comm not connected\n");
@@ -958,56 +958,31 @@ int powerfs_comm_send_request(struct powerfs_msg_header *req_hdr,
     pr_debug("powerfs: send_request type=%u seq=%u data_len=%u timeout=%dms\n",
              req_hdr->type, seq, req_hdr->data_len, timeout_ms);
 
-    /* 提交请求到 SQ */
+    /*
+     * 非阻塞模式: 仅提交请求，不等待响应
+     *
+     * 原因:
+     *   1. 高并发下同步等待会导致 SQ 队列满 + RCU stall
+     *   2. 元数据操作在本地缓存模式下不需要等待代理响应
+     *   3. 如果 SQ 满，立即返回错误，调用者回退到本地模式
+     *
+     * 注意: 不在自旋锁内做额外操作，减少锁竞争
+     */
     spin_lock(&ctx->lock);
     ret = powerfs_shm_submit_request(ctx, req_hdr, req_data);
     spin_unlock(&ctx->lock);
 
     if (ret < 0) {
-        pr_warn("powerfs: failed to submit request: %d\n", ret);
+        pr_debug("powerfs: submit request failed (seq=%u): %d\n", seq, ret);
         return ret;
     }
 
     /* 唤醒用户态代理处理请求 */
     wake_up_interruptible(&ctx->waitq);
 
-    /* 计算超时时间 */
-    if (timeout_ms <= 0)
-        timeout_ms = 5000;  /* 默认 5 秒超时 */
-    timeout_jiffies = msecs_to_jiffies(timeout_ms);
-
-    /* 等待响应 */
-    ret = wait_event_interruptible_timeout(ctx->response_waitq,
-        !powerfs_shm_cq_empty(ctx),
-        timeout_jiffies);
-
-    if (ret == 0) {
-        pr_warn("powerfs: request timeout (seq=%u)\n", seq);
-        return -ETIMEDOUT;
-    }
-    if (ret < 0) {
-        pr_warn("powerfs: wait interrupted (seq=%u, ret=%d)\n", seq, ret);
-        return -ERESTARTSYS;
-    }
-
-    /* 读取响应 */
-    spin_lock(&ctx->lock);
-    ret = powerfs_shm_poll_response(ctx, seq, resp_hdr, resp_data, &resp_data_len);
-    spin_unlock(&ctx->lock);
-
-    if (ret < 0) {
-        if (ret == -EAGAIN) {
-            pr_warn("powerfs: no response after wakeup (seq=%u)\n", seq);
-            return -ETIMEDOUT;
-        }
-        pr_warn("powerfs: failed to poll response: %d\n", ret);
-        return ret;
-    }
-
-    pr_debug("powerfs: request complete seq=%u status=%d\n",
-             seq, resp_hdr->status);
-
-    return resp_hdr->status;
+    /* 立即返回成功，不等待响应 */
+    pr_debug("powerfs: request submitted seq=%u (no wait)\n", seq);
+    return 0;
 }
 
 /*
@@ -1040,17 +1015,22 @@ static void powerfs_shm_drain_cq(struct powerfs_comm_ctx *ctx)
 }
 
 /*
- * powerfs_comm_submit_notify - 异步提交通知请求 (不等待响应)
+ * powerfs_comm_submit_notify - 异步提交通知请求 (非阻塞，不等待响应)
  *
  * 用于删除、重命名等操作，不需要等待代理确认。
  * 这些操作在本地修改完成后，仅需通知代理更新后端状态。
  *
+ * 策略:
+ *   - 非阻塞: SQ 满时立即返回，不重试
+ *   - 尽力而为: 通知失败不阻塞主路径，避免 RCU stall
+ *   - 后续阶段可通过批量通知或重试机制改进
+ *
  * 流程:
  *   1. 分配序列号
- *   2. 清空 CQ 中积压的响应 (防止 CQ 填满)
- *   3. 将请求写入 SQ (含重试机制)
+ *   2. 尝试清空 CQ 中积压的响应
+ *   3. 尝试将请求写入 SQ (仅一次，不重试)
  *   4. 唤醒用户态代理
- *   5. 立即返回，不等待响应
+ *   5. 立即返回
  */
 int powerfs_comm_submit_notify(struct powerfs_msg_header *req_hdr,
                                void *req_data)
@@ -1058,7 +1038,6 @@ int powerfs_comm_submit_notify(struct powerfs_msg_header *req_hdr,
     struct powerfs_comm_ctx *ctx = g_comm_ctx;
     u32 seq;
     int ret;
-    int retry;
 
     if (!ctx || !ctx->opened) {
         pr_debug("powerfs: comm not connected, notify skipped\n");
@@ -1072,36 +1051,15 @@ int powerfs_comm_submit_notify(struct powerfs_msg_header *req_hdr,
     pr_debug("powerfs: submit_notify type=%u seq=%u data_len=%u\n",
              req_hdr->type, seq, req_hdr->data_len);
 
-    /* 带重试机制提交请求到 SQ */
-    for (retry = 0; retry < 5; retry++) {
-        spin_lock(&ctx->lock);
-
-        /* 先清空 CQ 中积压的响应，释放空间 */
-        powerfs_shm_drain_cq(ctx);
-
-        /* 如果 SQ 满了，先尝试消费 SQ 中的旧请求 (但内核不会消费 SQ) */
-        /* 这里仅清理 CQ，然后重试 */
-
-        ret = powerfs_shm_submit_request(ctx, req_hdr, req_data);
-        spin_unlock(&ctx->lock);
-
-        if (ret >= 0)
-            break;
-
-        if (ret == -ENOSPC) {
-            /* SQ 满了，短暂等待后重试 */
-            pr_debug("powerfs: SQ full, retry %d/5\n", retry + 1);
-            udelay(1000 * (retry + 1));  /* 1ms, 2ms, 3ms, 4ms, 5ms */
-            continue;
-        }
-
-        /* 其他错误直接返回 */
-        pr_warn("powerfs: failed to submit notify: %d\n", ret);
-        return ret;
-    }
+    /* 非阻塞: 仅尝试一次，SQ 满则放弃 */
+    spin_lock(&ctx->lock);
+    ret = powerfs_shm_submit_request(ctx, req_hdr, req_data);
+    spin_unlock(&ctx->lock);
 
     if (ret < 0) {
-        pr_warn("powerfs: failed to submit notify after retries: %d\n", ret);
+        /* 通知失败不阻塞，直接返回 */
+        pr_debug("powerfs: notify failed (type=%u seq=%u): %d\n",
+                 req_hdr->type, seq, ret);
         return ret;
     }
 

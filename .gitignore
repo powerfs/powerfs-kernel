@@ -115,4 +115,5 @@ __pycache__/
 powerfs_mod_backup_*/
 powerfs_proxy/powerfs_proxy
 tests/concurrent_test
+tests/simple_test
 powerfs_mod/powerfs.mod
