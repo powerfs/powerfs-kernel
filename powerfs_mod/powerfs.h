@@ -35,6 +35,19 @@ struct powerfs_dentry_info;
 struct powerfs_client;
 struct powerfs_dir_file_info;
 
+/* 响应结构 (定义在 powerfs_comm.h) */
+struct powerfs_lookup_resp;
+struct powerfs_getattr_resp;
+struct powerfs_create_resp;
+struct powerfs_setattr_resp;
+struct powerfs_write_resp;
+struct powerfs_readlink_resp;
+struct powerfs_dirent;
+
+/* 请求结构 (定义在 powerfs_comm.h) */
+struct powerfs_lookup_req;
+struct powerfs_create_req;
+
 /* ========== Dentry 私有数据 (参考 ceph_dentry_info) ========== */
 
 struct powerfs_dentry_info {
@@ -44,6 +57,10 @@ struct powerfs_dentry_info {
     unsigned long time;               /* 最近更新时间 */
     u64 offset;                       /* readdir 偏移 */
     unsigned long flags;              /* 标志位 */
+
+    /* Delta Sync 字段 */
+    __u64 generation;                 /* 当前路径的 generation */
+    char path[256];                   /* 完整路径 (用于 Delta Sync) */
 };
 
 /* powerfs_dentry_info 标志位 */
@@ -107,6 +124,10 @@ struct powerfs_inode_info {
     /* 目录项链表 (用于本地 readdir, 由 dir_mutex 保护) */
     struct list_head dir_entries;
     struct mutex dir_mutex;  /* 保护目录项链表 (使用mutex因为readdir可能睡眠) */
+
+    /* Delta Sync 字段 */
+    __u64 generation;                 /* inode 的 generation 版本 */
+    bool net_cache_valid;             /* 网络缓存是否有效 */
 };
 
 /* Cap 位 (简化版) */
@@ -270,5 +291,24 @@ int powerfs_handle_invalidate(struct powerfs_invalidate_req *req);
 
 /* 通信层全局状态 */
 bool powerfs_comm_is_connected(void);
+
+/* 连接管理 (powerfs_transport.c) */
+int  powerfs_comm_connect(const char *addr, __u16 port);
+void powerfs_comm_disconnect(void);
+
+/* 便捷方法 (powerfs_transport.c) - 与 powerfs_fs.c 中静态版本不冲突的接口 */
+int powerfs_comm_read(struct inode *inode, loff_t offset, size_t length,
+                       __u8 *buf, size_t *read_len);
+int powerfs_comm_write(struct inode *inode, loff_t offset,
+                        const __u8 *data, size_t length, size_t *written);
+int powerfs_comm_readdir(struct inode *dir, __u64 offset, __u32 count,
+                          struct powerfs_dirent *entries,
+                          __u32 *actual_count);
+int powerfs_comm_readlink(struct inode *inode, char *target, size_t buflen);
+int powerfs_comm_statfs(struct kstatfs *stats);
+
+/* powerfs-net 初始化/清理 (powerfs_net.c) */
+int  powerfs_net_init(void);
+void powerfs_net_exit(void);
 
 #endif /* _POWERFS_H */

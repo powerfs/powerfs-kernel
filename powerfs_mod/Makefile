@@ -1,7 +1,7 @@
 # PowerFS 内核模块 Makefile
-# 基于 Linux 6.2 内核 + io_uring 架构
+# 基于 Linux 6.2 内核 + 内核态 powerfs-net (TCP) 架构
 
-# 内核源码路径 (默认使用 6.2 内核源码)
+# 内核源码路径 (使用 6.2 内核源码)
 KERNELDIR ?= /home/portion/powerfs/ubuntu-linux-git
 
 # PowerFS 模块配置
@@ -13,6 +13,8 @@ obj-m += $(MODULE_NAME).o
 $(MODULE_NAME)-objs := \
     powerfs_mod.o \
     powerfs_fs.o \
+    powerfs_net.o \
+    powerfs_tlv.o \
     powerfs_transport.o \
     powerfs_serializer.o
 
@@ -29,6 +31,10 @@ ccflags-y += -Wno-stack-protector
 ccflags-y += -Wframe-larger-than=8192
 ccflags-y += -I$(PWD)
 ccflags-y += -DMODULE_NAME=\"$(MODULE_NAME)\"
+ccflags-y += -DCONFIG_POWERFS_NET=1
+
+# 网络相关链接选项 (内核模块不需要显式链接)
+# ldflags-y += -lnet
 
 # 检查是否有内核源码
 ifeq ($(wildcard $(KERNELDIR)/Makefile),)

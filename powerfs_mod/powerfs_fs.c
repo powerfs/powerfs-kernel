@@ -33,6 +33,7 @@
 
 #include "powerfs.h"
 #include "powerfs_comm.h"
+#include "powerfs_net.h"
 
 /* ========== 全局 slab 缓存 (参考 ceph 全局 cache) ========== */
 
@@ -91,6 +92,10 @@ int powerfs_d_init(struct dentry *dentry)
     di->lease_expire = jiffies + POWERFS_DENTRY_LEASE_TTL;
     INIT_LIST_HEAD(&di->lease_list);
 
+    /* Delta Sync 初始化 */
+    di->generation = 0;
+    di->path[0] = '\0';
+
     dentry->d_fsdata = di;
 
     pr_debug("powerfs: d_init '%pd' (di=%p)\n", dentry, di);
@@ -146,24 +151,85 @@ static bool powerfs_comm_connected(void)
  *   - 返回 0: dentry 已失效，丢弃缓存重新 lookup
  *   - 返回负值: 错误
  *
- * 策略:
- *   - 通信层可用时: 使用 TTL 机制，过期则重新向代理查询
- *   - 纯内存模式: dentry 始终有效 (因为内存中文件不会被外部修改)
- *   - RCU 模式: 只做快速检查
+ * Delta Sync 策略:
+ *   - 检查 dentry 的 generation 是否过期
+ *   - 如果 generation 过期 (powerfs_net_path_stale 返回 true)，返回 0 失效
+ *   - 如果 powerfs_net 未连接 (本地模式)，始终返回 1
+ *   - 对于目录 dentry，基于 TTL 进行简单过期检查
  */
 int powerfs_d_revalidate(struct dentry *dentry, unsigned int flags)
 {
+    struct powerfs_dentry_info *di;
+    struct inode *inode;
+    struct powerfs_inode_info *pi;
+
+    /* RCU 模式: 快速检查 TTL */
+    if (flags & LOOKUP_RCU) {
+        return 1;  /* RCU 模式下不做完整验证 */
+    }
+
+    /* 获取 dentry 私有数据 */
+    di = dentry->d_fsdata;
+    if (!di)
+        return 1;
+
+    /* 如果没有 inode，负 dentry 始终有效 */
+    inode = d_inode(dentry);
+    if (!inode)
+        return 1;
+
+    /* 获取 inode 私有数据 */
+    pi = POWERFS_I(inode);
+
     /*
-     * 始终返回 1 (有效)，参考 ramfs (不定义 d_revalidate，默认始终有效)
-     *
-     * 在阶段0 (本地内存模式)，文件不会被外部修改，dentry 始终有效。
-     * TTL/lease 机制在阶段1+ 接入真实后端时再启用。
-     *
-     * 在高并发下返回 0 (失效) 会导致 VFS 调用 d_invalidate，
-     * 与并发 lookup 产生竞争，可能导致 dentry 哈希表损坏。
+     * 检查 1: TTL 过期检查
+     * 如果超过 TTL，强制失效以获取最新数据
      */
-    (void)dentry;
-    (void)flags;
+    if (time_after(jiffies, di->lease_expire)) {
+        pr_debug("powerfs: d_revalidate '%pd' TTL expired\n", dentry);
+        spin_lock(&pi->i_lock);
+        pi->cache_valid = false;
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+
+    /*
+     * 检查 2: Delta Sync generation 检查
+     * 如果 path 不为空，检查 generation 是否过期
+     */
+    if (di->path[0] != '\0' && powerfs_net_is_connected()) {
+        __u64 cached_gen = di->generation;
+        bool stale;
+
+        /* 检查路径是否过期 */
+        stale = powerfs_net_path_stale(di->path, cached_gen);
+        if (stale) {
+            pr_debug("powerfs: d_revalidate '%pd' generation stale (cached=%llu)\n",
+                     dentry, (unsigned long long)cached_gen);
+
+            /* 失效 inode 缓存 */
+            spin_lock(&pi->i_lock);
+            pi->cache_valid = false;
+            pi->net_cache_valid = false;
+            spin_unlock(&pi->i_lock);
+
+            return 0;  /* 失效，重新 lookup */
+        }
+    }
+
+    /*
+     * 检查 3: inode 级别的 net_cache_valid 检查
+     */
+    spin_lock(&pi->i_lock);
+    if (!pi->cache_valid && pi->net_cache_valid && powerfs_net_is_connected()) {
+        spin_unlock(&pi->i_lock);
+        pr_debug("powerfs: d_revalidate '%pd' inode cache invalid\n", dentry);
+        return 0;
+    }
+    spin_unlock(&pi->i_lock);
+
+    pr_debug("powerfs: d_revalidate '%pd' valid (gen=%llu)\n",
+             dentry, (unsigned long long)di->generation);
     return 1;
 }
 
@@ -231,13 +297,16 @@ void powerfs_d_prune(struct dentry *dentry)
     spin_unlock(&ppi->i_lock);
 }
 
-/* Dentry operations 表 - 完全空 (参考 ramfs)
+/* Dentry operations 表
  *
- * 完全移除 dentry_operations，使用 VFS 默认行为
- * ramfs 没有 dentry_operations，这样可以避免
- * dentry 哈希表竞争导致的 RCU stall
+ * 启用 Delta Sync 所需的 d_revalidate 和 d_init/d_release
+ * 参考 ceph dentry_operations
  */
 static const struct dentry_operations powerfs_dentry_operations = {
+    .d_revalidate   = powerfs_d_revalidate,
+    .d_init         = powerfs_d_init,
+    .d_release      = powerfs_d_release,
+    .d_prune        = powerfs_d_prune,
 };
 
 /* ========== 辅助函数 ========== */
@@ -347,6 +416,10 @@ int powerfs_init_inode(struct inode *inode, umode_t mode,
     pi->cache_expire = jiffies + POWERFS_INODE_CACHE_TTL;
     pi->i_caps = POWERFS_CAP_SHARED | POWERFS_CAP_EXCLUSIVE;
     pi->dir_complete = true;  /* 本地缓存模式: 目录始终完整 */
+
+    /* Delta Sync 初始化 */
+    pi->generation = 0;
+    pi->net_cache_valid = false;
 
     /* 初始化目录项链表 */
     INIT_LIST_HEAD(&pi->dir_entries);
@@ -585,6 +658,7 @@ static int powerfs_comm_lookup(struct inode *dir, const char *name,
     if (ret < 0)
         return ret;
 
+    /* 返回响应状态码 (0=成功, -ENOENT 等) */
     return resp_hdr.status;
 }
 
@@ -886,19 +960,79 @@ static int powerfs_comm_rename(struct inode *old_dir, const char *old_name,
 /*
  * powerfs_lookup - 查找文件/目录
  *
- * 策略 (纯本地 dcache 模式):
- *   - 如果 dentry 已有 inode (在 dcache 中)，直接返回
- *   - 否则: 添加负 dentry
+ * 策略:
+ *   1. 快速路径: dentry 已有 inode (在 dcache 中)，直接返回
+ *   2. 通信层可用: 通过代理查询后端 Filer
+ *      - 找到: 创建 inode 并实例化 dentry
+ *      - 未找到: 添加负 dentry
+ *   3. 通信层不可用: 纯本地模式，添加负 dentry
  *
  * 注意: 不在 RCU read-side critical section 中做任何阻塞操作
- *       目录项跨进程可见性通过 VFS 的 d_invalidate 机制实现
- *       (当 dentry 被其他进程操作时，VFS 会重新调用 lookup)
+ */
+/* 构建 dentry 的完整路径 (用于 Delta Sync) */
+static void powerfs_build_dentry_path(struct dentry *dentry, char *path, size_t path_len)
+{
+    char names[64][256];
+    struct dentry *cur;
+    int depth = 0;
+    int i;
+    size_t total_len;
+
+    if (!dentry || !path || path_len == 0)
+        return;
+
+    /* 向上遍历到根，收集各层名称 */
+    cur = dentry;
+    while (cur && !IS_ROOT(cur)) {
+        if (depth >= 63) break;  /* 防止过深递归 */
+        strncpy(names[depth], cur->d_name.name, 255);
+        names[depth][255] = '\0';
+        depth++;
+        cur = cur->d_parent;
+    }
+
+    /* 从根向下构建路径 */
+    path[0] = '/';
+    path[1] = '\0';
+    total_len = 1;
+    for (i = depth - 1; i >= 0 && total_len < path_len - 1; i--) {
+        size_t name_len = strlen(names[i]);
+        size_t need = name_len + (i > 0 ? 1 : 0);
+
+        if (total_len + need >= path_len)
+            break;
+
+        if (i < depth - 1) {
+            /* 非最后一个组件，添加 "/" */
+            path[total_len++] = '/';
+        }
+        memcpy(path + total_len, names[i], name_len);
+        total_len += name_len;
+    }
+    path[total_len] = '\0';
+}
+
+/*
+ * powerfs_lookup - 查找文件/目录
+ *
+ * 策略 (更新版 - Delta Sync + powerfs_net):
+ *   1. 快速路径: dentry 已有 inode (在 dcache 中)
+ *   2. powerfs_net 连接可用: 直接通过 powerfs_net_lookup 查询
+ *      - 找到: 创建 inode，设置 generation，记录路径
+ *      - 未找到: 添加负 dentry
+ *   3. powerfs_comm 连接可用 (兼容旧接口): 使用旧代理查询
+ *   4. 纯本地模式: 添加负 dentry
  */
 struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
                                unsigned int flags)
 {
-    (void)dir;
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(dir->i_sb);
+    struct inode *inode;
+    int err;
+
     (void)flags;
+
+    pr_debug("powerfs: lookup '%pd' in dir=%lu\n", dentry, dir->i_ino);
 
     /* 快速路径: dentry 已有 inode (在 dcache 中) */
     if (d_inode(dentry)) {
@@ -906,8 +1040,201 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
         return NULL;
     }
 
-    /* 未找到: 添加负 dentry */
-    pr_debug("powerfs: lookup '%pd' not found, negative dentry\n", dentry);
+    /* 路径已缓存为负 dentry (有 inode = 正条目，无 inode = 负条目) */
+    /* 负 dentry 检查: 通过 d_fsdata 的 generation 判断是否过期 */
+
+    /* === powerfs_net 直接通信模式 === */
+    if (powerfs_net_is_connected()) {
+        __u64 ino = 0;
+        __u32 mode = 0;
+        __u32 uid = 0, gid = 0;
+        __u64 size = 0;
+        __u32 nlink = 0;
+        char path_buf[256];
+        __u64 generation;
+
+        pr_debug("powerfs: lookup '%pd' via powerfs_net\n", dentry);
+
+        /* 构建完整路径 */
+        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+
+        /* 通过 powerfs_net 直接查询 */
+        err = powerfs_net_lookup(dir->i_ino, dentry->d_name.name,
+                                  strlen(dentry->d_name.name),
+                                  &ino, &mode, &uid, &gid,
+                                  &size, &nlink);
+
+        if (err == 0 && ino != 0) {
+            /* 找到文件: 创建 inode */
+            pr_debug("powerfs: lookup '%pd' found ino=%llu mode=%o\n",
+                     dentry, (unsigned long long)ino, mode);
+
+            inode = powerfs_iget(dir->i_sb, ino);
+            if (IS_ERR(inode)) {
+                pr_warn("powerfs: lookup '%pd' iget failed: %ld\n",
+                        dentry, PTR_ERR(inode));
+                d_add(dentry, NULL);
+                return NULL;
+            }
+
+            if (inode->i_state & I_NEW) {
+                /* 新 inode: 从响应初始化 */
+                inode->i_mode = mode;
+                inode->i_uid = make_kuid(&init_user_ns, uid);
+                inode->i_gid = make_kgid(&init_user_ns, gid);
+                inode->i_size = size;
+                set_nlink(inode, nlink);
+                inode->i_mtime = current_time(inode);
+                inode->i_atime = inode->i_mtime;
+                inode->i_ctime = inode->i_mtime;
+
+                /* 设置 inode 缓存有效 + Delta Sync 字段 */
+                {
+                    struct powerfs_inode_info *pi = POWERFS_I(inode);
+                    spin_lock(&pi->i_lock);
+                    pi->parent_ino = dir->i_ino;
+                    strncpy(pi->name, dentry->d_name.name,
+                            POWERFS_MAX_NAME_LEN - 1);
+                    pi->cache_valid = true;
+                    pi->net_cache_valid = true;
+                    /* generation 初始为 0，后续通过 Delta Sync 更新 */
+                    spin_unlock(&pi->i_lock);
+                }
+
+                unlock_new_inode(inode);
+            }
+
+            /* 实例化 dentry */
+            d_instantiate(dentry, inode);
+
+            /* 设置 dentry 的 Delta Sync 字段 */
+            {
+                struct powerfs_dentry_info *di = dentry->d_fsdata;
+                if (di) {
+                    strncpy(di->path, path_buf, sizeof(di->path) - 1);
+                    di->generation = 0;  /* 初始 generation */
+                    di->lease_expire = jiffies + POWERFS_DENTRY_LEASE_TTL;
+                    di->time = jiffies;
+                }
+            }
+
+            /* 获取当前路径的 generation */
+            generation = powerfs_net_get_path_generation(path_buf);
+            if (generation > 0) {
+                struct powerfs_dentry_info *di = dentry->d_fsdata;
+                if (di)
+                    di->generation = generation;
+
+                /* 同时更新 inode 的 generation */
+                if (inode) {
+                    struct powerfs_inode_info *pi = POWERFS_I(inode);
+                    spin_lock(&pi->i_lock);
+                    pi->generation = generation;
+                    spin_unlock(&pi->i_lock);
+                }
+            }
+
+            pr_debug("powerfs: lookup '%pd' completed, gen=%llu\n",
+                     dentry, (unsigned long long)generation);
+            return NULL;
+        }
+
+        if (err == -ENOENT) {
+            /* 文件不存在: 添加负 dentry */
+            pr_debug("powerfs: lookup '%pd' not found (powerfs_net)\n", dentry);
+            d_add(dentry, NULL);
+            return NULL;
+        }
+
+        /* 其他错误: 记录但仍添加负 dentry */
+        pr_warn("powerfs: lookup '%pd' powerfs_net error: %d\n", dentry, err);
+        d_add(dentry, NULL);
+        return NULL;
+    }
+
+    /* === 兼容旧 powerfs_comm 接口 === */
+    if (powerfs_comm_connected()) {
+        struct powerfs_lookup_resp resp;
+        umode_t mode;
+
+        pr_debug("powerfs: lookup '%pd' via powerfs_comm (legacy)\n", dentry);
+
+        err = powerfs_comm_lookup(dir, dentry->d_name.name, &resp);
+        if (err == 0) {
+            /* 找到文件: 创建 inode */
+            mode = resp.mode;
+
+            inode = powerfs_iget(dir->i_sb, resp.ino);
+            if (IS_ERR(inode)) {
+                pr_warn("powerfs: lookup '%pd' iget failed: %ld\n",
+                        dentry, PTR_ERR(inode));
+                d_add(dentry, NULL);
+                return NULL;
+            }
+
+            if (inode->i_state & I_NEW) {
+                /* 新 inode: 从响应初始化 */
+                inode->i_mode = mode;
+                inode->i_uid = make_kuid(&init_user_ns, resp.uid);
+                inode->i_gid = make_kgid(&init_user_ns, resp.gid);
+                inode->i_size = resp.size;
+                set_nlink(inode, resp.nlink);
+                inode->i_mtime.tv_sec = resp.mtime_sec;
+                inode->i_mtime.tv_nsec = 0;
+                inode->i_atime = inode->i_mtime;
+                inode->i_ctime = inode->i_mtime;
+
+                /* 设置 inode 缓存有效 + Delta Sync 字段 */
+                {
+                    struct powerfs_inode_info *pi = POWERFS_I(inode);
+                    spin_lock(&pi->i_lock);
+                    pi->parent_ino = dir->i_ino;
+                    strncpy(pi->name, dentry->d_name.name,
+                            POWERFS_MAX_NAME_LEN - 1);
+                    pi->cache_valid = true;
+                    pi->net_cache_valid = true;
+                    spin_unlock(&pi->i_lock);
+                }
+
+                unlock_new_inode(inode);
+            }
+
+            /* 实例化 dentry */
+            d_instantiate(dentry, inode);
+
+            /* 设置 dentry 的 Delta Sync 字段 */
+            {
+                char path_buf[256];
+                struct powerfs_dentry_info *di = dentry->d_fsdata;
+                if (di) {
+                    powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+                    strncpy(di->path, path_buf, sizeof(di->path) - 1);
+                    di->generation = powerfs_net_get_path_generation(path_buf);
+                    di->lease_expire = jiffies + POWERFS_DENTRY_LEASE_TTL;
+                    di->time = jiffies;
+                }
+            }
+
+            pr_debug("powerfs: lookup '%pd' found ino=%llu mode=%o (legacy)\n",
+                     dentry, (unsigned long long)resp.ino, mode);
+            return NULL;
+        }
+
+        if (err == -ENOENT || err == -ETIMEDOUT) {
+            /* 文件不存在: 添加负 dentry */
+            pr_debug("powerfs: lookup '%pd' not found (comm)\n", dentry);
+            d_add(dentry, NULL);
+            return NULL;
+        }
+
+        /* 其他错误 */
+        pr_warn("powerfs: lookup '%pd' comm error: %d\n", dentry, err);
+        d_add(dentry, NULL);
+        return NULL;
+    }
+
+    /* === 纯本地模式: 添加负 dentry === */
+    pr_debug("powerfs: lookup '%pd' not found (local mode)\n", dentry);
     d_add(dentry, NULL);
     return NULL;
 }
@@ -960,6 +1287,19 @@ static int powerfs_mknod(struct user_namespace *idmap, struct inode *dir,
 
     powerfs_add_dir_entry(dir, new_ino, type, dentry->d_name.name);
 
+    /* === Delta Sync: 更新路径 generation === */
+    {
+        char path_buf[256];
+        struct powerfs_dentry_info *di = dentry->d_fsdata;
+
+        if (di) {
+            powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+            /* 在创建后触发 generation 失效，强制后续操作同步 */
+            powerfs_net_invalidate_path(path_buf);
+            powerfs_net_invalidate_dir(dir->i_ino);
+        }
+    }
+
     pr_debug("powerfs: mknod '%pd' success, ino=%llu\n",
              dentry, new_ino);
 
@@ -978,9 +1318,10 @@ static int powerfs_mkdir(struct user_namespace *idmap, struct inode *dir,
             dentry, dir->i_ino, mode);
 
     /*
-     * 纯本地操作 + 异步通知:
-     *   1. 在本地创建 inode 和 dentry (dget 锁定 dentry 防止被 shrinker 回收)
-     *   2. 异步通知代理创建后端记录
+     * 本地操作 + 远程同步通知:
+     *   1. 在本地创建 inode 和 dentry
+     *   2. 通过 powerfs_net 同步到远端（Delta Sync）
+     *   3. 通过 powerfs_comm 异步通知代理（兼容旧接口）
      */
     err = powerfs_mknod(idmap, dir, dentry, mode | S_IFDIR, 0);
     if (err) {
@@ -991,10 +1332,30 @@ static int powerfs_mkdir(struct user_namespace *idmap, struct inode *dir,
     /* 增加父目录 nlink (".." 指向父目录) */
     inc_nlink(dir);
 
-    /* 获取新创建的 inode 用于通知 */
+    /* 获取新创建的 inode 用于远程同步 */
     inode = d_inode(dentry);
 
-    /* 异步通知代理创建目录 */
+    /* === powerfs_net 同步: 同步创建目录到远端 === */
+    if (inode && powerfs_net_is_connected()) {
+        char path_buf[256];
+
+        /* 构建路径用于 Delta Sync */
+        {
+            struct powerfs_dentry_info *di = dentry->d_fsdata;
+            if (di) {
+                powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+                strncpy(di->path, path_buf, sizeof(di->path) - 1);
+            }
+        }
+
+        /* 触发 Delta Sync: 失效缓存，后续操作将通过 pull_delta 获取最新状态 */
+        powerfs_net_invalidate_path(path_buf);
+        powerfs_net_invalidate_dir(dir->i_ino);
+
+        pr_debug("powerfs: mkdir '%pd' synced to powerfs_net\n", dentry);
+    }
+
+    /* === 兼容旧 powerfs_comm 接口 === */
     if (inode && powerfs_comm_connected()) {
         struct powerfs_msg_header req_hdr;
         struct powerfs_create_req req_data;
@@ -1063,7 +1424,18 @@ static int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
     /* 减少父目录的链接数 (因删除了一个子目录) */
     drop_nlink(dir);
 
-    /* 异步通知代理更新后端 */
+    /* === Delta Sync: 失效路径缓存 === */
+    if (powerfs_net_is_connected()) {
+        char path_buf[256];
+
+        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+        powerfs_net_invalidate_path(path_buf);
+        powerfs_net_invalidate_dir(dir->i_ino);
+        pr_debug("powerfs: rmdir '%pd' invalidated cache for '%s'\n",
+                 dentry, path_buf);
+    }
+
+    /* === 异步通知代理更新后端 (兼容旧接口) === */
     if (powerfs_comm_connected()) {
         struct powerfs_msg_header req_hdr;
         struct powerfs_remove_req req_data;
@@ -1103,9 +1475,10 @@ static int powerfs_create(struct user_namespace *idmap, struct inode *dir,
              dentry, dir->i_ino, mode);
 
     /*
-     * 纯本地操作 + 异步通知:
-     *   1. 在本地创建 inode 和 dentry (dget 锁定 dentry 防止被 shrinker 回收)
-     *   2. 异步通知代理创建后端记录
+     * 本地操作 + 远程同步通知:
+     *   1. 在本地创建 inode 和 dentry
+     *   2. 通过 powerfs_net 触发 Delta Sync 失效
+     *   3. 通过 powerfs_comm 异步通知代理（兼容旧接口）
      *
      * dget 锁定 dentry 后，stat() 直接从 dcache 查找，不触发 lookup，
      * 避免 lookup 时代理还没处理完 CREATE 导致 -ENOENT 的问题
@@ -1119,7 +1492,22 @@ static int powerfs_create(struct user_namespace *idmap, struct inode *dir,
     /* 获取新创建的 inode 用于通知 */
     inode = d_inode(dentry);
 
-    /* 异步通知代理创建文件 */
+    /* === powerfs_net: 触发 Delta Sync 失效 === */
+    if (inode && powerfs_net_is_connected()) {
+        char path_buf[256];
+        struct powerfs_dentry_info *di = dentry->d_fsdata;
+
+        if (di) {
+            powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+            strncpy(di->path, path_buf, sizeof(di->path) - 1);
+            powerfs_net_invalidate_path(path_buf);
+            powerfs_net_invalidate_dir(dir->i_ino);
+        }
+
+        pr_debug("powerfs: create '%pd' delta sync invalidated\n", dentry);
+    }
+
+    /* === 兼容旧 powerfs_comm 接口 === */
     if (inode && powerfs_comm_connected()) {
         struct powerfs_msg_header req_hdr;
         struct powerfs_create_req req_data;
@@ -1182,7 +1570,18 @@ static int powerfs_unlink(struct inode *dir, struct dentry *dentry)
     /* 从本地目录项链表中移除 */
     powerfs_remove_dir_entry(dir, dentry->d_name.name);
 
-    /* 异步通知代理更新后端 */
+    /* === Delta Sync: 失效路径缓存 === */
+    if (powerfs_net_is_connected()) {
+        char path_buf[256];
+
+        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+        powerfs_net_invalidate_path(path_buf);
+        powerfs_net_invalidate_dir(dir->i_ino);
+        pr_debug("powerfs: unlink '%pd' invalidated cache for '%s'\n",
+                 dentry, path_buf);
+    }
+
+    /* === 异步通知代理更新后端 (兼容旧接口) === */
     if (powerfs_comm_connected()) {
         struct powerfs_msg_header req_hdr;
         struct powerfs_remove_req req_data;
@@ -2544,7 +2943,32 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     /* 设置全局超级块指针 (供通信层使用) */
     g_powerfs_sb = sb;
 
+    /* === 初始化 powerfs_net 连接池 (多节点 Delta Sync) === */
+    powerfs_net_pool_init();
+
+    /* 配置 Filer 节点 (Delta Sync 的主节点) */
+    if (ctx && ctx->filer_addr[0]) {
+        powerfs_net_add_server(ctx->filer_addr, ctx->filer_port,
+                              POWERFS_NET_SERVER_FILER);
+    }
+
+    /* 配置 Master 节点 */
+    if (ctx && ctx->master_addr[0]) {
+        powerfs_net_add_server(ctx->master_addr, ctx->master_port,
+                              POWERFS_NET_SERVER_MASTER);
+    }
+
+    /* 配置 Volume 节点 */
+    if (ctx && ctx->volume_addr[0]) {
+        powerfs_net_add_server(ctx->volume_addr, ctx->volume_port,
+                              POWERFS_NET_SERVER_VOLUME);
+    }
+
+    /* 启动 Delta Sync 监控 (leader 探测 + 健康检查) */
+    powerfs_net_start_monitor();
+
     pr_info("powerfs: fill_super done, root ino=%lu\n", root->i_ino);
+    pr_info("powerfs: powerfs_net pool initialized (Delta Sync ready)\n");
     return 0;
 }
 
@@ -2559,6 +2983,10 @@ void powerfs_kill_sb_super(struct super_block *sb)
     /* 清除全局超级块指针 */
     if (g_powerfs_sb == sb)
         g_powerfs_sb = NULL;
+
+    /* === 清理 powerfs_net (停止 Delta Sync 监控，关闭所有连接) === */
+    powerfs_net_stop_monitor();
+    powerfs_net_pool_cleanup();
 
     if (sbi) {
         kfree(sbi);
