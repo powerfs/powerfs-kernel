@@ -1,6 +1,30 @@
 # PowerFS Kernel Module — Test Documentation
 
-This document describes how to use the PowerFS kernel module test suites to validate Delta Sync, multi-node connection pools, leader failover, and related functionality.
+This document describes how to set up test environments and run test suites to validate Delta Sync, multi-node connection pools, leader failover, and related functionality.
+
+## Quick Start
+
+```bash
+# 1. Start backend (FUSE containerized environment)
+sudo ./start_fuse_env.sh --wait
+
+# 2. Build and mount kernel module (connects to the backend)
+sudo ./start_kernel_env.sh --from-fuse-env
+
+# 3. Run integration tests
+sudo ./test_multi_node.sh
+
+# 4. Stop everything when done
+sudo ./stop_test_env.sh
+```
+
+## Test Environment Scripts
+
+| Script | Purpose | Requires Docker | Run Time |
+|--------|---------|-----------------|----------|
+| `start_fuse_env.sh` | Build & start FUSE containerized backend | Yes | ~2-5 min |
+| `start_kernel_env.sh` | Build, load, mount kernel module | No | ~30 sec |
+| `stop_test_env.sh` | Stop & clean all test environments | Yes | ~10 sec |
 
 ## Test Scripts Overview
 
@@ -8,6 +32,267 @@ This document describes how to use the PowerFS kernel module test suites to vali
 |--------|---------|------------------|----------|
 | `verify_module.sh` | Static compilation & symbol export check | No | ~5 seconds |
 | `test_multi_node.sh` | Full integration test suite | Yes | ~2-10 minutes |
+
+---
+
+## 0. Test Environment Setup & Management
+
+PowerFS testing requires two layers:
+1. **Backend services** (Master, Volume, Filer) — provided by the FUSE containerized environment
+2. **Client layer** — either the FUSE client (container) or the kernel module (local)
+
+### 0.1 FUSE Containerized Environment (`start_fuse_env.sh`)
+
+Builds and starts the complete PowerFS backend cluster plus FUSE client using Docker Compose.
+
+**Services started:**
+- `redis` — Metadata store
+- `master-1`, `master-2`, `master-3` — Raft consensus (ports 9433-9435)
+- `volume-1`, `volume-2`, `volume-3` — Data shards (ports 8180-8182, 8191-8193)
+- `filer-1`, `filer-2`, `filer-3` — Metadata routing (ports 8988-8993)
+- `fuse-test` — FUSE client mounted at `/tmp/powerfs/test`
+- `benchmark` — Container for running IO tests
+
+**Usage:**
+```bash
+# Start everything and wait for health (recommended)
+sudo ./start_fuse_env.sh --wait
+
+# Start, rebuild images first
+sudo ./start_fuse_env.sh --build --wait
+
+# Start backend only (no FUSE client)
+sudo ./start_fuse_env.sh --backend-only
+
+# Clean start (removes all data volumes)
+sudo ./start_fuse_env.sh --clean --wait
+
+# Tail FUSE logs after startup
+sudo ./start_fuse_env.sh --wait --logs
+```
+
+**Ports mapped to host:**
+
+| Service | Container Port | Host Port |
+|---------|---------------|-----------|
+| master-1 | 9333 | 9433 |
+| master-2 | 9333 | 9434 |
+| master-3 | 9333 | 9435 |
+| volume-1 | 8080 | 8180 |
+| volume-2 | 8080 | 8181 |
+| volume-3 | 8080 | 8182 |
+| filer-1 | 8888/8889 | 8988/8989 |
+| filer-2 | 8888/8889 | 8990/8991 |
+| filer-3 | 8888/8889 | 8992/8993 |
+
+**Environment Variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COMPOSE_FILE` | `docker-compose.test.yml` | Compose file name |
+| `COMPOSE_WORKDIR` | `docker/` | Directory containing compose file |
+| `FUSE_MOUNT` | `/tmp/powerfs/test` | Host mount point for FUSE |
+| `LOG_DIR` | `/tmp/powerfs/logs` | Log file directory |
+
+### 0.2 Kernel Filesystem Environment (`start_kernel_env.sh`)
+
+Builds the PowerFS kernel module, loads it, and mounts the filesystem to communicate with backend services via the `powerfs_net` TCP protocol (bypassing FUSE).
+
+**Usage:**
+```bash
+# Build module and mount with FUSE test env defaults (host ports)
+sudo ./start_kernel_env.sh --from-fuse-env
+
+# Build only (no mount)
+sudo ./start_kernel_env.sh --build-only
+
+# Mount with custom multi-node configuration
+sudo ./start_kernel_env.sh \
+    --filers "10.0.0.1:9334,10.0.0.2:9334,10.0.0.3:9334" \
+    --master "10.0.0.4:9333" \
+    --volume "10.0.0.5:8080"
+
+# Mount with default local config
+sudo ./start_kernel_env.sh
+
+# Unmount only (keep module loaded)
+sudo ./start_kernel_env.sh --unmount
+
+# Full reset (unload module + clean mount)
+sudo ./start_kernel_env.sh --reset
+```
+
+**Default Address Mapping (with FUSE containerized env):**
+
+When using `--from-fuse-env`, the script maps to the host-exposed ports from `docker-compose.test.yml`:
+
+| Component | Host Address |
+|-----------|-------------|
+| Filer 1 | `127.0.0.1:8988` |
+| Filer 2 | `127.0.0.1:8990` |
+| Filer 3 | `127.0.0.1:8992` |
+| Master | `127.0.0.1:9433` |
+| Volume | `127.0.0.1:8180` |
+
+**Environment Variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POWERFS_MODULE` | `powerfs` | Kernel module name |
+| `POWERFS_MOUNT` | `/mnt/powerfs` | Mount point |
+| `POWERFS_FILERS` | `127.0.0.1:8988,...` | Filer addresses |
+| `POWERFS_MASTER` | `127.0.0.1:9433` | Master address |
+| `POWERFS_VOLUME` | `127.0.0.1:8180` | Volume address |
+| `KERNEL_BUILD_DIR` | `/lib/modules/$(uname -r)/build` | Kernel headers path |
+
+**What the script does:**
+1. Detects kernel source tree and builds `powerfs.ko`
+2. Loads module via `insmod`
+3. Registers filesystem type in kernel
+4. Mounts with multi-node configuration
+5. Runs quick smoke test (create/read/Delta Sync)
+
+### 0.3 Stopping Test Environments (`stop_test_env.sh`)
+
+Safely stops and cleans all PowerFS test environments.
+
+**Usage:**
+```bash
+# Stop everything (kernel + FUSE containers)
+sudo ./stop_test_env.sh
+
+# Stop kernel environment only
+sudo ./stop_test_env.sh --kernel-only
+
+# Stop FUSE containers only
+sudo ./stop_test_env.sh --fuse-only
+
+# Full cleanup - removes ALL data volumes (destructive!)
+sudo ./stop_test_env.sh --clean
+
+# Check current status without stopping
+sudo ./stop_test_env.sh --status
+```
+
+**What the script does:**
+1. Unmounts kernel mount point (`/mnt/powerfs`)
+2. Unloads kernel module (`powerfs.ko`)
+3. Stops FUSE client container
+4. Unmounts FUSE host mount point
+5. Stops all backend containers
+6. Cleans up temporary directories
+
+**Environment Variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POWERFS_MODULE` | `powerfs` | Module to unload |
+| `POWERFS_MOUNT` | `/mnt/powerfs` | Kernel mount to unmount |
+| `FUSE_MOUNT` | `/tmp/powerfs/test` | FUSE mount to unmount |
+| `COMPOSE_FILE` | `docker-compose.test.yml` | Compose file |
+
+### 0.4 Environment Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Host Machine                             │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Kernel Module (powerfs.ko)                               │  │
+│  │  Mount: /mnt/powerfs  |  powerfs_net TCP protocol         │  │
+│  └───────────────────────┬───────────────────────────────────┘  │
+│                          │                                       │
+│                  TCP (host ports)                                │
+│                          │                                       │
+│  ┌───────────────────────▼───────────────────────────────────┐  │
+│  │  Docker Containers (docker-compose.test.yml)              │  │
+│  │                                                           │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                  │  │
+│  │  │  Redis  │  │ Master  │  │ Master  │  ...              │  │
+│  │  │  :6380  │  │  :9433  │  │  :9434  │                  │  │
+│  │  └─────────┘  └─────────┘  └─────────┘                  │  │
+│  │                                                           │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                  │  │
+│  │  │  Volume │  │  Volume │  │  Volume │                   │  │
+│  │  │  :8180  │  │  :8181  │  │  :8182  │                   │  │
+│  │  └─────────┘  └─────────┘  └─────────┘                  │  │
+│  │                                                           │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                  │  │
+│  │  │ Filer 1 │  │ Filer 2 │  │ Filer 3 │                   │  │
+│  │  │ :8988   │  │ :8990   │  │ :8992   │                   │  │
+│  │  └─────────┘  └─────────┘  └─────────┘                  │  │
+│  │                                                           │  │
+│  │  ┌─────────────────────────────────────────────────┐      │  │
+│  │  │ FUSE Client  (mounted at /tmp/powerfs/test)     │      │  │
+│  │  └─────────────────────────────────────────────────┘      │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 0.5 Typical Workflows
+
+**Workflow A: Kernel Module Testing (Full Stack)**
+```bash
+# 1. Start backend
+sudo ./start_fuse_env.sh --wait
+
+# 2. Mount kernel module
+sudo ./start_kernel_env.sh --from-fuse-env
+
+# 3. Run kernel integration tests
+sudo ./test_multi_node.sh
+
+# 4. Cleanup
+sudo ./stop_test_env.sh
+```
+
+**Workflow B: FUSE Client Testing**
+```bash
+# 1. Start full FUSE environment (backend + FUSE client)
+sudo ./start_fuse_env.sh --wait
+
+# 2. Test via FUSE mount point
+ls /tmp/powerfs/test
+echo "hello" > /tmp/powerfs/test/hello.txt
+cat /tmp/powerfs/test/hello.txt
+
+# 3. Connect to benchmark container for IO tests
+docker compose -f docker/docker-compose.test.yml exec benchmark bash
+
+# 4. Cleanup
+sudo ./stop_test_env.sh --fuse-only
+```
+
+**Workflow C: Kernel Module Unit Tests (No Backend)**
+```bash
+# 1. Build and verify module
+sudo ./start_kernel_env.sh --build-only
+
+# 2. Run static verification
+bash verify_module.sh
+
+# 3. Dry-run integration tests
+DUMMY_MODE=1 bash ./test_multi_node.sh
+```
+
+**Workflow D: Mixed Mode (Compare FUSE vs Kernel)**
+```bash
+# 1. Start backend only
+sudo ./start_fuse_env.sh --backend-only --wait
+
+# 2. Mount kernel module (shares same backend)
+sudo ./start_kernel_env.sh --from-fuse-env
+
+# 3. Run tests against kernel mount
+sudo ./test_multi_node.sh
+
+# 4. Compare with FUSE (start FUSE client separately)
+docker compose -f docker/docker-compose.test.yml up -d fuse-test
+
+# 5. Check both mount points
+ls /mnt/powerfs/          # kernel
+ls /tmp/powerfs/test/     # FUSE
+```
 
 ---
 
