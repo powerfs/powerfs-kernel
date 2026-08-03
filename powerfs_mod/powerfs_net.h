@@ -135,6 +135,7 @@ enum powerfs_net_msg_type {
 #define POWERFS_NET_STATUS_ERR_NO_SPACE    8
 #define POWERFS_NET_STATUS_ERR_BAD_FD      9
 #define POWERFS_NET_STATUS_ERR_SERVER      10
+#define POWERFS_NET_STATUS_ERR_REDIRECT    11  /* 响应体 Owner 字段携带 leader net 地址 "ip:port", 客户端需切换连接重试 */
 
 /* ========== TLV 字段 ID ========== */
 
@@ -299,8 +300,21 @@ struct powerfs_net_request {
 struct powerfs_net_conn {
     /* 网络连接 */
     struct socket *sock;
+    /*
+     * sock 引用计数: send_request 使用 sock 期间 inc, disconnect 置
+     * g_conn.sock=NULL 后 wait_event 等 sock_users==0 再 close, 防止
+     * 并发 recv 使用已释放 socket 的 use-after-free (QEMU 回归中
+     * ls/readdir 触发的 _raw_spin_lock_irqsave NULL deref 根因).
+     */
+    atomic_t sock_users;
+    wait_queue_head_t sock_user_wq;
     struct sockaddr_storage peer_addr;
     int peer_len;
+
+    /* 当前连接的目标地址 (用于 find_leader 判断是否需要重连,
+     * 避免 disconnect 与并发请求 recv 竞态导致 NULL deref) */
+    char cur_addr[64];
+    __u16 cur_port;
 
     /* 状态管理 */
     enum powerfs_net_state state;
@@ -325,6 +339,7 @@ struct powerfs_net_conn {
     /* 重连工作 */
     struct work_struct reconnect_work;
     int reconnect_count;
+    atomic_t stopping;          /* 模块退出时置 1，让 reconnect_work 提前退出（atomic_t 保证跨 CPU 可见性） */
 
     /* 服务端信息 (握手后) */
     __u64 server_id;
@@ -502,14 +517,30 @@ int powerfs_net_send_request(__u16 msg_type,
 
 /* ========== 便捷方法 ========== */
 
-/* LOOKUP */
+/* 目录条目 (readdir 返回) */
+struct powerfs_net_dir_entry {
+    __u64 ino;
+    char name[256];
+    __u32 mode;
+    __u32 uid;
+    __u32 gid;
+    __u64 size;
+    __u64 mtime;
+    __u64 atime;
+    __u64 ctime;
+    __u32 nlink;
+};
+
+/* LOOKUP (返回完整属性含时间戳) */
 int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
                        __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
-                       __u64 *size, __u32 *nlink);
+                       __u64 *size, __u32 *nlink,
+                       __u64 *mtime, __u64 *atime, __u64 *ctime);
 
-/* GETATTR */
+/* GETATTR (返回完整属性含时间戳) */
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
-                         __u64 *size, __u32 *nlink, __u64 *mtime_sec);
+                         __u64 *size, __u32 *nlink,
+                         __u64 *mtime, __u64 *atime, __u64 *ctime);
 
 /* SETATTR */
 int powerfs_net_setattr(__u64 ino, __u32 mode_valid, __u32 mode,
@@ -528,9 +559,10 @@ int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,
 int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_len,
                        __u64 new_dir_ino, const char *new_name, size_t new_name_len);
 
-/* READDIR */
-int powerfs_net_readdir(__u64 dir_ino, __u64 offset, __u32 count,
-                        __u8 *entries_buf, size_t buf_cap, __u32 *entries_count);
+/* READDIR (匹配 Filer 协议: ParentIno + Limit + LastName 分页) */
+int powerfs_net_readdir(__u64 dir_ino, const char *last_name, __u64 limit,
+                        struct powerfs_net_dir_entry *entries, __u32 max_entries,
+                        __u32 *actual_count, bool *has_more);
 
 /* READ */
 int powerfs_net_read(__u64 ino, __u64 offset, __u32 length,
@@ -560,6 +592,10 @@ int powerfs_net_ping(void);
 
 int  powerfs_net_init(void);
 void powerfs_net_exit(void);
+
+/* 暴露模块参数 (供 fill_super fallback 使用) */
+const char *powerfs_net_get_server_addr(void);
+__u16       powerfs_net_get_server_port(void);
 
 /* ========== 内部工具 ========== */
 

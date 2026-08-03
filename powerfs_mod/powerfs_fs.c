@@ -30,10 +30,14 @@
 #include <linux/list_lru.h>
 #include <linux/backing-dev.h>
 #include <linux/ramfs.h>
+#include <linux/writeback.h>     /* folio_mark_dirty (set_page_dirty 未导出到运行内核) */
 
 #include "powerfs.h"
 #include "powerfs_comm.h"
 #include "powerfs_net.h"
+
+/* netfs 请求操作 (Step 2 实现 issue_read，Step 0 先空声明) */
+static const struct netfs_request_ops powerfs_netfs_ops;
 
 /* ========== 全局 slab 缓存 (参考 ceph 全局 cache) ========== */
 
@@ -70,6 +74,9 @@ static int powerfs_add_dir_entry(struct inode *dir, u64 ino,
 static int powerfs_remove_dir_entry(struct inode *dir, const char *name);
 static void powerfs_clear_dir_entries(struct inode *dir);
 
+/* lease 续约 work 函数 (前向声明，Step 2 实现真实续约) */
+static void powerfs_lease_renew_work_func(struct work_struct *work);
+
 /* ========== Dentry operations 实现 ========== */
 
 /*
@@ -91,10 +98,6 @@ int powerfs_d_init(struct dentry *dentry)
     di->time = jiffies;
     di->lease_expire = jiffies + POWERFS_DENTRY_LEASE_TTL;
     INIT_LIST_HEAD(&di->lease_list);
-
-    /* Delta Sync 初始化 */
-    di->generation = 0;
-    di->path[0] = '\0';
 
     dentry->d_fsdata = di;
 
@@ -194,42 +197,17 @@ int powerfs_d_revalidate(struct dentry *dentry, unsigned int flags)
     }
 
     /*
-     * 检查 2: Delta Sync generation 检查
-     * 如果 path 不为空，检查 generation 是否过期
-     */
-    if (di->path[0] != '\0' && powerfs_net_is_connected()) {
-        __u64 cached_gen = di->generation;
-        bool stale;
-
-        /* 检查路径是否过期 */
-        stale = powerfs_net_path_stale(di->path, cached_gen);
-        if (stale) {
-            pr_debug("powerfs: d_revalidate '%pd' generation stale (cached=%llu)\n",
-                     dentry, (unsigned long long)cached_gen);
-
-            /* 失效 inode 缓存 */
-            spin_lock(&pi->i_lock);
-            pi->cache_valid = false;
-            pi->net_cache_valid = false;
-            spin_unlock(&pi->i_lock);
-
-            return 0;  /* 失效，重新 lookup */
-        }
-    }
-
-    /*
-     * 检查 3: inode 级别的 net_cache_valid 检查
+     * 检查 2: inode 级别的 cache_valid 检查
      */
     spin_lock(&pi->i_lock);
-    if (!pi->cache_valid && pi->net_cache_valid && powerfs_net_is_connected()) {
+    if (!pi->cache_valid) {
         spin_unlock(&pi->i_lock);
         pr_debug("powerfs: d_revalidate '%pd' inode cache invalid\n", dentry);
         return 0;
     }
     spin_unlock(&pi->i_lock);
 
-    pr_debug("powerfs: d_revalidate '%pd' valid (gen=%llu)\n",
-             dentry, (unsigned long long)di->generation);
+    pr_debug("powerfs: d_revalidate '%pd' valid\n", dentry);
     return 1;
 }
 
@@ -249,18 +227,14 @@ int powerfs_d_revalidate(struct dentry *dentry, unsigned int flags)
 int powerfs_d_delete(const struct dentry *dentry)
 {
     /*
-     * 返回 0: 让 VFS 执行默认行为 (调用 d_drop 释放 dentry)
+     * 返回 0: 保留 dentry 在 dcache LRU 中, 供 stat 等操作复用.
      *
-     * 参考 ramfs: ramfs 没有 d_delete 回调，VFS 默认行为是
-     * 调用 d_drop，将 dentry 从 inode 的 alias 链表中移除，
-     * 并触发 iput 减少 inode 引用计数。
+     * 参考 ramfs: ramfs 没有 d_delete 回调, VFS 默认保留 dentry.
+     * 参考 ceph: ceph_d_delete 返回 0 保留 dentry (供 cap 复用).
      *
-     * 配合 dget 钉住 dentry:
-     * - 创建时 dget 增加额外引用，防止 dentry 被 shrinker 回收
-     * - unlink/rmdir 时 VFS 调用 d_drop，触发 iput
-     * - d_drop 会释放 dentry 的引用
-     * - 由于 dget 额外增加了引用，iput 后 inode 不会立即释放
-     * - 当 dentry 真正被回收时（dentry_kill），最后的 iput 释放 inode
+     * inode 生命周期完全由 VFS dentry 引用管理:
+     *   d_count 归零 -> __dentry_kill -> dentry_unlink_inode -> iput
+     * 文件系统不应在 unlink/rmdir 中 ihold, 否则 i_count 泄漏.
      */
     (void)dentry;
     return 0;
@@ -414,12 +388,7 @@ int powerfs_init_inode(struct inode *inode, umode_t mode,
     strncpy(pi->name, name ? name : "", POWERFS_MAX_NAME_LEN - 1);
     pi->cache_valid = true;
     pi->cache_expire = jiffies + POWERFS_INODE_CACHE_TTL;
-    pi->i_caps = POWERFS_CAP_SHARED | POWERFS_CAP_EXCLUSIVE;
     pi->dir_complete = true;  /* 本地缓存模式: 目录始终完整 */
-
-    /* Delta Sync 初始化 */
-    pi->generation = 0;
-    pi->net_cache_valid = false;
 
     /* 初始化目录项链表 */
     INIT_LIST_HEAD(&pi->dir_entries);
@@ -496,7 +465,7 @@ static void powerfs_inode_init_once(void *foo)
 {
     struct powerfs_inode_info *pi = foo;
 
-    inode_init_once(&pi->vfs_inode);
+    inode_init_once(&pi->netfs.inode);
 
     /* 初始化私有字段 */
     pi->parent_ino = 0;
@@ -504,8 +473,6 @@ static void powerfs_inode_init_once(void *foo)
     spin_lock_init(&pi->i_lock);
     pi->cache_valid = false;
     pi->cache_expire = 0;
-    pi->i_caps = 0;
-    pi->i_dirty_caps = 0;
     pi->dir_complete = false;
 }
 
@@ -519,13 +486,30 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
 {
     struct powerfs_inode_info *pi;
 
-    pi = alloc_inode_sb(sb, powerfs_inode_cachep, GFP_KERNEL);
+    pi = alloc_inode_sb(sb, powerfs_inode_cachep, GFP_NOFS);
     if (!pi)
         return NULL;
 
-    pr_debug("powerfs: alloc_inode (pi=%p, inode=%p)\n", pi, &pi->vfs_inode);
+    /* netfs 初始化 (参考 ceph_alloc_inode) */
+    netfs_inode_init(&pi->netfs, &powerfs_netfs_ops);
 
-    return &pi->vfs_inode;
+    /* 初始化 Lease 相关字段 */
+    pi->lease_tree = RB_ROOT;
+    spin_lock_init(&pi->lease_lock);
+    INIT_DELAYED_WORK(&pi->lease_renew_work, powerfs_lease_renew_work_func);
+    pi->chunks = NULL;
+    pi->chunk_count = 0;
+    pi->content_size = 0;
+    pi->volume_id = 0;
+    pi->shutdown = false;
+
+    /* 初始化目录缓存字段 */
+    INIT_LIST_HEAD(&pi->dir_entries);
+    mutex_init(&pi->dir_mutex);
+
+    pr_debug("powerfs: alloc_inode (pi=%p, inode=%p)\n", pi, &pi->netfs.inode);
+
+    return &pi->netfs.inode;
 }
 
 /*
@@ -539,6 +523,10 @@ void powerfs_free_inode(struct inode *inode)
     struct powerfs_inode_info *pi = POWERFS_I(inode);
 
     pr_debug("powerfs: free_inode ino=%lu (pi=%p)\n", inode->i_ino, pi);
+
+    /* 释放 chunk 映射 */
+    kfree(pi->chunks);
+    pi->chunks = NULL;
 
     kmem_cache_free(powerfs_inode_cachep, pi);
 }
@@ -559,19 +547,101 @@ void powerfs_evict_inode(struct inode *inode)
 
     pr_debug("powerfs: evict_inode ino=%lu\n", inode->i_ino);
 
-    /* 第一步: 清理页面缓存 (必须先做) */
+    /* 1. 先截断 page cache (参考 ceph_evict_inode) */
     truncate_inode_pages_final(&inode->i_data);
 
-    /* 第二步: 清除 inode 核心 */
+    /* 2. 取消后台 lease 续约 work（必须在 clear_inode 之前，因为 work 可能引用 inode）
+     *    参考 ceph_evict_inode: cancel_writeback 是在 clear_inode 之前 */
+    cancel_delayed_work_sync(&pi->lease_renew_work);
+
+    /* 3. VFS 清理 */
     clear_inode(inode);
 
-    /* 第三步: 清理私有资源 */
+    /* 4. 释放所有 lease (rbtree 遍历) — Step 1 实现，Step 0 先清空 */
+    while (!RB_EMPTY_ROOT(&pi->lease_tree)) {
+        struct rb_node *n = rb_first(&pi->lease_tree);
+        rb_erase(n, &pi->lease_tree);
+        kfree(rb_entry(n, struct powerfs_lease, node));
+    }
+
+    /* 5. 释放 chunk 映射 */
+    kfree(pi->chunks);
+    pi->chunks = NULL;
+    pi->chunk_count = 0;
+
+    /* 6. 清理目录缓存链表 */
+    powerfs_clear_dir_entries(inode);
+
+    /* 7. 清理状态 */
     spin_lock(&pi->i_lock);
     pi->cache_valid = false;
     pi->dir_complete = false;
-    pi->i_caps = 0;
-    pi->i_dirty_caps = 0;
+    pi->shutdown = true;
     spin_unlock(&pi->i_lock);
+}
+
+/*
+ * powerfs_write_inode - VFS writeback 时同步 inode 元数据到 Filer
+ *
+ * 作用:
+ *   write_end 更新内存 inode 的 i_size, writepage 只刷数据页, 二者都
+ *   不会把 i_size 元数据同步到 Filer. 若不同步, sync/writeback 后 Filer
+ *   端 i_size 仍为 0, remount 后 lookup 返回 size=0, 文件内容丢失.
+ *
+ * 触发时机:
+ *   - sync(2) / sync 命令 (sync_filesystem -> writeback_inodes_sb)
+ *   - fsync(2) (file_write_and_wait_range -> __writeback_single_inode)
+ *   - 内存压力下的 writeback
+ *
+ * 优化:
+ *   用 pi->content_size 跟踪上次成功同步的 size, 仅在 i_size 变化时
+ *   发送 setattr, 避免每次 writeback 都网络往返.
+ *
+ * 参考: ceph_write_inode (fs/ceph/inode.c) 同步 caps 模式.
+ */
+static int powerfs_write_inode(struct inode *inode, struct writeback_control *wbc)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    loff_t i_size;
+    u64 last_synced;
+    int ret;
+
+    if (!powerfs_net_is_connected())
+        return 0;
+    if (!S_ISREG(inode->i_mode))
+        return 0;
+
+    i_size = i_size_read(inode);
+    if (i_size == 0)
+        return 0;
+
+    /* 仅在 i_size 变化时同步 */
+    spin_lock(&pi->i_lock);
+    last_synced = pi->content_size;
+    spin_unlock(&pi->i_lock);
+
+    if ((u64)i_size == last_synced)
+        return 0;
+
+    ret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
+                               0, 0, 0, (__u64)i_size);
+    if (ret < 0) {
+        pr_warn("powerfs: write_inode setattr ino=%lu size=%llu failed: %d\n",
+                inode->i_ino, (u64)i_size, ret);
+        return 0;  /* 不传播错误, 避免 writeback 卡死 */
+    }
+
+    spin_lock(&pi->i_lock);
+    pi->content_size = (u64)i_size;
+    spin_unlock(&pi->i_lock);
+
+    return 0;
+}
+
+/* Step 0 stub: lease 续约 work 函数（Step 2 实现真实续约逻辑） */
+static void powerfs_lease_renew_work_func(struct work_struct *work)
+{
+    /* Step 0: 无操作，Step 2 实现 lease 续约 */
 }
 
 /* ========== Inode 创建辅助函数 ========== */
@@ -972,7 +1042,7 @@ static int powerfs_comm_rename(struct inode *old_dir, const char *old_name,
 /* 构建 dentry 的完整路径 (用于 Delta Sync) */
 static void powerfs_build_dentry_path(struct dentry *dentry, char *path, size_t path_len)
 {
-    char names[64][256];
+    char (*names)[256];
     struct dentry *cur;
     int depth = 0;
     int i;
@@ -980,6 +1050,13 @@ static void powerfs_build_dentry_path(struct dentry *dentry, char *path, size_t 
 
     if (!dentry || !path || path_len == 0)
         return;
+
+    names = kmalloc_array(64, sizeof(*names), GFP_KERNEL);
+    if (!names) {
+        path[0] = '/';
+        path[1] = '\0';
+        return;
+    }
 
     /* 向上遍历到根，收集各层名称 */
     cur = dentry;
@@ -1010,6 +1087,8 @@ static void powerfs_build_dentry_path(struct dentry *dentry, char *path, size_t 
         total_len += name_len;
     }
     path[total_len] = '\0';
+
+    kfree(names);
 }
 
 /*
@@ -1034,14 +1113,14 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
 
     pr_debug("powerfs: lookup '%pd' in dir=%lu\n", dentry, dir->i_ino);
 
-    /* 快速路径: dentry 已有 inode (在 dcache 中) */
-    if (d_inode(dentry)) {
-        pr_debug("powerfs: lookup '%pd' found in dcache\n", dentry);
-        return NULL;
-    }
-
-    /* 路径已缓存为负 dentry (有 inode = 正条目，无 inode = 负条目) */
-    /* 负 dentry 检查: 通过 d_fsdata 的 generation 判断是否过期 */
+    /*
+     * VFS 契约: ->lookup 仅在 dentry 处于 DCACHE_PAR_LOOKUP (新鲜、
+     * d_inode==NULL、d_alias/d_in_lookup_hash 共享 union 且当前由
+     * in_lookup_hash 占用) 时调用 (见 namei.c __lookup_slow/__lookup_hash)。
+     * 因此这里不需要、也不应该检查 d_inode(dentry) —— 如果它非空，
+     * 说明 VFS 已被破坏，提前返回 NULL 只会把 dentry 留在 PAR_LOOKUP
+     * 悬挂状态，进一步污染 dcache。交由 d_add 走正常实例化路径。
+     */
 
     /* === powerfs_net 直接通信模式 === */
     if (powerfs_net_is_connected()) {
@@ -1050,19 +1129,16 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
         __u32 uid = 0, gid = 0;
         __u64 size = 0;
         __u32 nlink = 0;
-        char path_buf[256];
-        __u64 generation;
+        __u64 mtime = 0, atime = 0, ctime = 0;
 
         pr_debug("powerfs: lookup '%pd' via powerfs_net\n", dentry);
 
-        /* 构建完整路径 */
-        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-
-        /* 通过 powerfs_net 直接查询 */
+        /* 通过 powerfs_net 直接查询 (含时间戳) */
         err = powerfs_net_lookup(dir->i_ino, dentry->d_name.name,
                                   strlen(dentry->d_name.name),
                                   &ino, &mode, &uid, &gid,
-                                  &size, &nlink);
+                                  &size, &nlink,
+                                  &mtime, &atime, &ctime);
 
         if (err == 0 && ino != 0) {
             /* 找到文件: 创建 inode */
@@ -1078,64 +1154,63 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
             }
 
             if (inode->i_state & I_NEW) {
-                /* 新 inode: 从响应初始化 */
+                /*
+                 * 新 inode: 先用 powerfs_init_inode 设置 i_op/i_fop/a_ops
+                 * 和默认属性。缺少这一步会导致 looked-up inode 的操作表为
+                 * NULL，后续 open/read 等触发空指针解引用。
+                 */
+                powerfs_init_inode(inode, mode, dir->i_ino,
+                                   dentry->d_name.name);
+                /* 用 Filer 返回的权威属性覆盖默认值 */
                 inode->i_mode = mode;
                 inode->i_uid = make_kuid(&init_user_ns, uid);
                 inode->i_gid = make_kgid(&init_user_ns, gid);
                 inode->i_size = size;
                 set_nlink(inode, nlink);
-                inode->i_mtime = current_time(inode);
-                inode->i_atime = inode->i_mtime;
-                inode->i_ctime = inode->i_mtime;
+                inode->i_mtime.tv_sec = mtime;
+                inode->i_mtime.tv_nsec = 0;
+                inode->i_atime.tv_sec = atime;
+                inode->i_atime.tv_nsec = 0;
+                inode->i_ctime.tv_sec = ctime;
+                inode->i_ctime.tv_nsec = 0;
 
-                /* 设置 inode 缓存有效 + Delta Sync 字段 */
                 {
                     struct powerfs_inode_info *pi = POWERFS_I(inode);
                     spin_lock(&pi->i_lock);
-                    pi->parent_ino = dir->i_ino;
-                    strncpy(pi->name, dentry->d_name.name,
-                            POWERFS_MAX_NAME_LEN - 1);
                     pi->cache_valid = true;
-                    pi->net_cache_valid = true;
-                    /* generation 初始为 0，后续通过 Delta Sync 更新 */
                     spin_unlock(&pi->i_lock);
                 }
 
                 unlock_new_inode(inode);
             }
 
-            /* 实例化 dentry */
-            d_instantiate(dentry, inode);
+            /*
+             * 实例化 dentry —— 必须使用 d_add，不能用 d_instantiate。
+             *
+             * 根因: ->lookup 期间 dentry 仍处于 DCACHE_PAR_LOOKUP，
+             * d_alias 与 d_in_lookup_hash 共享 union (dcache.h:109-112)，
+             * 此时 in_lookup_hash 已链入 in_lookup 哈希表，故 d_alias 也
+             * 表现为 "hashed"。d_instantiate 直接 BUG_ON(!hlist_unhashed
+             * (&d_alias)) 即触发 kernel BUG (dcache.c:2032)。
+             *
+             * d_add -> __d_add (dcache.c:2775) 先 d_in_lookup 检测并
+             * __d_lookup_unhash 清理 in_lookup_hash，再 hlist_add_head
+             * (&d_alias)，最后 __d_rehash 加入主 dcache 哈希。这是 ->lookup
+             * 中实例化 dentry 的正确接口 (参考 ceph_lookup -> d_splice_alias
+             * -> __d_add)。
+             */
+            d_add(dentry, inode);
 
-            /* 设置 dentry 的 Delta Sync 字段 */
+            /* 更新 dentry 租约时间 */
             {
                 struct powerfs_dentry_info *di = dentry->d_fsdata;
                 if (di) {
-                    strncpy(di->path, path_buf, sizeof(di->path) - 1);
-                    di->generation = 0;  /* 初始 generation */
                     di->lease_expire = jiffies + POWERFS_DENTRY_LEASE_TTL;
                     di->time = jiffies;
                 }
             }
 
-            /* 获取当前路径的 generation */
-            generation = powerfs_net_get_path_generation(path_buf);
-            if (generation > 0) {
-                struct powerfs_dentry_info *di = dentry->d_fsdata;
-                if (di)
-                    di->generation = generation;
-
-                /* 同时更新 inode 的 generation */
-                if (inode) {
-                    struct powerfs_inode_info *pi = POWERFS_I(inode);
-                    spin_lock(&pi->i_lock);
-                    pi->generation = generation;
-                    spin_unlock(&pi->i_lock);
-                }
-            }
-
-            pr_debug("powerfs: lookup '%pd' completed, gen=%llu\n",
-                     dentry, (unsigned long long)generation);
+            pr_debug("powerfs: lookup '%pd' completed\n", dentry);
             return NULL;
         }
 
@@ -1173,7 +1248,12 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
             }
 
             if (inode->i_state & I_NEW) {
-                /* 新 inode: 从响应初始化 */
+                /*
+                 * 新 inode: 先用 powerfs_init_inode 设置 i_op/i_fop/a_ops
+                 * (与 net 路径同因)，再用响应数据覆盖。
+                 */
+                powerfs_init_inode(inode, mode, dir->i_ino,
+                                   dentry->d_name.name);
                 inode->i_mode = mode;
                 inode->i_uid = make_kuid(&init_user_ns, resp.uid);
                 inode->i_gid = make_kgid(&init_user_ns, resp.gid);
@@ -1184,32 +1264,23 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
                 inode->i_atime = inode->i_mtime;
                 inode->i_ctime = inode->i_mtime;
 
-                /* 设置 inode 缓存有效 + Delta Sync 字段 */
                 {
                     struct powerfs_inode_info *pi = POWERFS_I(inode);
                     spin_lock(&pi->i_lock);
-                    pi->parent_ino = dir->i_ino;
-                    strncpy(pi->name, dentry->d_name.name,
-                            POWERFS_MAX_NAME_LEN - 1);
                     pi->cache_valid = true;
-                    pi->net_cache_valid = true;
                     spin_unlock(&pi->i_lock);
                 }
 
                 unlock_new_inode(inode);
             }
 
-            /* 实例化 dentry */
-            d_instantiate(dentry, inode);
+            /* 实例化 dentry: 必须用 d_add (见 net 路径注释) */
+            d_add(dentry, inode);
 
-            /* 设置 dentry 的 Delta Sync 字段 */
+            /* 更新 dentry 租约时间 */
             {
-                char path_buf[256];
                 struct powerfs_dentry_info *di = dentry->d_fsdata;
                 if (di) {
-                    powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-                    strncpy(di->path, path_buf, sizeof(di->path) - 1);
-                    di->generation = powerfs_net_get_path_generation(path_buf);
                     di->lease_expire = jiffies + POWERFS_DENTRY_LEASE_TTL;
                     di->time = jiffies;
                 }
@@ -1260,8 +1331,28 @@ static int powerfs_mknod(struct user_namespace *idmap, struct inode *dir,
     pr_debug("powerfs: mknod '%pd' mode=%o in dir=%lu\n",
              dentry, mode, dir->i_ino);
 
-    /* 生成新 inode 号 */
-    new_ino = atomic_inc_return(&sbi->next_ino) + POWERFS_INO_START;
+    /*
+     * 当 powerfs_net 连接时, 向 filer 发 CREATE/MKDIR 请求获取权威 ino,
+     * 使文件元数据持久化到 filer (Raft 强一致); remount 后 lookup 能找回.
+     * 未连接时回退本地分配 (本地缓存模式).
+     * symlink/特殊文件暂走本地 (有独立 powerfs_net_symlink 接口).
+     */
+    if (powerfs_net_is_connected() && (S_ISREG(mode) || S_ISDIR(mode))) {
+        u64 remote_ino = 0;
+        int rerr = powerfs_net_create(dir->i_ino, dentry->d_name.name,
+                                       dentry->d_name.len, mode,
+                                       from_kuid(&init_user_ns, current_fsuid()),
+                                       from_kgid(&init_user_ns, current_fsgid()),
+                                       S_ISDIR(mode), &remote_ino);
+        if (rerr) {
+            pr_warn("powerfs: net_create '%pd' failed: %d\n", dentry, rerr);
+            return rerr;
+        }
+        new_ino = remote_ino ? remote_ino
+                             : (u64)atomic_inc_return(&sbi->next_ino) + POWERFS_INO_START;
+    } else {
+        new_ino = atomic_inc_return(&sbi->next_ino) + POWERFS_INO_START;
+    }
 
     /* 创建 inode */
     inode = powerfs_new_inode(dir->i_sb, mode, new_ino,
@@ -1287,17 +1378,14 @@ static int powerfs_mknod(struct user_namespace *idmap, struct inode *dir,
 
     powerfs_add_dir_entry(dir, new_ino, type, dentry->d_name.name);
 
-    /* === Delta Sync: 更新路径 generation === */
+    /* === Delta Sync: 失效路径缓存 === */
     {
         char path_buf[256];
-        struct powerfs_dentry_info *di = dentry->d_fsdata;
 
-        if (di) {
-            powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-            /* 在创建后触发 generation 失效，强制后续操作同步 */
-            powerfs_net_invalidate_path(path_buf);
-            powerfs_net_invalidate_dir(dir->i_ino);
-        }
+        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+        /* 在创建后触发 generation 失效，强制后续操作同步 */
+        powerfs_net_invalidate_path(path_buf);
+        powerfs_net_invalidate_dir(dir->i_ino);
     }
 
     pr_debug("powerfs: mknod '%pd' success, ino=%llu\n",
@@ -1340,13 +1428,7 @@ static int powerfs_mkdir(struct user_namespace *idmap, struct inode *dir,
         char path_buf[256];
 
         /* 构建路径用于 Delta Sync */
-        {
-            struct powerfs_dentry_info *di = dentry->d_fsdata;
-            if (di) {
-                powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-                strncpy(di->path, path_buf, sizeof(di->path) - 1);
-            }
-        }
+        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
 
         /* 触发 Delta Sync: 失效缓存，后续操作将通过 pull_delta 获取最新状态 */
         powerfs_net_invalidate_path(path_buf);
@@ -1400,14 +1482,13 @@ static int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
     }
 
     /*
-     * 参考 simple_rmdir 实现:
+     * 参考 simple_rmdir / ramfs_rmdir 实现:
      *   drop_nlink(inode) + drop_nlink(dir)
      *
-     * 关键: 在 drop_nlink 之前 ihold(inode)
-     *       防止 drop_nlink 触发的 iput + dentry_kill 的 iput
-     *       与 do_rmdir 的 iput 产生双重释放
+     * drop_nlink 仅递减 i_nlink, 不调用 iput.
+     * VFS 通过 dentry 引用管理 inode 生命周期, 无需 ihold.
+     * 之前的 ihold(inode) 会导致 i_count 泄漏, umount 时触发 BUG.
      */
-    ihold(inode);
 
     /* 更新父目录时间戳 */
     dir->i_mtime = dir->i_ctime = current_time(dir);
@@ -1424,15 +1505,20 @@ static int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
     /* 减少父目录的链接数 (因删除了一个子目录) */
     drop_nlink(dir);
 
-    /* === Delta Sync: 失效路径缓存 === */
+    /* === powerfs_net: 向 filer 发 RMDIR, 持久化删除 === */
     if (powerfs_net_is_connected()) {
-        char path_buf[256];
+        int rerr = powerfs_net_unlink(dir->i_ino, dentry->d_name.name,
+                                       dentry->d_name.len, true);
+        if (rerr && rerr != -ENOENT)
+            pr_warn("powerfs: net_rmdir '%pd' failed: %d\n", dentry, rerr);
 
-        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-        powerfs_net_invalidate_path(path_buf);
-        powerfs_net_invalidate_dir(dir->i_ino);
-        pr_debug("powerfs: rmdir '%pd' invalidated cache for '%s'\n",
-                 dentry, path_buf);
+        /* Delta Sync: 失效路径缓存 */
+        {
+            char path_buf[256];
+            powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+            powerfs_net_invalidate_path(path_buf);
+            powerfs_net_invalidate_dir(dir->i_ino);
+        }
     }
 
     /* === 异步通知代理更新后端 (兼容旧接口) === */
@@ -1495,14 +1581,10 @@ static int powerfs_create(struct user_namespace *idmap, struct inode *dir,
     /* === powerfs_net: 触发 Delta Sync 失效 === */
     if (inode && powerfs_net_is_connected()) {
         char path_buf[256];
-        struct powerfs_dentry_info *di = dentry->d_fsdata;
 
-        if (di) {
-            powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-            strncpy(di->path, path_buf, sizeof(di->path) - 1);
-            powerfs_net_invalidate_path(path_buf);
-            powerfs_net_invalidate_dir(dir->i_ino);
-        }
+        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+        powerfs_net_invalidate_path(path_buf);
+        powerfs_net_invalidate_dir(dir->i_ino);
 
         pr_debug("powerfs: create '%pd' delta sync invalidated\n", dentry);
     }
@@ -1548,18 +1630,16 @@ static int powerfs_unlink(struct inode *dir, struct dentry *dentry)
     }
 
     /*
-     * 参考 simple_unlink 实现:
-     *   drop_nlink(inode) - 由文件系统负责
-     *   VFS 会在 unlink 返回后处理 dentry 和 iput
+     * 参考 simple_unlink / ramfs_unlink 实现:
+     *   drop_nlink(inode) - 仅递减 i_nlink, 不调用 iput
+     *   VFS 通过 dentry 引用管理 inode 生命周期:
+     *     do_unlinkat -> vfs_unlink -> powerfs_unlink
+     *     -> dput(dentry) -> __dentry_kill -> iput(inode)
      *
-     * 关键: 当 nlink 从 1 降到 0 时, drop_nlink 内部会调用 iput
-     *       此时 do_unlinkat 还持有一个 ihold 的引用，所以 i_count > 0
-     *       VFS 在 vfs_unlink 返回后才会 iput(inode)
-     *
-     * 因此: 不要在这里手动 iput(inode)
-     *       让 VFS 的 do_unlinkat 统一处理
+     * 因此: 不要 ihold/iput, 让 VFS 的 dentry 路径统一处理.
+     * 之前的 ihold(inode) 是基于错误假设 (误以为 drop_nlink 会 iput),
+     * 导致 i_count 泄漏, umount 时 inode 无法释放触发 BUG at fs/inode.c.
      */
-    ihold(inode);  /* 额外引用，保护 drop_nlink 内部的 iput */
 
     /* 更新父目录时间戳 */
     dir->i_mtime = dir->i_ctime = current_time(dir);
@@ -1570,15 +1650,20 @@ static int powerfs_unlink(struct inode *dir, struct dentry *dentry)
     /* 从本地目录项链表中移除 */
     powerfs_remove_dir_entry(dir, dentry->d_name.name);
 
-    /* === Delta Sync: 失效路径缓存 === */
+    /* === powerfs_net: 向 filer 发 UNLINK, 持久化删除 === */
     if (powerfs_net_is_connected()) {
-        char path_buf[256];
+        int rerr = powerfs_net_unlink(dir->i_ino, dentry->d_name.name,
+                                       dentry->d_name.len, false);
+        if (rerr && rerr != -ENOENT)
+            pr_warn("powerfs: net_unlink '%pd' failed: %d\n", dentry, rerr);
 
-        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-        powerfs_net_invalidate_path(path_buf);
-        powerfs_net_invalidate_dir(dir->i_ino);
-        pr_debug("powerfs: unlink '%pd' invalidated cache for '%s'\n",
-                 dentry, path_buf);
+        /* Delta Sync: 失效路径缓存 */
+        {
+            char path_buf[256];
+            powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+            powerfs_net_invalidate_path(path_buf);
+            powerfs_net_invalidate_dir(dir->i_ino);
+        }
     }
 
     /* === 异步通知代理更新后端 (兼容旧接口) === */
@@ -1649,7 +1734,20 @@ static int powerfs_symlink(struct user_namespace *idmap, struct inode *dir,
     /* 添加目录项到本地链表 */
     powerfs_add_dir_entry(dir, new_ino, S_IFLNK, dentry->d_name.name);
 
-    /* 异步通知代理创建符号链接 */
+    /* powerfs_net 同步: symlink 必须持久化到 Filer */
+    if (powerfs_net_is_connected()) {
+        __u64 sym_ino = 0;
+        int nret = powerfs_net_symlink(dir->i_ino,
+                                        dentry->d_name.name,
+                                        dentry->d_name.len,
+                                        symname, strlen(symname),
+                                        &sym_ino);
+        if (nret < 0)
+            pr_warn("powerfs: symlink net_sync name=%s failed: %d\n",
+                    dentry->d_name.name, nret);
+    }
+
+    /* 异步通知代理创建符号链接 (兼容旧 comm 层) */
     if (powerfs_comm_connected()) {
         struct powerfs_msg_header req_hdr;
         struct powerfs_symlink_req req_data;
@@ -1771,8 +1869,14 @@ static int powerfs_link(struct dentry *old_dentry, struct inode *dir,
      *
      * 注意: VFS (vfs_link) 不会自动 inc_nlink
      *       需要文件系统自己调用 inc_nlink
+     *
+     * 关键: d_add 不递增 i_count! 每个 dentry 必须持有独立的 i_count
+     *       引用, 否则第一个 dentry 被回收时 iput 使 i_count=0 触发
+     *       eviction, 而第二个 dentry 仍指向已释放的 inode → UAF.
+     *       参考 simple_link / ramfs_link 均在 d_add 前调用 ihold.
      */
     inc_nlink(inode);
+    ihold(inode);
     d_add(new_dentry, inode);
 
     dir->i_mtime = dir->i_ctime = current_time(dir);
@@ -1782,7 +1886,17 @@ static int powerfs_link(struct dentry *old_dentry, struct inode *dir,
                           inode->i_mode & S_IFMT,
                           new_dentry->d_name.name);
 
-    /* 异步通知代理创建硬链接 */
+    /* powerfs_net 同步: hard link 必须持久化到 Filer */
+    if (powerfs_net_is_connected()) {
+        int nret = powerfs_net_link(inode->i_ino, dir->i_ino,
+                                     new_dentry->d_name.name,
+                                     new_dentry->d_name.len);
+        if (nret < 0)
+            pr_warn("powerfs: link net_sync name=%s failed: %d\n",
+                    new_dentry->d_name.name, nret);
+    }
+
+    /* 异步通知代理创建硬链接 (兼容旧 comm 层) */
     if (powerfs_comm_connected()) {
         struct powerfs_msg_header req_hdr;
         struct powerfs_link_req req_data;
@@ -1876,6 +1990,10 @@ int powerfs_setattr(struct user_namespace *idmap, struct dentry *dentry,
     (void)idmap;
 
     pr_debug("powerfs: setattr '%pd' ia_valid=0x%x\n", dentry, attr->ia_valid);
+    pr_info("powerfs: SETATTR ino=%lu ia_valid=0x%x ia_size=%lld cur_size=%lld\n",
+            inode->i_ino, attr->ia_valid,
+            (attr->ia_valid & ATTR_SIZE) ? attr->ia_size : -1,
+            i_size_read(inode));
 
     /*
      * 纯本地操作 + 异步通知:
@@ -1891,11 +2009,22 @@ int powerfs_setattr(struct user_namespace *idmap, struct dentry *dentry,
     if (err)
         return err;
 
-    /* 处理文件大小变更 */
+    /* 处理文件大小变更
+     *
+     * 注意: setattr_copy 不会设置 i_size (它只处理 uid/gid/mode/time).
+     * 必须调用 truncate_setsize 来同时截断 page cache 并更新 i_size.
+     * 之前只调 truncate_pagecache 导致 i_size 未更新, O_TRUNC 后
+     * i_size 仍为旧值, O_APPEND 写到了错误的 offset.
+     */
     if (ia_valid & ATTR_SIZE) {
-        if (attr->ia_size < i_size_read(inode)) {
-            truncate_pagecache(inode, attr->ia_size);
-        }
+        truncate_setsize(inode, attr->ia_size);
+        /* 同步 pi->content_size, 否则 write_end 的
+         * (new_size != pi->content_size) 检查会误判为 "未变化"
+         * 而跳过 net_setattr, 导致 O_TRUNC 后的写入不持久化 size.
+         * 例: 文件原 size=4, O_TRUNC 设 size=0, 再写 4 字节:
+         *   new_size=4 == pi->content_size=4 → 跳过 setattr
+         *   Filer 端 size 仍为 0 → remount 后文件为空 */
+        pi->content_size = attr->ia_size;
     }
 
     /* 第二步: 在本地修改 inode 属性 */
@@ -1907,6 +2036,44 @@ int powerfs_setattr(struct user_namespace *idmap, struct dentry *dentry,
     pi->cache_valid = true;
     pi->cache_expire = jiffies + POWERFS_INODE_CACHE_TTL;
     spin_unlock(&pi->i_lock);
+
+    /*
+     * powerfs_net 同步: truncate/fchmod/chown 等必须持久化到 Filer,
+     * 否则 remount 后属性丢失. fsync 路径已单独同步 size, 这里覆盖
+     * setattr 回调路径 (truncate/ftruncate/chmod/chown/utimes).
+     */
+    if (powerfs_net_is_connected()) {
+        __u32 valid = 0;
+        __u32 m = 0, u = 0, g = 0;
+        __u64 sz = 0;
+
+        if (ia_valid & ATTR_MODE) {
+            valid |= POWERFS_ATTR_MODE;
+            m = inode->i_mode;
+        }
+        if (ia_valid & ATTR_UID) {
+            valid |= POWERFS_ATTR_UID;
+            u = from_kuid(&init_user_ns, inode->i_uid);
+        }
+        if (ia_valid & ATTR_GID) {
+            valid |= POWERFS_ATTR_GID;
+            g = from_kgid(&init_user_ns, inode->i_gid);
+        }
+        if (ia_valid & ATTR_SIZE) {
+            valid |= POWERFS_ATTR_SIZE;
+            sz = i_size_read(inode);
+        }
+
+        if (valid) {
+            int sret = powerfs_net_setattr(inode->i_ino, valid,
+                                            m, u, g, sz);
+            pr_info("powerfs: SETATTR net ino=%lu valid=0x%x sz=%llu sret=%d\n",
+                    inode->i_ino, valid, sz, sret);
+            if (sret < 0)
+                pr_warn("powerfs: setattr net sync ino=%lu failed: %d\n",
+                        inode->i_ino, sret);
+        }
+    }
 
     /* 第三步: 异步通知代理更新后端记录 */
     if (powerfs_comm_connected()) {
@@ -2075,7 +2242,20 @@ int powerfs_rename(struct user_namespace *idmap,
             }
         }
 
-        /* 异步通知代理更新后端 */
+        /* powerfs_net 同步: rename 必须持久化到 Filer, 否则 remount 后
+         * 旧名称仍存在、新名称丢失. 之前只走 comm 层异步通知, net 层
+         * 未发送 rename 请求, 导致 Filer 端目录项未更新. */
+        if (powerfs_net_is_connected()) {
+            int nret = powerfs_net_rename(old_dir->i_ino,
+                                           old_name_buf, strlen(old_name_buf),
+                                           new_dir->i_ino,
+                                           new_name_buf, strlen(new_name_buf));
+            if (nret < 0)
+                pr_warn("powerfs: rename net_sync old=%s new=%s failed: %d\n",
+                        old_name_buf, new_name_buf, nret);
+        }
+
+        /* 异步通知代理更新后端 (兼容旧 comm 层) */
         if (powerfs_comm_connected()) {
             memset(&req_data, 0, sizeof(req_data));
             req_data.old_dir_ino = old_dir->i_ino;
@@ -2377,13 +2557,73 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
 
     pos = ctx->pos - 2;
 
+    /* 如果目录缓存为空且网络可用，从 Filer 获取目录列表 */
+    if (list_empty(&dpi->dir_entries) && powerfs_net_is_connected()) {
+        struct powerfs_net_dir_entry *net_entries;
+        __u32 net_count = 0;
+        bool has_more = false;
+        char last_name[256] = "";
+        int ret;
+
+        net_entries = kmalloc_array(256, sizeof(*net_entries), GFP_KERNEL);
+        if (!net_entries)
+            return -ENOMEM;
+
+        /* 从 Filer 获取目录条目 (分页循环直到获取全部) */
+        do {
+            ret = powerfs_net_readdir(dir->i_ino, last_name, 256,
+                                      net_entries, 256,
+                                      &net_count, &has_more);
+            if (ret < 0) {
+                pr_warn("powerfs: readdir ino=%lu net error: %d\n",
+                        dir->i_ino, ret);
+                kfree(net_entries);
+                return ret;
+            }
+
+            /* 将网络条目添加到本地缓存 */
+            mutex_lock(&dpi->dir_mutex);
+            for (__u32 i = 0; i < net_count; i++) {
+                struct powerfs_dir_entry *de;
+                struct powerfs_net_dir_entry *ne = &net_entries[i];
+
+                /* 检查是否已存在 (避免重复) */
+                bool found = false;
+                list_for_each_entry(de, &dpi->dir_entries, list) {
+                    if (de->ino == ne->ino) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found)
+                    continue;
+
+                de = kmalloc(sizeof(*de), GFP_KERNEL);
+                if (!de) {
+                    mutex_unlock(&dpi->dir_mutex);
+                    kfree(net_entries);
+                    return -ENOMEM;
+                }
+
+                de->ino = ne->ino;
+                de->type = ne->mode & S_IFMT;
+                strncpy(de->name, ne->name, POWERFS_MAX_NAME_LEN - 1);
+                de->name[POWERFS_MAX_NAME_LEN - 1] = '\0';
+                list_add_tail(&de->list, &dpi->dir_entries);
+
+                /* 更新 last_name 用于分页 */
+                strncpy(last_name, ne->name, sizeof(last_name) - 1);
+                last_name[sizeof(last_name) - 1] = '\0';
+            }
+            mutex_unlock(&dpi->dir_mutex);
+        } while (has_more && net_count > 0);
+
+        kfree(net_entries);
+        dpi->dir_complete = true;
+    }
+
     /*
      * 第一阶段: 在锁内复制目录项到临时缓冲区
-     *
-     * 使用 kmalloc 动态分配 (避免栈溢出)
-     * 限制最大条目数 256 (单条 ~264B × 256 ≈ 68KB < 128KM_MAX_SIZE)
-     *
-     * 关键: 在锁内仅做 O(n) 内存复制，不做任何可能阻塞的操作
      */
     {
         struct dentry_emit_entry {
@@ -2475,74 +2715,106 @@ static const struct file_operations powerfs_dir_operations = {
 /* ========== 地址空间操作 (page cache) ========== */
 
 /*
- * powerfs_read_folio - 读取页面 (纯本地模式，不与代理通信)
+ * powerfs_read_folio - 读取页面
  *
- * 参考 ramfs_read_folio (fs/ramfs/inode.c)
- *
- * 策略:
- *   - 阶段0 (本地缓存模式): 直接零填充页面，数据完全由 page cache 管理
- *   - 写入路径 (write_begin + write_end) 将数据写入 page cache
- *   - 读取路径从 page cache 获取数据，不需要代理参与
- *   - 如果页面不在 cache 中 (首次访问/被回收)，零填充是正确行为
- *
- * 这避免了高并发下同步通信导致的 SQ 队列满 + RCU stall
- * 后续阶段 (接入真实后端) 可通过异步通知机制扩展
+ * 当 powerfs_net 连接时: 从 filer 读取数据填充 folio (跨 client 可见),
+ *   remount 后读取持久化数据由此完成.
+ * 未连接时: 本地缓存模式, 零填充.
  */
 static int powerfs_read_folio(struct file *file, struct folio *folio)
 {
-    pr_debug("powerfs: read_folio ino=%lu index=%lu (local zero-fill)\n",
-             folio->mapping->host->i_ino, folio->index);
+    struct inode *inode = folio->mapping->host;
+    loff_t offset = folio_pos(folio);
+    size_t count = folio_size(folio);
+    __u32 read_len = 0;
+    char *kaddr;
+    int err;
 
-    /*
-     * 纯本地模式: 零填充页面
-     *
-     * 参考 ramfs: 不定义 read_folio，使用内核默认行为
-     * 默认行为: 如果页面不在 cache 中，清零并返回
-     *
-     * 原因:
-     *   1. 数据存储在 page cache 中 (由 write_begin/write_end 管理)
-     *   2. 代理仅负责元数据 (inode/dentry)，不负责数据
-     *   3. 避免同步通信导致的死锁和 RCU stall
-     *   4. 后续接入真实后端时，可在 read_folio 中添加异步预读
-     */
-    folio_zero_range(folio, 0, folio_size(folio));
+    pr_debug("powerfs: read_folio ino=%lu index=%lu\n",
+             inode->i_ino, folio->index);
+
+    /* 本地缓存模式: 零填充 */
+    if (!powerfs_net_is_connected()) {
+        folio_zero_range(folio, 0, count);
+        folio_mark_uptodate(folio);
+        folio_unlock(folio);
+        return 0;
+    }
+
+    /* 超出文件大小的部分零填充 */
+    if (offset >= i_size_read(inode)) {
+        folio_zero_range(folio, 0, count);
+        folio_mark_uptodate(folio);
+        folio_unlock(folio);
+        return 0;
+    }
+
+    kaddr = kmap_local_folio(folio, 0);
+    err = powerfs_net_read(inode->i_ino, offset, count, kaddr, count, &read_len);
+    kunmap_local(kaddr);
+
+    if (err) {
+        pr_warn("powerfs: read_folio ino=%lu offset=%llu failed: %d\n",
+                inode->i_ino, offset, err);
+        /* 读失败时零填充, 避免向上层传播 IO error 导致读路径死锁 */
+        folio_zero_range(folio, 0, count);
+    } else if (read_len < count) {
+        /* 不足部分零填充 */
+        folio_zero_range(folio, read_len, count - read_len);
+    }
+
     folio_mark_uptodate(folio);
     folio_unlock(folio);
-
     return 0;
 }
 
 /*
- * powerfs_writepage - 写入页面 (纯本地模式，不与代理通信)
+ * powerfs_writepage - 写入页面
  *
- * 参考 ramfs_writepage (fs/ramfs/inode.c)
- *
- * 策略:
- *   - 阶段0 (本地缓存模式): 直接标记页面为干净，不与代理通信
- *   - 数据完全存储在 page cache 中，代理仅负责元数据
- *   - 后续阶段 (接入真实后端) 可通过异步通知机制扩展
- *
- * 这避免了高并发下 writepage 阻塞代理通知导致的 SQ 队列满 + RCU stall
+ * 当 powerfs_net 连接时: 同步将页数据写到 filer (filer 转发 volume server),
+ *   实现数据持久化; fsync/release 触发 writeback 时由此完成刷盘.
+ * 未连接时: 本地缓存模式, 仅标记干净.
  */
 int powerfs_writepage(struct page *page, struct writeback_control *wbc)
 {
     struct inode *inode = page->mapping->host;
+    loff_t offset = page_offset(page);
+    size_t count = PAGE_SIZE;
+    __u32 written = 0;
+    char *kaddr;
+    int err = 0;
 
-    pr_debug("powerfs: writepage ino=%lu index=%lu (local, skip proxy)\n",
+    pr_debug("powerfs: writepage ino=%lu index=%lu\n",
              inode->i_ino, page->index);
 
-    /*
-     * 纯本地模式: 直接标记页面为干净
-     *
-     * 参考 ramfs: writepage 直接调用 end_page_writeback
-     * 不与代理通信，避免阻塞
-     *
-     * 数据在 page cache 中，由 write_begin/write_end 管理
-     * writepage 仅在内核回写线程触发时标记页面干净
-     */
-    end_page_writeback(page);
+    /* 本地缓存模式: 直接标记干净 */
+    if (!powerfs_net_is_connected()) {
+        end_page_writeback(page);
+        return 0;
+    }
 
-    return 0;
+    /* 超出文件大小的页不写 */
+    if (offset >= i_size_read(inode)) {
+        end_page_writeback(page);
+        return 0;
+    }
+    /* 最后一页截断到 i_size */
+    if (offset + count > i_size_read(inode))
+        count = i_size_read(inode) - offset;
+
+    kaddr = kmap_local_page(page);
+    err = powerfs_net_write(inode->i_ino, offset, kaddr, count, &written);
+    kunmap_local(kaddr);
+
+    if (err) {
+        pr_warn("powerfs: writepage ino=%lu offset=%llu failed: %d\n",
+                inode->i_ino, offset, err);
+        SetPageError(page);
+        mapping_set_error(page->mapping, err);
+    }
+
+    end_page_writeback(page);
+    return err;
 }
 
 /*
@@ -2613,43 +2885,102 @@ int powerfs_write_end(struct file *file, struct address_space *mapping,
                        struct page *page, void *fsdata)
 {
     struct inode *inode = mapping->host;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
     loff_t end_pos = pos + copied;
+    loff_t new_size;
 
     pr_debug("powerfs: write_end ino=%lu pos=%lld copied=%u (async)\n",
              inode->i_ino, pos, copied);
 
     if (copied > 0) {
         /* 更新文件大小 */
-        if (end_pos > i_size_read(inode)) {
-            i_size_write(inode, end_pos);
+        new_size = i_size_read(inode);
+        if (end_pos > new_size) {
+            new_size = end_pos;
+            i_size_write(inode, new_size);
             mark_inode_dirty(inode);
         }
 
         /*
          * 异步模式: 仅标记页面为脏，由 writepage 后台异步通知代理
          * 这样 write 系统调用立即返回，不会因代理处理慢而阻塞
+         *
+         * 注意: folio_mark_dirty 内部通过 mapping->a_ops->dirty_folio()
+         * 间接调用 (mm/page-writeback.c). 若 a_ops 未设置 .dirty_folio
+         * 则 NULL 间接调用 → powerfs_write_end+0x45 NULL instruction
+         * fetch oops. 根因是 powerfs_aops 接口不完整, 已在 aops 表中
+         * 补 .dirty_folio = filemap_dirty_folio 修复 (参考 nfs/btrfs).
          */
         if (!PageUptodate(page))
             SetPageUptodate(page);
-        set_page_dirty(page);
+        folio_mark_dirty(page_folio(page));
+
+        /*
+         * 同步数据 + i_size 到 Filer:
+         *
+         * 基本功能阶段采用同步写: write_end 直接调用 powerfs_net_write
+         * 将本页数据持久化到 Filer 的 inline data store, 保证 write()
+         * 返回后数据可被跨 mount session 读取.
+         *
+         * 不依赖 writepage 异步刷盘的原因:
+         *   - writepage 由 VM writeback 触发, 时机不可控 (内存充裕时
+         *     可能永远不触发), umount/sync 路径在本地缓存模式下也可能
+         *     跳过网络写 → remount 后数据丢失.
+         *   - 高并发同步写的 SQ 队列满问题来自旧 comm 层
+         *     (powerfs_comm_send_request), 新 net 层 (powerfs_net_write)
+         *     使用独立 TCP 连接 + send_recv_mutex 串行化, 不涉及 SQ.
+         *
+         * 后续优化可改回异步 (writepage 刷盘 + fsync 同步), 但需确保
+         * umount 路径触发并等待 writeback 完成.
+         */
+        if (powerfs_net_is_connected()) {
+            __u32 written = 0;
+            /* pos % PAGE_SIZE gives the offset within the page where the
+             * new data was written. kaddr points to the page start, so we
+             * must add the in-page offset to send the actual written bytes
+             * (not bytes from the beginning of the page, which would be
+             * stale data from prior writes in the same page). This was the
+             * root cause of append-write corruption: all appends sent the
+             * first chunk's bytes because kaddr[0..copied) was used
+             * regardless of the write position within the page. */
+            size_t off_in_page = pos & (PAGE_SIZE - 1);
+            char *kaddr = kmap_local_page(page);
+            int wret = powerfs_net_write(inode->i_ino, pos,
+                                         kaddr + off_in_page, copied, &written);
+            kunmap_local(kaddr);
+            if (wret < 0) {
+                pr_warn("powerfs: write_end net_write ino=%lu pos=%lld len=%u failed: %d\n",
+                        inode->i_ino, pos, copied, wret);
+            }
+        }
+
+        /*
+         * 同步 i_size 到 Filer:
+         *   writepage 只刷数据页, sync 命令只触发 writeback 不触发 fsync,
+         *   若不在 write_end 同步 size, Filer 端 i_size 永远为 0, remount
+         *   后 lookup 返回 size=0, read_folio zero fill → 数据丢失.
+         *
+         *   用 pi->content_size 跟踪上次同步值, 仅在变化时 setattr,
+         *   避免每次 write_end 都网络往返. write_end 在用户进程上下文
+         *   (持有 page lock 但可睡眠, GFP_KERNEL), 调用 net_setattr 安全.
+         *   不用 write_inode: writeback 上下文调用网络 IO 会与 writepage
+         *   串行化卡死 (send_recv_mutex).
+         */
+        if (powerfs_net_is_connected() && (u64)new_size != pi->content_size) {
+            int sret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
+                                            0, 0, 0, (u64)new_size);
+            if (sret < 0)
+                pr_warn("powerfs: write_end setattr ino=%lu size=%llu failed: %d\n",
+                        inode->i_ino, (u64)new_size, sret);
+            else
+                pi->content_size = (u64)new_size;
+        }
     }
 
     unlock_page(page);
     put_page(page);
 
     return copied;
-}
-
-/*
- * powerfs_dirty_folio - 标记folio为脏
- *
- * 参考 ramfs 的实现，直接返回 true
- */
-static bool powerfs_dirty_folio(struct address_space *mapping,
-                                 struct folio *folio)
-{
-    folio_set_dirty(folio);
-    return true;
 }
 
 /*
@@ -2662,14 +2993,21 @@ sector_t powerfs_bmap(struct address_space *mapping, sector_t block)
     return 0;
 }
 
-/* 地址空间操作表 */
+/* 地址空间操作表 - 内核 6.2 netfs 风格
+ *
+ * .dirty_folio 必须设置: folio_mark_dirty() 内部通过
+ * mapping->a_ops->dirty_folio() 间接调用 (mm/page-writeback.c),
+ * 若未设置则为 NULL, write_end 标脏页时触发 NULL instruction fetch oops.
+ * 参考 fs/nfs/file.c, fs/btrfs/inode.c, fs/ceph/addr.c (均设置 dirty_folio).
+ * 我们不使用 buffer_heads, 故用 filemap_dirty_folio (与 nfs/btrfs/zonefs 一致).
+ */
 static const struct address_space_operations powerfs_aops = {
     .read_folio    = powerfs_read_folio,
     .writepage     = powerfs_writepage,
     .write_begin   = powerfs_write_begin,
     .write_end     = powerfs_write_end,
+    .dirty_folio   = filemap_dirty_folio,
     .bmap          = powerfs_bmap,
-    .dirty_folio   = powerfs_dirty_folio,
 };
 
 /* ========== statfs ========== */
@@ -2696,56 +3034,78 @@ int powerfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 /*
  * powerfs_fsync - 数据同步操作
  *
- * 当通信层可用时，发送 FSYNC 通知代理同步数据
- * 当通信层不可用时，直接返回成功 (纯内存模式)
+ * powerfs_net 连接时: file_write_and_wait_range 触发 writepage→net_write,
+ *   将脏页同步刷到 filer; 兼容旧 comm 接口发 FSYNC 通知.
+ * 未连接时: 纯内存模式直接返回.
  */
 static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
     struct inode *inode = file->f_mapping->host;
-    struct powerfs_msg_header req_hdr, resp_hdr;
-    struct powerfs_fsync_req req_data;
-    struct powerfs_fsync_resp resp_data;
     int ret;
+    loff_t i_size;
 
     pr_debug("powerfs: fsync ino=%lu datasync=%d\n", inode->i_ino, datasync);
 
-    /* 通信层不可用，纯内存模式直接返回 */
-    if (!powerfs_comm_connected())
-        return 0;
+    /* powerfs_net: 触发脏页写回 (writepage→powerfs_net_write) */
+    if (powerfs_net_is_connected()) {
+        ret = file_write_and_wait_range(file, start, end);
+        if (ret < 0)
+            pr_warn("powerfs: fsync write_and_wait error: %d\n", ret);
 
-    /* 触发 inode 脏页写回 */
-    ret = file_write_and_wait_range(file, start, end);
-    if (ret < 0)
-        pr_warn("powerfs: fsync write_and_wait error: %d\n", ret);
-
-    /* 构建 FSYNC 请求 */
-    memset(&req_hdr, 0, sizeof(req_hdr));
-    req_hdr.type = POWERFS_MSG_FSYNC;
-    req_hdr.ino = inode->i_ino;
-    req_hdr.data_len = sizeof(req_data);
-
-    memset(&req_data, 0, sizeof(req_data));
-    req_data.ino = inode->i_ino;
-    req_data.datasync = datasync ? 1 : 0;
-
-    memset(&resp_hdr, 0, sizeof(resp_hdr));
-    memset(&resp_data, 0, sizeof(resp_data));
-
-    /* 发送 FSYNC 请求 */
-    ret = powerfs_comm_send_request(&req_hdr, &req_data,
-                                     &resp_hdr, &resp_data, 500);
-    if (ret < 0) {
-        pr_warn("powerfs: fsync comm error: %d\n", ret);
-        /* 通信层错误，仍然返回成功 (数据在本地 page cache) */
-        return 0;
+        /*
+         * 同步 i_size 到 Filer:
+         *   write_end 仅更新内存 inode 的 i_size, writepage 只刷数据页,
+         *   二者都不会把 i_size 元数据同步到 Filer. 若不同步, remount 后
+         *   lookup 返回 Filer 端 i_size=0, read_folio 见 offset>=i_size
+         *   直接 zero fill → 文件内容丢失.
+         *   修复: fsync 在刷完数据页后, 调用 powerfs_net_setattr 同步 size.
+         *   不依赖 VFS write_inode (powerfs_super_ops 未实现 write_inode).
+         */
+        i_size = i_size_read(inode);
+        if (i_size > 0) {
+            int sret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
+                                            0, 0, 0, (__u64)i_size);
+            if (sret < 0)
+                pr_warn("powerfs: fsync setattr size=%llu ino=%lu failed: %d\n",
+                        (u64)i_size, inode->i_ino, sret);
+        }
+        return ret;
     }
 
-    if (resp_hdr.status != 0) {
-        pr_warn("powerfs: fsync resp error: %d\n", resp_hdr.status);
-        return resp_hdr.status;
+    /* 兼容旧 comm 接口 */
+    if (powerfs_comm_connected()) {
+        struct powerfs_msg_header req_hdr, resp_hdr;
+        struct powerfs_fsync_req req_data;
+        struct powerfs_fsync_resp resp_data;
+
+        ret = file_write_and_wait_range(file, start, end);
+        if (ret < 0)
+            pr_warn("powerfs: fsync write_and_wait error: %d\n", ret);
+
+        memset(&req_hdr, 0, sizeof(req_hdr));
+        req_hdr.type = POWERFS_MSG_FSYNC;
+        req_hdr.ino = inode->i_ino;
+        req_hdr.data_len = sizeof(req_data);
+
+        memset(&req_data, 0, sizeof(req_data));
+        req_data.ino = inode->i_ino;
+        req_data.datasync = datasync ? 1 : 0;
+
+        memset(&resp_hdr, 0, sizeof(resp_hdr));
+        memset(&resp_data, 0, sizeof(resp_data));
+
+        ret = powerfs_comm_send_request(&req_hdr, &req_data,
+                                         &resp_hdr, &resp_data, 500);
+        if (ret < 0) {
+            pr_warn("powerfs: fsync comm error: %d\n", ret);
+            return 0;
+        }
+        if (resp_hdr.status != 0) {
+            pr_warn("powerfs: fsync resp error: %d\n", resp_hdr.status);
+            return resp_hdr.status;
+        }
     }
 
-    pr_debug("powerfs: fsync complete ino=%lu\n", inode->i_ino);
     return 0;
 }
 
@@ -2809,7 +3169,7 @@ static int powerfs_show_options(struct seq_file *m, struct dentry *root)
 
 static const struct super_operations powerfs_super_ops = {
     .alloc_inode   = powerfs_alloc_inode,
-    .destroy_inode = powerfs_free_inode,
+    .free_inode    = powerfs_free_inode,
     .evict_inode   = powerfs_evict_inode,
     .statfs        = powerfs_statfs,
     .drop_inode    = generic_delete_inode,
@@ -2824,8 +3184,8 @@ int powerfs_init_inode_cache(void)
     powerfs_inode_cachep = kmem_cache_create(
         "powerfs_inode_cache",
         sizeof(struct powerfs_inode_info),
-        0,
-        SLAB_HWCACHE_ALIGN,
+        __alignof__(struct powerfs_inode_info),
+        SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD | SLAB_ACCOUNT,
         powerfs_inode_init_once);
     if (!powerfs_inode_cachep)
         return -ENOMEM;
@@ -2834,8 +3194,8 @@ int powerfs_init_inode_cache(void)
     powerfs_dentry_cachep = kmem_cache_create(
         "powerfs_dentry_cache",
         sizeof(struct powerfs_dentry_info),
-        0,
-        SLAB_HWCACHE_ALIGN,
+        __alignof__(struct powerfs_dentry_info),
+        SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD,
         NULL);
     if (!powerfs_dentry_cachep) {
         kmem_cache_destroy(powerfs_inode_cachep);
@@ -2946,10 +3306,21 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     /* === 初始化 powerfs_net 连接池 (多节点 Delta Sync) === */
     powerfs_net_pool_init();
 
-    /* 配置 Filer 节点 (Delta Sync 的主节点) */
-    if (ctx && ctx->filer_addr[0]) {
-        powerfs_net_add_server(ctx->filer_addr, ctx->filer_port,
-                              POWERFS_NET_SERVER_FILER);
+    /* 配置 Filer 节点 (Delta Sync 的主节点).
+     * mount 无参数时 ctx->filer_addr 为空, 此时 fallback 到模块参数
+     * g_server_addr/g_server_port (由 insmod 传入), 保证 pool 非空,
+     * 否则 leader_check_work/monitor_work 会一直报 "no leader found". */
+    {
+        const char *faddr = (ctx && ctx->filer_addr[0]) ?
+                            ctx->filer_addr : powerfs_net_get_server_addr();
+        __u16 fport = (ctx && ctx->filer_addr[0]) ?
+                      ctx->filer_port : powerfs_net_get_server_port();
+        if (faddr && faddr[0]) {
+            powerfs_net_add_server(faddr, fport,
+                                  POWERFS_NET_SERVER_FILER);
+            /* 标记为 leader (单 Filer 模式) */
+            powerfs_net_set_primary(faddr, fport);
+        }
     }
 
     /* 配置 Master 节点 */

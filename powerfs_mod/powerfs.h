@@ -12,6 +12,7 @@
 #include <linux/statfs.h>
 #include <linux/seq_file.h>
 #include <linux/fs_context.h>
+#include <linux/netfs.h>
 
 /* ========== 常量定义 ========== */
 
@@ -26,6 +27,11 @@
 
 /* Inode cache 超时 (jiffies, 默认 10 秒) */
 #define POWERFS_INODE_CACHE_TTL     (10 * HZ)
+
+/* Chunk 和 Stripe 大小 */
+#define POWERFS_CHUNK_SIZE      (2 * 1024 * 1024)    /* 2MB */
+#define POWERFS_STRIPE_SIZE     (64 * 1024 * 1024)   /* 64MB */
+#define POWERFS_LEASE_DURATION  (30 * HZ)
 
 /* ========== 前向声明 ========== */
 
@@ -57,10 +63,6 @@ struct powerfs_dentry_info {
     unsigned long time;               /* 最近更新时间 */
     u64 offset;                       /* readdir 偏移 */
     unsigned long flags;              /* 标志位 */
-
-    /* Delta Sync 字段 */
-    __u64 generation;                 /* 当前路径的 generation */
-    char path[256];                   /* 完整路径 (用于 Delta Sync) */
 };
 
 /* powerfs_dentry_info 标志位 */
@@ -102,43 +104,62 @@ struct powerfs_dir_entry {
 
 /* ========== Inode 扩展结构 (参考 ceph_inode_info) ========== */
 
-struct powerfs_inode_info {
-    struct inode vfs_inode;           /* VFS inode (必须是第一个字段) */
-    
-    u64 parent_ino;                   /* 父目录 inode 号 */
-    char name[POWERFS_MAX_NAME_LEN];  /* 文件名 (用于调试) */
-    
-    spinlock_t i_lock;                /* 保护私有字段的锁 */
-    
-    /* 缓存有效性 */
-    bool cache_valid;
-    unsigned long cache_expire;       /* 缓存过期时间 */
-    
-    /* 简化版 cap (参考 ceph cap 机制) */
-    int i_caps;                       /* 当前持有的 cap 位 */
-    int i_dirty_caps;                 /* 脏 cap 位 */
-    
-    /* 目录 complete 标志 (目录内容缓存完整) */
-    bool dir_complete;
-    
-    /* 目录项链表 (用于本地 readdir, 由 dir_mutex 保护) */
-    struct list_head dir_entries;
-    struct mutex dir_mutex;  /* 保护目录项链表 (使用mutex因为readdir可能睡眠) */
-
-    /* Delta Sync 字段 */
-    __u64 generation;                 /* inode 的 generation 版本 */
-    bool net_cache_valid;             /* 网络缓存是否有效 */
+/* Chunk 映射条目 */
+struct powerfs_chunk_map {
+    u32 chunk_idx;
+    u64 needle_id;
+    u64 volume_id;
+    u32 crc32;
 };
 
-/* Cap 位 (简化版) */
-#define POWERFS_CAP_SHARED    (1 << 0)  /* 共享读权限 */
-#define POWERFS_CAP_EXCLUSIVE (1 << 1)  /* 独占写权限 */
-#define POWERFS_CAP_LAZY      (1 << 2)  /* 延迟写 */
+/* Per-stripe Lease (参考 ceph_cap) */
+struct powerfs_lease {
+    struct rb_node node;
+    u64 stripe_start;
+    u64 stripe_count;
+    char token[64];
+    u64 epoch;
+    unsigned long expire_jiffies;
+    bool exclusive;
+    u64 content_size;
+};
+
+struct powerfs_inode_info {
+    struct netfs_inode netfs;          /* 内含 struct inode，必须第一个字段 */
+
+    u64 parent_ino;
+    char name[POWERFS_MAX_NAME_LEN];
+
+    spinlock_t i_lock;
+
+    /* Lease 强一致 (参考 ceph i_caps rbtree) */
+    struct rb_root lease_tree;         /* per-stripe lease，按 stripe_start 排序 */
+    spinlock_t lease_lock;             /* 保护 lease_tree */
+    struct delayed_work lease_renew_work;
+
+    /* Chunk 映射 (open/getattr 时从 Filer 获取) */
+    struct powerfs_chunk_map *chunks;
+    u32 chunk_count;
+    u64 content_size;
+    u64 volume_id;
+
+    /* 缓存有效性 */
+    bool cache_valid;
+    unsigned long cache_expire;
+
+    /* 目录缓存 */
+    bool dir_complete;
+    struct list_head dir_entries;
+    struct mutex dir_mutex;
+
+    /* shutdown 标志 (参考 ceph_inode_is_shutdown) */
+    bool shutdown;
+};
 
 /* 获取 inode 扩展结构 */
 static inline struct powerfs_inode_info *POWERFS_I(struct inode *inode)
 {
-    return container_of(inode, struct powerfs_inode_info, vfs_inode);
+    return container_of(inode, struct powerfs_inode_info, netfs.inode);
 }
 
 /* ========== 客户端结构 (参考 ceph_fs_client) ========== */

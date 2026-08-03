@@ -51,12 +51,34 @@
 static struct powerfs_net_conn g_conn;
 static bool g_initialized = false;
 
+/*
+ * 串行化 send_request 的 send+recv 序列.
+ *
+ * 同一 TCP 连接上, 若两个请求并发发送 (A.seq=10, B.seq=11), Filer 响应
+ * 顺序不保证与请求一致. A 的 recv 可能拿到 B 的响应 → seq mismatch -EIO.
+ *
+ * 当前为同步请求-响应模型 (单连接), 必须串行化整个 send-recv 过程, 保证
+ * 一次只有一个请求在等待响应. 这牺牲了并发吞吐, 但保证基本功能正确性.
+ * 后续若需并发, 应改为多连接或异步 req 表 + completion 匹配.
+ *
+ * 不复用 conn_lock: conn_lock 用于保护连接状态/sock 引用获取 (短临界区),
+ * 若 send_request 长时间持有会阻塞 disconnect 的 conn_lock 获取. 故用
+ * 独立 mutex.
+ */
+static DEFINE_MUTEX(send_recv_mutex);
+
 /* 目标服务地址 (模块参数) */
 static char *g_server_addr = "127.0.0.1";
 static __u16 g_server_port = 9000;
 
 module_param(g_server_addr, charp, 0644);
 module_param(g_server_port, ushort, 0644);
+
+/* 暴露模块参数给其他编译单元 (fill_super 用于 fallback) */
+const char *powerfs_net_get_server_addr(void) { return g_server_addr; }
+__u16 powerfs_net_get_server_port(void) { return g_server_port; }
+EXPORT_SYMBOL_GPL(powerfs_net_get_server_addr);
+EXPORT_SYMBOL_GPL(powerfs_net_get_server_port);
 
 /* ========== 前向声明 ========== */
 static void powerfs_net_monitor_work_func(struct work_struct *work);
@@ -115,8 +137,12 @@ void powerfs_net_frame_hdr_encode(struct powerfs_net_frame_hdr *hdr,
     __u32 crc_buf[7];  /* 前 24 字节 (6 u32) 的 CRC 计算缓冲 */
     __u32 crc;
 
-    /* 填充字段 */
-    hdr->magic = (__be32)POWERFS_NET_MAGIC;
+    /* 填充字段.
+     * 注意: magic 必须用 cpu_to_be32() 真正翻转字节, 使内存布局为
+     * "PFSN" (50 46 53 4E), 与 Filer 端 b"PFSN" 一致.
+     * 之前用 (__be32) 强制转换不翻转字节, 导致内存为 "NSFP", Filer
+     * 端 magic 校验失败 -> "invalid frame header". */
+    hdr->magic = cpu_to_be32(POWERFS_NET_MAGIC);
     hdr->version = POWERFS_NET_VERSION;
     hdr->flags = flags;
 
@@ -243,6 +269,16 @@ static void powerfs_net_close_socket(struct socket *sock)
         kernel_sock_shutdown(sock, SHUT_RDWR);
         sock_release(sock);
     }
+}
+
+/*
+ * 释放 sock 引用计数; 归零时唤醒等待中的 disconnect.
+ * send_request 使用本地 sock 引用完毕后必须调用一次.
+ */
+static void powerfs_net_put_sock_ref(void)
+{
+    if (atomic_dec_and_test(&g_conn.sock_users))
+        wake_up(&g_conn.sock_user_wq);
 }
 
 /* ========== 帧发送/接收 ========== */
@@ -529,6 +565,10 @@ int powerfs_net_connect(const char *addr, __u16 port)
 
     g_conn.state = POWERFS_NET_STATE_CONNECTED;
     g_conn.reconnect_count = 0;
+    /* 记录当前连接地址, 供 find_leader 判断是否需要重连 */
+    strncpy(g_conn.cur_addr, addr, sizeof(g_conn.cur_addr) - 1);
+    g_conn.cur_addr[sizeof(g_conn.cur_addr) - 1] = '\0';
+    g_conn.cur_port = port;
 
     pr_info("powerfs: net connected to %s:%u\n", addr, port);
 
@@ -538,22 +578,42 @@ int powerfs_net_connect(const char *addr, __u16 port)
 
 /**
  * powerfs_net_disconnect - 断开连接
+ *
+ * 关键: 不在持锁期间 close socket. 先把 g_conn.sock 置 NULL (退役),
+ * 释放 conn_lock 后 wait_event 等待所有 send_request 释放引用
+ * (sock_users==0), 再 close. 这样并发 recv 不会使用已释放 socket
+ * (修复 ls/readdir 的 use-after-free: _raw_spin_lock_irqsave NULL deref).
  */
 void powerfs_net_disconnect(void)
 {
+    struct socket *sock = NULL;
+
     mutex_lock(&g_conn.conn_lock);
 
     if (g_conn.sock) {
-        powerfs_net_close_socket(g_conn.sock);
-        g_conn.sock = NULL;
+        sock = g_conn.sock;
+        g_conn.sock = NULL;  /* 退役: 新请求看到 NULL 返回 -ENOTCONN */
     }
 
     g_conn.state = POWERFS_NET_STATE_DISCONNECTED;
-
-    /* 完成所有待处理请求 (返回错误) */
-    pr_info("powerfs: net disconnected\n");
+    g_conn.cur_addr[0] = '\0';
+    g_conn.cur_port = 0;
 
     mutex_unlock(&g_conn.conn_lock);
+
+    /*
+     * 等待正在使用旧 sock 的 send_request 释放引用.
+     * send_request 持引用期间可能阻塞在 kernel_recvmsg (sk_rcvtimeo
+     * 兜底), 此处等待是 failover 的可接受代价. wait_event 期间不持
+     * conn_lock, 不影响新 connect 获取锁建立新连接.
+     */
+    if (sock) {
+        wait_event(g_conn.sock_user_wq,
+                   atomic_read(&g_conn.sock_users) == 0);
+        powerfs_net_close_socket(sock);
+    }
+
+    pr_info("powerfs: net disconnected\n");
 }
 
 /**
@@ -567,13 +627,52 @@ bool powerfs_net_is_connected(void)
 /* ========== 请求/响应核心 ========== */
 
 /**
+ * powerfs_net_parse_redirect - 从 REDIRECT 响应 body 解析 leader net 地址
+ *
+ * Filer 的 check_leader 在非 leader 时返回 STATUS_ERR_REDIRECT,
+ * 响应 body 包含 Owner 字段 (string, 格式 "ip:port").
+ * 内核需解析出地址, 切换连接到 leader 后重试请求.
+ *
+ * 返回: 0 成功, 负数失败
+ */
+static int powerfs_net_parse_redirect(const __u8 *body, size_t body_len,
+                                       char *addr, size_t addr_cap,
+                                       __u16 *port)
+{
+    struct powerfs_tlv_dec dec;
+    char owner[80];
+    char *colon;
+    unsigned long p;
+
+    powerfs_tlv_dec_init(&dec, body, body_len);
+    if (powerfs_tlv_dec_string(&dec, POWERFS_NET_FLD_OWNER,
+                                owner, sizeof(owner) - 1) < 0)
+        return -EINVAL;
+
+    /* 解析 "ip:port" (用 strrchr 兼容 IPv6) */
+    colon = strrchr(owner, ':');
+    if (!colon)
+        return -EINVAL;
+
+    *colon = '\0';
+    if (kstrtoul(colon + 1, 10, &p) < 0 || p == 0 || p > 0xFFFF)
+        return -EINVAL;
+    *port = (__u16)p;
+
+    strncpy(addr, owner, addr_cap - 1);
+    addr[addr_cap - 1] = '\0';
+    return 0;
+}
+
+/**
  * powerfs_net_send_request - 发送同步请求并等待响应
  *
  * 实现真正的同步发送-接收流程:
  *   1. 编码并发送请求帧
  *   2. 同步接收响应帧
- *   3. 拷贝响应数据到输出缓冲区
- *   4. 返回响应状态码
+ *   3. 若收到 REDIRECT, 解析 leader 地址, 切换连接并重试 (最多 1 次)
+ *   4. 拷贝响应数据到输出缓冲区
+ *   5. 返回响应状态码
  *
  * @resp_body_len_out: 输出: 实际接收到的 body 长度 (可为 NULL)
  * @resp_data_len_out: 输出: 实际接收到的 data 长度 (可为 NULL)
@@ -595,32 +694,18 @@ int powerfs_net_send_request(__u16 msg_type,
     struct powerfs_net_frame_hdr resp_hdr;
     __u32 seq;
     __u8 *tmp_body, *tmp_data;
-    size_t tmp_body_len, tmp_data_len;
+    size_t tmp_body_len = 0, tmp_data_len = 0;
     int ret;
-    int net_status;
+    int net_status = 0;
+    int attempt;
+    struct socket *sock;   /* 本地引用, 由 sock_users 引用计数保护 */
 
-    /* 检查连接状态 */
-    if (g_conn.state != POWERFS_NET_STATE_CONNECTED || !g_conn.sock) {
+    /* 快速路径: 无锁读 state, 避免已断开时无谓 kmalloc (循环内会持锁复检) */
+    if (g_conn.state != POWERFS_NET_STATE_CONNECTED) {
         pr_debug("powerfs: not connected, cannot send request\n");
         return -ENOTCONN;
     }
 
-    /* 分配序列号 */
-    seq = atomic_inc_return(&g_conn.seq_counter);
-
-    /* 编码并发送帧 */
-    powerfs_net_frame_hdr_encode(&hdr, msg_type,
-                                  POWERFS_NET_FLAG_REQUEST,
-                                  seq, 0, body_len + data_len);
-
-    ret = powerfs_net_frame_send(g_conn.sock, &hdr, body, body_len,
-                                  data, data_len);
-    if (ret < 0) {
-        pr_debug("powerfs: send failed seq=%u: %d\n", seq, ret);
-        return ret;
-    }
-
-    /* 同步接收响应 */
     tmp_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
     tmp_data = kmalloc(POWERFS_NET_MAX_DATA, GFP_KERNEL);
     if (!tmp_body || !tmp_data) {
@@ -629,44 +714,151 @@ int powerfs_net_send_request(__u16 msg_type,
         return -ENOMEM;
     }
 
-    tmp_body_len = 0;
-    tmp_data_len = 0;
+    /*
+     * 串行化 send+recv: 单连接同步模型下, 并发请求会导致响应交叉 seq
+     * mismatch. 持有 send_recv_mutex 覆盖整个 send-recv (含 redirect 重试).
+     * 注意: 此处不能用 mutex_lock_interruptible, VFS 回调路径 (如 writepage)
+     * 不可被信号中断; 用 mutex_lock 阻塞等待.
+     */
+    mutex_lock(&send_recv_mutex);
 
-    ret = powerfs_net_frame_recv(g_conn.sock, &resp_hdr,
-                                  tmp_body, POWERFS_NET_MAX_BODY, &tmp_body_len,
-                                  tmp_data, POWERFS_NET_MAX_DATA, &tmp_data_len,
-                                  timeout_ms);
-    if (ret < 0) {
-        pr_debug("powerfs: recv failed seq=%u: %d\n", seq, ret);
-
-        /* 连接断开 */
-        if (ret == -EPIPE || ret == -ECONNRESET || ret == -ETIMEDOUT) {
-            pr_err("powerfs: connection lost during request seq=%u\n", seq);
-            mutex_lock(&g_conn.conn_lock);
-            if (g_conn.sock) {
-                powerfs_net_close_socket(g_conn.sock);
-                g_conn.sock = NULL;
-            }
-            g_conn.state = POWERFS_NET_STATE_DISCONNECTED;
+    /*
+     * 最多尝试 2 次: 第 1 次可能收到 REDIRECT (当前连接的 Filer 非 leader),
+     * 解析响应 body 中的 leader net 地址, 切换连接后重试 1 次.
+     * 这避免了上层每个请求函数都要单独处理 redirect.
+     */
+    for (attempt = 0; attempt < 2; attempt++) {
+        /*
+         * 获取 sock 本地引用 (持锁检查 + inc sock_users).
+         * disconnect 会先置 g_conn.sock=NULL 再 wait sock_users==0,
+         * 故持锁期间 sock 不会被释放; 释放锁后即使 disconnect 退役
+         * 该 sock, 本地引用仍有效 (disconnect 在 close 前等待引用归零).
+         * 这修复了并发 recv 使用已释放 socket 的 use-after-free.
+         */
+        mutex_lock(&g_conn.conn_lock);
+        if (g_conn.state != POWERFS_NET_STATE_CONNECTED || !g_conn.sock) {
             mutex_unlock(&g_conn.conn_lock);
+            pr_debug("powerfs: not connected (attempt %d)\n", attempt);
+            ret = -ENOTCONN;
+            break;
+        }
+        sock = g_conn.sock;
+        atomic_inc(&g_conn.sock_users);
+        mutex_unlock(&g_conn.conn_lock);
+
+        seq = atomic_inc_return(&g_conn.seq_counter);
+
+        powerfs_net_frame_hdr_encode(&hdr, msg_type,
+                                      POWERFS_NET_FLAG_REQUEST,
+                                      seq, 0, body_len + data_len);
+
+        ret = powerfs_net_frame_send(sock, &hdr, body, body_len,
+                                      data, data_len);
+        if (ret < 0) {
+            pr_debug("powerfs: send failed seq=%u: %d\n", seq, ret);
+            powerfs_net_put_sock_ref();
+            break;
         }
 
+        tmp_body_len = 0;
+        tmp_data_len = 0;
+
+        /*
+         * recv 循环: 同一 TCP 连接上 filer 可能插入异步 NOTIFY 帧
+         * (Invalidate/PUSH_DELTA 通知, seq=0). 同步 send-recv 模型下,
+         * 这些通知会被 recv 误当作请求响应, 导致 seq mismatch (-EIO).
+         * 解决: 跳过 NOTIFY 帧继续 recv, 直到收到 seq 匹配的 RESPONSE.
+         */
+        {
+            bool ref_released = false;
+
+            while (1) {
+                tmp_body_len = 0;
+                tmp_data_len = 0;
+
+                ret = powerfs_net_frame_recv(sock, &resp_hdr,
+                                              tmp_body, POWERFS_NET_MAX_BODY, &tmp_body_len,
+                                              tmp_data, POWERFS_NET_MAX_DATA, &tmp_data_len,
+                                              timeout_ms);
+                if (ret < 0) {
+                    pr_debug("powerfs: recv failed seq=%u: %d\n", seq, ret);
+                    if (ret == -EPIPE || ret == -ECONNRESET || ret == -ETIMEDOUT) {
+                        /* 先释放引用再 disconnect, 避免 disconnect
+                         * wait sock_users==0 与本线程持有引用死锁 */
+                        powerfs_net_put_sock_ref();
+                        ref_released = true;
+                        pr_err("powerfs: connection lost during request seq=%u\n", seq);
+                        powerfs_net_disconnect();
+                    }
+                    break;
+                }
+
+                /* 跳过异步通知帧 (Invalidate 等), 继续等待匹配响应 */
+                if (resp_hdr.seq != seq &&
+                    (resp_hdr.flags & POWERFS_NET_FLAG_NOTIFY || resp_hdr.seq == 0)) {
+                    pr_debug("powerfs: skip notify frame seq=%u flags=0x%02x (waiting seq=%u)\n",
+                             resp_hdr.seq, resp_hdr.flags, seq);
+                    continue;
+                }
+
+                if (resp_hdr.seq != seq) {
+                    pr_warn("powerfs: seq mismatch: sent=%u received=%u\n",
+                             seq, resp_hdr.seq);
+                    ret = -EIO;
+                }
+                break;
+            }
+
+            /* recv 完成, 不再使用 sock, 释放引用 (若未在错误路径释放) */
+            if (!ref_released)
+                powerfs_net_put_sock_ref();
+        }
+
+        if (ret < 0)
+            break;
+
+        net_status = (int)resp_hdr.status;
+
+        /* 处理 REDIRECT: 切换到 leader 并重试 (仅第 1 次) */
+        if (net_status == POWERFS_NET_STATUS_ERR_REDIRECT && attempt == 0) {
+            char leader_addr[64];
+            __u16 leader_port;
+
+            if (powerfs_net_parse_redirect(tmp_body, tmp_body_len,
+                                             leader_addr, sizeof(leader_addr),
+                                             &leader_port) == 0) {
+                pr_info("powerfs: redirect to leader %s:%u\n",
+                        leader_addr, leader_port);
+                /* 断开当前连接 (非 leader), 再连接到 leader.
+                 * powerfs_net_connect 在 state=CONNECTED 时会跳过重连,
+                 * 故必须先 disconnect 使其建立新连接. */
+                powerfs_net_disconnect();
+                ret = powerfs_net_connect(leader_addr, leader_port);
+                if (ret < 0) {
+                    pr_warn("powerfs: redirect connect to %s:%u failed: %d\n",
+                            leader_addr, leader_port, ret);
+                    break;
+                }
+                /* 已切换到 leader, 重试请求 */
+                continue;
+            }
+            /* redirect 响应缺少 leader 地址, 无法重试 */
+            pr_warn("powerfs: redirect response missing leader addr\n");
+            ret = -EAGAIN;
+            break;
+        }
+
+        /* 非 REDIRECT (或第 2 次尝试): 正常完成 */
+        ret = 0;
+        break;
+    }
+
+    if (ret < 0) {
+        mutex_unlock(&send_recv_mutex);
         kfree(tmp_body);
         kfree(tmp_data);
         return ret;
     }
-
-    /* 检查响应序列号 */
-    if (resp_hdr.seq != seq) {
-        pr_warn("powerfs: seq mismatch: sent=%u received=%u\n",
-                 seq, resp_hdr.seq);
-        kfree(tmp_body);
-        kfree(tmp_data);
-        return -EIO;
-    }
-
-    /* 获取响应状态 */
-    net_status = (int)resp_hdr.status;
 
     /* 拷贝响应 body 到输出缓冲区 */
     if (resp_body && tmp_body_len > 0) {
@@ -686,8 +878,10 @@ int powerfs_net_send_request(__u16 msg_type,
     if (resp_data_len_out)
         *resp_data_len_out = tmp_data_len;
 
-    pr_debug("powerfs: request completed seq=%u msg_type=%u status=%d body=%zu data=%zu\n",
-             seq, msg_type, net_status, tmp_body_len, tmp_data_len);
+    pr_debug("powerfs: request completed msg_type=%u status=%d body=%zu data=%zu\n",
+             msg_type, net_status, tmp_body_len, tmp_data_len);
+
+    mutex_unlock(&send_recv_mutex);
 
     kfree(tmp_body);
     kfree(tmp_data);
@@ -725,8 +919,27 @@ static void powerfs_net_reconnect_work(struct work_struct *work)
 
     /* 尝试重连 */
     for (i = 0; i < POWERFS_NET_MAX_RECONNECT; i++) {
-        /* 等待一段时间 */
-        msleep(POWERFS_NET_RECONNECT_DELAY);
+        /* 模块退出时提前终止重连循环（atomic_read 保证跨 CPU 可见性） */
+        if (atomic_read(&g_conn.stopping)) {
+            pr_info("powerfs: reconnect stopped (module exiting)\n");
+            return;
+        }
+
+        /* 等待一段时间 (用 msleep_interruptible 让 cancel 能更快响应) */
+        if (msleep_interruptible(POWERFS_NET_RECONNECT_DELAY))
+            return;  /* 被信号中断 */
+
+        /* msleep 醒来后再检查一次 stopping，避免进入会阻塞的 kernel_connect */
+        if (atomic_read(&g_conn.stopping)) {
+            pr_info("powerfs: reconnect stopped after sleep (module exiting)\n");
+            return;
+        }
+
+        /* connect 超时可能很长（TCP SYN 重试 ~10s），connect 前最后检查一次 */
+        if (atomic_read(&g_conn.stopping)) {
+            pr_info("powerfs: reconnect stopped before connect (module exiting)\n");
+            return;
+        }
 
         ret = powerfs_net_connect(addr, port);
         if (ret == 0) {
@@ -763,6 +976,8 @@ static int net_status_to_errno(__u16 status)
     case POWERFS_NET_STATUS_ERR_NO_SPACE:    return -ENOSPC;
     case POWERFS_NET_STATUS_ERR_BAD_FD:      return -EBADF;
     case POWERFS_NET_STATUS_ERR_SERVER:      return -EREMOTEIO;
+    /* REDIRECT 正常在 send_request 内部处理; 若漏到此处说明重试耗尽, 返回 -EAGAIN */
+    case POWERFS_NET_STATUS_ERR_REDIRECT:    return -EAGAIN;
     default:                                 return -EIO;
     }
 }
@@ -770,30 +985,32 @@ static int net_status_to_errno(__u16 status)
 /* ========== 便捷方法 ========== */
 
 /**
- * powerfs_net_lookup - 查找文件
+ * powerfs_net_lookup - 查找文件 (返回完整属性含时间戳)
+ *
+ * Filer 响应 TLV 字段: Ino, Mode, Uid, Gid, Size, Nlink, Mtime, Atime, Ctime, Name
  */
 int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
                        __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
-                       __u64 *size, __u32 *nlink)
+                       __u64 *size, __u32 *nlink,
+                       __u64 *mtime, __u64 *atime, __u64 *ctime)
 {
     __u8 body[256];
     struct powerfs_tlv_enc enc;
-    __u8 resp_body[256];
+    __u8 resp_body[512];
     size_t resp_body_len = 0;
     struct powerfs_tlv_dec dec;
     int ret;
 
-    /* 编码请求 */
+    /* 编码请求: ParentIno + Name */
     powerfs_tlv_enc_init(&enc, body, sizeof(body));
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_PARENT_INO, dir_ino);
     powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_NAME, name, name_len);
 
-    /* 发送请求 */
     ret = powerfs_net_send_request(POWERFS_NET_MSG_LOOKUP,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
                                     resp_body, sizeof(resp_body),
-                                    NULL, 0, 2000,
+                                    NULL, 0, 3000,
                                     &resp_body_len, NULL);
     if (ret < 0)
         return ret;
@@ -809,20 +1026,26 @@ int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
         powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_GID, gid);
         powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_SIZE, size);
         powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_NLINK, nlink);
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_MTIME, mtime);
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_ATIME, atime);
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_CTIME, ctime);
     }
 
     return 0;
 }
 
 /**
- * powerfs_net_getattr - 获取文件属性
+ * powerfs_net_getattr - 获取文件属性 (返回完整属性含时间戳)
+ *
+ * Filer 响应 TLV 字段: Ino, Mode, Uid, Gid, Size, Nlink, Mtime, Atime, Ctime
  */
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
-                         __u64 *size, __u32 *nlink, __u64 *mtime_sec)
+                         __u64 *size, __u32 *nlink,
+                         __u64 *mtime, __u64 *atime, __u64 *ctime)
 {
     __u8 body[64];
     struct powerfs_tlv_enc enc;
-    __u8 resp_body[128];
+    __u8 resp_body[256];
     size_t resp_body_len = 0;
     struct powerfs_tlv_dec dec;
     int ret;
@@ -834,7 +1057,7 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
                                     resp_body, sizeof(resp_body),
-                                    NULL, 0, 2000,
+                                    NULL, 0, 3000,
                                     &resp_body_len, NULL);
     if (ret < 0)
         return ret;
@@ -848,7 +1071,9 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
         powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_GID, gid);
         powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_SIZE, size);
         powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_NLINK, nlink);
-        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_MTIME, mtime_sec);
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_MTIME, mtime);
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_ATIME, atime);
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_CTIME, ctime);
     }
 
     return 0;
@@ -874,9 +1099,24 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
     powerfs_tlv_enc_init(&enc, body, sizeof(body));
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_PARENT_INO, dir_ino);
     powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_NAME, name, name_len);
-    powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_MODE, mode);
-    powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_UID, uid);
-    powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_GID, gid);
+    /*
+     * 编码必须与 Filer 解码匹配:
+     *   - CREATE: Filer handle_create 用 next_u32 (匹配 FUSE encode_create_req)
+     *   - MKDIR:   Filer handle_mkdir  用 next_u64 (匹配 FUSE encode_mkdir_req)
+     * 若内核 MKDIR 用 u32 编码, Filer next_u64 解码失败 (期望 8 字节, 实际 4),
+     * 游标不前进, 后续字段全部错位, mode 回退默认 0o755 (不含 S_IFDIR),
+     * 导致 readdir 返回的目录项 d_type=DT_UNKNOWN, ls 显示 "?rwxr-xr-x".
+     * 修复: MKDIR 路径用 u64 编码 mode/uid/gid.
+     */
+    if (is_dir) {
+        powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_MODE, (__u64)mode);
+        powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_UID, (__u64)uid);
+        powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_GID, (__u64)gid);
+    } else {
+        powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_MODE, mode);
+        powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_UID, uid);
+        powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_GID, gid);
+    }
     powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_IS_DIR, is_dir ? 1 : 0);
 
     ret = powerfs_net_send_request(msg_type,
@@ -960,54 +1200,145 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
 }
 
 /**
- * powerfs_net_readdir - 读取目录项
+ * powerfs_net_readdir - 读取目录项 (匹配 Filer 协议)
+ *
+ * 请求 TLV 字段: ParentIno, Limit, LastName (分页游标)
+ * 响应 TLV 字段: Count, HasMore, Entry[] (每个 Entry 是嵌套 TLV)
+ *
+ * 每个 Entry 嵌套字段: Ino, Name, Mode, Uid, Gid, Size, Atime, Mtime, Ctime, Nlink
  */
-int powerfs_net_readdir(__u64 dir_ino, __u64 offset, __u32 count,
-                        __u8 *entries_buf, size_t buf_cap, __u32 *entries_count)
+int powerfs_net_readdir(__u64 dir_ino, const char *last_name, __u64 limit,
+                        struct powerfs_net_dir_entry *entries, __u32 max_entries,
+                        __u32 *actual_count, bool *has_more)
 {
-    __u8 body[64];
+    __u8 body[512];
     struct powerfs_tlv_enc enc;
-    size_t resp_data_len = 0;
+    __u8 *resp_body;
+    size_t resp_body_len = 0;
+    struct powerfs_tlv_dec dec;
+    __u32 count = 0;
+    __u64 more = 0;
+    __u8 field;
+    size_t flen;
     int ret;
 
+    *actual_count = 0;
+    *has_more = false;
+
+    /* 动态分配响应缓冲 (避免栈溢出) */
+    resp_body = kmalloc(16384, GFP_KERNEL);
+    if (!resp_body)
+        return -ENOMEM;
+
+    /* 编码请求: ParentIno + Limit + LastName */
     powerfs_tlv_enc_init(&enc, body, sizeof(body));
-    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, dir_ino);
-    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_OFFSET, offset);
-    powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_COUNT, count);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_PARENT_INO, dir_ino);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_LIMIT, limit);
+    if (last_name && last_name[0])
+        powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_LAST_NAME,
+                               last_name, strlen(last_name));
 
     ret = powerfs_net_send_request(POWERFS_NET_MSG_READDIR,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    NULL, 0,
-                                    entries_buf, buf_cap, 5000,
-                                    NULL, &resp_data_len);
-    if (ret < 0)
+                                    resp_body, 16384,
+                                    NULL, 0, 5000,
+                                    &resp_body_len, NULL);
+    if (ret < 0) {
+        kfree(resp_body);
         return ret;
-    if (ret > 0)
+    }
+    if (ret > 0) {
+        kfree(resp_body);
         return net_status_to_errno((__u16)ret);
-
-    /* 解析 readdir 响应 */
-    if (entries_count && resp_data_len > 0) {
-        struct powerfs_tlv_dec dec;
-        __u32 cnt = 0;
-
-        powerfs_tlv_dec_init(&dec, entries_buf, resp_data_len);
-        powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_COUNT, &cnt);
-        *entries_count = cnt;
     }
 
+    if (resp_body_len == 0) {
+        kfree(resp_body);
+        return 0;
+    }
+
+    /* 解码响应: 先读 Count 和 HasMore，再逐个解析 Entry */
+    powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+    powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_COUNT, &count);
+    powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_HAS_MORE, &more);
+    *has_more = (more != 0);
+
+    /* 限制返回条目数不超过 max_entries */
+    if (count > max_entries)
+        count = max_entries;
+
+    /* 遍历 Entry 字段 (嵌套 TLV) */
+    while (count > 0 && !powerfs_tlv_dec_is_empty(&dec)) {
+        const __u8 *entry_data;
+        size_t entry_len;
+
+        ret = powerfs_tlv_dec_next(&dec, &field, &flen);
+        if (ret < 0)
+            break;
+
+        if (field != POWERFS_NET_FLD_ENTRY) {
+            powerfs_tlv_dec_skip(&dec, flen);
+            continue;
+        }
+
+        entry_data = dec.buf + dec.pos;
+        entry_len = flen;
+
+        /* 解码嵌套 TLV 中的条目字段 */
+        {
+            struct powerfs_tlv_dec edec;
+            struct powerfs_net_dir_entry *e = &entries[*actual_count];
+
+            memset(e, 0, sizeof(*e));
+            powerfs_tlv_dec_init(&edec, entry_data, entry_len);
+            powerfs_tlv_dec_u64(&edec, POWERFS_NET_FLD_INO, &e->ino);
+            powerfs_tlv_dec_string(&edec, POWERFS_NET_FLD_NAME,
+                                   e->name, sizeof(e->name));
+            powerfs_tlv_dec_u32(&edec, POWERFS_NET_FLD_MODE, &e->mode);
+            powerfs_tlv_dec_u32(&edec, POWERFS_NET_FLD_UID, &e->uid);
+            powerfs_tlv_dec_u32(&edec, POWERFS_NET_FLD_GID, &e->gid);
+            powerfs_tlv_dec_u64(&edec, POWERFS_NET_FLD_SIZE, &e->size);
+            powerfs_tlv_dec_u64(&edec, POWERFS_NET_FLD_ATIME, &e->atime);
+            powerfs_tlv_dec_u64(&edec, POWERFS_NET_FLD_MTIME, &e->mtime);
+            powerfs_tlv_dec_u64(&edec, POWERFS_NET_FLD_CTIME, &e->ctime);
+            powerfs_tlv_dec_u32(&edec, POWERFS_NET_FLD_NLINK, &e->nlink);
+
+            (*actual_count)++;
+            count--;
+        }
+
+        /* 跳过已读字段的数据 */
+        powerfs_tlv_dec_skip(&dec, flen);
+    }
+
+    kfree(resp_body);
     return 0;
 }
 
 /**
  * powerfs_net_read - 读数据
+ *
+ * Filer 的 Read 响应将文件内容作为裸 payload 发送 (TLV body 为空,
+ * data 段为文件字节). 帧头 data_len = body.len() + data.len() = 文件字节数.
+ *
+ * 但内核 powerfs_net_frame_recv 按 body_cap(64KB) 机械切分 payload:
+ *   - payload <= 64KB: 全部放入 tmp_body, tmp_data_len=0
+ *   - payload >  64KB: 前 64KB 入 tmp_body, 余下入 tmp_data
+ *
+ * 当前 read 调用方 (powerfs_read_folio) 每次读 folio_size (4KB),
+ * payload 必然 <= 64KB, 故全部数据落在 resp_body. 之前代码误将 buf
+ * 作为 resp_data 传入, 导致 tmp_body 的数据被丢弃, read_len 恒为 0,
+ * folio 被零填充, 表现为 "remount 后 cat 文件内容为空".
+ *
+ * 修复: 将 buf 作为 resp_body 传入, resp_data 留空 (folio 读不会溢出).
  */
 int powerfs_net_read(__u64 ino, __u64 offset, __u32 length,
                      __u8 *buf, size_t buf_cap, __u32 *read_len)
 {
     __u8 body[64];
     struct powerfs_tlv_enc enc;
-    size_t resp_data_len = 0;
+    size_t resp_body_len = 0;
     int ret;
 
     powerfs_tlv_enc_init(&enc, body, sizeof(body));
@@ -1018,16 +1349,16 @@ int powerfs_net_read(__u64 ino, __u64 offset, __u32 length,
     ret = powerfs_net_send_request(POWERFS_NET_MSG_READ,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    NULL, 0,
-                                    buf, buf_cap, 10000,
-                                    NULL, &resp_data_len);
+                                    buf, buf_cap,
+                                    NULL, 0, 10000,
+                                    &resp_body_len, NULL);
     if (ret < 0)
         return ret;
     if (ret > 0)
         return net_status_to_errno((__u16)ret);
 
     if (read_len)
-        *read_len = (__u32)resp_data_len;
+        *read_len = (__u32)resp_body_len;
 
     return 0;
 }
@@ -1269,6 +1600,9 @@ int powerfs_net_init(void)
     memset(&g_conn, 0, sizeof(g_conn));
     g_conn.state = POWERFS_NET_STATE_DISCONNECTED;
     atomic_set(&g_conn.seq_counter, 0);
+    atomic_set(&g_conn.stopping, 0);
+    atomic_set(&g_conn.sock_users, 0);
+    init_waitqueue_head(&g_conn.sock_user_wq);
     mutex_init(&g_conn.conn_lock);
     spin_lock_init(&g_conn.req_lock);
     hash_init(g_conn.pending_reqs);
@@ -1303,11 +1637,19 @@ void powerfs_net_exit(void)
     if (!g_initialized)
         return;
 
+    /* 通知 reconnect_work 提前退出 msleep 循环（atomic_set 保证跨 CPU 可见性） */
+    atomic_set(&g_conn.stopping, 1);
+
     /* 断开连接 */
     powerfs_net_disconnect();
 
-    /* 取消重连工作 */
+    /* 取消重连工作（stopping=true 后 reconnect_work 会在下次循环检查时退出） */
     cancel_work_sync(&g_conn.reconnect_work);
+
+    /* 清理连接池（停止 monitor delayed_work + 销毁 pool mutex）
+     * 注意: kill_sb 已调用 stop_monitor + pool_cleanup，但 pool_exit 还没调用；
+     *       如果 umount 没执行（直接 rmmod），这里兜底 */
+    powerfs_net_pool_exit();
 
     /* 释放缓冲区 (对应 vmalloc 使用 vfree) */
     if (g_conn.recv_buf)
@@ -1744,27 +2086,40 @@ int powerfs_net_find_leader(void)
         int idx = atomic_read(&g_pool.leader_idx);
         if (idx < g_pool.server_count &&
             g_pool.servers[idx].type == POWERFS_NET_SERVER_FILER) {
-            /* 尝试 ping leader */
+            char addr[64];
+            __u16 port;
             mutex_lock(&g_pool.pool_lock);
-            {
-                char addr[64];
-                __u16 port;
-                strncpy(addr, g_pool.servers[idx].addr, sizeof(addr) - 1);
-                port = g_pool.servers[idx].port;
-                mutex_unlock(&g_pool.pool_lock);
+            strncpy(addr, g_pool.servers[idx].addr, sizeof(addr) - 1);
+            port = g_pool.servers[idx].port;
+            mutex_unlock(&g_pool.pool_lock);
 
-                pr_info("powerfs: trying known leader %s:%u\n", addr, port);
+            /* 若已连接到该 leader 地址, 直接返回, 不 disconnect.
+             * 之前无条件 disconnect+connect 会与并发的 send_request/recv
+             * (如 monitor_work 的 ping) 竞态, socket 被关闭后 recv 路径
+             * 的 remove_wait_queue 访问 NULL -> oops. */
+            if (g_conn.state == POWERFS_NET_STATE_CONNECTED &&
+                g_conn.sock &&
+                strcmp(g_conn.cur_addr, addr) == 0 &&
+                g_conn.cur_port == port) {
+                pr_debug("powerfs: already connected to leader %s:%u\n", addr, port);
+                return idx;
+            }
+
+            /* 未连接或地址不匹配, 尝试连接 (connect 内部检查 state,
+             * 已连接会返回 0; 但地址不同时需先 disconnect) */
+            pr_info("powerfs: trying known leader %s:%u\n", addr, port);
+            if (g_conn.state == POWERFS_NET_STATE_CONNECTED &&
+                (strcmp(g_conn.cur_addr, addr) != 0 || g_conn.cur_port != port))
                 powerfs_net_disconnect();
-                ret = powerfs_net_connect(addr, port);
-                if (ret == 0) {
-                    pr_info("powerfs: connected to known leader\n");
-                    return idx;
-                }
+            ret = powerfs_net_connect(addr, port);
+            if (ret == 0) {
+                pr_info("powerfs: connected to known leader\n");
+                return idx;
             }
         }
     }
 
-    /* 遍历所有 Filer 尝试连接 */
+    /* 遍历所有 Filer 尝试连接 (故障转移场景) */
     mutex_lock(&g_pool.pool_lock);
     for (i = 0; i < g_pool.server_count; i++) {
         if (g_pool.servers[i].type == POWERFS_NET_SERVER_FILER) {
@@ -1774,6 +2129,25 @@ int powerfs_net_find_leader(void)
             strncpy(addr, g_pool.servers[i].addr, sizeof(addr) - 1);
             port = g_pool.servers[i].port;
             mutex_unlock(&g_pool.pool_lock);
+
+            /* 跳过已连接的 Filer (避免无谓 disconnect) */
+            if (g_conn.state == POWERFS_NET_STATE_CONNECTED &&
+                g_conn.sock &&
+                strcmp(g_conn.cur_addr, addr) == 0 &&
+                g_conn.cur_port == port) {
+                /* 已连接到此 Filer, 标记为 leader */
+                mutex_lock(&g_pool.pool_lock);
+                {
+                    int j;
+                    for (j = 0; j < g_pool.server_count; j++)
+                        g_pool.servers[j].is_leader = (j == i);
+                }
+                atomic_set(&g_pool.leader_idx, i);
+                atomic_set(&g_pool.leader_known, 1);
+                mutex_unlock(&g_pool.pool_lock);
+                pr_info("powerfs: already connected, marked as leader %d\n", i);
+                return i;
+            }
 
             pr_info("powerfs: trying filer %d (%s:%u)\n", i, addr, port);
             powerfs_net_disconnect();
@@ -1917,8 +2291,12 @@ static void powerfs_net_leader_check_work_func(struct work_struct *work)
     if (!g_pool.monitoring)
         return;
 
-    /* 定期尝试发现/切换 leader */
-    powerfs_net_find_leader();
+    /* 仅在没有已知 leader 时才尝试发现, 避免与 monitor_work 的 ping 并发
+     * (find_leader 会 disconnect+connect, 与并发的 send_request/recv 竞态).
+     * 已有 leader 时由 monitor_work 的 ping 负责健康检测, ping 失败后
+     * failover 会清 leader_known, 下次 leader_check 才重新发现. */
+    if (!powerfs_net_has_leader())
+        powerfs_net_find_leader();
 
     if (g_pool.monitoring) {
         schedule_delayed_work(&g_pool.leader_check_work,
@@ -1946,6 +2324,10 @@ void powerfs_net_start_monitor(void)
  */
 void powerfs_net_stop_monitor(void)
 {
+    /* 已停止则跳过（避免 kill_sb 和 pool_exit 重复调用导致重复打印） */
+    if (!g_pool.monitoring)
+        return;
+
     g_pool.monitoring = false;
     cancel_delayed_work_sync(&g_pool.monitor_work);
     cancel_delayed_work_sync(&g_pool.leader_check_work);

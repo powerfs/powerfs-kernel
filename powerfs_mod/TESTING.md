@@ -5,16 +5,19 @@ This document describes how to set up test environments and run test suites to v
 ## Quick Start
 
 ```bash
-# 1. Start backend (FUSE containerized environment)
+# 1. First time: Build Docker images (one-time, ~5-15 min)
+sudo ./build_powerfs_image.sh
+
+# 2. Start backend (FUSE containerized environment, fast)
 sudo ./start_fuse_env.sh --wait
 
-# 2. Build and mount kernel module (connects to the backend)
+# 3. Build and mount kernel module (connects to the backend)
 sudo ./start_kernel_env.sh --from-fuse-env
 
-# 3. Run integration tests
+# 4. Run integration tests
 sudo ./test_multi_node.sh
 
-# 4. Stop everything when done
+# 5. Stop everything when done
 sudo ./stop_test_env.sh
 ```
 
@@ -22,7 +25,8 @@ sudo ./stop_test_env.sh
 
 | Script | Purpose | Requires Docker | Run Time |
 |--------|---------|-----------------|----------|
-| `start_fuse_env.sh` | Build & start FUSE containerized backend | Yes | ~2-5 min |
+| `build_powerfs_image.sh` | **Build** Docker images (one-time) | Yes | ~5-15 min |
+| `start_fuse_env.sh` | **Start** pre-built FUSE containerized backend | Yes | ~1-2 min |
 | `start_kernel_env.sh` | Build, load, mount kernel module | No | ~30 sec |
 | `stop_test_env.sh` | Stop & clean all test environments | Yes | ~10 sec |
 
@@ -41,24 +45,62 @@ PowerFS testing requires two layers:
 1. **Backend services** (Master, Volume, Filer) — provided by the FUSE containerized environment
 2. **Client layer** — either the FUSE client (container) or the kernel module (local)
 
-### 0.1 FUSE Containerized Environment (`start_fuse_env.sh`)
+### 0.0 Docker Image Building (`build_powerfs_image.sh`)
 
-Builds and starts the complete PowerFS backend cluster plus FUSE client using Docker Compose.
+**One-time** build script that compiles Rust binaries and creates Docker images. Run this first before starting the test environment.
 
-**Services started:**
-- `redis` — Metadata store
-- `master-1`, `master-2`, `master-3` — Raft consensus (ports 9433-9435)
-- `volume-1`, `volume-2`, `volume-3` — Data shards (ports 8180-8182, 8191-8193)
-- `filer-1`, `filer-2`, `filer-3` — Metadata routing (ports 8988-8993)
-- `fuse-test` — FUSE client mounted at `/tmp/powerfs/test`
-- `benchmark` — Container for running IO tests
+**Produces:**
+- `powerfs:latest` — Base image with master/volume/filer binaries
+- `powerfs-test:latest` — Extended image with FUSE client + benchmark tools (fio)
 
 **Usage:**
 ```bash
-# Start everything and wait for health (recommended)
+# First time: Build everything
+sudo ./build_powerfs_image.sh
+
+# Rebuild after code changes
+sudo ./build_powerfs_image.sh --force
+
+# Skip Rust compilation (use existing target/release/ binaries)
+sudo ./build_powerfs_image.sh --skip-rust
+
+# Build Docker without layer cache
+sudo ./build_powerfs_image.sh --no-cache
+```
+
+**What it does:**
+1. Checks prerequisites (cargo, docker, docker compose)
+2. Compiles Rust binaries via `cargo build --release` (if not skipped)
+3. Builds `powerfs:latest` Docker image
+4. Builds `powerfs-test:latest` Docker image
+5. Verifies images and lists contents
+
+**Time estimate:**
+- Rust build: 5-15 min (first time)
+- Docker build: 1-3 min
+- Total: ~6-18 min
+
+**Subsequent runs** (after first build) only need `docker build` if Rust code changed, or nothing if only config changes.
+
+### 0.1 FUSE Containerized Environment (`start_fuse_env.sh`)
+
+Starts the complete PowerFS backend cluster plus FUSE client using **pre-built** Docker images. For fast startup, images must be built first with `build_powerfs_image.sh`.
+
+**Services started (in 4 waves):**
+- **Wave 1**: `redis` — Metadata store
+- **Wave 2**: `master-1`, `master-2`, `master-3` — Raft consensus (ports 9433-9435)
+- **Wave 3**: `volume-1`, `volume-2`, `volume-3`, `filer-1`, `filer-2`, `filer-3` — Data + Metadata routing (ports 8180-8182, 8988-8993)
+- **Wave 4**: `fuse-test`, `benchmark` — FUSE client mounted at `/tmp/powerfs/test`
+
+**Usage:**
+```bash
+# Quick start (fire & forget)
+sudo ./start_fuse_env.sh
+
+# Start and wait for health (recommended)
 sudo ./start_fuse_env.sh --wait
 
-# Start, rebuild images first
+# Start, rebuild images first (calls build_powerfs_image.sh)
 sudo ./start_fuse_env.sh --build --wait
 
 # Start backend only (no FUSE client)
@@ -69,6 +111,12 @@ sudo ./start_fuse_env.sh --clean --wait
 
 # Tail FUSE logs after startup
 sudo ./start_fuse_env.sh --wait --logs
+```
+
+**Timeout control:**
+```bash
+# Custom timeout for --wait mode (default: 180s)
+START_TIMEOUT=300 sudo ./start_fuse_env.sh --wait
 ```
 
 **Ports mapped to host:**
@@ -93,6 +141,13 @@ sudo ./start_fuse_env.sh --wait --logs
 | `COMPOSE_WORKDIR` | `docker/` | Directory containing compose file |
 | `FUSE_MOUNT` | `/tmp/powerfs/test` | Host mount point for FUSE |
 | `LOG_DIR` | `/tmp/powerfs/logs` | Log file directory |
+| `START_TIMEOUT` | `180` | Max seconds to wait for --wait mode |
+
+**Performance optimization:**
+- Health check intervals reduced (2-3s instead of 5-10s)
+- `start_period` added to prevent premature health check failures
+- Services started in parallel waves to minimize wait time
+- Expected startup: ~1-2 min (vs ~6-10 min with old build-every-time approach)
 
 ### 0.2 Kernel Filesystem Environment (`start_kernel_env.sh`)
 
@@ -708,9 +763,248 @@ cat /sys/kernel/debug/powerfs/dentries 2>/dev/null || \
 
 ---
 
-## 7. Reference
+## 7. IO500 Benchmark Testing in QEMU
+
+### Purpose
+
+Evaluate metadata and data I/O performance of the PowerFS kernel module running inside a QEMU virtual machine. This provides controlled benchmarking results for CI/CD regression and performance comparison.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          Host Machine                               │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                     QEMU Virtual Machine                      │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │  PowerFS Kernel Module (powerfs.ko)                     │  │  │
+│  │  │  Mount: /mnt/powerfs                                    │  │  │
+│  │  │  powerfs_net TCP protocol (kernel-mode)                 │  │  │
+│  │  └─────────────────────────┬───────────────────────────────┘  │  │
+│  │                            │                                   │  │
+│  │  ┌─────────────────────────▼───────────────────────────────┐  │  │
+│  │  │  IO500 Benchmark (inside VM)                            │  │  │
+│  │  │  mdtest-easy/hard, ior-easy, ior-rnd4K                 │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────┬───────────────────────────────────┘  │
+│                              │ SSH (localhost:2223 → VM:22)          │
+│                              ▼                                       │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Docker Backend Services (172.20.0.0/16 network)              │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐          │  │
+│  │  │  Redis  │  │ Master  │  │  Volume │  │  Filer  │          │  │
+│  │  └─────────┘  └─────────┘  └─────────┘  └─────────┘          │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Prerequisites
+
+1. **IO500 binary compiled**
+   ```bash
+   cd io500 && make clean && make
+   # Binary: io500/io500
+   ```
+
+2. **PowerFS kernel module compiled**
+   ```bash
+   cd kernel/powerfs_mod
+   make
+   # Module: kernel/vm/output/powerfs.ko
+   ```
+
+3. **QEMU VM built**
+   ```bash
+   cd kernel/vm
+   ./build_kernel.sh      # Build kernel bzImage
+   ./build_initramfs.sh   # Build initramfs with SSH
+   ```
+
+4. **Backend Docker services** (Master, Volume, Filer, Redis)
+   ```bash
+   cd io500
+   docker compose up -d master-1 volume-1 filer-1 redis
+   ```
+
+5. **QEMU network configured**
+   ```bash
+   cd kernel/vm
+   sudo ./setup_network.sh
+   ```
+
+### Quick Start
+
+```bash
+# Run full IO500 benchmark in QEMU
+cd kernel/powerfs_mod
+sudo ./run_io500_qemu.sh
+
+# The script will:
+#   1. Start backend Docker services
+#   2. Setup TAP network for QEMU ↔ Docker communication
+#   3. Add IO500 binary to initramfs
+#   4. Launch QEMU VM (4GB RAM, 4 CPUs, KVM)
+#   5. Mount PowerFS kernel filesystem in VM
+#   6. Run IO500 benchmark
+#   7. Collect results and display performance summary
+#   8. Cleanup (stop QEMU, unmount)
+```
+
+### IO500 Configuration
+
+Default configuration uses `config-powerfs-kernel-quick.ini`:
+
+```ini
+[global]
+datadir = /mnt/powerfs/io500-data
+resultdir = /mnt/powerfs/io500-results
+verbosity = 1
+min_runtime = 5
+
+[mdtest-easy]    # Metadata easy: 100 files create/stat/read/delete
+[mdtest-hard]    # Metadata hard: 50 files with shared directory
+[ior-easy]       # Data I/O: 1MB transfer, 100MB block
+[ior-rnd4K]      # Random 4K I/O test
+```
+
+**Available config files:**
+
+| File | Description | Duration |
+|------|-------------|----------|
+| `config-powerfs-kernel-quick.ini` | Quick test (metadata + small data) | ~1-2 min |
+| `config-powerfs-quick.ini` | Basic metadata test | ~30s |
+| `config-powerfs-medium.ini` | Medium metadata + data | ~5 min |
+| `config-powerfs.ini` | Full benchmark suite | ~30 min |
+
+### Command-Line Options
+
+```bash
+# Use specific config
+sudo ./run_io500_qemu.sh --config config-powerfs-medium.ini
+
+# Skip initramfs rebuild (for repeated tests)
+sudo ./run_io500_qemu.sh --skip-build
+
+# Skip backend startup (assume services are running)
+sudo ./run_io500_qemu.sh --skip-backend
+
+# Keep VM alive after test (for debugging)
+sudo ./run_io500_qemu.sh --keep-alive
+# Then SSH in: ssh -p 2223 root@localhost
+
+# Custom backend address
+sudo ./run_io500_qemu.sh --backend 172.20.0.35:9334
+
+# Dry run (show plan without executing)
+sudo ./run_io500_qemu.sh --dry-run
+```
+
+### Output and Results
+
+Results are saved to: `io500/results/qemu-kernel-<timestamp>/`
+
+```
+io500/results/qemu-kernel-20260727_150000/
+├── io500_summary.txt        # Benchmark summary with timestamp
+├── io500_output.log         # Full IO500 output from VM
+├── io500_results.tar.gz     # Raw results tarball
+└── vm_info.txt              # VM memory/CPU info
+```
+
+**Example output:**
+```
+━━━ IO500 Benchmark Results ━━━
+
+IO500 SCORE: total: 2300.61
+BANDWIDTH:  bandwidth: 425.437149 GB/s
+IOPS:       ops/sec: 716865
+LATENCY:    max: 0.528000
+
+Full output:
+────────────────────────────────────────
+#IO500 version: version 3.4
+#IO500: $Id$
+...
+```
+
+### Performance Expectations (QEMU Environment)
+
+| Metric | Expected Range | Notes |
+|--------|---------------|-------|
+| mdtest-easy (create) | 100-500 ops/sec | Single-node, low concurrency |
+| mdtest-hard (create) | 50-200 ops/sec | Shared directory contention |
+| ior-easy write | 100-400 MB/s | Sequential write, depends on Volume |
+| ior-easy read | 200-500 MB/s | Sequential read |
+| ior-rnd4K | 50-200 MB/s | Random 4K I/O |
+
+**Note:** QEMU adds overhead compared to bare metal. The kernel module communicates with backend via TAP network bridge, which adds latency. Actual production performance will be higher.
+
+### Troubleshooting
+
+**QEMU fails to start:**
+```bash
+# Check KVM availability
+ls -la /dev/kvm
+dmesg | grep kvm
+
+# Check TAP device
+ip link show tap0
+ip addr show tap0
+```
+
+**Backend not reachable from VM:**
+```bash
+# Verify Docker containers are on the right network
+docker network ls
+docker inspect <container> | grep IPAddress
+
+# Check TAP bridge connection
+ip link show tap0
+docker network inspect <network> | grep Bridge
+```
+
+**IO500 binary not found in VM:**
+```bash
+# Transfer manually
+scp -P 2223 io500/io500 root@localhost:/io500/
+scp -P 2223 io500/config-powerfs-kernel-quick.ini root@localhost:/io500/
+
+# SSH and test
+ssh -p 2223 root@localhost
+ls -la /io500/io500
+```
+
+**Mount fails in VM:**
+```bash
+# Check kernel log
+ssh -p 2223 root@localhost "dmesg | tail -30"
+
+# Verify module loaded
+ssh -p 2223 root@localhost "lsmod | grep powerfs"
+
+# Try manual mount
+ssh -p 2223 root@localhost "mount -t powerfs -o filer=172.20.0.35:9334,master=172.20.0.14:9333,volume=172.20.0.24:8080 none /mnt/powerfs"
+```
+
+### Script Reference
+
+| Script | Purpose |
+|--------|---------|
+| `run_io500_qemu.sh` | Main IO500 benchmark orchestration |
+| `start_fuse_env.sh` | Start backend Docker services |
+| `start_kernel_env.sh` | Build/mount kernel module (host) |
+| `stop_test_env.sh` | Stop test environments |
+| `build_initramfs.sh` | Build initramfs with SSH |
+| `run_qemu_kernel_ssh.sh` | Manual QEMU launch with SSH |
+| `setup_network.sh` | Configure TAP network for QEMU |
+
+---
+
+## 8. Reference
 
 - FUSE Client implementation: `powerfs-fuse/src/metadata_cache.rs` — Reference Delta Sync implementation
 - PowerFS Net protocol: `powerfs-net/src/protocol.rs` — Protocol definitions
 - Kernel net layer: `kernel/powerfs_mod/powerfs_net.c` — Kernel-side powerfs-net client
 - Kernel VFS layer: `kernel/powerfs_mod/powerfs_fs.c` — VFS operations with Delta Sync
+- IO500 benchmark: `io500/README.md` — IO500 documentation and configuration guide

@@ -4,10 +4,12 @@
  * 从 Rust powerfs-net/src/serialize.rs 移植到 C 内核实现。
  *
  * TLV 格式:
- *   field_id (1B) | length (2B, little-endian) | value (length bytes)
+ *   field_id (1B) | length (4B, big-endian) | value (length bytes)
  *
- * 这是简单紧凑的二进制序列化格式，支持字段添加和向后兼容。
- * 比 protobuf 更简单，适合元数据操作。
+ * 注意: length 字段为 4 字节 big-endian, value 内部整数用 little-endian,
+ * 必须与 Filer 端 powerfs-net/src/serialize.rs 的 TlvEncoder/TlvDecoder 一致.
+ * 之前内核误用 2B little-endian length, 与 Filer 的 4B big-endian 不匹配,
+ * 导致 Filer 解析 TLV 时字段错位 (如 readdir 收到 parent_ino=0).
  */
 
 #include <linux/module.h>
@@ -32,16 +34,19 @@ void powerfs_tlv_enc_init(struct powerfs_tlv_enc *enc, __u8 *buf, size_t cap)
     enc->cap = cap;
 }
 
-/* 内部: 写入 TLV 头部 (field_id + length) */
+/* 内部: 写入 TLV 头部 (field_id 1B + length 4B big-endian, 匹配 Filer 端) */
 static int powerfs_tlv_enc_write_hdr(struct powerfs_tlv_enc *enc,
-                                      __u8 field, __u16 length)
+                                      __u8 field, __u32 length)
 {
-    if (enc->len + 3 > enc->cap)
+    if (enc->len + 5 > enc->cap)
         return -ENOSPC;
 
     enc->buf[enc->len++] = field;
-    enc->buf[enc->len++] = (__u8)(length & 0xFF);       /* length low byte */
-    enc->buf[enc->len++] = (__u8)((length >> 8) & 0xFF); /* length high byte */
+    /* length: 4 bytes big-endian (匹配 Filer serialize.rs write_header) */
+    enc->buf[enc->len++] = (__u8)((length >> 24) & 0xFF);
+    enc->buf[enc->len++] = (__u8)((length >> 16) & 0xFF);
+    enc->buf[enc->len++] = (__u8)((length >> 8) & 0xFF);
+    enc->buf[enc->len++] = (__u8)(length & 0xFF);
     return 0;
 }
 
@@ -143,7 +148,7 @@ int powerfs_tlv_enc_string(struct powerfs_tlv_enc *enc, __u8 field,
     if (len > POWERFS_NET_MAX_TLV)
         return -E2BIG;
 
-    ret = powerfs_tlv_enc_write_hdr(enc, field, (__u16)len);
+    ret = powerfs_tlv_enc_write_hdr(enc, field, (__u32)len);
     if (ret < 0)
         return ret;
 
@@ -168,7 +173,7 @@ int powerfs_tlv_enc_bytes(struct powerfs_tlv_enc *enc, __u8 field,
     if (len > POWERFS_NET_MAX_TLV)
         return -E2BIG;
 
-    ret = powerfs_tlv_enc_write_hdr(enc, field, (__u16)len);
+    ret = powerfs_tlv_enc_write_hdr(enc, field, (__u32)len);
     if (ret < 0)
         return ret;
 
@@ -221,21 +226,29 @@ void powerfs_tlv_dec_init(struct powerfs_tlv_dec *dec, const __u8 *buf,
 /**
  * powerfs_tlv_dec_next - 读取下一个 TLV 字段的 field_id 和 length
  *
+ * TLV 头部格式: field_id (1B) + length (4B big-endian), 共 5 字节,
+ * 必须与编码器 powerfs_tlv_enc_write_hdr 和 Filer 端 serialize.rs 一致.
+ *
  * 返回: 0 成功, -ENOENT 无更多字段, -EINVAL 格式错误
  */
 int powerfs_tlv_dec_next(struct powerfs_tlv_dec *dec, __u8 *field,
                           size_t *length)
 {
-    if (dec->pos + 3 > dec->len)
+    __u32 tmp;
+
+    if (dec->pos + 5 > dec->len)
         return -ENOENT;
 
     *field = dec->buf[dec->pos];
     dec->pos++;
 
-    /* little-endian length */
-    *length = (size_t)dec->buf[dec->pos] |
-              ((size_t)dec->buf[dec->pos + 1] << 8);
-    dec->pos += 2;
+    /* 4 字节 big-endian length (匹配 Filer serialize.rs next_field) */
+    tmp = ((__u32)dec->buf[dec->pos] << 24) |
+          ((__u32)dec->buf[dec->pos + 1] << 16) |
+          ((__u32)dec->buf[dec->pos + 2] << 8) |
+          (__u32)dec->buf[dec->pos + 3];
+    *length = (size_t)tmp;
+    dec->pos += 4;
 
     /* 检查是否超出缓冲区 */
     if (dec->pos + *length > dec->len)
@@ -250,28 +263,29 @@ static const __u8 *powerfs_tlv_dec_read(struct powerfs_tlv_dec *dec,
                                           __u8 *actual_field, size_t *actual_len)
 {
     __u8 field;
-    size_t length;
-    int ret;
+    __u32 length;
 
-    /* 先 peek at current field */
-    if (dec->pos + 3 > dec->len)
+    /* peek at current field (1B field_id + 4B BE length = 5B header) */
+    if (dec->pos + 5 > dec->len)
         return NULL;
 
     field = dec->buf[dec->pos];
-    length = (size_t)dec->buf[dec->pos + 1] |
-             ((size_t)dec->buf[dec->pos + 2] << 8);
+    length = ((__u32)dec->buf[dec->pos + 1] << 24) |
+             ((__u32)dec->buf[dec->pos + 2] << 16) |
+             ((__u32)dec->buf[dec->pos + 3] << 8) |
+             (__u32)dec->buf[dec->pos + 4];
 
     /* 检查长度 */
-    if (dec->pos + 3 + length > dec->len)
+    if (dec->pos + 5 + (size_t)length > dec->len)
         return NULL;
 
     if (actual_field)
         *actual_field = field;
     if (actual_len)
-        *actual_len = length;
+        *actual_len = (size_t)length;
 
-    /* 跳过 TLV 头部 (3 字节) */
-    dec->pos += 3;
+    /* 跳过 TLV 头部 (5 字节: 1B field + 4B length) */
+    dec->pos += 5;
 
     /* 如果字段类型不匹配，跳过数据 */
     if (field != expected_field) {
@@ -280,7 +294,7 @@ static const __u8 *powerfs_tlv_dec_read(struct powerfs_tlv_dec *dec,
     }
 
     /* 长度必须匹配 (或者 expected_len=0 表示接受任意长度) */
-    if (expected_len > 0 && length != expected_len) {
+    if (expected_len > 0 && (size_t)length != expected_len) {
         dec->pos += length;
         return NULL;
     }
