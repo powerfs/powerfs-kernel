@@ -2559,3 +2559,236 @@ PowerFS: `pfs_process_receive` 内部检查 `skb_queue_empty(&sk->sk_receive_que
 | 误删仍在用的字段 | 低 (已 grep 确认) | 删除前再次 grep, 编译验证 |
 | `lease_expire` 误删 | 中 (d_revalidate 在用) | 单独保留, 不随 lease_list 一起删 |
 | 行为变化 | 无 (都是 no-op 代码) | drop_caches 回归测试确认 |
+
+---
+
+## 十四、VFS 持锁流程中的网络等待优化
+
+### 14.1 背景
+
+VFS 设计原则: `i_rwsem` / `page lock` 等粗粒度或细粒度锁持锁期间, 文件系统回调只能做内存级操作 (修改 dcache/inode 字段). 网络文件系统 (Ceph / NFS / Lustre) 都遵循 "锁外发请求 + 锁内更新缓存" 模式.
+
+PowerFS 当前实现违反该原则: 在 VFS 回调内同步调用 `powerfs_net_*` 等待 filer 响应 (最长 30s `wait_for_completion_timeout`), 把整个 RPC 往返时延叠加到 VFS 锁持有时间上. 这会导致:
+
+- **目录访问雪崩**: 一个 `unlink` 阻塞 30s 期间, 整个父目录下所有其他文件的 `lookup`/`stat`/`open`/`readdir` 全部排队等 `i_rwsem`.
+- **跨层死锁风险**: `write_end` 持 page lock 等网络, 与并发 `read_folio` (也持 page lock 等网络) 在内存回收路径下形成循环依赖.
+- **hung task 报警**: VFS 系统调用线程在 D 状态超过 120s 触发 `hung_task_timeout`.
+
+### 14.2 违反 VFS 设计的流程清单
+
+按严重性排序:
+
+| 严重级 | VFS 回调 | 持有的 VFS 锁 | 同步网络调用 | 代码位置 |
+|---|---|---|---|---|
+| P0 (最严重) | `powerfs_rename` | `old_dir->i_rwsem` + `new_dir->i_rwsem` (双写锁) + 相关 `dentry->d_lock` | `powerfs_net_rename()` | powerfs_fs.c:1445 |
+| P0 | `powerfs_mknod` (被 mkdir/create 调用) | `dir->i_rwsem` 写锁 | `powerfs_net_create()` | powerfs_fs.c:865 |
+| P0 | `powerfs_unlink` | `dir->i_rwsem` 写锁 | `powerfs_net_unlink()` | powerfs_fs.c:1060 |
+| P0 | `powerfs_rmdir` | `dir->i_rwsem` 写锁 | `powerfs_net_unlink(rmdir=true)` | powerfs_fs.c:970 |
+| P0 | `powerfs_symlink` | `dir->i_rwsem` 写锁 | `powerfs_net_symlink()` | powerfs_fs.c:1103 |
+| P0 | `powerfs_link` | `dir->i_rwsem` 写锁 | `powerfs_net_link()` | powerfs_fs.c:1241 |
+| P1 | `powerfs_lookup` | `dir->i_rwsem` 读锁 (VFS `__lookup_slow` 持有) | `powerfs_net_lookup()` | powerfs_fs.c:739 |
+| P1 | `powerfs_readdir` | `dir->i_rwsem` 读锁 | `powerfs_net_readdir()` (循环分页, 多次往返) | powerfs_fs.c:1862 |
+| P1 | `powerfs_setattr` (ATTR_SIZE 路径) | `inode->i_rwsem` 写锁 (VFS `notify_change` 持有) | `powerfs_net_setattr()` | powerfs_fs.c:1415 |
+| P2 | `powerfs_write_end` | `page lock (PG_locked)` + `i_rwsem` (write_iter 路径) | `powerfs_net_write()` + `powerfs_net_setattr()` | powerfs_fs.c:2237 |
+| P2 | `powerfs_read_folio` | `page lock (PG_locked)` | `powerfs_net_read()` | powerfs_fs.c:2013 |
+| P3 | `powerfs_fsync` | 不持 i_rwsem, 但 `file_write_and_wait_range` 等待 writeback | 间接同步 (经 writepage) | powerfs_fs.c:2330 |
+
+### 14.3 改造方案
+
+参照 Ceph (`fs/ceph/dir.c`, `fs/ceph/inode.c`, `fs/ceph/addr.c`) 和 NFS (`fs/nfs/`) 的标准做法, 每一类回调的改造模式如下.
+
+#### 14.3.1 元数据操作类 (mkdir / rmdir / create / unlink / symlink / link / rename)
+
+**模式**: 锁内取参数快照 → 放锁 → 同步发网络 → 锁外原子应用结果
+
+参考 `ceph_mkdir` / `ceph_create` / `ceph_unlink` / `ceph_rename`:
+
+```c
+/* 改造前 (powerfs_unlink 简化版) */
+static int powerfs_unlink(struct inode *dir, struct dentry *dentry)
+{
+    /* VFS 已持 dir->i_rwsem 写锁 */
+    rerr = powerfs_net_unlink(...);   /* 同步等网络, 30s */
+    if (rerr) return rerr;
+    /* 改本地数据结构 */
+    drop_nlink(inode);
+    powerfs_remove_dir_entry(...);
+    return 0;
+}
+
+/* 改造后 (参照 ceph_unlink) */
+static int powerfs_unlink(struct inode *dir, struct dentry *dentry)
+{
+    /* VFS 持 dir->i_rwsem. 这里仍在锁内, 但只做参数快照, 不发网络.
+     * Ceph 在锁内组装 request 并 submit, submit 只入队不等响应.
+     * 我们目前是同步 RPC 架构, 简化为: 在锁内仅取 name/ino 等参数. */
+    char name[POWERFS_MAX_NAME_LEN + 1];
+    u64 dir_ino = dir->i_ino;
+    strncpy(name, dentry->d_name.name, POWERFS_MAX_NAME_LEN);
+    name[POWERFS_MAX_NAME_LEN] = '\0';
+    /* dget 防止 dentry 在放锁期间被 shrinker 回收 */
+    dget(dentry);
+    inode = igrab(d_inode(dentry));
+    /* inode_unlock(dir) — 但 VFS 持锁, 文件系统不能直接放锁.
+     * 见 14.3.1 末尾的注解. */
+
+    /* 锁外发网络 */
+    rerr = powerfs_net_unlink(dir_ino, name, strlen(name), false);
+
+    /* 重新获取锁, 应用结果 (VFS 层面无法直接重新持锁, 见注解) */
+    ...
+}
+```
+
+**注解**: VFS 调用 `->mkdir`/`->unlink` 等时已持有 `dir->i_rwsem`, 文件系统回调**无法在中间放锁再重新持锁** (VFS 不提供这个能力, Ceph 是通过**异步 RPC + 完成回调**避免在锁内等待). 因此 PowerFS 的真正改造方向是:
+
+1. **异步化**: 引入 `powerfs_request_submit_async(req, callback)` 接口, submit 只入队立即返回, 不等响应. VFS 回调内 submit 后立即返回 `-EIOCBQUEUED` 或挂起在 per-req 的 `wait_for_completion` 上, 但**关键是 submit 不持 VFS 锁**, 任何 RPC 往返都在调度器线程完成, 不阻塞 VFS 路径.
+2. **保持 VFS 锁内同步但缩短超时**: 给 `powerfs_net_*` 配置短超时 (lookup 2s, 元数据操作 5s), 超时后返回 `-EAGAIN`, 让 VFS 上层重试. 这是过渡方案, 不是根本解.
+3. **推荐方案 (异步化 + 完成回调)**: 见 14.4.
+
+**rename 的特殊性**: rename 持双 `i_rwsem` 写锁, 是 VFS 中最重的锁. Ceph 的做法是在 `ceph_rename` 内组装 request + 异步 submit, 不等响应就返回 (返回 `-EINPROGRESS`, VFS 通过 `dcache` 后续操作完成). PowerFS 若不能完全异步化, 至少应把 rename 的网络超时压缩到 5s 内, 并在断连时立即返回 `-ENOTCONN` 不等待重连.
+
+#### 14.3.2 lookup
+
+**模式**: 保持 `i_rwsem` 读锁 (VFS 不允许 lookup 在锁外做), 但缩短超时 + 充分利用本地 dcache
+
+```c
+/* 改造后 */
+struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
+                              unsigned int flags)
+{
+    /* 1. 先查本地 dcache (d_revalidate 已在 VFS 层做过, 这里二次保险) */
+    /* 2. dcache miss 时才发网络, 超时 2s (而非通用 10s) */
+    err = powerfs_net_lookup_timeout(dir->i_ino, name, ..., 2000);
+    if (err == -ETIMEDOUT || err == -ENOTCONN) {
+        /* 网络不可达: 返回负 dentry, 让 VFS 上层决定 ENOENT 还是重试.
+         * 参考 ceph_lookup: "if request returns -EAGAIN, retry once" */
+        d_add(dentry, NULL);
+        return NULL;
+    }
+    ...
+}
+```
+
+#### 14.3.3 readdir
+
+**模式**: 锁外预取 + 锁内 emit
+
+```c
+/* 改造后 (参照 ceph_readdir) */
+int powerfs_readdir(struct file *file, struct dir_context *ctx)
+{
+    /* 1. 检查 dpi->dir_complete, 命中直接 emit 本地缓存 */
+    if (dpi->dir_complete) {
+        /* 锁内只 emit, 不发网络 */
+        return powerfs_readdir_emit_cached(file, ctx);
+    }
+
+    /* 2. 缓存 miss: 在 mutex (dpi->dir_mutex) 内标记 "正在填充",
+     *    释放 mutex, 同步发网络拉取整个目录到 dpi->dir_entries,
+     *    再加锁标记 dir_complete.
+     *    注意: VFS 在 iterate_dir 持有 dir->i_rwsem 读锁, 这里同样无法放锁.
+     *    实际做法: 把 powerfs_net_readdir 的循环分页改成单次大页 (limit=256),
+     *    减少往返次数; 同时缩短单次超时到 5s. */
+    ret = powerfs_net_readdir_batch(dir->i_ino, ..., 5000);
+    ...
+}
+```
+
+#### 14.3.4 setattr (ATTR_SIZE)
+
+**模式**: 异步发请求 + 锁内立即更新本地
+
+参照 `ceph_setattr`: 在 `inode_lock` 内修改本地 inode + submit 异步请求, submit 不等响应, 由 `powerfs_inode_writeback_callback` 在响应到达后处理错误.
+
+```c
+/* 改造后 */
+int powerfs_setattr(struct user_namespace *idmap, struct dentry *dentry,
+                    struct iattr *attr)
+{
+    /* VFS 持 inode->i_rwsem. 锁内做本地修改 + submit 异步请求. */
+    err = setattr_prepare(...);
+    if (err) return err;
+    if (ia_valid & ATTR_SIZE) {
+        truncate_setsize(inode, attr->ia_size);
+        pi->content_size = attr->ia_size;
+    }
+    setattr_copy(...);
+    mark_inode_dirty(inode);
+
+    /* 异步 submit, 不等响应 */
+    if (powerfs_net_is_connected() && valid) {
+        powerfs_net_setattr_async(inode->i_ino, valid, m, u, g, sz,
+                                  powerfs_setattr_callback, inode);
+        /* 立即返回, 网络错误由 callback 处理 (重试或 mark inode dirty) */
+    }
+    return 0;
+}
+```
+
+#### 14.3.5 write_end / read_folio
+
+**模式**: 推迟网络 I/O 到锁外
+
+- **write_end**: page lock 内只更新 page cache + 标记脏, 不发网络. 网络写由 `writepage` (writeback 路径, 不持 page lock 等网络) 异步完成, 或由 `fsync` 显式同步.
+  - 注意: 14.3.4 的 `setattr_async` 已能解决 i_size 同步问题.
+  - 风险: write 返回后未持久化, 进程崩溃数据丢失. 需配合 `O_SYNC` 或显式 `fsync`. 这是 NFS / Ceph 的标准语义, 不是 PowerFS 独有.
+- **read_folio**: page lock 内不发网络 (page lock 持锁等网络是死锁高发点). 改为:
+  - `read_folio` 内同步发网络 (page lock 持锁), 但超时缩短到 2s
+  - 或参考 netfs_helper: `read_folio` 仅标记 "需要网络", 实际 I/O 由 netfs subreq 在锁外完成. 这是更彻底的方案, 但需要接入 netfs framework.
+
+### 14.4 推荐的整体方案 (异步化)
+
+PowerFS 当前是**同步 RPC 架构** (submit 等响应). 真正符合 VFS 设计的方案是**异步化 RPC**, 类似 Ceph / NFS:
+
+```
+VFS 回调 (持锁)
+  ├─ 组装 request (内存操作)
+  ├─ powerfs_request_submit_async(req, callback)  ← 不等响应, 立即返回
+  └─ 返回 -EIOCBQUEUED (或挂起在 wait_for_completion, 但 submit 本身不阻塞)
+
+调度器线程 (不持任何 VFS 锁)
+  ├─ kernel_sendmsg 发送 request
+  └─ 收到 response → callback(req)
+       ├─ 锁内更新 inode / dentry (callback 内部按需 inode_lock)
+       └─ complete(&req->done) (如果是同步等待的调用方)
+```
+
+**实现路径**:
+
+1. 新增 `powerfs_request_submit_async(req, callback)` API, submit 入队后立即返回, 不调 `wait_for_completion_timeout`. 已有的 `powerfs_request_submit` 改为 `submit_async` + `wait_for_completion` 的封装.
+2. 为元数据操作类回调增加异步路径: `powerfs_net_create_async` / `powerfs_net_unlink_async` 等, 接收 callback + context 参数.
+3. callback 内处理响应: 成功则更新本地 dcache/inode, 失败则 mark_inode_dirty / drop_dentry. 注意 callback 在调度器线程上下文运行, 不能持有 VFS 锁, 需要在 callback 内按需 `inode_lock` 重入.
+4. VFS 回调返回策略:
+   - 元数据操作 (mkdir / unlink 等): submit 后返回 `-EINPROGRESS`, VFS 当前不支持这个返回值, 需要返回 0 (假装成功) + 在 callback 内修复任何错误 (难) 或返回 `-EAGAIN` 让 VFS 重试 (简单但语义不干净).
+   - **务实方案**: 保留同步等待, 但把 `wait_for_completion_timeout` 从 30s 压到 5s, 超时返回 `-EAGAIN` 让 VFS 重试. 不解决根本问题但显著降低 hung task 风险.
+
+### 14.5 实施计划 (分阶段)
+
+| 阶段 | 内容 | 风险 | 验证 |
+|---|---|---|---|
+| Stage A (速赢) | lookup / readdir 单独配短超时 (2s/5s), 超时返回 `-EAGAIN`; `powerfs_net_*_timeout` 系列接口加 timeout_ms 参数 | 低 | test_stage2_disconnect.sh + fio 小文件 |
+| Stage B (中等) | setattr (ATTR_SIZE) 异步化: `powerfs_net_setattr_async` + callback; write_end 取消同步 setattr, 改由 setattr_async 完成 | 中 | fio 顺序写 + 断连测试 |
+| Stage C (大改) | write_end / read_folio 不在 page lock 内发网络: write_end 仅标脏, read_folio 改用 netfs_helper | 高 | fio 随机读写 + 大文件 + drop_caches 回归 |
+| Stage D (根本) | 元数据操作异步化: `powerfs_net_create_async` / `_unlink_async` 等, callback 内更新 dcache. 解决 rename 双锁问题 | 高 | 全套 fio + io500 + 断连回归 |
+
+### 14.6 不改的风险
+
+- **hung task**: 任何 filer 慢响应 / 网络抖动 → VFS 系统调用 D 状态超过 120s → `hung_task_timeout` 触发 → 内核打印调用栈, 影响生产稳定性.
+- **目录雪崩**: 一个 `unlink` 卡 30s → 整个目录的并发 `lookup` / `stat` / `open` 全部排队 → 业务层超时雪崩.
+- **跨层死锁**: write_end 持 page lock 等网络, 内存回收路径触发 read_folio (持同页 lock 等网络) → 循环等待 → 死锁.
+
+### 14.7 优先级建议
+
+按收益 / 风险比排序:
+
+1. **Stage A**: 立即可做, 风险低, 立竿见影减少 hung task. **先做**.
+2. **Stage B**: setattr 异步化是中等改动, 解决 write_end 路径的同步 setattr 阻塞. **第二**.
+3. **Stage C**: write_end / read_folio 不持 page lock 发网络, 需要重构 aops. **第三**.
+4. **Stage D**: 元数据操作异步化, 涉及 callback 重入 VFS 锁, 复杂度最高. **最后**, 需要先验证 Stage A-C 的效果.
+
+### 14.8 待确认事项
+
+- Stage A 的超时阈值: lookup 2s / readdir 5s 是否合适? 需 fio + 网络抖动测试确定.
+- Stage D 的 callback 重入 VFS 锁: 是否会出现 `inode_lock` 在 callback 中重入导致死锁? 需参考 Ceph 的 `ceph_mdsc_ensure_flushed` 模式.
+- 是否引入 netfs_helper (Stage C): netfs_helper 是 6.2+ 内核的新框架, 接入收益大 (自动处理 readahead / writeback), 但 PowerFS 当前是 inline data store 模型, 不完全匹配 netfs 的 page-based 模型.
