@@ -606,9 +606,12 @@ static int powerfs_write_inode(struct inode *inode, struct writeback_control *wb
     u64 last_synced;
     int ret;
 
-    if (!powerfs_net_is_connected())
-        return 0;
     if (!S_ISREG(inode->i_mode))
+        return 0;
+
+    /* umount 期间 (stopping=1): 跳过网络同步, 返回 0 允许 inode 驱逐.
+     * 否则 writeback 会 redirty, evict_inodes 无法驱逐, umount 挂起. */
+    if (powerfs_net_is_stopping())
         return 0;
 
     i_size = i_size_read(inode);
@@ -623,14 +626,18 @@ static int powerfs_write_inode(struct inode *inode, struct writeback_control *wb
     if ((u64)i_size == last_synced)
         return 0;
 
+    /* 先请求 Filer 同步 size, 成功后才更新本地 content_size.
+     * 断连时 powerfs_net_setattr 返回 -ENOTCONN, writeback 会重试.
+     * 之前断连时 return 0 (假装成功) 导致 size 未同步, remount 后不一致. */
     ret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
                                0, 0, 0, (__u64)i_size);
     if (ret < 0) {
         pr_warn("powerfs: write_inode setattr ino=%lu size=%llu failed: %d\n",
                 inode->i_ino, (u64)i_size, ret);
-        return 0;  /* 不传播错误, 避免 writeback 卡死 */
+        return ret;  /* 传播错误, writeback 会 redirty 重试 */
     }
 
+    /* 请求成功后才更新本地记录 */
     spin_lock(&pi->i_lock);
     pi->content_size = (u64)i_size;
     spin_unlock(&pi->i_lock);
@@ -1332,12 +1339,12 @@ static int powerfs_mknod(struct user_namespace *idmap, struct inode *dir,
              dentry, mode, dir->i_ino);
 
     /*
-     * 当 powerfs_net 连接时, 向 filer 发 CREATE/MKDIR 请求获取权威 ino,
-     * 使文件元数据持久化到 filer (Raft 强一致); remount 后 lookup 能找回.
-     * 未连接时回退本地分配 (本地缓存模式).
+     * 向 filer 发 CREATE/MKDIR 请求获取权威 ino, 使文件元数据持久化到
+     * filer (Raft 强一致); remount 后 lookup 能找回.
+     * 断连时 powerfs_net_create 返回 -ENOTCONN, 操作失败 (不再本地分配).
      * symlink/特殊文件暂走本地 (有独立 powerfs_net_symlink 接口).
      */
-    if (powerfs_net_is_connected() && (S_ISREG(mode) || S_ISDIR(mode))) {
+    if (S_ISREG(mode) || S_ISDIR(mode)) {
         u64 remote_ino = 0;
         int rerr = powerfs_net_create(dir->i_ino, dentry->d_name.name,
                                        dentry->d_name.len, mode,
@@ -1469,6 +1476,7 @@ static int powerfs_mkdir(struct user_namespace *idmap, struct inode *dir,
 static int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
 {
     struct inode *inode = d_inode(dentry);
+    int rerr;
 
     pr_debug("powerfs: rmdir '%pd' in dir=%lu\n", dentry, dir->i_ino);
 
@@ -1482,18 +1490,23 @@ static int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
     }
 
     /*
-     * 参考 simple_rmdir / ramfs_rmdir 实现:
-     *   drop_nlink(inode) + drop_nlink(dir)
-     *
-     * drop_nlink 仅递减 i_nlink, 不调用 iput.
-     * VFS 通过 dentry 引用管理 inode 生命周期, 无需 ihold.
-     * 之前的 ihold(inode) 会导致 i_count 泄漏, umount 时触发 BUG.
+     * 先向 filer 发 RMDIR 持久化删除, 成功后才改本地数据结构.
+     * 断连时 powerfs_net_unlink 返回 -ENOTCONN, 操作失败, 本地不变.
+     * -ENOENT 视为幂等成功 (目录已在 filer 端删除).
      */
+    rerr = powerfs_net_unlink(dir->i_ino, dentry->d_name.name,
+                               dentry->d_name.len, true);
+    if (rerr && rerr != -ENOENT) {
+        pr_warn("powerfs: net_rmdir '%pd' failed: %d\n", dentry, rerr);
+        return rerr;
+    }
+
+    /* === 以下操作仅在 filer 删除成功后执行 === */
 
     /* 更新父目录时间戳 */
     dir->i_mtime = dir->i_ctime = current_time(dir);
 
-    /* 减少被删除目录的链接数 */
+    /* 减少被删除目录的链接数 (参考 simple_rmdir, 不 ihold/iput) */
     drop_nlink(inode);
 
     /* 清空子目录的目录项链表 */
@@ -1505,37 +1518,12 @@ static int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
     /* 减少父目录的链接数 (因删除了一个子目录) */
     drop_nlink(dir);
 
-    /* === powerfs_net: 向 filer 发 RMDIR, 持久化删除 === */
-    if (powerfs_net_is_connected()) {
-        int rerr = powerfs_net_unlink(dir->i_ino, dentry->d_name.name,
-                                       dentry->d_name.len, true);
-        if (rerr && rerr != -ENOENT)
-            pr_warn("powerfs: net_rmdir '%pd' failed: %d\n", dentry, rerr);
-
-        /* Delta Sync: 失效路径缓存 */
-        {
-            char path_buf[256];
-            powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-            powerfs_net_invalidate_path(path_buf);
-            powerfs_net_invalidate_dir(dir->i_ino);
-        }
-    }
-
-    /* === 异步通知代理更新后端 (兼容旧接口) === */
-    if (powerfs_comm_connected()) {
-        struct powerfs_msg_header req_hdr;
-        struct powerfs_remove_req req_data;
-
-        memset(&req_hdr, 0, sizeof(req_hdr));
-        req_hdr.type = POWERFS_MSG_RMDIR;
-        req_hdr.ino = dir->i_ino;
-        req_hdr.data_len = sizeof(req_data);
-
-        memset(&req_data, 0, sizeof(req_data));
-        req_data.dir_ino = dir->i_ino;
-        strncpy(req_data.name, dentry->d_name.name, sizeof(req_data.name) - 1);
-
-        powerfs_comm_submit_notify(&req_hdr, &req_data);
+    /* 失效路径缓存 */
+    {
+        char path_buf[256];
+        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+        powerfs_net_invalidate_path(path_buf);
+        powerfs_net_invalidate_dir(dir->i_ino);
     }
 
     pr_debug("powerfs: rmdir '%pd' success\n", dentry);
@@ -1621,6 +1609,7 @@ static int powerfs_create(struct user_namespace *idmap, struct inode *dir,
 static int powerfs_unlink(struct inode *dir, struct dentry *dentry)
 {
     struct inode *inode = d_inode(dentry);
+    int rerr;
 
     pr_debug("powerfs: unlink '%pd' in dir=%lu\n", dentry, dir->i_ino);
 
@@ -1630,57 +1619,35 @@ static int powerfs_unlink(struct inode *dir, struct dentry *dentry)
     }
 
     /*
-     * 参考 simple_unlink / ramfs_unlink 实现:
-     *   drop_nlink(inode) - 仅递减 i_nlink, 不调用 iput
-     *   VFS 通过 dentry 引用管理 inode 生命周期:
-     *     do_unlinkat -> vfs_unlink -> powerfs_unlink
-     *     -> dput(dentry) -> __dentry_kill -> iput(inode)
-     *
-     * 因此: 不要 ihold/iput, 让 VFS 的 dentry 路径统一处理.
-     * 之前的 ihold(inode) 是基于错误假设 (误以为 drop_nlink 会 iput),
-     * 导致 i_count 泄漏, umount 时 inode 无法释放触发 BUG at fs/inode.c.
+     * 先向 filer 发 UNLINK 持久化删除, 成功后才改本地数据结构.
+     * 断连时 powerfs_net_unlink 返回 -ENOTCONN, 操作失败, 本地不变.
+     * -ENOENT 视为幂等成功 (文件已在 filer 端删除).
+     * 之前是"先改本地再发网络", 断连时本地已改但 filer 未删 → 不一致.
      */
+    rerr = powerfs_net_unlink(dir->i_ino, dentry->d_name.name,
+                               dentry->d_name.len, false);
+    if (rerr && rerr != -ENOENT) {
+        pr_warn("powerfs: net_unlink '%pd' failed: %d\n", dentry, rerr);
+        return rerr;
+    }
+
+    /* === 以下操作仅在 filer 删除成功后执行 === */
 
     /* 更新父目录时间戳 */
     dir->i_mtime = dir->i_ctime = current_time(dir);
 
-    /* 减少 inode 链接数 */
+    /* 减少 inode 链接数 (参考 simple_unlink, 不 ihold/iput, 由 VFS dentry 管理) */
     drop_nlink(inode);
 
     /* 从本地目录项链表中移除 */
     powerfs_remove_dir_entry(dir, dentry->d_name.name);
 
-    /* === powerfs_net: 向 filer 发 UNLINK, 持久化删除 === */
-    if (powerfs_net_is_connected()) {
-        int rerr = powerfs_net_unlink(dir->i_ino, dentry->d_name.name,
-                                       dentry->d_name.len, false);
-        if (rerr && rerr != -ENOENT)
-            pr_warn("powerfs: net_unlink '%pd' failed: %d\n", dentry, rerr);
-
-        /* Delta Sync: 失效路径缓存 */
-        {
-            char path_buf[256];
-            powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-            powerfs_net_invalidate_path(path_buf);
-            powerfs_net_invalidate_dir(dir->i_ino);
-        }
-    }
-
-    /* === 异步通知代理更新后端 (兼容旧接口) === */
-    if (powerfs_comm_connected()) {
-        struct powerfs_msg_header req_hdr;
-        struct powerfs_remove_req req_data;
-
-        memset(&req_hdr, 0, sizeof(req_hdr));
-        req_hdr.type = POWERFS_MSG_UNLINK;
-        req_hdr.ino = dir->i_ino;
-        req_hdr.data_len = sizeof(req_data);
-
-        memset(&req_data, 0, sizeof(req_data));
-        req_data.dir_ino = dir->i_ino;
-        strncpy(req_data.name, dentry->d_name.name, sizeof(req_data.name) - 1);
-
-        powerfs_comm_submit_notify(&req_hdr, &req_data);
+    /* 失效路径缓存 */
+    {
+        char path_buf[256];
+        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
+        powerfs_net_invalidate_path(path_buf);
+        powerfs_net_invalidate_dir(dir->i_ino);
     }
 
     pr_debug("powerfs: unlink '%pd' success\n", dentry);
@@ -1694,7 +1661,6 @@ static int powerfs_symlink(struct user_namespace *idmap, struct inode *dir,
                             struct dentry *dentry, const char *symname)
 {
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(dir->i_sb);
-    struct powerfs_inode_info *dpi = POWERFS_I(dir);
     struct inode *inode;
     u64 new_ino;
     int err;
@@ -1704,13 +1670,26 @@ static int powerfs_symlink(struct user_namespace *idmap, struct inode *dir,
     pr_debug("powerfs: symlink '%pd' -> '%s'\n", dentry, symname);
 
     /*
-     * 本地操作 + 异步通知 (与mkdir/create/unlink保持一致):
-     *   1. 在本地创建 inode 和 dentry
-     *   2. 异步通知代理创建后端记录
+     * 先向 filer 发 SYMLINK 持久化, 成功后才创建本地 inode.
+     * 断连时 powerfs_net_symlink 返回 -ENOTCONN, 操作失败.
      */
+    {
+        __u64 sym_ino = 0;
+        int nret = powerfs_net_symlink(dir->i_ino,
+                                        dentry->d_name.name,
+                                        dentry->d_name.len,
+                                        symname, strlen(symname),
+                                        &sym_ino);
+        if (nret < 0) {
+            pr_warn("powerfs: symlink net_sync name=%s failed: %d\n",
+                    dentry->d_name.name, nret);
+            return nret;
+        }
+        new_ino = sym_ino ? sym_ino
+                          : (u64)atomic_inc_return(&sbi->next_ino) + POWERFS_INO_START;
+    }
 
-    /* 生成新 inode 号 */
-    new_ino = atomic_inc_return(&sbi->next_ino) + POWERFS_INO_START;
+    /* === 以下操作仅在 filer 创建成功后执行 === */
 
     /* 创建符号链接 inode */
     inode = powerfs_new_inode(dir->i_sb, S_IFLNK | 0777, new_ino,
@@ -1733,39 +1712,6 @@ static int powerfs_symlink(struct user_namespace *idmap, struct inode *dir,
 
     /* 添加目录项到本地链表 */
     powerfs_add_dir_entry(dir, new_ino, S_IFLNK, dentry->d_name.name);
-
-    /* powerfs_net 同步: symlink 必须持久化到 Filer */
-    if (powerfs_net_is_connected()) {
-        __u64 sym_ino = 0;
-        int nret = powerfs_net_symlink(dir->i_ino,
-                                        dentry->d_name.name,
-                                        dentry->d_name.len,
-                                        symname, strlen(symname),
-                                        &sym_ino);
-        if (nret < 0)
-            pr_warn("powerfs: symlink net_sync name=%s failed: %d\n",
-                    dentry->d_name.name, nret);
-    }
-
-    /* 异步通知代理创建符号链接 (兼容旧 comm 层) */
-    if (powerfs_comm_connected()) {
-        struct powerfs_msg_header req_hdr;
-        struct powerfs_symlink_req req_data;
-
-        memset(&req_hdr, 0, sizeof(req_hdr));
-        req_hdr.type = POWERFS_MSG_SYMLINK;
-        req_hdr.ino = dir->i_ino;
-        req_hdr.data_len = sizeof(req_data);
-
-        memset(&req_data, 0, sizeof(req_data));
-        req_data.dir_ino = dir->i_ino;
-        req_data.name_len = strlen(dentry->d_name.name);
-        req_data.symname_len = strlen(symname);
-        strncpy(req_data.name, dentry->d_name.name, sizeof(req_data.name) - 1);
-        strncpy(req_data.symname, symname, sizeof(req_data.symname) - 1);
-
-        powerfs_comm_submit_notify(&req_hdr, &req_data);
-    }
 
     pr_debug("powerfs: symlink '%pd' success, ino=%llu\n",
              dentry, (unsigned long long)new_ino);
@@ -1854,6 +1800,7 @@ static int powerfs_link(struct dentry *old_dentry, struct inode *dir,
                         struct dentry *new_dentry)
 {
     struct inode *inode = d_inode(old_dentry);
+    int nret;
 
     pr_debug("powerfs: link '%pd' -> '%pd' (ino=%lu)\n",
              old_dentry, new_dentry, inode->i_ino);
@@ -1863,17 +1810,24 @@ static int powerfs_link(struct dentry *old_dentry, struct inode *dir,
         return -EPERM;
 
     /*
-     * 本地操作:
-     *   1. 增加 inode 链接数 (硬链接需要)
-     *   2. 添加新 dentry 到 inode 的哈希表
-     *
-     * 注意: VFS (vfs_link) 不会自动 inc_nlink
-     *       需要文件系统自己调用 inc_nlink
-     *
-     * 关键: d_add 不递增 i_count! 每个 dentry 必须持有独立的 i_count
-     *       引用, 否则第一个 dentry 被回收时 iput 使 i_count=0 触发
-     *       eviction, 而第二个 dentry 仍指向已释放的 inode → UAF.
-     *       参考 simple_link / ramfs_link 均在 d_add 前调用 ihold.
+     * 先向 filer 发 LINK 持久化, 成功后才改本地数据结构.
+     * 断连时 powerfs_net_link 返回 -ENOTCONN, 操作失败, 本地不变.
+     */
+    nret = powerfs_net_link(inode->i_ino, dir->i_ino,
+                             new_dentry->d_name.name,
+                             new_dentry->d_name.len);
+    if (nret < 0) {
+        pr_warn("powerfs: link net_sync name=%s failed: %d\n",
+                new_dentry->d_name.name, nret);
+        return nret;
+    }
+
+    /* === 以下操作仅在 filer link 成功后执行 === */
+
+    /*
+     * VFS (vfs_link) 不会自动 inc_nlink, 需要文件系统自己调用.
+     * d_add 不递增 i_count! 每个 dentry 必须持有独立的 i_count
+     * 参考 simple_link / ramfs_link 均在 d_add 前调用 ihold.
      */
     inc_nlink(inode);
     ihold(inode);
@@ -1885,38 +1839,6 @@ static int powerfs_link(struct dentry *old_dentry, struct inode *dir,
     powerfs_add_dir_entry(dir, inode->i_ino,
                           inode->i_mode & S_IFMT,
                           new_dentry->d_name.name);
-
-    /* powerfs_net 同步: hard link 必须持久化到 Filer */
-    if (powerfs_net_is_connected()) {
-        int nret = powerfs_net_link(inode->i_ino, dir->i_ino,
-                                     new_dentry->d_name.name,
-                                     new_dentry->d_name.len);
-        if (nret < 0)
-            pr_warn("powerfs: link net_sync name=%s failed: %d\n",
-                    new_dentry->d_name.name, nret);
-    }
-
-    /* 异步通知代理创建硬链接 (兼容旧 comm 层) */
-    if (powerfs_comm_connected()) {
-        struct powerfs_msg_header req_hdr;
-        struct powerfs_link_req req_data;
-
-        memset(&req_hdr, 0, sizeof(req_hdr));
-        req_hdr.type = POWERFS_MSG_LINK;
-        req_hdr.ino = inode->i_ino;
-        req_hdr.data_len = sizeof(req_data);
-
-        memset(&req_data, 0, sizeof(req_data));
-        req_data.ino = inode->i_ino;
-        req_data.dir_ino = dir->i_ino;
-        strncpy(req_data.name, new_dentry->d_name.name,
-                sizeof(req_data.name) - 1);
-
-        powerfs_comm_submit_notify(&req_hdr, &req_data);
-    }
-
-    pr_debug("powerfs: link '%pd' -> '%pd' success\n",
-             old_dentry, new_dentry);
 
     return 0;
 }
@@ -2161,24 +2083,16 @@ int powerfs_rename(struct user_namespace *idmap,
      * 保存旧/新名称 (VFS 会在 rename 返回后调用 d_move 改变 dentry 名称)
      */
     {
-        struct powerfs_msg_header req_hdr;
-        struct powerfs_rename_req req_data;
         char old_name_buf[POWERFS_MAX_NAME_LEN + 1];
         char new_name_buf[POWERFS_MAX_NAME_LEN + 1];
+        int nret;
 
         strncpy(old_name_buf, old_dentry->d_name.name, POWERFS_MAX_NAME_LEN);
         old_name_buf[POWERFS_MAX_NAME_LEN] = '\0';
         strncpy(new_name_buf, new_dentry->d_name.name, POWERFS_MAX_NAME_LEN);
         new_name_buf[POWERFS_MAX_NAME_LEN] = '\0';
 
-        /*
-         * 目标已存在的情况
-         *
-         * 参考 ramfs_rename (fs/ramfs/inode.c):
-         *   - 减少目标 inode 的 nlink
-         *   - 如果目标是目录，减少目标父目录的 nlink
-         *   - 不调用 d_delete/d_drop，VFS 会在 dput 时处理
-         */
+        /* 检查目标已存在的情况 (但不修改 nlink, 等 net_rename 成功后再改) */
         if (d_really_is_positive(new_dentry)) {
             struct inode *target = d_inode(new_dentry);
 
@@ -2194,20 +2108,41 @@ int powerfs_rename(struct user_namespace *idmap,
                 /* 目录必须为空 */
                 if (!simple_empty(new_dentry))
                     return -ENOTEMPTY;
-                drop_nlink(new_dir);
             }
-
-            drop_nlink(target);
         } else if (flags & RENAME_NOREPLACE) {
             return -EEXIST;
         }
 
         /*
-         * 注意: VFS (vfs_rename) 不会自动处理 nlink 调整
-         *       需要文件系统自己处理:
-         *       1. 替换目标时: drop_nlink(target) 已在上方处理
-         *       2. 目录跨移动时: drop_nlink(old_dir) + inc_nlink(new_dir)
-         *          参考 simple_rename_exchange
+         * 先向 filer 发 RENAME 持久化, 成功后才改本地数据结构.
+         * 断连时 powerfs_net_rename 返回 -ENOTCONN, 操作失败, 本地不变.
+         */
+        nret = powerfs_net_rename(old_dir->i_ino,
+                                   old_name_buf, strlen(old_name_buf),
+                                   new_dir->i_ino,
+                                   new_name_buf, strlen(new_name_buf));
+        if (nret < 0) {
+            pr_warn("powerfs: rename net_sync old=%s new=%s failed: %d\n",
+                    old_name_buf, new_name_buf, nret);
+            return nret;
+        }
+
+        /* === 以下操作仅在 filer rename 成功后执行 === */
+
+        /*
+         * 目标已存在: 减少目标 inode 的 nlink
+         * 参考 ramfs_rename (fs/ramfs/inode.c)
+         */
+        if (d_really_is_positive(new_dentry)) {
+            struct inode *target = d_inode(new_dentry);
+            if (S_ISDIR(target->i_mode))
+                drop_nlink(new_dir);
+            drop_nlink(target);
+        }
+
+        /*
+         * 目录跨移动: drop_nlink(old_dir) + inc_nlink(new_dir)
+         * 参考 simple_rename_exchange
          */
         if (S_ISDIR(inode->i_mode) && old_dir != new_dir) {
             drop_nlink(old_dir);
@@ -2240,40 +2175,6 @@ int powerfs_rename(struct user_namespace *idmap,
             if (target) {
                 powerfs_remove_dir_entry(new_dir, new_name_buf);
             }
-        }
-
-        /* powerfs_net 同步: rename 必须持久化到 Filer, 否则 remount 后
-         * 旧名称仍存在、新名称丢失. 之前只走 comm 层异步通知, net 层
-         * 未发送 rename 请求, 导致 Filer 端目录项未更新. */
-        if (powerfs_net_is_connected()) {
-            int nret = powerfs_net_rename(old_dir->i_ino,
-                                           old_name_buf, strlen(old_name_buf),
-                                           new_dir->i_ino,
-                                           new_name_buf, strlen(new_name_buf));
-            if (nret < 0)
-                pr_warn("powerfs: rename net_sync old=%s new=%s failed: %d\n",
-                        old_name_buf, new_name_buf, nret);
-        }
-
-        /* 异步通知代理更新后端 (兼容旧 comm 层) */
-        if (powerfs_comm_connected()) {
-            memset(&req_data, 0, sizeof(req_data));
-            req_data.old_dir_ino = old_dir->i_ino;
-            req_data.new_dir_ino = new_dir->i_ino;
-            req_data.flags = flags;
-            strncpy(req_data.old_name, old_name_buf,
-                    sizeof(req_data.old_name) - 1);
-            strncpy(req_data.new_name, new_name_buf,
-                    sizeof(req_data.new_name) - 1);
-            req_data.old_name_len = strlen(old_name_buf);
-            req_data.new_name_len = strlen(new_name_buf);
-
-            memset(&req_hdr, 0, sizeof(req_hdr));
-            req_hdr.type = POWERFS_MSG_RENAME;
-            req_hdr.ino = old_dir->i_ino;
-            req_hdr.data_len = sizeof(req_data);
-
-            powerfs_comm_submit_notify(&req_hdr, &req_data);
         }
     }
 
@@ -3034,9 +2935,9 @@ int powerfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 /*
  * powerfs_fsync - 数据同步操作
  *
- * powerfs_net 连接时: file_write_and_wait_range 触发 writepage→net_write,
- *   将脏页同步刷到 filer; 兼容旧 comm 接口发 FSYNC 通知.
- * 未连接时: 纯内存模式直接返回.
+ * file_write_and_wait_range 触发 writepage→powerfs_net_write 将脏页刷到 filer,
+ * 然后调用 powerfs_net_setattr 同步 i_size.
+ * 断连时 writepage 和 setattr 返回 -ENOTCONN, fsync 传播错误.
  */
 static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
@@ -3046,63 +2947,22 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 
     pr_debug("powerfs: fsync ino=%lu datasync=%d\n", inode->i_ino, datasync);
 
-    /* powerfs_net: 触发脏页写回 (writepage→powerfs_net_write) */
-    if (powerfs_net_is_connected()) {
-        ret = file_write_and_wait_range(file, start, end);
-        if (ret < 0)
-            pr_warn("powerfs: fsync write_and_wait error: %d\n", ret);
-
-        /*
-         * 同步 i_size 到 Filer:
-         *   write_end 仅更新内存 inode 的 i_size, writepage 只刷数据页,
-         *   二者都不会把 i_size 元数据同步到 Filer. 若不同步, remount 后
-         *   lookup 返回 Filer 端 i_size=0, read_folio 见 offset>=i_size
-         *   直接 zero fill → 文件内容丢失.
-         *   修复: fsync 在刷完数据页后, 调用 powerfs_net_setattr 同步 size.
-         *   不依赖 VFS write_inode (powerfs_super_ops 未实现 write_inode).
-         */
-        i_size = i_size_read(inode);
-        if (i_size > 0) {
-            int sret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
-                                            0, 0, 0, (__u64)i_size);
-            if (sret < 0)
-                pr_warn("powerfs: fsync setattr size=%llu ino=%lu failed: %d\n",
-                        (u64)i_size, inode->i_ino, sret);
-        }
+    /* 触发脏页写回 (writepage→powerfs_net_write) */
+    ret = file_write_and_wait_range(file, start, end);
+    if (ret < 0) {
+        pr_warn("powerfs: fsync write_and_wait error: %d\n", ret);
         return ret;
     }
 
-    /* 兼容旧 comm 接口 */
-    if (powerfs_comm_connected()) {
-        struct powerfs_msg_header req_hdr, resp_hdr;
-        struct powerfs_fsync_req req_data;
-        struct powerfs_fsync_resp resp_data;
-
-        ret = file_write_and_wait_range(file, start, end);
-        if (ret < 0)
-            pr_warn("powerfs: fsync write_and_wait error: %d\n", ret);
-
-        memset(&req_hdr, 0, sizeof(req_hdr));
-        req_hdr.type = POWERFS_MSG_FSYNC;
-        req_hdr.ino = inode->i_ino;
-        req_hdr.data_len = sizeof(req_data);
-
-        memset(&req_data, 0, sizeof(req_data));
-        req_data.ino = inode->i_ino;
-        req_data.datasync = datasync ? 1 : 0;
-
-        memset(&resp_hdr, 0, sizeof(resp_hdr));
-        memset(&resp_data, 0, sizeof(resp_data));
-
-        ret = powerfs_comm_send_request(&req_hdr, &req_data,
-                                         &resp_hdr, &resp_data, 500);
-        if (ret < 0) {
-            pr_warn("powerfs: fsync comm error: %d\n", ret);
-            return 0;
-        }
-        if (resp_hdr.status != 0) {
-            pr_warn("powerfs: fsync resp error: %d\n", resp_hdr.status);
-            return resp_hdr.status;
+    /* 同步 i_size 到 Filer */
+    i_size = i_size_read(inode);
+    if (i_size > 0) {
+        int sret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
+                                        0, 0, 0, (__u64)i_size);
+        if (sret < 0) {
+            pr_warn("powerfs: fsync setattr size=%llu ino=%lu failed: %d\n",
+                    (u64)i_size, inode->i_ino, sret);
+            return sret;
         }
     }
 
@@ -3355,7 +3215,16 @@ void powerfs_kill_sb_super(struct super_block *sb)
     if (g_powerfs_sb == sb)
         g_powerfs_sb = NULL;
 
-    /* === 清理 powerfs_net (停止 Delta Sync 监控，关闭所有连接) === */
+    /* 1. 先 sync 脏 inode (网络仍可用, write_inode 能同步 size 到 Filer).
+     *    如果先关闭网络, write_inode 的 setattr 会失败, inode 保持 dirty,
+     *    evict_inodes 无法驱逐, 导致 umount 挂起或内存泄漏. */
+    sync_filesystem(sb);
+
+    /* 2. 设置 stopping 标志: 让 send_request 立即返回 -ENOTCONN,
+     *    阻止 reconnect_work 在 g_pool 清零后访问野指针. */
+    powerfs_net_set_stopping();
+
+    /* 3. 停止监控并关闭所有连接 (g_pool 会被清零) */
     powerfs_net_stop_monitor();
     powerfs_net_pool_cleanup();
 
@@ -3364,6 +3233,7 @@ void powerfs_kill_sb_super(struct super_block *sb)
         sb->s_fs_info = NULL;
     }
 
+    /* 4. kill_anon_super 会再次 sync (但已无脏数据) + shrink_dcache + evict_inodes */
     kill_anon_super(sb);
 }
 

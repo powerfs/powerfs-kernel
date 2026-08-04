@@ -53,8 +53,13 @@
 #define POWERFS_NET_RECV_TIMEOUT     10000
 #define POWERFS_NET_RECONNECT_DELAY  2000
 
-/* 最大重连次数 */
-#define POWERFS_NET_MAX_RECONNECT    10
+/* 最大重连次数: 3 次都失败才返回 -ENOTCONN */
+#define POWERFS_NET_MAX_RECONNECT    3
+
+/* send_request 等待重连的最大时间 (ms).
+ * reconnect_work 3 次重连约 6s, 此超时作为安全兜底防止 wait_event 挂死.
+ * 正常情况下 reconnect_work 成功/失败都会 wake_up, 不会等满 30s. */
+#define POWERFS_NET_RECONNECT_WAIT_TIMEOUT_MS  30000
 
 /* ========== 帧标志 ========== */
 
@@ -341,6 +346,12 @@ struct powerfs_net_conn {
     int reconnect_count;
     atomic_t stopping;          /* 模块退出时置 1，让 reconnect_work 提前退出（atomic_t 保证跨 CPU 可见性） */
 
+    /* 请求等待队列: send_request 断连时在此等待重连,
+     * 重连成功或 3 次失败后唤醒. */
+    wait_queue_head_t reconnect_wq;
+    atomic_t reconnect_failed;  /* 3 次重连都失败置 1, send_request 见此返回 -ENOTCONN */
+    atomic_t failover_count;    /* 连续 failover/reconnect 失败次数, 成功后归零 */
+
     /* 服务端信息 (握手后) */
     __u64 server_id;
     __u32 server_features;
@@ -437,6 +448,12 @@ int powerfs_net_remove_server(const char *addr, __u16 port);
 
 /* 清理连接池 (关闭所有连接，释放资源) */
 void powerfs_net_pool_cleanup(void);
+
+/* 设置 stopping 标志, 让所有等待的 send_request 返回 -ENOTCONN */
+void powerfs_net_set_stopping(void);
+
+/* 检查是否正在停止 (umount 中) */
+bool powerfs_net_is_stopping(void);
 
 /* 设置主 Filer 地址 (兼容旧接口) */
 int powerfs_net_set_primary(const char *addr, __u16 port);

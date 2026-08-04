@@ -51,6 +51,9 @@
 static struct powerfs_net_conn g_conn;
 static bool g_initialized = false;
 
+/* 前向声明: g_pool 定义在后面 (多连接池实现段), reconnect_work 需要访问 */
+static struct powerfs_net_pool g_pool;
+
 /*
  * 串行化 send_request 的 send+recv 序列.
  *
@@ -699,12 +702,7 @@ int powerfs_net_send_request(__u16 msg_type,
     int net_status = 0;
     int attempt;
     struct socket *sock;   /* 本地引用, 由 sock_users 引用计数保护 */
-
-    /* 快速路径: 无锁读 state, 避免已断开时无谓 kmalloc (循环内会持锁复检) */
-    if (g_conn.state != POWERFS_NET_STATE_CONNECTED) {
-        pr_debug("powerfs: not connected, cannot send request\n");
-        return -ENOTCONN;
-    }
+    int retry_count = 0;
 
     tmp_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
     tmp_data = kmalloc(POWERFS_NET_MAX_DATA, GFP_KERNEL);
@@ -712,6 +710,51 @@ int powerfs_net_send_request(__u16 msg_type,
         kfree(tmp_body);
         kfree(tmp_data);
         return -ENOMEM;
+    }
+
+retry:
+    /* 快速路径: 无锁读 state, 避免已断开时无谓进入 mutex (循环内会持锁复检) */
+    if (g_conn.state != POWERFS_NET_STATE_CONNECTED) {
+        /* 断连时等待重连, 不直接返回 -ENOTCONN.
+         * 主动调度 reconnect_work (不等 monitor_work 的 5s 间隔),
+         * find_leader 会遍历所有 filer 支持 leader 切换.
+         * wait_event_timeout 防止 D state 挂死 (30s 安全兜底,
+         * 正常 reconnect_work 6s 内完成重连或 3 次失败). */
+        if (!atomic_read(&g_conn.stopping))
+            schedule_work(&g_conn.reconnect_work);
+
+        pr_info("powerfs: not connected, waiting for reconnect (retry %d)\n",
+                retry_count);
+        {
+            long wait_ret = wait_event_timeout(
+                g_conn.reconnect_wq,
+                g_conn.state == POWERFS_NET_STATE_CONNECTED ||
+                atomic_read(&g_conn.reconnect_failed) ||
+                atomic_read(&g_conn.stopping),
+                msecs_to_jiffies(POWERFS_NET_RECONNECT_WAIT_TIMEOUT_MS));
+
+            if (atomic_read(&g_conn.stopping)) {
+                kfree(tmp_body);
+                kfree(tmp_data);
+                return -ENOTCONN;
+            }
+            if (atomic_read(&g_conn.reconnect_failed)) {
+                pr_warn("powerfs: reconnect failed after %d attempts, returning -ENOTCONN\n",
+                        POWERFS_NET_MAX_RECONNECT);
+                kfree(tmp_body);
+                kfree(tmp_data);
+                return -ENOTCONN;
+            }
+            if (wait_ret == 0) {
+                /* 超时: reconnect_work 未在 30s 内完成 (异常情况) */
+                pr_err("powerfs: reconnect wait timed out (%dms), returning -ENOTCONN\n",
+                       POWERFS_NET_RECONNECT_WAIT_TIMEOUT_MS);
+                kfree(tmp_body);
+                kfree(tmp_data);
+                return -ENOTCONN;
+            }
+        }
+        /* 重连成功, 继续发送 */
     }
 
     /*
@@ -757,6 +800,8 @@ int powerfs_net_send_request(__u16 msg_type,
         if (ret < 0) {
             pr_debug("powerfs: send failed seq=%u: %d\n", seq, ret);
             powerfs_net_put_sock_ref();
+            /* 发送失败说明连接已断, 触发 disconnect 让后续请求走 wait_event */
+            powerfs_net_disconnect();
             break;
         }
 
@@ -855,6 +900,23 @@ int powerfs_net_send_request(__u16 msg_type,
 
     if (ret < 0) {
         mutex_unlock(&send_recv_mutex);
+
+        /* 网络错误 (连接断开/超时): 等待重连后重试, 不直接返回错误.
+         * 这确保 kill filer 期间 write/create 等操作阻塞等待 failover,
+         * 而非立即返回 -EIO/-ENOTCONN 导致数据不一致.
+         * 非 0 非 redirect 的 errno 视为不可重试错误 (如 -ENOMEM). */
+        if (ret == -ENOTCONN || ret == -EPIPE || ret == -ECONNRESET ||
+            ret == -ETIMEDOUT || ret == -EIO || ret == -EHOSTUNREACH) {
+            if (++retry_count <= POWERFS_NET_MAX_RECONNECT) {
+                pr_info("powerfs: send failed (%d), will wait for reconnect (retry %d/%d)\n",
+                        ret, retry_count, POWERFS_NET_MAX_RECONNECT);
+                goto retry;
+            }
+            pr_warn("powerfs: max retries (%d) exceeded, returning -ENOTCONN\n",
+                    retry_count);
+            ret = -ENOTCONN;
+        }
+
         kfree(tmp_body);
         kfree(tmp_data);
         return ret;
@@ -897,27 +959,25 @@ int powerfs_net_send_request(__u16 msg_type,
 
 /* ========== 重连机制 ========== */
 
+/* 前向声明: find_leader 定义在后面, reconnect_work 需要调用它遍历所有 filer */
+int powerfs_net_find_leader(void);
+
 /**
  * powerfs_net_reconnect_work - 重连工作函数
  */
 static void powerfs_net_reconnect_work(struct work_struct *work)
 {
-    char addr[64];
-    __u16 port;
     int ret;
     int i;
 
-    /* 读取目标地址 */
-    mutex_lock(&g_conn.conn_lock);
-    strncpy(addr, g_server_addr, sizeof(addr) - 1);
-    addr[sizeof(addr) - 1] = '\0';
-    port = g_server_port;
-    mutex_unlock(&g_conn.conn_lock);
+    pr_info("powerfs: reconnect_work started (attempt %d)\n",
+            g_conn.reconnect_count + 1);
 
-    pr_info("powerfs: trying to reconnect to %s:%u (attempt %d)\n",
-            addr, port, g_conn.reconnect_count + 1);
+    /* 尝试重连: 用 find_leader 遍历所有 filer (而非只连原始地址),
+     * 支持 leader 切换场景 (filer-1 被 kill 后 filer-2 成为新 leader).
+     * 清除 leader_known 跳过 "已知 leader" 快速路径, 强制遍历. */
+    atomic_set(&g_pool.leader_known, 0);
 
-    /* 尝试重连 */
     for (i = 0; i < POWERFS_NET_MAX_RECONNECT; i++) {
         /* 模块退出时提前终止重连循环（atomic_read 保证跨 CPU 可见性） */
         if (atomic_read(&g_conn.stopping)) {
@@ -935,24 +995,29 @@ static void powerfs_net_reconnect_work(struct work_struct *work)
             return;
         }
 
-        /* connect 超时可能很长（TCP SYN 重试 ~10s），connect 前最后检查一次 */
-        if (atomic_read(&g_conn.stopping)) {
-            pr_info("powerfs: reconnect stopped before connect (module exiting)\n");
-            return;
-        }
-
-        ret = powerfs_net_connect(addr, port);
-        if (ret == 0) {
-            pr_info("powerfs: reconnected successfully\n");
+        ret = powerfs_net_find_leader();
+        if (ret >= 0) {
+            pr_info("powerfs: reconnected successfully (leader=%d)\n", ret);
+            /* 重连成功: 归零计数, 不影响下次断连的重试次数 */
+            g_conn.reconnect_count = 0;
+            /* 唤醒等待的 send_request */
+            atomic_set(&g_conn.failover_count, 0);
+            atomic_set(&g_conn.reconnect_failed, 0);
+            wake_up(&g_conn.reconnect_wq);
             return;
         }
 
         g_conn.reconnect_count++;
+        pr_warn("powerfs: reconnect attempt %d/%d failed\n",
+                i + 1, POWERFS_NET_MAX_RECONNECT);
     }
 
     pr_err("powerfs: failed to reconnect after %d attempts\n",
            POWERFS_NET_MAX_RECONNECT);
     g_conn.state = POWERFS_NET_STATE_ERROR;
+    /* 3 次重连都失败: 设置 reconnect_failed, 唤醒所有等待的 send_request */
+    atomic_set(&g_conn.reconnect_failed, 1);
+    wake_up_all(&g_conn.reconnect_wq);
 }
 
 /* ========== 便捷方法 ========== */
@@ -1607,6 +1672,9 @@ int powerfs_net_init(void)
     spin_lock_init(&g_conn.req_lock);
     hash_init(g_conn.pending_reqs);
     INIT_WORK(&g_conn.reconnect_work, powerfs_net_reconnect_work);
+    init_waitqueue_head(&g_conn.reconnect_wq);
+    atomic_set(&g_conn.reconnect_failed, 0);
+    atomic_set(&g_conn.failover_count, 0);
 
     /* 分配接收缓冲区 (使用 vmalloc 避免大内存分配失败) */
     g_conn.recv_buf = vmalloc(POWERFS_NET_MAX_BODY + POWERFS_NET_MAX_DATA);
@@ -1706,8 +1774,8 @@ EXPORT_SYMBOL_GPL(powerfs_net_exit);
 
 /* ========== 多连接池实现 ========== */
 
-/* 全局连接池和 Delta Sync 状态 */
-static struct powerfs_net_pool g_pool;
+/* 全局连接池和 Delta Sync 状态
+ * (g_pool 已在文件顶部声明, 这里仅声明 g_delta 和 g_pool_initialized) */
 static struct powerfs_net_delta_state g_delta;
 static bool g_pool_initialized = false;
 
@@ -1730,6 +1798,20 @@ int powerfs_net_pool_init(void)
     INIT_DELAYED_WORK(&g_pool.monitor_work, powerfs_net_monitor_work_func);
     INIT_DELAYED_WORK(&g_pool.leader_check_work, powerfs_net_leader_check_work_func);
     g_pool.monitoring = false;
+
+    /* 重新挂载时重置 g_conn 状态:
+     * kill_sb 中 powerfs_net_set_stopping() 设置了 stopping=1,
+     * 此处必须重置, 否则 remount 后 send_request 立即返回 -ENOTCONN.
+     * 不重新初始化锁/等待队列/recv_buf (它们在 powerfs_net_init 中已初始化,
+     * 模块未卸载时仍然有效). */
+    if (g_initialized) {
+        atomic_set(&g_conn.stopping, 0);
+        g_conn.state = POWERFS_NET_STATE_DISCONNECTED;
+        atomic_set(&g_conn.reconnect_failed, 0);
+        atomic_set(&g_conn.failover_count, 0);
+        g_conn.reconnect_count = 0;
+        pr_info("powerfs: g_conn state reset for remount\n");
+    }
 
     /* 初始化服务器条目 */
     for (i = 0; i < POWERFS_NET_MAX_SERVERS; i++) {
@@ -1773,12 +1855,30 @@ void powerfs_net_pool_exit(void)
  * 关闭所有活动连接，清理 delta 状态，重置服务器列表
  * 用于文件系统卸载时清理
  */
+/* 设置 stopping 标志: 让所有等待的 send_request 立即返回 -ENOTCONN.
+ * 在 kill_sb 中网络清零前调用, 防止 reconnect_work 访问已清零的 g_pool. */
+void powerfs_net_set_stopping(void)
+{
+    atomic_set(&g_conn.stopping, 1);
+    /* 唤醒所有等待 reconnect_wq 的 send_request */
+    wake_up_all(&g_conn.reconnect_wq);
+}
+
+bool powerfs_net_is_stopping(void)
+{
+    return atomic_read(&g_conn.stopping) != 0;
+}
+
 void powerfs_net_pool_cleanup(void)
 {
     int i;
 
     if (!g_pool_initialized)
         return;
+
+    /* 安全措施: 确保 stopping 已设置 (防止 reconnect_work 在清零后访问 g_pool) */
+    atomic_set(&g_conn.stopping, 1);
+    wake_up_all(&g_conn.reconnect_wq);
 
     /* 停止监控 */
     powerfs_net_stop_monitor();
@@ -2228,25 +2328,33 @@ int powerfs_net_get_leader_idx(void)
 int powerfs_net_failover(void)
 {
     int old_idx;
-    int ret;
 
     old_idx = atomic_read(&g_pool.leader_idx);
 
     pr_warn("powerfs: starting failover from server %d\n", old_idx);
 
-    /* 尝试查找新 leader */
-    ret = powerfs_net_find_leader();
-    if (ret < 0) {
-        pr_err("powerfs: failover failed, no new leader found\n");
-        return ret;
+    /* ping 已失败, 先 disconnect 当前连接.
+     * 不然 find_leader 会因 state==CONNECTED && cur_addr 匹配而
+     * 直接返回同一个 server (server 0 -> 0), 无法切换到其他 filer. */
+    powerfs_net_disconnect();
+
+    /* 清除 leader_known, 让 reconnect_work 内的 find_leader 跳过
+     * "已知 leader" 快速路径, 直接走遍历逻辑尝试所有 filer. */
+    atomic_set(&g_pool.leader_known, 0);
+
+    /* 统一由 reconnect_work 处理重连 (3 次重试 + find_leader 遍历),
+     * 避免 failover 与 reconnect_work 并发调用 find_leader 的竞态.
+     * reconnect_work 成功后会 wake_up 等待的 send_request. */
+    if (!atomic_read(&g_conn.stopping)) {
+        schedule_work(&g_conn.reconnect_work);
     }
 
     /* 记录故障转移统计 */
     atomic_inc(&g_pool.failover_count);
     atomic_set(&g_pool.last_failover_time, jiffies);
 
-    pr_info("powerfs: failover completed: server %d -> %d\n",
-            old_idx, ret);
+    pr_info("powerfs: failover triggered, server %d -> reconnect_work\n",
+            old_idx);
 
     /* Delta Sync: 失效所有缓存 */
     powerfs_net_clear_all_generations();
