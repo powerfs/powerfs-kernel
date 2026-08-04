@@ -106,9 +106,31 @@ int powerfs_d_init(struct dentry *dentry)
 }
 
 /*
+ * powerfs_di_free_rcu - RCU 回调, 延迟释放 dentry 私有数据
+ *
+ * 为什么需要 RCU 延迟释放:
+ *   __d_lookup_rcu 在 RCU 临界区中返回 dentry, 调用者 lookup_fast 随后调用
+ *   d_revalidate, 后者读 dentry->d_fsdata. 如果 d_release 直接 kmem_cache_free
+ *   释放 di, RCU reader 仍可能解引用已释放的指针 -> UAF in __d_lookup_rcu.
+ *
+ *   d_release 只是设置 d_fsdata = NULL 并 call_rcu 排队, 真正的 kmem_cache_free
+ *   在 RCU grace period 之后执行, 此时所有 RCU reader 已退出临界区.
+ */
+static void powerfs_di_free_rcu(struct rcu_head *head)
+{
+    struct powerfs_dentry_info *di =
+        container_of(head, struct powerfs_dentry_info, rcu);
+
+    kmem_cache_free(powerfs_dentry_cachep, di);
+}
+
+/*
  * d_release - dentry 销毁前释放私有数据
  *
  * 参考 ceph_d_release (fs/ceph/dir.c)
+ *
+ * 重要: d_fsdata 必须用 call_rcu 延迟释放, 不能裸 kmem_cache_free.
+ * 原因: RCU path walk (__d_lookup_rcu + d_revalidate) 可能并发读 d_fsdata.
  */
 void powerfs_d_release(struct dentry *dentry)
 {
@@ -129,8 +151,12 @@ void powerfs_d_release(struct dentry *dentry)
         }
     }
 
+    /* 设置 d_fsdata = NULL 并通过 RCU 延迟释放 di.
+     * RCU reader 在 d_revalidate 中读 d_fsdata 可能看到 NULL (安全:
+     * d_revalidate 检查 !di 返回 1) 或旧指针 (仍有效, 因为 di 还没被 free).
+     * grace period 后才真正 free, 保证无 UAF. */
     dentry->d_fsdata = NULL;
-    kmem_cache_free(powerfs_dentry_cachep, di);
+    call_rcu(&di->rcu, powerfs_di_free_rcu);
 }
 
 /*
@@ -149,9 +175,12 @@ int powerfs_d_revalidate(struct dentry *dentry, unsigned int flags)
     struct inode *inode;
     struct powerfs_inode_info *pi;
 
-    /* RCU 模式: 快速检查 TTL */
+    /* RCU 模式: 退出到非 RCU 模式重试 (参考 ceph_d_revalidate).
+     * 返回 -ECHILD 让 VFS 退出 RCU 路径查找, 改用引用计数保护的非 RCU 模式.
+     * 这样 dentry 不会被 shrinker 在 RCU reader 期间释放, 避免 UAF.
+     * 代价: 路径查找需 d_lock + 引用计数, 但网络文件系统安全性优先. */
     if (flags & LOOKUP_RCU) {
-        return 1;  /* RCU 模式下不做完整验证 */
+        return -ECHILD;
     }
 
     /* 获取 dentry 私有数据 */
@@ -195,35 +224,6 @@ int powerfs_d_revalidate(struct dentry *dentry, unsigned int flags)
 }
 
 /*
- * d_delete - d_count 归零时决定是否立即删除
- *
- * 参考 ceph_d_delete (fs/ceph/dir.c)
- *
- * 返回 0: 保留在 dcache LRU 缓存中
- * 返回 1: 立即删除 dentry
- *
- * 策略:
- *   - 返回 0: 保留 dentry 在 dcache 中
- *     这样 stat 等操作可以复用已缓存的 dentry
- *     避免频繁的路径解析导致的性能问题
- */
-int powerfs_d_delete(const struct dentry *dentry)
-{
-    /*
-     * 返回 0: 保留 dentry 在 dcache LRU 中, 供 stat 等操作复用.
-     *
-     * 参考 ramfs: ramfs 没有 d_delete 回调, VFS 默认保留 dentry.
-     * 参考 ceph: ceph_d_delete 返回 0 保留 dentry (供 cap 复用).
-     *
-     * inode 生命周期完全由 VFS dentry 引用管理:
-     *   d_count 归零 -> __dentry_kill -> dentry_unlink_inode -> iput
-     * 文件系统不应在 unlink/rmdir 中 ihold, 否则 i_count 泄漏.
-     */
-    (void)dentry;
-    return 0;
-}
-
-/*
  * d_prune - dentry 被 shrinker 回收前的通知
  *
  * 参考 ceph_d_prune (fs/ceph/dir.c)
@@ -236,9 +236,13 @@ void powerfs_d_prune(struct dentry *dentry)
     struct powerfs_inode_info *ppi;
     struct inode *dir;
 
-    if (!parent)
+    /* 根 dentry 不 prune (参考 ceph_d_prune) */
+    if (IS_ROOT(dentry))
         return;
 
+    /* d_prune 在 dentry->d_lock 被持有时调用 (见 __dentry_kill).
+     * 只能用 d_parent (d_lock 保护) 和无锁操作, 不能获取任何 spinlock
+     * (如 i_lock), 否则会与持 i_lock 后尝试 d_lock 的路径死锁. */
     dir = d_inode(parent);
     if (!dir || !S_ISDIR(dir->i_mode))
         return;
@@ -248,10 +252,10 @@ void powerfs_d_prune(struct dentry *dentry)
     pr_debug("powerfs: d_prune '%pd' (parent=%pd, clearing dir_complete)\n",
              dentry, parent);
 
-    /* 清除父目录的 complete 标志 */
-    spin_lock(&ppi->i_lock);
-    ppi->dir_complete = false;
-    spin_unlock(&ppi->i_lock);
+    /* 清除父目录的 complete 标志.
+     * 参照 ceph __ceph_dir_clear_complete (atomic64_inc, 无锁).
+     * dir_complete 是 bool, WRITE_ONCE 保证原子写入, 读取侧用 READ_ONCE. */
+    WRITE_ONCE(ppi->dir_complete, false);
 }
 
 /* Dentry operations 表

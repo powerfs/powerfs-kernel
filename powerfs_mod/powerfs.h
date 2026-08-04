@@ -63,6 +63,7 @@ struct powerfs_dentry_info {
     unsigned long time;               /* 最近更新时间 */
     u64 offset;                       /* readdir 偏移 */
     unsigned long flags;              /* 标志位 */
+    struct rcu_head rcu;              /* RCU 延迟释放 (d_fsdata 不能裸 kmem_cache_free) */
 };
 
 /* powerfs_dentry_info 标志位 */
@@ -252,7 +253,6 @@ int  powerfs_statfs(struct dentry *dentry, struct kstatfs *buf);
 
 /* dentry_operations */
 int  powerfs_d_revalidate(struct dentry *dentry, unsigned int flags);
-int  powerfs_d_delete(const struct dentry *dentry);
 int  powerfs_d_init(struct dentry *dentry);
 void powerfs_d_release(struct dentry *dentry);
 void powerfs_d_prune(struct dentry *dentry);
