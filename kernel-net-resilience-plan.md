@@ -2495,3 +2495,67 @@ PowerFS: `pfs_process_receive` 内部检查 `skb_queue_empty(&sk->sk_receive_que
 - 请求生命周期: ✓ (seq + req_tree + completion, 参照 v1)
 - 断连感知: ✓ (state_change + error_report + keepalive, 参照 BeeGFS)
 - 引用计数: ✓ (conn_get/put, 调度器持引用, 参照 Lustre)
+
+---
+
+## 13. 死代码清理计划 (待 UAF 修复后统一处理)
+
+**触发条件**: dentry UAF 问题修复完成, 测试通过后, 在最终代码清理阶段统一执行.
+
+**原则**: 每一项删除前需再次 grep 确认无新引用, 删除后编译通过 + 跑一遍 drop_caches 测试.
+
+### 13.1 Lease 链表机制 (整个机制未启用)
+
+**根因**: `struct powerfs_client` 从未被分配 (`sbi->client` 永远为 NULL), 整个 lease 链表机制是死代码.
+
+| 位置 | 内容 | 状态 |
+|------|------|------|
+| `powerfs.h:167` `struct powerfs_client` | 整个结构体定义 | 未使用 (从未 kzalloc) |
+| `powerfs.h:190` `sbi->client` 字段 | `struct powerfs_client *client` | 未使用 (从未赋值) |
+| `powerfs.h:74` `di->lease_list` | `struct list_head lease_list` | 未使用 (从未 list_add) |
+| `powerfs.h:77` `di->time` | `unsigned long time` (lease 续约用) | 未使用 |
+| `powerfs.h:79` `di->lease_expire` | `unsigned long lease_expire` | 仅在 `d_init` 赋值, `d_revalidate` 读取 (待确认是否保留) |
+| `powerfs_fs.c:100` `INIT_LIST_HEAD(&di->lease_list)` | d_init 中初始化 | 死代码 |
+| `powerfs_fs.c:123-130` `d_release` lease 移除块 | `if (!list_empty(...))` 整个块 | 死代码 (条件永远 false) |
+| `powerfs_fs.c:78` `powerfs_lease_renew_work_func` 前向声明 | lease 续约 work | 死代码 |
+| `powerfs_fs.c:?` `powerfs_lease_renew_work` 实现 | 续约逻辑 | 死代码 (从未 schedule) |
+
+**清理动作**:
+1. 删除 `struct powerfs_client` 整个结构体
+2. 删除 `sbi->client` 字段
+3. 删除 `di->lease_list` 字段和 `INIT_LIST_HEAD`
+4. 删除 `d_release` 中的 lease 移除块
+5. 删除 `powerfs_lease_renew_work_func` 及其前向声明
+6. **保留** `di->lease_expire` 和 `di->time` (d_revalidate TTL 检查仍用, 待确认)
+
+### 13.2 `dfi->last_name` (从未分配)
+
+**根因**: `last_name` 字段只在 open 时赋值为 NULL, 从未 kmalloc/kstrdup.
+
+| 位置 | 内容 | 状态 |
+|------|------|------|
+| `powerfs.h:85` `dfi->last_name` 字段 | `char *last_name` | 未使用 |
+| `powerfs_fs.c:1567` `dfi->last_name = NULL` | open 时初始化 | 死代码 |
+| `powerfs_fs.c:1596` `kfree(dfi->last_name)` | release 时释放 | `kfree(NULL)` no-op |
+
+**清理动作**: 删除字段声明、初始化、释放.
+
+### 13.3 已删除的 `d_delete` 回调 (已完成)
+
+**说明**: `powerfs_d_delete` 无条件返回 0, 等价于 VFS 默认行为, 已于本次清理删除. 记录在此供回溯.
+
+### 13.4 执行顺序
+
+1. 先完成 dentry UAF 修复 + drop_caches 测试通过
+2. 按 13.1 → 13.2 顺序删除
+3. 每删一项编译一次, 确认无新引用
+4. 全部删除后, 跑一遍 `test_stage2_disconnect.sh` + drop_caches 回归
+5. 英文 commit: "kernel: remove dead lease-list and last_name code"
+
+### 13.5 风险评估
+
+| 风险 | 评估 | 缓解 |
+|------|------|------|
+| 误删仍在用的字段 | 低 (已 grep 确认) | 删除前再次 grep, 编译验证 |
+| `lease_expire` 误删 | 中 (d_revalidate 在用) | 单独保留, 不随 lease_list 一起删 |
+| 行为变化 | 无 (都是 no-op 代码) | drop_caches 回归测试确认 |
