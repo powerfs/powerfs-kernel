@@ -2792,3 +2792,338 @@ VFS 回调 (持锁)
 - Stage A 的超时阈值: lookup 2s / readdir 5s 是否合适? 需 fio + 网络抖动测试确定.
 - Stage D 的 callback 重入 VFS 锁: 是否会出现 `inode_lock` 在 callback 中重入导致死锁? 需参考 Ceph 的 `ceph_mdsc_ensure_flushed` 模式.
 - 是否引入 netfs_helper (Stage C): netfs_helper 是 6.2+ 内核的新框架, 接入收益大 (自动处理 readahead / writeback), 但 PowerFS 当前是 inline data store 模型, 不完全匹配 netfs 的 page-based 模型.
+
+---
+
+## 十五、Stage A 结合 Lease 机制的细化方案
+
+### 15.1 现状盘点
+
+| 项 | 现状 | 问题 |
+|---|---|---|
+| Dentry lease | `powerfs_dentry_info.lease_expire` (TTL=5s) 已存在, `d_init` 设置, `d_revalidate` 检查过期 | 仅 TTL, 无 Filer callback, 过期就要重新 lookup |
+| Inode 缓存 | `cache_valid` + `cache_expire` (TTL=10s) | 仅 TTL, 无 callback, getattr 后 10s 内不验证 |
+| 目录缓存 | `dir_complete` bool + `dir_entries` 链表 | 仅 TTL 隐式 (readdir 后一直 complete 直到 d_prune), 显式无效化仅在本地 mutation |
+| Per-stripe 文件 lease | `lease_tree` rbtree + `lease_renew_work_func` **全是 stub** | 从未实际使用, 文件数据读写走 inline `powerfs_net_write/read` 无 lease 保护 |
+| Filer 侧 lease 支持 | `powerfs-volume/src/range_lease.rs` 完整实现 (RangeLeaseManager + RocksDB 持久化 + fence token) | 协议 `POWERFS_NET_MSG_RANGE_LEASE = 0x0067` + 字段 `LEASE_ID/DURATION/EPOCH` 已定义, 但内核侧无客户端实现 |
+| Filer INVALIDATE 推送 | 协议 `POWERFS_NET_MSG_INVALIDATE = 0x0032` + `FLAG_NOTIFY` 已定义 | 内核侧无 notify 接收处理 (需要 filer 主动推送) |
+
+### 15.2 设计目标
+
+把 Stage A (lookup/readdir 短超时) 与 lease 机制合并, 分三阶段实施:
+
+1. **Phase 1 (内核侧 client-side lease, 不依赖 Filer callback)**: 显式 TTL + 本地 mutation 主动失效. 短超时 + `-EAGAIN` 重试. **立即可做, 不需要 Filer 改动**.
+2. **Phase 2 (内核侧 file data lease, 接入 Filer range lease)**: 客户端 acquire/renew/release per-stripe lease. lease_renew_work 真正续约. read/write 路径用 lease token. **需要 Filer 协议对接, 但 Filer 侧已实现**.
+3. **Phase 3 (Filer push invalidation)**: Filer 主动推送 INVALIDATE 帧到内核, 内核接收后清 dentry/inode/dir cache. **需要 Filer 侧增加 push 路径**.
+
+本章只细化 Phase 1 (合并到 Stage A 一起实施). Phase 2/3 单列后续章节.
+
+### 15.3 Phase 1 详细设计 (Stage A + client-side lease)
+
+#### 15.3.1 数据结构变更
+
+`powerfs_inode_info` 新增字段 (在现有 `dir_complete` 旁边):
+
+```c
+struct powerfs_inode_info {
+    /* ... 现有字段 ... */
+
+    /* === 目录 lease (Phase 1: client-side TTL) ===
+     * dir_complete: readdir 已拉取完整目录列表
+     * dir_lease_expire: 目录 lease 过期时间 (jiffies)
+     *   - readdir 成功后设为 now + POWERFS_DIR_LEASE_TTL (30s)
+     *   - 本目录发生 mkdir/rmdir/create/unlink/rename 时清零 (本地已知变化)
+     *   - 过期后 readdir 必须重新拉取
+     * dir_lease_epoch: 单调递增, 本地 mutation 时自增, 用于将来 Phase 3
+     *   callback 比对 (callback 携带 epoch, 不匹配说明有过本地修改) */
+    unsigned long dir_lease_expire;
+    u64 dir_lease_epoch;
+};
+```
+
+`powerfs.h` 新增常量:
+
+```c
+/* 目录 lease TTL (jiffies) */
+#define POWERFS_DIR_LEASE_TTL       (30 * HZ)
+
+/* Dentry lease TTL (已存在, 5s) */
+/* #define POWERFS_DENTRY_LEASE_TTL   (5 * HZ) */
+
+/* Lookup / Readdir 短超时 (ms) */
+#define POWERFS_LOOKUP_TIMEOUT_MS   2000   /* lookup: 2s */
+#define POWERFS_READDIR_TIMEOUT_MS  5000   /* readdir: 5s */
+```
+
+#### 15.3.2 lookup 改造 (短超时 + dentry lease + -EAGAIN)
+
+```c
+struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
+                              unsigned int flags)
+{
+    /* dentry lease fast-path 由 d_revalidate 处理, 走到 lookup 说明:
+     *   a. 全新 dentry (d_revalidate 没机会跑)
+     *   b. d_revalidate 返回 0 (lease 过期) 且 d_drop 后 VFS 重 lookup
+     *   c. dentry 处于 DCACHE_PAR_LOOKUP (刚创建, 等实例化)
+     * 这里直接发网络, 不再查 dcache. */
+
+    if (powerfs_net_is_connected()) {
+        /* 短超时 2s, 替代通用 10s */
+        err = powerfs_net_lookup_timeout(dir->i_ino, name, len,
+                                         &ino, &mode, ..., POWERFS_LOOKUP_TIMEOUT_MS);
+        if (err == -ETIMEDOUT || err == -ENOTCONN) {
+            /* 网络不可达: 返回 -EAGAIN 让 VFS 上层重试.
+             * VFS 的 path_openat / path_lookup 会重试 lookup,
+             * 重试时 d_revalidate 可能已重新生效 (lease 续期).
+             *
+             * 注意: lookup 返回 ERR_PTR(-EAGAIN) 时 VFS 不识别,
+             *       会直接返回 -EAGAIN 给 userspace. userspace
+             *       应用一般会重试 open/stat. 这是过渡方案,
+             *       Phase 3 接入 callback 后可改为返回负 dentry. */
+            return ERR_PTR(-EAGAIN);
+        }
+        if (err == 0 && ino != 0) {
+            inode = powerfs_iget(...);
+            /* ... 填充 inode 属性 ... */
+            powerfs_init_inode(inode, mode, ...);
+            /* 设置 dentry lease: 5s 内 d_revalidate 直接返回 1 */
+            powerfs_set_dentry_lease(dentry, POWERFS_DENTRY_LEASE_TTL);
+            /* 设置 inode cache TTL */
+            spin_lock(&pi->i_lock);
+            pi->cache_valid = true;
+            pi->cache_expire = jiffies + POWERFS_INODE_CACHE_TTL;
+            spin_unlock(&pi->i_lock);
+            return d_splice_alias(inode, dentry);
+        }
+        /* ENOENT: 创建负 dentry, 设短 lease 防止反复 lookup */
+        powerfs_set_dentry_lease(dentry, POWERFS_DENTRY_LEASE_TTL);
+        d_add(dentry, NULL);
+        return NULL;
+    }
+    /* 完全离线: 返回负 dentry (与现有行为一致) */
+    d_add(dentry, NULL);
+    return NULL;
+}
+```
+
+#### 15.3.3 d_revalidate 改造 (lease fast-path)
+
+```c
+int powerfs_d_revalidate(struct dentry *dentry, unsigned int flags)
+{
+    struct powerfs_dentry_info *di;
+    struct powerfs_inode_info *pi;
+    struct inode *inode;
+
+    /* RCU 模式退出 (已有, 避免错释放 d_fsdata) */
+    if (flags & LOOKUP_RCU)
+        return -ECHILD;
+
+    di = dentry->d_fsdata;
+    if (!di)
+        return 1;
+
+    /* === Lease fast-path: dentry lease 未过期, 直接返回 valid ===
+     * 不发网络, 不查 inode cache, 最快路径.
+     * 这是 Phase 1 的核心收益: 5s 内的重复 lookup 走纯内存. */
+    if (time_before(jiffies, di->lease_expire)) {
+        /* 但仍要检查 inode 级 cache_valid (防止 inode 被本地 mutation 失效) */
+        inode = d_inode(dentry);
+        if (inode) {
+            pi = POWERFS_I(inode);
+            smp_rmb();  /* 配对 WRITE_ONCE in mutations */
+            if (READ_ONCE(pi->cache_valid))
+                return 1;
+            /* inode cache 失效: 让 VFS 重新 lookup (返回 0) */
+            return 0;
+        }
+        return 1;  /* 负 dentry, lease 未过期 */
+    }
+
+    /* Lease 过期: 让 VFS 调 lookup 重新验证 (返回 0).
+     * lookup 内会重新设 lease. */
+    return 0;
+}
+```
+
+#### 15.3.4 readdir 改造 (目录 lease + 短超时 + -EAGAIN)
+
+```c
+int powerfs_readdir(struct file *file, struct dir_context *ctx)
+{
+    struct powerfs_inode_info *dpi = POWERFS_I(dir);
+
+    /* === Phase 1 目录 lease fast-path ===
+     * dir_complete && dir_lease_expire 未过期: 直接用本地缓存, 不发网络.
+     * 这是 Phase 1 最大收益: 30s 内重复 readdir 走纯内存. */
+    if (READ_ONCE(dpi->dir_complete) &&
+        time_before(jiffies, READ_ONCE(dpi->dir_lease_expire))) {
+        return powerfs_readdir_emit_cached(file, ctx);
+    }
+
+    /* Lease 过期或 dir_complete=false: 拉取.
+     * 用 5s 短超时, 替代之前隐式 5s (实际可能多页累积超过 5s). */
+    if (!powerfs_net_is_connected()) {
+        /* 离线: 若有缓存用缓存 (best-effort), 否则 -ENOTCONN */
+        if (READ_ONCE(dpi->dir_complete))
+            return powerfs_readdir_emit_cached(file, ctx);
+        return -ENOTCONN;
+    }
+
+    do {
+        ret = powerfs_net_readdir_timeout(dir->i_ino, last_name, 256,
+                                          entries, 256, &count, &has_more,
+                                          POWERFS_READDIR_TIMEOUT_MS);
+        if (ret == -ETIMEDOUT || ret == -ENOTCONN) {
+            /* 部分页已拉取: 用已拉取的, 不返回错误.
+             * 一页都没拉到: 返回 -EAGAIN 让 VFS 重试. */
+            if (total_pulled == 0)
+                return -EAGAIN;
+            break;  /* 用部分结果 */
+        }
+        if (ret < 0)
+            return ret;
+        /* 累加到 dpi->dir_entries (已有逻辑) */
+        ...
+        total_pulled += count;
+    } while (has_more && count > 0);
+
+    /* 拉取成功: 设置 dir_complete + dir_lease_expire */
+    mutex_lock(&dpi->dir_mutex);
+    WRITE_ONCE(dpi->dir_complete, true);
+    WRITE_ONCE(dpi->dir_lease_expire, jiffies + POWERFS_DIR_LEASE_TTL);
+    mutex_unlock(&dpi->dir_mutex);
+
+    /* emit 本地缓存 (已有逻辑) */
+    return powerfs_readdir_emit_cached(file, ctx);
+}
+```
+
+#### 15.3.5 本地 mutation 主动失效
+
+在 `powerfs_mkdir / rmdir / create / unlink / symlink / link / rename` 内, 网络请求成功后, 修改本地数据结构的同时清目录 lease:
+
+```c
+/* 例: powerfs_mknod 末尾 (现有 d_add 之后) */
+static int powerfs_mknod(...)
+{
+    /* ... 现有逻辑: powerfs_net_create + inode 创建 + d_add ... */
+
+    /* Phase 1: 本地 mutation, 清父目录 lease (dir_complete 保留, 但 lease 过期)
+     * 下次 readdir 看到 lease 过期会重新拉取, 看到自己刚加的项.
+     * 同时自增 epoch (Phase 3 callback 比对用). */
+    {
+        struct powerfs_inode_info *dpi = POWERFS_I(dir);
+        mutex_lock(&dpi->dir_mutex);
+        WRITE_ONCE(dpi->dir_lease_expire, 0);
+        dpi->dir_lease_epoch++;
+        mutex_unlock(&dpi->dir_mutex);
+    }
+    return 0;
+}
+```
+
+`rename` 同时清 old_dir 和 new_dir 的 lease (跨目录情况).
+
+#### 15.3.6 新增 net 层 API: `powerfs_net_*_timeout`
+
+现有 `powerfs_net_lookup` / `powerfs_net_readdir` 内部硬编码 `timeout_ms=10000`/`5000`. 改为接受 `timeout_ms` 参数:
+
+```c
+/* powerfs_net.h */
+int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
+                               __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
+                               __u64 *size, __u32 *nlink,
+                               __u64 *mtime, __u64 *atime, __u64 *ctime,
+                               int timeout_ms);
+
+int powerfs_net_readdir_timeout(__u64 dir_ino, const char *last_name, __u64 limit,
+                                struct powerfs_net_dir_entry *entries,
+                                __u32 max_entries, __u32 *actual_count,
+                                bool *has_more, int timeout_ms);
+
+/* 旧 powerfs_net_lookup / powerfs_net_readdir 保留为 wrapper, 内部调 _timeout
+ * 传默认 10s, 保持调用方兼容. */
+static inline int powerfs_net_lookup(...) {
+    return powerfs_net_lookup_timeout(..., POWERFS_NET_RECV_TIMEOUT);
+}
+```
+
+#### 15.3.7 -EAGAIN 在 VFS 路径的传播
+
+| VFS 回调 | 返回 -EAGAIN 后 VFS 行为 |
+|---|---|
+| `lookup` (返回 `ERR_PTR(-EAGAIN)`) | VFS 把 -EAGAIN 透传到 `path_lookup` / `path_openat` → userspace 看到 `-EAGAIN` → 应用层需重试 |
+| `readdir` (返回 `-EAGAIN`) | VFS 透传 → userspace `getdents` 看到 `-EAGAIN` → 应用层重试 |
+| `d_revalidate` (返回 0) | VFS 走 `lookup_slow` 重新 lookup, **不返回错误给 userspace** |
+
+**注意**: `lookup` 返回 `-EAGAIN` 会让 userspace 看到错误, 这是过渡方案的副作用. 应用层一般会重试 (NFS 也有类似行为). Phase 3 接入 callback 后可改为返回负 dentry (假装文件不存在, 等 callback 到达再 invalidate).
+
+为减少 -EAGAIN 暴露给 userspace 的频率, lookup/readdir 的短超时只在**断连/重连期间**生效 (即 `powerfs_net_is_connected()` 返回 false 或最近 5s 内有断连事件). 正常连接时仍用 10s 超时, 让 RPC 有足够时间完成.
+
+```c
+static int powerfs_lookup_timeout_for_current_state(void)
+{
+    /* 正常连接: 10s (RPC 充足时间)
+     * 断连/重连中: 2s (快速失败, 让 VFS 重试) */
+    if (powerfs_net_is_connected() && !powerfs_net_recently_disconnected(5000))
+        return POWERFS_NET_RECV_TIMEOUT;  /* 10s */
+    return POWERFS_LOOKUP_TIMEOUT_MS;     /* 2s */
+}
+```
+
+### 15.4 Phase 1 实施步骤
+
+| 步骤 | 内容 | 验证 |
+|---|---|---|
+| 1 | `powerfs.h` 加常量 `POWERFS_DIR_LEASE_TTL` / `POWERFS_LOOKUP_TIMEOUT_MS` / `POWERFS_READDIR_TIMEOUT_MS` | 编译通过 |
+| 2 | `powerfs.h` 给 `powerfs_inode_info` 加 `dir_lease_expire` + `dir_lease_epoch` 字段 | 编译通过 |
+| 3 | `powerfs_net.h` / `powerfs_net.c` 加 `powerfs_net_lookup_timeout` / `powerfs_net_readdir_timeout`, 旧 API 改 wrapper | 编译通过, 现有调用行为不变 |
+| 4 | `powerfs_fs.c` 改 `powerfs_readdir`: 加 lease fast-path + 短超时 + -EAGAIN | test_readdir + ls 大目录 |
+| 5 | `powerfs_fs.c` 改 `powerfs_lookup`: 短超时 + -EAGAIN + 设置 dentry lease | test_lookup + stat 循环 |
+| 6 | `powerfs_fs.c` 改 `powerfs_d_revalidate`: lease fast-path (现有逻辑基础上简化) | 验证 5s 内重复 stat 无网络 |
+| 7 | `powerfs_fs.c` 在 `mknod / mkdir / rmdir / create / unlink / symlink / link / rename` 末尾清父目录 lease + epoch++ | mkdir 后立即 readdir 能看到新项 |
+| 8 | `powerfs_fs.c` 在 `powerfs_init_inode` / `powerfs_evict_inode` 初始化 / 清理 `dir_lease_expire` + `dir_lease_epoch` | umount/mount 后状态正确 |
+| 9 | 编译 + checkpatch | 无新增 warning |
+| 10 | QEMU 内挂载 + fio 小文件 + 断连测试 | test_stage2_disconnect.sh + fio metadata workload |
+
+### 15.5 Phase 1 不做的事 (留给 Phase 2/3)
+
+- ❌ 不实现 Filer push callback (Phase 3): Phase 1 仅靠本地 TTL, 跨客户端修改最长 30s 后可见
+- ❌ 不实现 per-stripe file data lease (Phase 2): 文件数据读写仍走 inline `powerfs_net_write/read`
+- ❌ 不引入 netfs_helper (Stage C): aops 仍是 inline 模型
+- ❌ 不异步化元数据操作 (Stage D): lookup/readdir/metadata 仍同步等 RPC, 只是超时缩短 + lease 命中时不发 RPC
+
+### 15.6 Phase 2 / Phase 3 预告
+
+**Phase 2 (file data lease)**:
+- 新增 `powerfs_net_acquire_lease(ino, stripe_start, stripe_count, exclusive, &token, &expire)`
+- 实现 `powerfs_lease_renew_work_func`: 周期扫描 `lease_tree`, 对快过期的 lease 调 `powerfs_net_renew_lease`
+- `powerfs_read_folio` / `powerfs_write_begin` 先检查 `lease_tree` 是否有有效 lease, miss 则 acquire
+- `powerfs_evict_inode` 释放所有 lease (调 `powerfs_net_release_lease`)
+- Filer 侧已支持 (`powerfs-volume/src/range_lease.rs`), 内核侧对接即可
+
+**Phase 3 (Filer push invalidation)**:
+- 内核连接 Filer 时注册 notify handler (类似 FUSE 的 `set_notification_handler`)
+- Filer 在 metadata 变更时 (mkdir/unlink/rename 等) 推送 `INVALIDATE` 帧给所有持有该目录 lease 的客户端
+- 内核收到后: 清 `dir_complete` + `dir_lease_expire` + d_drop 相关 dentry
+- 需要 Filer 侧增加 lease holder 列表 + push 路径
+
+### 15.7 风险评估
+
+| 风险 | 评估 | 缓解 |
+|---|---|---|
+| lookup 返回 -EAGAIN 应用层不重试 | 中 (POSIX 应用一般重试, 但有边界) | Phase 1 只在断连/重连期间用 2s, 正常期间 10s. Phase 3 后改返回负 dentry |
+| readdir 部分页拉取后超时, 目录列表不完整 | 中 | 已在方案中处理: 部分页已拉取则用部分结果, 一页都没拉到才 -EAGAIN |
+| 本地 mutation 清 lease 后, 并发 readdir 看到中间状态 | 低 | `dir_mutex` 保护 `dir_entries` 链表, mutation 在 `i_rwsem` 写锁内, readdir 在读锁, 互斥 |
+| `dir_lease_epoch` 字段未使用 (Phase 3 才用) | 低 | 占 8 字节, 不影响功能, 留给 Phase 3 |
+| 短超时误判 filer 慢响应 | 低 | 正常连接用 10s, 仅断连/重连期间用 2s/5s |
+
+### 15.8 待确认事项
+
+1. **短超时阈值**: lookup 2s / readdir 5s 是否合适? 建议先按此实施, fio + 断连测试后微调.
+2. **`powerfs_net_recently_disconnected(5000)` 实现**: 需要在 `powerfs_conn_disconnect_one` 内记录最近断连时间戳, 提供查询 API. 简单做法: `g_pool.last_disconnect_jiffies` atomic_long_t.
+3. **`-EAGAIN` 是否暴露给 userspace**: 当前方案会暴露. 是否接受? 若不接受, 备选方案是断连期间 lookup 返回负 dentry (假 ENOENT), 但语义更差.
+4. **d_revalidate fast-path 是否要检查 inode cache_valid**: 方案中加了检查, 但若 inode cache_valid 已被本地 mutation 清零, dentry lease 未过期也会被强制重 lookup. 这是正确的 (mutation 后属性可能变), 但会损失部分 fast-path 收益. 可选: 不检查 inode cache_valid, 只看 dentry lease, 让 getattr 路径自己处理 inode 失效.
+
+请确认以上 4 点后开始 Phase 1 实施.
