@@ -543,6 +543,34 @@ bool powerfs_net_is_connected(void)
     return g_pool.filer_count > 0 && !atomic_read(&g_pool.stopping);
 }
 
+/* Phase 1: 最近断连窗口检查.
+ * 返回 true 表示最近 window_ms 内发生过断连 (lookup/readdir 应使用短超时).
+ * 实现: 读取 g_pool.last_disconnect_jiffies, 与 jiffies 比对.
+ * 0 表示从未断连, 返回 false. */
+bool powerfs_net_recently_disconnected(unsigned int window_ms)
+{
+    unsigned long last = atomic_long_read(&g_pool.last_disconnect_jiffies);
+    unsigned long threshold;
+
+    if (last == 0)
+        return false;
+    threshold = last + msecs_to_jiffies(window_ms);
+    return time_before(jiffies, threshold);
+}
+
+/* Phase 1: 根据 当前连接状态 + 最近断连情况 选择超时.
+ * - 完全离线: 返回 short_timeout_ms (调用方决定是否发请求)
+ * - 已连接 + 非最近断连: 返回 POWERFS_NET_RECV_TIMEOUT (10s, RPC 充足时间)
+ * - 已连接 + 最近断连窗口内: 返回 short_timeout_ms (快速失败, 让 VFS 重试)
+ * - 未连接 + 最近断连: 返回 short_timeout_ms */
+int powerfs_net_pick_timeout(int short_timeout_ms)
+{
+    if (!powerfs_net_is_connected() ||
+        powerfs_net_recently_disconnected(POWERFS_RECENT_DISCONNECT_MS))
+        return short_timeout_ms;
+    return POWERFS_NET_RECV_TIMEOUT;
+}
+
 /* ========== 连接池实现 (新架构) ========== */
 
 /* === 1. 辅助函数 === */
@@ -1513,6 +1541,10 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
 
     pr_info("powerfs: filer %s:%u state CONNECTED -> RECONNECTING (disconnect)\n",
             conn->addr, conn->port);
+
+    /* Phase 1: 记录断连时间戳, 供 powerfs_net_recently_disconnected 判断.
+     * 让此后窗口内的 lookup/readdir 走短超时, 避免长时间持 VFS 锁等重连. */
+    atomic_long_set(&g_pool.last_disconnect_jiffies, jiffies);
 
     /* 路由降级: 所有 leader=该filer 的 shard → CHECKING
      * (find_available_filer 会跳过 RECONNECTING 的 filer, 请求路由到其他 filer).
@@ -2558,10 +2590,11 @@ static int net_status_to_errno(__u16 status)
  *
  * Filer 响应 TLV 字段: Ino, Mode, Uid, Gid, Size, Nlink, Mtime, Atime, Ctime, Name
  */
-int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
-                       __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
-                       __u64 *size, __u32 *nlink,
-                       __u64 *mtime, __u64 *atime, __u64 *ctime)
+int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
+                               __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
+                               __u64 *size, __u32 *nlink,
+                               __u64 *mtime, __u64 *atime, __u64 *ctime,
+                               int timeout_ms)
 {
     __u8 body[256];
     struct powerfs_tlv_enc enc;
@@ -2579,7 +2612,7 @@ int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
                                     resp_body, sizeof(resp_body),
-                                    NULL, 0, 10000,
+                                    NULL, 0, timeout_ms,
                                     &resp_body_len, NULL);
     if (ret < 0)
         return ret;
@@ -2601,6 +2634,19 @@ int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
     }
 
     return 0;
+}
+
+/* 兼容 wrapper: 用默认 10s 超时 (POWERFS_NET_RECV_TIMEOUT). */
+int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
+                       __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
+                       __u64 *size, __u32 *nlink,
+                       __u64 *mtime, __u64 *atime, __u64 *ctime)
+{
+    return powerfs_net_lookup_timeout(dir_ino, name, name_len,
+                                      ino, mode, uid, gid,
+                                      size, nlink,
+                                      mtime, atime, ctime,
+                                      POWERFS_NET_RECV_TIMEOUT);
 }
 
 /**
@@ -2776,9 +2822,10 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
  *
  * 每个 Entry 嵌套字段: Ino, Name, Mode, Uid, Gid, Size, Atime, Mtime, Ctime, Nlink
  */
-int powerfs_net_readdir(__u64 dir_ino, const char *last_name, __u64 limit,
-                        struct powerfs_net_dir_entry *entries, __u32 max_entries,
-                        __u32 *actual_count, bool *has_more)
+int powerfs_net_readdir_timeout(__u64 dir_ino, const char *last_name, __u64 limit,
+                                struct powerfs_net_dir_entry *entries,
+                                __u32 max_entries, __u32 *actual_count,
+                                bool *has_more, int timeout_ms)
 {
     __u8 body[512];
     struct powerfs_tlv_enc enc;
@@ -2811,7 +2858,7 @@ int powerfs_net_readdir(__u64 dir_ino, const char *last_name, __u64 limit,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
                                     resp_body, 16384,
-                                    NULL, 0, 5000,
+                                    NULL, 0, timeout_ms,
                                     &resp_body_len, NULL);
     if (ret < 0) {
         kfree(resp_body);
@@ -2883,6 +2930,17 @@ int powerfs_net_readdir(__u64 dir_ino, const char *last_name, __u64 limit,
 
     kfree(resp_body);
     return 0;
+}
+
+/* 兼容 wrapper: 用默认 5s 超时 (POWERFS_READDIR_TIMEOUT_MS). */
+int powerfs_net_readdir(__u64 dir_ino, const char *last_name, __u64 limit,
+                        struct powerfs_net_dir_entry *entries, __u32 max_entries,
+                        __u32 *actual_count, bool *has_more)
+{
+    return powerfs_net_readdir_timeout(dir_ino, last_name, limit,
+                                       entries, max_entries,
+                                       actual_count, has_more,
+                                       POWERFS_READDIR_TIMEOUT_MS);
 }
 
 /**
@@ -3199,14 +3257,18 @@ void powerfs_net_exit(void)
 /* ========== 导出符号 ========== */
 
 EXPORT_SYMBOL_GPL(powerfs_net_is_connected);
+EXPORT_SYMBOL_GPL(powerfs_net_recently_disconnected);
+EXPORT_SYMBOL_GPL(powerfs_net_pick_timeout);
 EXPORT_SYMBOL_GPL(powerfs_net_send_request);
 EXPORT_SYMBOL_GPL(powerfs_net_lookup);
+EXPORT_SYMBOL_GPL(powerfs_net_lookup_timeout);
 EXPORT_SYMBOL_GPL(powerfs_net_getattr);
 EXPORT_SYMBOL_GPL(powerfs_net_setattr);
 EXPORT_SYMBOL_GPL(powerfs_net_create);
 EXPORT_SYMBOL_GPL(powerfs_net_unlink);
 EXPORT_SYMBOL_GPL(powerfs_net_rename);
 EXPORT_SYMBOL_GPL(powerfs_net_readdir);
+EXPORT_SYMBOL_GPL(powerfs_net_readdir_timeout);
 EXPORT_SYMBOL_GPL(powerfs_net_read);
 EXPORT_SYMBOL_GPL(powerfs_net_write);
 EXPORT_SYMBOL_GPL(powerfs_net_statfs);

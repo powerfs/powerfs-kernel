@@ -52,6 +52,16 @@
 #define POWERFS_NET_SEND_TIMEOUT     10000  /* post-connect send timeout: 10s */
 #define POWERFS_NET_RECV_TIMEOUT     10000
 
+/* Phase 1: Lookup / Readdir 短超时 (ms).
+ * 仅在最近发生过断连的窗口内使用 (见 powerfs_net_recently_disconnected),
+ * 用于快速失败让 VFS / 应用层重试, 避免 hung task.
+ * 正常连接时仍用 POWERFS_NET_RECV_TIMEOUT (10s). */
+#define POWERFS_LOOKUP_TIMEOUT_MS       2000    /* lookup: 2s */
+#define POWERFS_READDIR_TIMEOUT_MS      5000    /* readdir: 5s */
+
+/* 断连窗口: 断连后 5s 内视为 "最近断连", lookup/readdir 用短超时 */
+#define POWERFS_RECENT_DISCONNECT_MS    5000
+
 /* 最大重连次数 (per-conn 状态机使用) */
 #define POWERFS_NET_MAX_RECONNECT    3
 
@@ -644,6 +654,12 @@ struct powerfs_net_pool {
 
     atomic_t stopping;
 
+    /* === Phase 1: 最近断连时间戳 (atomic_long_t, jiffies) ===
+     * powerfs_conn_disconnect_one 内 WRITE_ONCE 更新.
+     * powerfs_net_recently_disconnected 读取, 判断是否在断连窗口内
+     * (窗口内 lookup/readdir 用短超时, 见 powerfs.h). */
+    atomic_long_t last_disconnect_jiffies;
+
     /* === v2: 独立重连/断连 workqueue ===
      * 重连 work 中 kernel_connect 可能阻塞 3s, 多 filer 同时重连时
      * 若共享 system_wq 会串行执行, 累积超过 workqueue lockup 阈值.
@@ -717,6 +733,15 @@ int powerfs_net_set_volume(const char *addr, __u16 port);
 /* 连接状态检查 (新架构: 检查 g_pool 是否有可用 filer 连接) */
 bool powerfs_net_is_connected(void);
 
+/* 检查最近是否发生过断连 (窗口内 lookup/readdir 用短超时, 见 powerfs.h).
+ * window_ms: 窗口大小 (ms), 返回 true 表示窗口内有过断连. */
+bool powerfs_net_recently_disconnected(unsigned int window_ms);
+
+/* 根据 当前连接状态 + 最近断连情况 选择 lookup/readdir 超时.
+ * 正常连接 + 非最近断连: POWERFS_NET_RECV_TIMEOUT (10s)
+ * 否则 (断连中 / 最近断连窗口内): 用 short_timeout_ms */
+int powerfs_net_pick_timeout(int short_timeout_ms);
+
 /* ========== 请求/响应 API ========== */
 
 /**
@@ -762,11 +787,19 @@ struct powerfs_net_dir_entry {
     __u32 nlink;
 };
 
-/* LOOKUP (返回完整属性含时间戳) */
+/* LOOKUP (返回完整属性含时间戳).
+ * powerfs_net_lookup 用默认 10s 超时 (兼容旧调用方).
+ * powerfs_net_lookup_timeout 由调用方指定超时 (Phase 1: lookup 在断连窗口内
+ * 用 2s 短超时, 见 powerfs_net_pick_timeout). */
 int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
                        __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
                        __u64 *size, __u32 *nlink,
                        __u64 *mtime, __u64 *atime, __u64 *ctime);
+int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
+                               __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
+                               __u64 *size, __u32 *nlink,
+                               __u64 *mtime, __u64 *atime, __u64 *ctime,
+                               int timeout_ms);
 
 /* GETATTR (返回完整属性含时间戳) */
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
@@ -790,10 +823,16 @@ int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,
 int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_len,
                        __u64 new_dir_ino, const char *new_name, size_t new_name_len);
 
-/* READDIR (匹配 Filer 协议: ParentIno + Limit + LastName 分页) */
+/* READDIR (匹配 Filer 协议: ParentIno + Limit + LastName 分页).
+ * powerfs_net_readdir 用默认 5s 超时 (兼容旧调用方).
+ * powerfs_net_readdir_timeout 由调用方指定超时 (Phase 1: 断连窗口内用 5s). */
 int powerfs_net_readdir(__u64 dir_ino, const char *last_name, __u64 limit,
                         struct powerfs_net_dir_entry *entries, __u32 max_entries,
                         __u32 *actual_count, bool *has_more);
+int powerfs_net_readdir_timeout(__u64 dir_ino, const char *last_name, __u64 limit,
+                                struct powerfs_net_dir_entry *entries,
+                                __u32 max_entries, __u32 *actual_count,
+                                bool *has_more, int timeout_ms);
 
 /* READ */
 int powerfs_net_read(__u64 ino, __u64 offset, __u32 length,

@@ -28,6 +28,11 @@
 /* Inode cache 超时 (jiffies, 默认 10 秒) */
 #define POWERFS_INODE_CACHE_TTL     (10 * HZ)
 
+/* 目录 lease 超时 (jiffies, 默认 30 秒).
+ * readdir 成功后 30s 内重复 readdir 走本地缓存, 不发网络.
+ * 本地 mutation (mkdir/rmdir/create/unlink/rename 等) 主动清零. */
+#define POWERFS_DIR_LEASE_TTL       (30 * HZ)
+
 /* Chunk 和 Stripe 大小 */
 #define POWERFS_CHUNK_SIZE      (2 * 1024 * 1024)    /* 2MB */
 #define POWERFS_STRIPE_SIZE     (64 * 1024 * 1024)   /* 64MB */
@@ -152,6 +157,16 @@ struct powerfs_inode_info {
     bool dir_complete;
     struct list_head dir_entries;
     struct mutex dir_mutex;
+
+    /* === 目录 lease (Phase 1: client-side TTL) ===
+     * dir_lease_expire: 目录 lease 过期时间 (jiffies)
+     *   - readdir 成功后设为 now + POWERFS_DIR_LEASE_TTL (30s)
+     *   - 本目录发生 mkdir/rmdir/create/unlink/rename 时清零
+     *   - 过期后 readdir 必须重新拉取
+     * dir_lease_epoch: 单调递增, 本地 mutation 时自增, 留给 Phase 3
+     *   callback 比对 (callback 携带 epoch, 不匹配说明有过本地修改) */
+    unsigned long dir_lease_expire;
+    u64 dir_lease_epoch;
 
     /* shutdown 标志 (参考 ceph_inode_is_shutdown) */
     bool shutdown;

@@ -169,6 +169,10 @@ void powerfs_d_release(struct dentry *dentry)
  *   - 返回 0: dentry 已失效，丢弃缓存重新 lookup
  *   - 返回负值: 错误
  */
+
+/* Phase 1 前置声明: 目录 lease 失效 (定义在 readdir 区段, 但 mknod 等更早使用). */
+static void powerfs_invalidate_dir_lease(struct inode *dir);
+
 int powerfs_d_revalidate(struct dentry *dentry, unsigned int flags)
 {
     struct powerfs_dentry_info *di;
@@ -188,29 +192,33 @@ int powerfs_d_revalidate(struct dentry *dentry, unsigned int flags)
     if (!di)
         return 1;
 
-    /* 如果没有 inode，负 dentry 始终有效 */
-    inode = d_inode(dentry);
-    if (!inode)
-        return 1;
-
-    /* 获取 inode 私有数据 */
-    pi = POWERFS_I(inode);
-
-    /*
-     * 检查 1: TTL 过期检查
-     * 如果超过 TTL，强制失效以获取最新数据
-     */
+    /* === Phase 1: Dentry lease fast-path ===
+     * dentry lease 未过期: 负 dentry 直接返回 1 (5s 内不再 lookup),
+     * 正 dentry 还需检查 inode cache_valid (本地 mutation 可能已失效).
+     * dentry lease 过期: 让 VFS 调 lookup 重新验证 (返回 0). */
     if (time_after(jiffies, di->lease_expire)) {
-        pr_debug("powerfs: d_revalidate '%pd' TTL expired\n", dentry);
-        spin_lock(&pi->i_lock);
-        pi->cache_valid = false;
-        spin_unlock(&pi->i_lock);
+        /* lease 过期: 让 VFS 重新 lookup. 正 dentry 同时清 cache_valid,
+         * 让后续 getattr 拉取最新属性. 负 dentry 直接 return 0. */
+        inode = d_inode(dentry);
+        if (inode) {
+            pi = POWERFS_I(inode);
+            spin_lock(&pi->i_lock);
+            pi->cache_valid = false;
+            spin_unlock(&pi->i_lock);
+        }
+        pr_debug("powerfs: d_revalidate '%pd' lease expired\n", dentry);
         return 0;
     }
 
-    /*
-     * 检查 2: inode 级别的 cache_valid 检查
-     */
+    /* lease 未过期 */
+    inode = d_inode(dentry);
+    if (!inode)
+        return 1;   /* 负 dentry, lease 仍有效 */
+
+    /* 正 dentry: 检查 inode 级 cache_valid.
+     * 本地 mutation (mkdir/unlink 等) 会清 cache_valid, 即使 dentry lease
+     * 未过期也要重新 lookup (mutation 后属性/存在性可能变). */
+    pi = POWERFS_I(inode);
     spin_lock(&pi->i_lock);
     if (!pi->cache_valid) {
         spin_unlock(&pi->i_lock);
@@ -376,6 +384,11 @@ int powerfs_init_inode(struct inode *inode, umode_t mode,
     pi->cache_valid = true;
     pi->cache_expire = jiffies + POWERFS_INODE_CACHE_TTL;
     pi->dir_complete = true;  /* 本地缓存模式: 目录始终完整 */
+    /* Phase 1: 目录 lease 初始化.
+     * 新建目录: 设 lease 未过期 (空目录, 无需拉取).
+     * 新建普通文件: dir_lease_* 字段无意义, 但统一初始化. */
+    pi->dir_lease_expire = jiffies + POWERFS_DIR_LEASE_TTL;
+    pi->dir_lease_epoch = 0;
 
     /* 初始化目录项链表 */
     INIT_LIST_HEAD(&pi->dir_entries);
@@ -563,6 +576,9 @@ void powerfs_evict_inode(struct inode *inode)
     spin_lock(&pi->i_lock);
     pi->cache_valid = false;
     pi->dir_complete = false;
+    /* Phase 1: 清目录 lease, 防止 inode 复用 (slab 重分配) 后误命中旧 lease. */
+    pi->dir_lease_expire = 0;
+    pi->dir_lease_epoch = 0;
     pi->shutdown = true;
     spin_unlock(&pi->i_lock);
 }
@@ -732,15 +748,37 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
         __u64 size = 0;
         __u32 nlink = 0;
         __u64 mtime = 0, atime = 0, ctime = 0;
+        int timeout_ms;
 
         pr_debug("powerfs: lookup '%pd' via powerfs_net\n", dentry);
 
+        /* Phase 1: 短超时策略.
+         * 正常连接: 10s (RPC 充足时间).
+         * 断连/重连中或最近断连窗口内: 2s (快速失败, 让 VFS/应用层重试,
+         *   避免 hung task). 超时返回 -EAGAIN (见下). */
+        timeout_ms = powerfs_net_pick_timeout(POWERFS_LOOKUP_TIMEOUT_MS);
+
         /* 通过 powerfs_net 直接查询 (含时间戳) */
-        err = powerfs_net_lookup(dir->i_ino, dentry->d_name.name,
-                                  strlen(dentry->d_name.name),
-                                  &ino, &mode, &uid, &gid,
-                                  &size, &nlink,
-                                  &mtime, &atime, &ctime);
+        err = powerfs_net_lookup_timeout(dir->i_ino, dentry->d_name.name,
+                                          strlen(dentry->d_name.name),
+                                          &ino, &mode, &uid, &gid,
+                                          &size, &nlink,
+                                          &mtime, &atime, &ctime,
+                                          timeout_ms);
+
+        /* Phase 1: 断连/重连期间超时或网络不可达, 返回 -EAGAIN 让 VFS/应用层重试.
+         * - ETIMEDOUT: 短超时内未收到响应 (断连中/重连中/filer 慢)
+         * - ENOTCONN: disconnect_one 已 complete(-ENOTCONN) (在途请求被取消)
+         * - ESHUTDOWN: pool 正在 stopping
+         * 注意: lookup 返回 ERR_PTR(-EAGAIN) 时 VFS 会透传给 userspace,
+         *       应用层需重试 (NFS 风格). Phase 3 接入 callback 后可改为
+         *       返回负 dentry. */
+        if (err == -ETIMEDOUT || err == -ENOTCONN || err == -ESHUTDOWN) {
+            pr_warn("powerfs: lookup '%pd' transient error %d (timeout_ms=%d), "
+                    "return -EAGAIN for retry\n",
+                    dentry, err, timeout_ms);
+            return ERR_PTR(-EAGAIN);
+        }
 
         if (err == 0 && ino != 0) {
             /* 找到文件: 创建 inode */
@@ -817,16 +855,23 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
         }
 
         if (err == -ENOENT) {
-            /* 文件不存在: 添加负 dentry */
+            /* 文件不存在: 添加负 dentry + 设短 lease (5s 内不再重复 lookup).
+             * Phase 1: 负 dentry lease 减少对不存在文件的重复网络请求. */
+            struct powerfs_dentry_info *di;
             pr_debug("powerfs: lookup '%pd' not found (powerfs_net)\n", dentry);
             d_add(dentry, NULL);
+            di = dentry->d_fsdata;
+            if (di)
+                di->lease_expire = jiffies + POWERFS_DENTRY_LEASE_TTL;
             return NULL;
         }
 
-        /* 其他错误: 记录但仍添加负 dentry */
+        /* 其他错误: 返回错误给 VFS, 不缓存负 dentry (避免误缓存 "不存在").
+         * Phase 1: 之前是 "记录 + 添加负 dentry", 这会让网络瞬态错误被
+         * 当成 "文件不存在" 缓存, 后续访问该文件继续返回 ENOENT.
+         * 现在返回错误, 让 VFS/userspace 看到真实错误码并重试. */
         pr_warn("powerfs: lookup '%pd' powerfs_net error: %d\n", dentry, err);
-        d_add(dentry, NULL);
-        return NULL;
+        return ERR_PTR(err);
     }
 
     /* === 纯本地模式: 添加负 dentry === */
@@ -902,6 +947,9 @@ static int powerfs_mknod(struct user_namespace *idmap, struct inode *dir,
         type = mode & S_IFMT;
 
     powerfs_add_dir_entry(dir, new_ino, type, dentry->d_name.name);
+
+    /* Phase 1: 本地 mutation 清父目录 lease, 下次 readdir 重新拉取. */
+    powerfs_invalidate_dir_lease(dir);
 
     pr_debug("powerfs: mknod '%pd' success, ino=%llu\n",
              dentry, new_ino);
@@ -991,6 +1039,9 @@ static int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
     /* 减少父目录的链接数 (因删除了一个子目录) */
     drop_nlink(dir);
 
+    /* Phase 1: 本地 mutation 清父目录 lease, 下次 readdir 重新拉取. */
+    powerfs_invalidate_dir_lease(dir);
+
     pr_debug("powerfs: rmdir '%pd' success\n", dentry);
 
     /*
@@ -1075,6 +1126,9 @@ static int powerfs_unlink(struct inode *dir, struct dentry *dentry)
     /* 从本地目录项链表中移除 */
     powerfs_remove_dir_entry(dir, dentry->d_name.name);
 
+    /* Phase 1: 本地 mutation 清父目录 lease, 下次 readdir 重新拉取. */
+    powerfs_invalidate_dir_lease(dir);
+
     pr_debug("powerfs: unlink '%pd' success\n", dentry);
 
     return 0;
@@ -1137,6 +1191,9 @@ static int powerfs_symlink(struct user_namespace *idmap, struct inode *dir,
 
     /* 添加目录项到本地链表 */
     powerfs_add_dir_entry(dir, new_ino, S_IFLNK, dentry->d_name.name);
+
+    /* Phase 1: 本地 mutation 清父目录 lease, 下次 readdir 重新拉取. */
+    powerfs_invalidate_dir_lease(dir);
 
     pr_debug("powerfs: symlink '%pd' success, ino=%llu\n",
              dentry, (unsigned long long)new_ino);
@@ -1264,6 +1321,9 @@ static int powerfs_link(struct dentry *old_dentry, struct inode *dir,
     powerfs_add_dir_entry(dir, inode->i_ino,
                           inode->i_mode & S_IFMT,
                           new_dentry->d_name.name);
+
+    /* Phase 1: 本地 mutation 清父目录 lease, 下次 readdir 重新拉取. */
+    powerfs_invalidate_dir_lease(dir);
 
     return 0;
 }
@@ -1564,6 +1624,13 @@ int powerfs_rename(struct user_namespace *idmap,
                 powerfs_remove_dir_entry(new_dir, new_name_buf);
             }
         }
+
+        /* Phase 1: 本地 mutation 清两个父目录的 lease + epoch++.
+         * rename 涉及 old_dir 和 new_dir (可能相同), 都要清,
+         * 下次 readdir 重新拉取, 看到重命名后的结果. */
+        powerfs_invalidate_dir_lease(old_dir);
+        if (old_dir != new_dir)
+            powerfs_invalidate_dir_lease(new_dir);
     }
 
     pr_debug("powerfs: rename '%pd' -> '%pd' success\n",
@@ -1813,6 +1880,28 @@ static void powerfs_clear_dir_entries(struct inode *dir)
     mutex_unlock(&dpi->dir_mutex);
 }
 
+/* Phase 1: 本地 mutation 后清父目录 lease + bump epoch.
+ * 调用时机: mkdir/rmdir/create/unlink/symlink/link/rename 网络请求成功后,
+ *           在修改本地数据结构的同时清目录 lease.
+ * 效果: 下次 readdir 看到 lease 过期会重新拉取, 看到自己刚加/删的项.
+ *       epoch++ 留给 Phase 3 callback 比对 (callback 携带 epoch,
+ *       不匹配说明有过本地修改, 需重新拉取).
+ * 注意: 调用方已持 dir->i_rwsem 写锁 (VFS 保证), 此处无需额外锁. */
+static void powerfs_invalidate_dir_lease(struct inode *dir)
+{
+    struct powerfs_inode_info *dpi;
+
+    if (!dir || !S_ISDIR(dir->i_mode))
+        return;
+    dpi = POWERFS_I(dir);
+    /* dir_mutex 保护 dir_entries 链表; dir_lease_expire/epoch 是 atomic-like
+     * 字段, 用 WRITE_ONCE 配合 readdir 的 READ_ONCE. */
+    mutex_lock(&dpi->dir_mutex);
+    WRITE_ONCE(dpi->dir_lease_expire, 0);
+    dpi->dir_lease_epoch++;
+    mutex_unlock(&dpi->dir_mutex);
+}
+
 /*
  * powerfs_readdir - 读取目录内容 (使用本地链表)
  *
@@ -1846,29 +1935,80 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
 
     pos = ctx->pos - 2;
 
-    /* 如果目录缓存为空且网络可用，从 Filer 获取目录列表 */
-    if (list_empty(&dpi->dir_entries) && powerfs_net_is_connected()) {
+    /* === Phase 1: 目录 lease fast-path ===
+     * dir_complete && dir_lease_expire 未过期: 直接用本地缓存, 不发网络.
+     * 30s 内重复 readdir 走纯内存 (POWERFS_DIR_LEASE_TTL).
+     * lease 过期或 dir_complete=false: 清缓存重新拉取 (本地 mutation 后). */
+    if (READ_ONCE(dpi->dir_complete) &&
+        time_before(jiffies, READ_ONCE(dpi->dir_lease_expire))) {
+        pr_debug("powerfs: readdir ino=%lu lease fast-path (cached)\n",
+                 dir->i_ino);
+        goto emit_cached;
+    }
+
+    /* 如果目录 lease 过期或缓存为空, 且网络可用, 从 Filer 获取目录列表.
+     * lease 过期但缓存非空: 先清缓存 (避免新旧条目混合). */
+    if (powerfs_net_is_connected()) {
         struct powerfs_net_dir_entry *net_entries;
         __u32 net_count = 0;
         bool has_more = false;
         char last_name[256] = "";
         int ret;
+        int timeout_ms;
+        bool pulled_any = false;  /* 是否已拉取到至少一页 (超时容错) */
+
+        /* lease 过期: 清空旧缓存, 重新拉取 (本地 mutation 后). */
+        if (READ_ONCE(dpi->dir_complete) &&
+            time_after(jiffies, READ_ONCE(dpi->dir_lease_expire))) {
+            powerfs_clear_dir_entries(dir);
+            WRITE_ONCE(dpi->dir_complete, false);
+            WRITE_ONCE(dpi->dir_lease_expire, 0);
+        }
 
         net_entries = kmalloc_array(256, sizeof(*net_entries), GFP_KERNEL);
         if (!net_entries)
             return -ENOMEM;
 
+        /* Phase 1: 短超时策略 (同 lookup). */
+        timeout_ms = powerfs_net_pick_timeout(POWERFS_READDIR_TIMEOUT_MS);
+
         /* 从 Filer 获取目录条目 (分页循环直到获取全部) */
         do {
-            ret = powerfs_net_readdir(dir->i_ino, last_name, 256,
-                                      net_entries, 256,
-                                      &net_count, &has_more);
+            ret = powerfs_net_readdir_timeout(dir->i_ino, last_name, 256,
+                                              net_entries, 256,
+                                              &net_count, &has_more,
+                                              timeout_ms);
             if (ret < 0) {
+                /* Phase 1: 瞬态错误处理.
+                 * - 已拉取部分页: 用已拉取的, 不返回错误 (best-effort).
+                 * - 一页都没拉到:
+                 *   * 缓存有内容 (lease 过期但未清): 用旧缓存
+                 *   * 缓存为空: 返回 -EAGAIN 让 VFS/应用层重试 */
+                if (pulled_any) {
+                    pr_warn("powerfs: readdir ino=%lu partial fetch err=%d, "
+                            "using entries pulled so far\n",
+                            dir->i_ino, ret);
+                    break;
+                }
+                if (!list_empty(&dpi->dir_entries)) {
+                    pr_warn("powerfs: readdir ino=%lu net err=%d, "
+                            "using stale cache\n", dir->i_ino, ret);
+                    break;
+                }
+                if (ret == -ETIMEDOUT || ret == -ENOTCONN ||
+                    ret == -ESHUTDOWN) {
+                    pr_warn("powerfs: readdir ino=%lu transient err=%d "
+                            "(timeout_ms=%d), return -EAGAIN\n",
+                            dir->i_ino, ret, timeout_ms);
+                    kfree(net_entries);
+                    return -EAGAIN;
+                }
                 pr_warn("powerfs: readdir ino=%lu net error: %d\n",
                         dir->i_ino, ret);
                 kfree(net_entries);
                 return ret;
             }
+            pulled_any = true;
 
             /* 将网络条目添加到本地缓存 */
             mutex_lock(&dpi->dir_mutex);
@@ -1908,8 +2048,14 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
         } while (has_more && net_count > 0);
 
         kfree(net_entries);
-        dpi->dir_complete = true;
+
+        /* 拉取成功 (或部分成功): 设置 dir_complete + dir_lease_expire.
+         * 部分成功时也设 dir_complete (避免反复部分拉取), 下次 lease 过期再补. */
+        WRITE_ONCE(dpi->dir_complete, true);
+        WRITE_ONCE(dpi->dir_lease_expire, jiffies + POWERFS_DIR_LEASE_TTL);
     }
+
+emit_cached:
 
     /*
      * 第一阶段: 在锁内复制目录项到临时缓冲区
