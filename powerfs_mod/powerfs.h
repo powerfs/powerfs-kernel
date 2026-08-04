@@ -313,10 +313,6 @@ int powerfs_handle_invalidate(struct powerfs_invalidate_req *req);
 /* 通信层全局状态 */
 bool powerfs_comm_is_connected(void);
 
-/* 连接管理 (powerfs_transport.c) */
-int  powerfs_comm_connect(const char *addr, __u16 port);
-void powerfs_comm_disconnect(void);
-
 /* 便捷方法 (powerfs_transport.c) - 与 powerfs_fs.c 中静态版本不冲突的接口 */
 int powerfs_comm_read(struct inode *inode, loff_t offset, size_t length,
                        __u8 *buf, size_t *read_len);

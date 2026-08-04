@@ -51,14 +51,12 @@
 #define POWERFS_NET_CONNECT_TIMEOUT  5000
 #define POWERFS_NET_SEND_TIMEOUT     10000
 #define POWERFS_NET_RECV_TIMEOUT     10000
-#define POWERFS_NET_RECONNECT_DELAY  2000
 
-/* 最大重连次数: 3 次都失败才返回 -ENOTCONN */
+/* 最大重连次数 (per-conn 状态机使用) */
 #define POWERFS_NET_MAX_RECONNECT    3
 
 /* send_request 等待重连的最大时间 (ms).
- * reconnect_work 3 次重连约 6s, 此超时作为安全兜底防止 wait_event 挂死.
- * 正常情况下 reconnect_work 成功/失败都会 wake_up, 不会等满 30s. */
+ * 作为安全兜底防止 wait_event 挂死. */
 #define POWERFS_NET_RECONNECT_WAIT_TIMEOUT_MS  30000
 
 /* ========== 帧标志 ========== */
@@ -101,8 +99,6 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_WRITE = 0x0021,
 
     /* 一致性操作 */
-    POWERFS_NET_MSG_PUSH_DELTA = 0x0030,
-    POWERFS_NET_MSG_PULL_DELTA = 0x0031,
     POWERFS_NET_MSG_INVALIDATE = 0x0032,
 
     /* 状态 */
@@ -172,7 +168,6 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_BLOCKS = 0x12,
     POWERFS_NET_FLD_CONTENT_SIZE = 0x13,
     POWERFS_NET_FLD_DISK_SIZE = 0x14,
-    POWERFS_NET_FLD_GENERATION = 0x15,
     POWERFS_NET_FLD_HARD_LINK_ID = 0x16,
     POWERFS_NET_FLD_OWNER = 0x17,
     POWERFS_NET_FLD_BACKEND = 0x18,
@@ -415,15 +410,11 @@ struct powerfs_net_server_conn {
 
     /* TCP 连接 */
     struct socket *sock;        /* 当前 socket (NULL=未连接) */
-    atomic_t sock_users;        /* 引用计数 */
     wait_queue_head_t sock_user_wq;
 
     /* 状态机 */
     enum powerfs_conn_state state;
     spinlock_t state_lock;      /* 保护 state */
-
-    /* Per-conn 互斥锁 (替代全局 send_recv_mutex) */
-    struct mutex send_mutex;
 
     /* Per-conn 重连 */
     struct delayed_work reconnect_work;
@@ -466,8 +457,7 @@ struct powerfs_net_server_conn {
     /* === v2 调度器引用计数 ===
      * kref 用于调度器持引用: 回调投递到 rx_conns/tx_conns 时 get,
      * 调度器处理完 put. disconnect 等 kref refcount==1 (只剩 owner 引用)
-     * 才 sock_release, 防止调度器在飞时 UAF.
-     * (sock_users 字段保留但 v2 不再使用, do_send 不直接碰 sock) */
+     * 才 sock_release, 防止调度器在飞时 UAF. */
     struct kref kref;
 
     /* === 指数退避 (参照 Ceph con->delay) === */
@@ -590,10 +580,6 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn);
 void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
                             enum powerfs_conn_state new_state);
 
-/* 健康监控 */
-void powerfs_conn_start_monitor(void);
-void powerfs_conn_stop_monitor(void);
-
 /* === 请求生命周期 (参照 Ceph osd_request 设计) === */
 
 /*
@@ -636,93 +622,11 @@ void powerfs_shard_route_dispatch_pending(u64 shard_id);
 /* kref 释放 (内部, powerfs_request_free 调用) */
 void powerfs_request_release(struct kref *kref);
 
-/* ========== 旧连接管理 (兼容期保留) ========== */
-
-/* 连接状态 */
-enum powerfs_net_state {
-    POWERFS_NET_STATE_DISCONNECTED = 0,
-    POWERFS_NET_STATE_CONNECTING,
-    POWERFS_NET_STATE_CONNECTED,
-    POWERFS_NET_STATE_HANDSHAKING,
-    POWERFS_NET_STATE_ERROR,
-    POWERFS_NET_STATE_RECONNECTING,
-};
-
-/* 请求上下文 (用于异步请求/响应匹配) */
-struct powerfs_net_request {
-    struct hlist_node node;     /* 哈希表节点 */
-    struct completion done;     /* 请求完成事件 */
-    __u32 seq;                  /* 序列号 (作为哈希键) */
-    __u16 msg_type;             /* 消息类型 */
-    int status;                 /* 结果状态 (0=成功, 负值=错误) */
-    __u8 *resp_body;            /* 响应 body 数据 */
-    size_t resp_body_len;       /* 响应 body 长度 */
-    __u8 *resp_data;            /* 响应 data 数据 */
-    size_t resp_data_len;       /* 响应 data 长度 */
-};
-
-/* 连接上下文 */
-struct powerfs_net_conn {
-    /* 网络连接 */
-    struct socket *sock;
-    /*
-     * sock 引用计数: send_request 使用 sock 期间 inc, disconnect 置
-     * g_conn.sock=NULL 后 wait_event 等 sock_users==0 再 close, 防止
-     * 并发 recv 使用已释放 socket 的 use-after-free (QEMU 回归中
-     * ls/readdir 触发的 _raw_spin_lock_irqsave NULL deref 根因).
-     */
-    atomic_t sock_users;
-    wait_queue_head_t sock_user_wq;
-    struct sockaddr_storage peer_addr;
-    int peer_len;
-
-    /* 当前连接的目标地址 (用于 find_leader 判断是否需要重连,
-     * 避免 disconnect 与并发请求 recv 竞态导致 NULL deref) */
-    char cur_addr[64];
-    __u16 cur_port;
-
-    /* 状态管理 */
-    enum powerfs_net_state state;
-    atomic_t seq_counter;
-    atomic_t pending_count;
-
-    /* 锁 */
-    struct mutex conn_lock;     /* 连接操作锁 */
-    spinlock_t req_lock;        /* 请求表锁 */
-
-    /* 待处理请求表 (seq -> request 映射) */
-    DECLARE_HASHTABLE(pending_reqs, 8);
-
-    /* 接收缓冲区 */
-    __u8 *recv_buf;
-    size_t recv_buf_len;
-
-    /* 发送缓冲区 */
-    __u8 *send_buf;
-    size_t send_buf_len;
-
-    /* 重连工作 */
-    struct work_struct reconnect_work;
-    int reconnect_count;
-    atomic_t stopping;          /* 模块退出时置 1，让 reconnect_work 提前退出（atomic_t 保证跨 CPU 可见性） */
-
-    /* 请求等待队列: send_request 断连时在此等待重连,
-     * 重连成功或 3 次失败后唤醒. */
-    wait_queue_head_t reconnect_wq;
-    atomic_t reconnect_failed;  /* 3 次重连都失败置 1, send_request 见此返回 -ENOTCONN */
-    atomic_t failover_count;    /* 连续 failover/reconnect 失败次数, 成功后归零 */
-
-    /* 服务端信息 (握手后) */
-    __u64 server_id;
-    __u32 server_features;
-};
-
 /* ========== 多连接池配置 ========== */
 
 #define POWERFS_NET_MAX_SERVERS    32   /* 最大服务器数量 (Filer + Master + Volume, 支持多节点扩展) */
 #define POWERFS_NET_MAX_FILERS     16   /* 最大 Filer 数量 */
 #define POWERFS_NET_MAX_VOLUMES    32   /* 最大 Volume 数量 */
-#define POWERFS_NET_MAX_PATHS      256   /* Delta Sync 最大路径缓存数 */
 #define POWERFS_NET_MONITOR_INTERVAL 5000  /* 健康检查间隔 (ms) */
 #define POWERFS_NET_LEADER_CHECK_INTERVAL 2000  /* Leader 检查间隔 (ms) */
 
@@ -755,9 +659,6 @@ struct powerfs_net_pool {
     __u16 master_port;
     bool master_set;
 
-    /* === 健康监控 === */
-    struct delayed_work monitor_work;
-    bool monitoring;
     atomic_t stopping;
 
     /* === v2: per-CPU 调度器数组 (参照 Lustre ksocknal_data.ksnd_schedulers) ===
@@ -780,27 +681,6 @@ struct powerfs_net_pool {
     atomic_t last_failover_time;
     struct mutex pool_lock;
     struct delayed_work leader_check_work;
-};
-
-/* Delta Sync 路径条目 */
-struct powerfs_net_path_entry {
-    char path[256];            /* 路径 */
-    __u64 generation;          /* 当前 generation */
-    __u64 last_update;         /* 最后更新时间 (jiffies) */
-    bool valid;                /* 是否有效 */
-};
-
-/* Delta Sync 状态 */
-struct powerfs_net_delta_state {
-    struct powerfs_net_path_entry paths[POWERFS_NET_MAX_PATHS];
-    atomic_t path_count;
-    spinlock_t gen_lock;
-    
-    /* 全局 generation 追踪 */
-    atomic_t global_generation;
-    
-    /* 最后一次全量同步时间 */
-    __u64 last_full_sync;
 };
 
 /* ========== 连接管理 API (增强版) ========== */
@@ -844,41 +724,8 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port);
 /* 设置 Volume 地址 */
 int powerfs_net_set_volume(const char *addr, __u16 port);
 
-/* 连接管理 */
-int  powerfs_net_connect(const char *addr, __u16 port);
-void powerfs_net_disconnect(void);
+/* 连接状态检查 (新架构: 检查 g_pool 是否有可用 filer 连接) */
 bool powerfs_net_is_connected(void);
-
-/* Leader 管理 */
-int powerfs_net_switch_leader(int new_idx);
-int powerfs_net_find_leader(void);
-int powerfs_net_leader_ping(void);
-bool powerfs_net_has_leader(void);
-int powerfs_net_get_leader_idx(void);
-
-/* 故障转移 */
-int powerfs_net_failover(void);
-void powerfs_net_start_monitor(void);
-void powerfs_net_stop_monitor(void);
-
-/* ========== Delta Sync API ========== */
-
-/* 路径 generation 管理 */
-int powerfs_net_set_path_generation(const char *path, __u64 generation);
-__u64 powerfs_net_get_path_generation(const char *path);
-bool powerfs_net_path_stale(const char *path, __u64 cached_generation);
-void powerfs_net_invalidate_path(const char *path);
-void powerfs_net_invalidate_dir(__u64 dir_ino);
-void powerfs_net_clear_all_generations(void);
-
-/* 增量同步 */
-int powerfs_net_pull_delta(const char *path, __u64 *new_generation);
-int powerfs_net_push_delta(const char *path, __u64 generation);
-int powerfs_net_full_sync(void);
-
-/* 全局 generation */
-__u64 powerfs_net_get_global_generation(void);
-void powerfs_net_inc_global_generation(void);
 
 /* ========== 请求/响应 API ========== */
 
@@ -986,10 +833,6 @@ int powerfs_net_ping(void);
 
 int  powerfs_net_init(void);
 void powerfs_net_exit(void);
-
-/* 暴露模块参数 (供 fill_super fallback 使用) */
-const char *powerfs_net_get_server_addr(void);
-__u16       powerfs_net_get_server_port(void);
 
 /* ========== 内部工具 ========== */
 

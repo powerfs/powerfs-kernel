@@ -472,10 +472,7 @@ test_04_leader_failover() {
     
     if [ "$total_filers" -lt 2 ]; then
         log_skip "Need 2+ Filers for failover test (have $total_filers)"
-        log_info "Failover mechanism is integrated in the kernel module:"
-        log_info "  - powerfs_net_failover() handles leader switch"
-        log_info "  - powerfs_net_start_monitor() enables health checking"
-        log_info "  - powerfs_net_switch_leader() triggers reconnection"
+        log_info "Failover is handled by sk_state_change callback + shard routing + per-conn reconnect_work"
         return 0
     fi
     
@@ -504,26 +501,7 @@ test_04_leader_failover() {
     # Record the active leader
     log_info "Current leader info from dmesg:"
     dmesg 2>/dev/null | grep -i "leader\|active.*filer\|server.*connect" | tail -5 | tee -a "$LOG_FILE"
-    
-    # Trigger failover by removing the leader
-    # In a real test, this would kill the Filer process
-    # For now, we verify the failover infrastructure exists
-    log_info "Failover infrastructure verification:"
-    
-    local symbols_found=0
-    for sym in powerfs_net_failover powerfs_net_switch_leader powerfs_net_find_leader powerfs_net_monitor_work_func; do
-        if [ "$DUMMY_MODE" -eq 1 ] || nm "$MODULE_NAME".ko 2>/dev/null | grep -q "$sym"; then
-            log_pass "Symbol $sym available"
-            ((symbols_found++))
-        else
-            log_warn "Symbol $sym not found"
-        fi
-    done
-    
-    if [ "$symbols_found" -ge 4 ]; then
-        log_pass "Failover mechanism fully implemented"
-    fi
-    
+
     # After failover verification, create more data
     echo "post_failover_data" > "$TEST_DIR/failover_test/data2.txt"
     [ -f "$TEST_DIR/failover_test/data2.txt" ] && log_pass "Post-failover data accessible" || log_fail "Post-failover data inaccessible"

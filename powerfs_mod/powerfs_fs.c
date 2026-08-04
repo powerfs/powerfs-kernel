@@ -153,12 +153,6 @@ static bool powerfs_comm_connected(void)
  *   - 返回 1: dentry 仍然有效，使用缓存
  *   - 返回 0: dentry 已失效，丢弃缓存重新 lookup
  *   - 返回负值: 错误
- *
- * Delta Sync 策略:
- *   - 检查 dentry 的 generation 是否过期
- *   - 如果 generation 过期 (powerfs_net_path_stale 返回 true)，返回 0 失效
- *   - 如果 powerfs_net 未连接 (本地模式)，始终返回 1
- *   - 对于目录 dentry，基于 TTL 进行简单过期检查
  */
 int powerfs_d_revalidate(struct dentry *dentry, unsigned int flags)
 {
@@ -1046,58 +1040,6 @@ static int powerfs_comm_rename(struct inode *old_dir, const char *old_name,
  *
  * 注意: 不在 RCU read-side critical section 中做任何阻塞操作
  */
-/* 构建 dentry 的完整路径 (用于 Delta Sync) */
-static void powerfs_build_dentry_path(struct dentry *dentry, char *path, size_t path_len)
-{
-    char (*names)[256];
-    struct dentry *cur;
-    int depth = 0;
-    int i;
-    size_t total_len;
-
-    if (!dentry || !path || path_len == 0)
-        return;
-
-    names = kmalloc_array(64, sizeof(*names), GFP_KERNEL);
-    if (!names) {
-        path[0] = '/';
-        path[1] = '\0';
-        return;
-    }
-
-    /* 向上遍历到根，收集各层名称 */
-    cur = dentry;
-    while (cur && !IS_ROOT(cur)) {
-        if (depth >= 63) break;  /* 防止过深递归 */
-        strncpy(names[depth], cur->d_name.name, 255);
-        names[depth][255] = '\0';
-        depth++;
-        cur = cur->d_parent;
-    }
-
-    /* 从根向下构建路径 */
-    path[0] = '/';
-    path[1] = '\0';
-    total_len = 1;
-    for (i = depth - 1; i >= 0 && total_len < path_len - 1; i--) {
-        size_t name_len = strlen(names[i]);
-        size_t need = name_len + (i > 0 ? 1 : 0);
-
-        if (total_len + need >= path_len)
-            break;
-
-        if (i < depth - 1) {
-            /* 非最后一个组件，添加 "/" */
-            path[total_len++] = '/';
-        }
-        memcpy(path + total_len, names[i], name_len);
-        total_len += name_len;
-    }
-    path[total_len] = '\0';
-
-    kfree(names);
-}
-
 /*
  * powerfs_lookup - 查找文件/目录
  *
@@ -1385,16 +1327,6 @@ static int powerfs_mknod(struct user_namespace *idmap, struct inode *dir,
 
     powerfs_add_dir_entry(dir, new_ino, type, dentry->d_name.name);
 
-    /* === Delta Sync: 失效路径缓存 === */
-    {
-        char path_buf[256];
-
-        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-        /* 在创建后触发 generation 失效，强制后续操作同步 */
-        powerfs_net_invalidate_path(path_buf);
-        powerfs_net_invalidate_dir(dir->i_ino);
-    }
-
     pr_debug("powerfs: mknod '%pd' success, ino=%llu\n",
              dentry, new_ino);
 
@@ -1429,20 +1361,6 @@ static int powerfs_mkdir(struct user_namespace *idmap, struct inode *dir,
 
     /* 获取新创建的 inode 用于远程同步 */
     inode = d_inode(dentry);
-
-    /* === powerfs_net 同步: 同步创建目录到远端 === */
-    if (inode && powerfs_net_is_connected()) {
-        char path_buf[256];
-
-        /* 构建路径用于 Delta Sync */
-        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-
-        /* 触发 Delta Sync: 失效缓存，后续操作将通过 pull_delta 获取最新状态 */
-        powerfs_net_invalidate_path(path_buf);
-        powerfs_net_invalidate_dir(dir->i_ino);
-
-        pr_debug("powerfs: mkdir '%pd' synced to powerfs_net\n", dentry);
-    }
 
     /* === 兼容旧 powerfs_comm 接口 === */
     if (inode && powerfs_comm_connected()) {
@@ -1518,14 +1436,6 @@ static int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
     /* 减少父目录的链接数 (因删除了一个子目录) */
     drop_nlink(dir);
 
-    /* 失效路径缓存 */
-    {
-        char path_buf[256];
-        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-        powerfs_net_invalidate_path(path_buf);
-        powerfs_net_invalidate_dir(dir->i_ino);
-    }
-
     pr_debug("powerfs: rmdir '%pd' success\n", dentry);
 
     /*
@@ -1565,17 +1475,6 @@ static int powerfs_create(struct user_namespace *idmap, struct inode *dir,
 
     /* 获取新创建的 inode 用于通知 */
     inode = d_inode(dentry);
-
-    /* === powerfs_net: 触发 Delta Sync 失效 === */
-    if (inode && powerfs_net_is_connected()) {
-        char path_buf[256];
-
-        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-        powerfs_net_invalidate_path(path_buf);
-        powerfs_net_invalidate_dir(dir->i_ino);
-
-        pr_debug("powerfs: create '%pd' delta sync invalidated\n", dentry);
-    }
 
     /* === 兼容旧 powerfs_comm 接口 === */
     if (inode && powerfs_comm_connected()) {
@@ -1641,14 +1540,6 @@ static int powerfs_unlink(struct inode *dir, struct dentry *dentry)
 
     /* 从本地目录项链表中移除 */
     powerfs_remove_dir_entry(dir, dentry->d_name.name);
-
-    /* 失效路径缓存 */
-    {
-        char path_buf[256];
-        powerfs_build_dentry_path(dentry, path_buf, sizeof(path_buf));
-        powerfs_net_invalidate_path(path_buf);
-        powerfs_net_invalidate_dir(dir->i_ino);
-    }
 
     pr_debug("powerfs: unlink '%pd' success\n", dentry);
 
@@ -3217,14 +3108,10 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
             }
         }
 
-        /* 回退: 手动解析 filer_addr / g_server_addr */
+        /* 回退: 手动解析 filer_addr (模块参数 filer_addr=...) */
         if (discovered <= 0) {
-            const char *faddr = (sbi->filer_addr[0]) ?
-                                sbi->filer_addr :
-                                powerfs_net_get_server_addr();
-            __u16 fport = (sbi->filer_addr[0]) ?
-                          sbi->filer_port :
-                          powerfs_net_get_server_port();
+            const char *faddr = sbi->filer_addr;
+            __u16 fport = sbi->filer_port;
             if (faddr && faddr[0]) {
                 char addr_buf[256];
                 char *p, *tok;
@@ -3271,28 +3158,18 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         }
     }
 
-    /* 初始化新连接池并启动健康监控.
+    /* 初始化新连接池.
      *
-     * 新架构 (per-conn 状态机 + shard 路由 + 事件驱动) 为首选路径;
-     * 旧 g_conn 单连接 + 旧 monitor 仅在连接池初始化失败时作为 fallback.
-     *
-     * 重要: 新旧 monitor 共享 g_pool.monitor_work 与 monitoring 标志, 二者互斥.
-     * 之前无条件先调用 powerfs_net_start_monitor() 置 monitoring=true, 会使
-     * powerfs_conn_start_monitor() 直接 return, 导致新的 per-filer 健康监控
-     * (powerfs_conn_health_monitor_fn) 从不运行 —— filer 死亡只能靠 I/O 发送
-     * 失败被动发现, 且旧 monitor 在 discovery 路径下因 g_conn 从未连接而空转.
-     * 因此必须根据连接池初始化结果二选一, 绝不同时启动. */
+     * 新架构 (per-conn 状态机 + shard 路由 + 事件驱动) 为唯一路径.
+     * 旧 g_conn 单连接 fallback 已移除, pool_init 失败直接返回错误.
+     * 断连检测由 sk_state_change 回调 + TCP keepalive 取代, 无需健康监控线程. */
     {
         int pool_ret = powerfs_conn_pool_init(NULL, 0);
-        if (pool_ret == 0) {
-            powerfs_conn_start_monitor();
-            pr_info("powerfs: new connection pool initialized (per-filer health monitor active)\n");
-        } else {
-            pr_warn("powerfs: new connection pool init failed (%d), using legacy g_conn path\n",
-                    pool_ret);
-            /* fallback: 旧 g_conn 单连接, 由旧 monitor 负责 leader 探测 + 健康检查 */
-            powerfs_net_start_monitor();
+        if (pool_ret != 0) {
+            pr_err("powerfs: connection pool init failed (%d)\n", pool_ret);
+            return pool_ret;
         }
+        pr_info("powerfs: new connection pool initialized (sk callback + keepalive)\n");
     }
 
     pr_info("powerfs: fill_super done, root ino=%lu\n", root->i_ino);
@@ -3321,8 +3198,7 @@ void powerfs_kill_sb_super(struct super_block *sb)
      *    阻止 reconnect_work 在 g_pool 清零后访问野指针. */
     powerfs_net_set_stopping();
 
-    /* 3. 停止监控并关闭所有连接 (g_pool 会被清零) */
-    powerfs_net_stop_monitor();
+    /* 3. 关闭所有连接 (g_pool 会被清零) */
     powerfs_net_pool_cleanup();
 
     if (sbi) {

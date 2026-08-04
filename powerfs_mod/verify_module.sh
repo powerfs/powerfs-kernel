@@ -159,15 +159,6 @@ DELTA_SYMBOLS=(
     "powerfs_net_pool_init"
     "powerfs_net_pool_cleanup"
     "powerfs_net_add_server"
-    "powerfs_net_find_leader"
-    "powerfs_net_failover"
-    "powerfs_net_start_monitor"
-    "powerfs_net_stop_monitor"
-    "powerfs_net_set_path_generation"
-    "powerfs_net_get_path_generation"
-    "powerfs_net_path_stale"
-    "powerfs_net_invalidate_path"
-    "powerfs_net_invalidate_dir"
     "powerfs_net_is_connected"
     "powerfs_net_lookup"
     "powerfs_net_disconnect"
@@ -183,32 +174,10 @@ done
 section_header "5. Multi-Node / Leader Symbols"
 
 LEADER_SYMBOLS=(
-    "powerfs_net_switch_leader"
-    "powerfs_net_leader_ping"
-    "powerfs_net_has_leader"
-    "powerfs_net_get_leader_idx"
     "powerfs_net_remove_server"
 )
 
 for sym in "${LEADER_SYMBOLS[@]}"; do
-    run_test "$sym exported" 'echo "$NM_OUTPUT" | grep -q "$sym$"'
-done
-
-# ============================================================================
-# 6. Delta Sync Implementation Symbols
-# ============================================================================
-section_header "6. Delta Sync Implementation Symbols"
-
-IMPL_SYMBOLS=(
-    "powerfs_net_pull_delta"
-    "powerfs_net_push_delta"
-    "powerfs_net_full_sync"
-    "powerfs_net_get_global_generation"
-    "powerfs_net_inc_global_generation"
-    "powerfs_net_clear_all_generations"
-)
-
-for sym in "${IMPL_SYMBOLS[@]}"; do
     run_test "$sym exported" 'echo "$NM_OUTPUT" | grep -q "$sym$"'
 done
 

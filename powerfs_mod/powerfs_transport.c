@@ -422,28 +422,22 @@ static int decode_kernel_response(__u32 msg_type,
 
 /* ========== 传输层公共 API ========== */
 
-static bool g_comm_connected = false;
-
 /**
  * powerfs_comm_init - 初始化通信层
+ *
+ * 新架构: 仅初始化 powerfs-net 子系统 (CRC32C 表 + discover 序列号).
+ * 实际的 per-filer 连接池由 powerfs_conn_pool_init (在 fill_super 中) 创建,
+ * 连接状态由 powerfs_net_is_connected() 直接查询连接池, 无需本地标志缓存.
  */
 int powerfs_comm_init(void)
 {
     int ret;
 
-    /* 初始化 powerfs-net 子系统 (内部会尝试连接服务器) */
     ret = powerfs_net_init();
     if (ret < 0) {
         pr_err("powerfs: net init failed: %d\n", ret);
         return ret;
     }
-
-    /* 检查连接状态 (powerfs_net_init 内部已尝试连接) */
-    g_comm_connected = powerfs_net_is_connected();
-    if (g_comm_connected)
-        pr_info("powerfs: connected to backend server\n");
-    else
-        pr_warn("powerfs: not connected yet, will retry\n");
 
     pr_info("powerfs: comm layer initialized (net mode)\n");
     return 0;
@@ -451,43 +445,23 @@ int powerfs_comm_init(void)
 
 /**
  * powerfs_comm_exit - 清理通信层
+ *
+ * 兜底调用 powerfs_net_exit() 停止新架构连接池 (per-filer 连接 + 调度器线程).
  */
 void powerfs_comm_exit(void)
 {
-    g_comm_connected = false;
     powerfs_net_exit();
     pr_info("powerfs: comm layer exited\n");
 }
 
 /**
- * powerfs_comm_connect - 建立到 Filer 的连接
- */
-int powerfs_comm_connect(const char *addr, __u16 port)
-{
-    int ret;
-
-    ret = powerfs_net_connect(addr, port);
-    if (ret == 0)
-        g_comm_connected = true;
-
-    return ret;
-}
-
-/**
- * powerfs_comm_disconnect - 断开连接
- */
-void powerfs_comm_disconnect(void)
-{
-    g_comm_connected = false;
-    powerfs_net_disconnect();
-}
-
-/**
  * powerfs_comm_is_connected - 检查连接状态
+ *
+ * 新架构: 直接查询连接池状态 (g_pool.filer_count > 0 && !stopping).
  */
 bool powerfs_comm_is_connected(void)
 {
-    return g_comm_connected && powerfs_net_is_connected();
+    return powerfs_net_is_connected();
 }
 
 /**
@@ -569,10 +543,6 @@ int powerfs_comm_send_request(struct powerfs_msg_header *req_hdr,
     if (ret < 0) {
         pr_debug("powerfs: send_request failed: %d (type=%u)\n",
                  ret, req_hdr->type);
-
-        /* 如果是连接断开，标记为未连接 */
-        if (ret == -EPIPE || ret == -ECONNRESET)
-            g_comm_connected = false;
 
         kfree(resp_body);
         kfree(resp_data_buf);
@@ -792,8 +762,6 @@ EXPORT_SYMBOL_GPL(powerfs_comm_exit);
 EXPORT_SYMBOL_GPL(powerfs_comm_is_connected);
 EXPORT_SYMBOL_GPL(powerfs_comm_send_request);
 EXPORT_SYMBOL_GPL(powerfs_comm_submit_notify);
-EXPORT_SYMBOL_GPL(powerfs_comm_connect);
-EXPORT_SYMBOL_GPL(powerfs_comm_disconnect);
 EXPORT_SYMBOL_GPL(powerfs_comm_read);
 EXPORT_SYMBOL_GPL(powerfs_comm_write);
 EXPORT_SYMBOL_GPL(powerfs_comm_readdir);
