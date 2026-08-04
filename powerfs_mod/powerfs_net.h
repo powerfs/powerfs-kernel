@@ -115,6 +115,10 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_KEEP_CONNECTED = 0x0053,
     POWERFS_NET_MSG_VOLUME_LIST = 0x0054,
 
+    /* Master topology & discovery */
+    POWERFS_NET_MSG_GET_TOPOLOGY = 0x0070,
+    POWERFS_NET_MSG_LIST_FILERS = 0x0074,
+
     /* Volume 操作 */
     POWERFS_NET_MSG_CREATE_VOLUME = 0x0060,
     POWERFS_NET_MSG_DELETE_VOLUME = 0x0061,
@@ -278,6 +282,315 @@ bool powerfs_tlv_dec_is_empty(const struct powerfs_tlv_dec *dec);
 
 /* ========== powerfs-net 连接管理 ========== */
 
+/* 服务器类型 (前置声明: 新架构 struct powerfs_net_server_conn 需要) */
+enum powerfs_net_server_type {
+    POWERFS_NET_SERVER_FILER = 0,
+    POWERFS_NET_SERVER_MASTER = 1,
+    POWERFS_NET_SERVER_VOLUME = 2,
+};
+
+/* ========== 连接池状态机 (Phase 1: 新架构) ========== */
+
+/*
+ * Per-conn 状态机:
+ *
+ *   DISCONNECTED → CONNECTING → CONNECTED
+ *                      ↓              ↓
+ *                   fail         send error / health fail
+ *                      ↓              ↓
+ *                   RECONNECTING ←────┘
+ *                      ↓
+ *                retry (count++)
+ *                      ↓
+ *              count >= MAX → FAULT
+ *              success → CONNECTED (count=0)
+ *
+ * 每个连接独立维护状态，互不影响。
+ * 上层通过 shard_leader_map 路由到对应 filer 的连接。
+ */
+enum powerfs_conn_state {
+    CONN_INIT = 0,          /* 初始化，尚未连接 */
+    CONN_CONNECTING,        /* TCP 连接中 */
+    CONN_CONNECTED,         /* 已连接，可用 */
+    CONN_RECONNECTING,      /* 重连中 (1-3次) */
+    CONN_FAULT,             /* 重连失败，仅 umount 可恢复 */
+};
+
+/*
+ * 请求对象 (参照 Ceph ceph_osd_request / ceph_mds_request 设计)
+ *
+ * 关键设计 (学习 Ceph):
+ *   1. kref 引用计数: 多处持有请求时自动管理生命周期
+ *   2. rb_node 红黑树: by seq 快速查找 (O(log n)), 用于 reply 匹配
+ *   3. 断连重发: 请求不取消, 而是标记 r_needs_resend, 重连后自动重发
+ *   4. 异步回调: 支持 callback + completion 两种完成方式
+ *   5. 尝试计数: r_attempts, 超过阈值放弃
+ *
+ * 生命周期:
+ *   1. VFS 回调创建 request (powerfs_request_alloc), kref=1
+ *   2. submit: 分配 seq, 挂到 filer->pending_reqs + filer->req_tree
+ *   3. 发送 + 接收响应
+ *   4a. 成功: 从 pending 摘除, complete/callback, kref_put
+ *   4b. 断连: 标记 needs_resend, 不取消, 重连后自动重发
+ *   5. 超时/超过重试: error=-ETIMEDOUT, complete, kref_put
+ *   6. VFS 回调读取 resp_*, powerfs_request_free (kref_put → kfree)
+ */
+struct powerfs_request {
+    /* === 红黑树节点 (参照 Ceph r_node) === */
+    /* 挂到 filer->req_tree, by seq 快速查找, 用于 reply 匹配 */
+    struct rb_node rb_node;
+
+    /* === 链表节点 === */
+    /* 挂到 filer->pending_reqs (发送顺序) 或 shard pending 队列 */
+    struct list_head list_node;
+
+    /* === 请求标识 === */
+    __u32 seq;                   /* 序列号 (per-conn, 由 submit 分配) */
+    __u16 msg_type;             /* 消息类型 (POWERFS_NET_MSG_*) */
+    __u64 shard_id;             /* 所属 shard (用于路由, 0=不关心) */
+
+    /* === 请求数据 (发送方提供, submit 不修改) === */
+    const __u8 *req_body;       /* TLV body */
+    size_t req_body_len;
+    const __u8 *req_data;       /* 附加数据 (如写数据) */
+    size_t req_data_len;
+
+    /* === 响应空间 (submit 填入, 调用方读取) === */
+    __u16 resp_status;          /* 响应状态码 (0=OK, 其他=错误) */
+    __u8 *resp_body;            /* 响应 body 缓冲区 (调用方分配) */
+    size_t resp_body_cap;       /* 缓冲区容量 */
+    size_t resp_body_len;       /* 实际响应 body 长度 */
+    __u8 *resp_data;            /* 响应 data 缓冲区 (调用方分配) */
+    size_t resp_data_cap;       /* 缓冲区容量 */
+    size_t resp_data_len;       /* 实际响应 data 长度 */
+
+    /* === 完成与超时 === */
+    struct completion done;     /* 同步等待 */
+    int (*callback)(struct powerfs_request *);  /* 异步回调 (可选, NULL=同步) */
+    int error;                  /* 最终错误码 (0=成功, <0=错误) */
+    unsigned long deadline;     /* 超时 jiffies (0=使用默认) */
+
+    /* === 重发控制 (参照 Ceph r_attempts) === */
+    int attempts;               /* 发送尝试次数 */
+    bool needs_resend;          /* 断连后标记, 重连后自动重发 */
+#define POWERFS_REQ_MAX_ATTEMPTS  5
+
+    /* === 关联 === */
+    struct powerfs_net_server_conn *filer;  /* 发往哪个 filer (NULL=未绑定) */
+    struct kref kref;                      /* 引用计数 (参照 Ceph r_kref) */
+};
+
+/* 请求分配/释放 */
+struct powerfs_request *powerfs_request_alloc(__u16 msg_type, gfp_t gfp);
+void powerfs_request_free(struct powerfs_request *req);
+
+/* Per-server 连接 (替代全局 g_conn) */
+struct powerfs_net_server_conn {
+    /* 标识 */
+    char addr[64];              /* IP 地址 */
+    __u16 port;                 /* 端口 */
+    enum powerfs_net_server_type type;
+    bool in_use;                /* 该槽位是否已使用 */
+
+    /* TCP 连接 */
+    struct socket *sock;        /* 当前 socket (NULL=未连接) */
+    atomic_t sock_users;        /* 引用计数 */
+    wait_queue_head_t sock_user_wq;
+
+    /* 状态机 */
+    enum powerfs_conn_state state;
+    spinlock_t state_lock;      /* 保护 state */
+
+    /* Per-conn 互斥锁 (替代全局 send_recv_mutex) */
+    struct mutex send_mutex;
+
+    /* Per-conn 重连 */
+    struct delayed_work reconnect_work;
+    int reconnect_count;        /* 当前重连次数 (0-3) */
+    wait_queue_head_t reconnect_wq;  /* 等待重连完成 */
+
+    /* Per-conn 序列号 */
+    atomic_t seq_counter;
+
+    /* 服务端信息 (握手后) */
+    __u64 server_id;
+    __u32 server_features;
+
+    /* === 请求追踪 (参照 Ceph out_queue + out_sent) === */
+    /* pending_reqs: 已发送等待响应的请求 (链表, 按发送顺序) */
+    struct list_head pending_reqs;
+    /* req_tree: 按 seq 查找请求 (红黑树, O(log n), 用于 reply 匹配) */
+    struct rb_root req_tree;
+    spinlock_t req_lock;        /* 保护 pending_reqs + req_tree */
+
+    /* === 指数退避 (参照 Ceph con->delay) === */
+    unsigned long reconnect_delay;  /* 当前退避间隔 (jiffies) */
+#define POWERFS_NET_BASE_DELAY    1000    /* 初始 1s */
+#define POWERFS_NET_MAX_DELAY     30000   /* 最大 30s */
+};
+
+/* Shard 路由表: shard_id → filer_idx */
+#define POWERFS_MAX_SHARDS  64
+
+/*
+ * Per-shard 路由状态机:
+ *
+ *   ROUTE_VALID ←───────────────────────────────┐
+ *       │                                       │
+ *   leader filer 断连 (事件)                      │
+ *       ↓                                       │
+ *   ROUTE_CHECKING ──→ 找到新 leader ────────────┘
+ *       │                  (REDIRECT)
+ *       │
+ *   所有 filer 都试过, 无 leader
+ *       ↓
+ *   ROUTE_UNKNOWN ──→ filer 重连成功 → ROUTE_CHECKING
+ *
+ * 事件来源:
+ *   1. 连接断开: conn_pool 通知 route_table, 相关 shard → CHECKING
+ *   2. REDIRECT 响应: 更新 leader, shard → VALID
+ *   3. filer 重连成功: conn_pool 通知, 相关 shard → CHECKING (重试)
+ */
+enum powerfs_shard_route_state {
+    ROUTE_VALID = 0,       /* leader 已知且连接正常 */
+    ROUTE_CHECKING,        /* leader filer 断连, 正在寻找新 leader */
+    ROUTE_UNKNOWN,         /* 所有 filer 都试过, 暂无 leader */
+};
+
+struct powerfs_shard_route_entry {
+    int leader_filer_idx;               /* -1=未知 */
+    enum powerfs_shard_route_state state;
+
+    /* CHECKING/UNKNOWN 状态下的待处理请求队列.
+     * 请求在此等待, 直到:
+     *   - REDIRECT 找到新 leader → VALID, 队列中的请求发往新 leader
+     *   - 超时 → 请求返回 -ETIMEDOUT
+     * VALID 状态下此队列为空 (请求直接走 filer->pending_reqs). */
+    struct list_head pending_reqs;
+    spinlock_t req_lock;
+};
+
+struct powerfs_shard_route {
+    struct powerfs_shard_route_entry entries[POWERFS_MAX_SHARDS];
+    spinlock_t lock;
+    __u64 shard_count;          /* 从 Filer 获取 */
+};
+
+/* 连接状态查询辅助函数 */
+static inline const char *powerfs_conn_state_str(enum powerfs_conn_state s)
+{
+    switch (s) {
+    case CONN_INIT:        return "INIT";
+    case CONN_CONNECTING:  return "CONNECTING";
+    case CONN_CONNECTED:   return "CONNECTED";
+    case CONN_RECONNECTING:return "RECONNECTING";
+    case CONN_FAULT:       return "FAULT";
+    default:               return "UNKNOWN";
+    }
+}
+
+/* ========== 连接池 API (新架构) ========== */
+
+/* 初始化连接池 (从 Master 发现 filer/volume 列表) */
+int powerfs_conn_pool_init(const char *master_addr, __u16 master_port);
+
+/* 连接池清理 */
+void powerfs_conn_pool_exit(void);
+
+/* 获取 shard 对应的 filer 连接 (路由表查找) */
+struct powerfs_net_server_conn *
+powerfs_conn_get_filer_for_shard(u64 shard_id);
+
+/* 通过地址查找 filer 连接 */
+struct powerfs_net_server_conn *
+powerfs_conn_find_filer(const char *addr, __u16 port);
+
+/* 更新 shard 路由 (REDIRECT 时调用, shard → VALID) */
+void powerfs_shard_route_update(u64 shard_id, int filer_idx);
+
+/* === 事件驱动: 连接状态变化通知 shard 路由 === */
+
+/*
+ * 连接断开时调用: 所有 leader=该filer 的 shard → ROUTE_CHECKING
+ * 场景: TCP 断连、send/recv 错误、健康检查失败
+ */
+void powerfs_shard_route_on_filer_disconnect(int filer_idx);
+
+/*
+ * 连接重连成功时调用: 所有 leader=该filer 的 shard → ROUTE_CHECKING
+ * (不是直接 VALID, 因为 leader 可能已切换到其他 filer, 需要重新确认)
+ */
+void powerfs_shard_route_on_filer_reconnect(int filer_idx);
+
+/*
+ * 获取 shard 路由状态
+ */
+enum powerfs_shard_route_state
+powerfs_shard_route_get_state(u64 shard_id);
+
+/*
+ * 在 ROUTE_CHECKING 状态下, 获取下一个可用的 filer
+ * 跳过 FAULT 和 DISCONNECTED 的连接
+ * 返回 filer_idx, 或 -1 如果没有可用 filer
+ */
+int powerfs_shard_route_find_available_filer(u64 shard_id);
+
+/* 单个连接的状态操作 */
+int  powerfs_conn_connect_one(struct powerfs_net_server_conn *conn);
+void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn);
+
+/* 连接状态变更 (内部调用, 触发路由表更新) */
+void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
+                            enum powerfs_conn_state new_state);
+
+/* 健康监控 */
+void powerfs_conn_start_monitor(void);
+void powerfs_conn_stop_monitor(void);
+
+/* === 请求生命周期 (参照 Ceph osd_request 设计) === */
+
+/*
+ * 提交请求并通过连接池发送 (主入口, 替代 powerfs_net_send_request)
+ *
+ * 流程:
+ *   1. 根据 shard_id 查路由状态
+ *   2. VALID: 直接用 leader filer 连接
+ *   3. CHECKING: 尝试其他 filer, 或将请求挂到 shard pending 队列
+ *   4. UNKNOWN: 挂到 shard pending 队列等待, 或返回 -EAGAIN
+ *   5. 发送+接收, 处理 REDIRECT (更新路由表, 重试)
+ *   6. 断连: 标记 needs_resend, 重连后自动重发 (参照 Ceph con_fault)
+ *
+ * 返回 req->error (0=成功, <0=错误)
+ */
+int powerfs_request_submit(struct powerfs_request *req);
+
+/*
+ * 断连时标记重发 (参照 Ceph con_fault: list_splice_init + requeue)
+ *
+ * 不取消请求, 而是标记 needs_resend=true.
+ * 重连成功后, resend_pending 自动重发这些请求.
+ * 对于等待 completion 的调用者, 不会被唤醒 (继续等待重发结果).
+ */
+void powerfs_request_mark_resend_on_conn(struct powerfs_net_server_conn *conn);
+
+/*
+ * 重连成功后重发待重发请求 (参照 Ceph con_fault_finish)
+ *
+ * 遍历 pending_reqs, 对 needs_resend=true 的请求重新发送.
+ * 超过 MAX_ATTEMPTS 的请求标记 -ETIMEDOUT 并完成.
+ */
+void powerfs_request_resend_pending(struct powerfs_net_server_conn *conn);
+
+/*
+ * 派发 shard pending 队列中的请求 (找到新 leader 后调用)
+ */
+void powerfs_shard_route_dispatch_pending(u64 shard_id);
+
+/* kref 释放 (内部, powerfs_request_free 调用) */
+void powerfs_request_release(struct kref *kref);
+
+/* ========== 旧连接管理 (兼容期保留) ========== */
+
 /* 连接状态 */
 enum powerfs_net_state {
     POWERFS_NET_STATE_DISCONNECTED = 0,
@@ -359,19 +672,14 @@ struct powerfs_net_conn {
 
 /* ========== 多连接池配置 ========== */
 
-#define POWERFS_NET_MAX_SERVERS    8    /* 最大服务器数量 (Filer + Master) */
+#define POWERFS_NET_MAX_SERVERS    32   /* 最大服务器数量 (Filer + Master + Volume, 支持多节点扩展) */
+#define POWERFS_NET_MAX_FILERS     16   /* 最大 Filer 数量 */
+#define POWERFS_NET_MAX_VOLUMES    32   /* 最大 Volume 数量 */
 #define POWERFS_NET_MAX_PATHS      256   /* Delta Sync 最大路径缓存数 */
 #define POWERFS_NET_MONITOR_INTERVAL 5000  /* 健康检查间隔 (ms) */
 #define POWERFS_NET_LEADER_CHECK_INTERVAL 2000  /* Leader 检查间隔 (ms) */
 
-/* 服务器类型 */
-enum powerfs_net_server_type {
-    POWERFS_NET_SERVER_FILER = 0,
-    POWERFS_NET_SERVER_MASTER = 1,
-    POWERFS_NET_SERVER_VOLUME = 2,
-};
-
-/* 服务器条目 */
+/* 服务器条目 (元数据, 兼容旧代码) */
 struct powerfs_net_server_entry {
     char addr[64];              /* 服务器地址 */
     __u16 port;                 /* 端口 */
@@ -381,35 +689,43 @@ struct powerfs_net_server_entry {
     __u64 last_check_time;      /* 最后检查时间 (jiffies) */
 };
 
-/* 连接池结构 */
+/* 连接池结构 (新架构: per-conn 连接 + shard 路由) */
 struct powerfs_net_pool {
-    /* 服务器配置 */
+    /* === 连接池 === */
+    /* Filer 连接池: 每个连接独立 state/mutex/reconnect */
+    struct powerfs_net_server_conn filers[POWERFS_NET_MAX_FILERS];
+    int filer_count;
+
+    /* Volume 连接池 */
+    struct powerfs_net_server_conn volumes[POWERFS_NET_MAX_VOLUMES];
+    int volume_count;
+
+    /* === Shard 路由表 === */
+    struct powerfs_shard_route shard_route;
+
+    /* === Master 地址 (用于 discover) === */
+    char master_addr[64];
+    __u16 master_port;
+    bool master_set;
+
+    /* === 健康监控 === */
+    struct delayed_work monitor_work;
+    bool monitoring;
+    atomic_t stopping;
+
+    /* === 旧字段 (兼容期, 逐步移除) === */
     struct powerfs_net_server_entry servers[POWERFS_NET_MAX_SERVERS];
     int server_count;
-    int filer_count;
     int master_count;
-    int volume_count;
-    
-    /* 当前活跃索引 */
     atomic_t active_filer_idx;
     atomic_t active_master_idx;
     atomic_t active_volume_idx;
-    
-    /* leader 相关 */
-    atomic_t leader_idx;        /* 当前 leader 在 filers 中的索引 */
-    atomic_t leader_known;      /* leader 已知标志 */
-    
-    /* 故障转移统计 */
+    atomic_t leader_idx;
+    atomic_t leader_known;
     atomic_t failover_count;
     atomic_t last_failover_time;
-    
-    /* 锁 */
     struct mutex pool_lock;
-    
-    /* 监控线程 */
-    struct delayed_work monitor_work;
     struct delayed_work leader_check_work;
-    bool monitoring;
 };
 
 /* Delta Sync 路径条目 */
@@ -463,6 +779,13 @@ int powerfs_net_set_filers(const char *addrs, const char *ports);
 
 /* 设置 Master 地址 */
 int powerfs_net_set_master(const char *addr, __u16 port);
+
+/* 从 Master 查询 filer 列表并添加到连接池.
+ * 遍历 master_addrs (逗号分隔), 连接第一个可达的 Master leader,
+ * 发送 LIST_FILERS 请求, 解析响应并 add_server 每个返回的 filer.
+ * 成功返回 filer 数量 (>0), 失败返回负值.
+ * master_port 为 Master 的 powerfs-net 端口 (通常 9334). */
+int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port);
 
 /* 设置 Volume 地址 */
 int powerfs_net_set_volume(const char *addr, __u16 port);

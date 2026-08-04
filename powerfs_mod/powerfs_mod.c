@@ -20,31 +20,41 @@
 
 #include "powerfs.h"
 
-/* ========== 模块参数 ========== */
+/* ========== 模块参数 ==========
+ *
+ * 默认值对齐 docker-compose 部署 (network: 172.30.0.0/24):
+ *   master: 172.30.0.11/12/13, net_port=9334 (powerfs-net 端口)
+ *   filer:  172.30.0.35/36/37, net_port=9334
+ *   volume: 172.30.0.21/22/23, net_port=8901
+ *
+ * 注意: master_port 必须是 net_port (9334), 不是 grpc_port (9333),
+ * 因为内核通过 powerfs-net (TLV) 协议与 Master 通信.
+ * filer_port 同理, 使用 net_port 而非 grpc_port.
+ */
 
-static char *master_addr = "172.20.0.14";
+static char *master_addr = "172.30.0.11,172.30.0.12,172.30.0.13";
 module_param(master_addr, charp, 0644);
-MODULE_PARM_DESC(master_addr, "Master server address");
+MODULE_PARM_DESC(master_addr, "Master server addresses (comma-separated), powerfs-net port");
 
-static ushort master_port = 9333;
+static ushort master_port = 9334;
 module_param(master_port, ushort, 0644);
-MODULE_PARM_DESC(master_port, "Master server port");
+MODULE_PARM_DESC(master_port, "Master powerfs-net port (default 9334, not gRPC 9333)");
 
-static char *volume_addr = "172.20.0.24";
+static char *volume_addr = "172.30.0.21,172.30.0.22,172.30.0.23";
 module_param(volume_addr, charp, 0644);
-MODULE_PARM_DESC(volume_addr, "Volume server address");
+MODULE_PARM_DESC(volume_addr, "Volume server addresses (comma-separated)");
 
-static ushort volume_port = 8080;
+static ushort volume_port = 8901;
 module_param(volume_port, ushort, 0644);
-MODULE_PARM_DESC(volume_port, "Volume server port");
+MODULE_PARM_DESC(volume_port, "Volume powerfs-net port (default 8901)");
 
-static char *filer_addr = "172.20.0.37";
+static char *filer_addr = "172.30.0.35,172.30.0.36,172.30.0.37";
 module_param(filer_addr, charp, 0644);
-MODULE_PARM_DESC(filer_addr, "Filer server address");
+MODULE_PARM_DESC(filer_addr, "Filer server addresses (comma-separated, fallback when Master discovery fails)");
 
-static ushort filer_port = 8889;
+static ushort filer_port = 9334;
 module_param(filer_port, ushort, 0644);
-MODULE_PARM_DESC(filer_port, "Filer server port");
+MODULE_PARM_DESC(filer_port, "Filer powerfs-net port (default 9334)");
 
 /* ========== fs_context 参数解析 ========== */
 
@@ -90,6 +100,8 @@ static int powerfs_parse_param(struct fs_context *fc, struct fs_parameter *param
     struct powerfs_ctx *ctx = fc->s_fs_info;
     struct fs_parse_result result;
     int opt;
+
+    pr_info("powerfs: parse_param: key=%s, ctx=%px\n", param->key, ctx);
 
     opt = fs_parse(fc, powerfs_fs_parameters, param, &result);
     if (opt == -ENOPARAM) {
@@ -155,6 +167,8 @@ static int powerfs_init_fs_context(struct fs_context *fc)
 {
     struct powerfs_ctx *ctx;
 
+    pr_info("powerfs: init_fs_context called, master_addr=%s\n", master_addr);
+
     ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
     if (!ctx)
         return -ENOMEM;
@@ -169,6 +183,9 @@ static int powerfs_init_fs_context(struct fs_context *fc)
 
     fc->s_fs_info = ctx;
     fc->ops = &powerfs_ctx_ops;
+
+    pr_info("powerfs: init_fs_context done, ctx=%px, master_addr=%s\n",
+            ctx, ctx->master_addr);
 
     return 0;
 }

@@ -3103,11 +3103,16 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         char filer_addr[64];
         u16  filer_port;
     };
-    struct powerfs_ctx_simple *ctx = fc->s_fs_info;
+    /* 注意: sget_fc() 会将 fc->s_fs_info 转移到 sb->s_fs_info, 然后将
+     * fc->s_fs_info 置 NULL. 因此必须从 sb->s_fs_info 获取 ctx, 而不是
+     * 从 fc->s_fs_info 获取 (后者已经是 NULL).
+     * 参考: fs/super.c sget_fc() 第 566-574 行 */
+    struct powerfs_ctx_simple *ctx = sb->s_fs_info;
     struct powerfs_sb_info *sbi;
     struct inode *root;
 
-    pr_info("powerfs: fill_super\n");
+    pr_info("powerfs: fill_super (sb->s_fs_info=%px, master_addr='%s')\n",
+            ctx, ctx ? ctx->master_addr : "(null)");
 
     /* 创建超级块私有信息 */
     sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
@@ -3116,7 +3121,7 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
     sbi->sb = sb;
 
-    /* 保存挂载参数 */
+    /* 保存挂载参数 (ctx 来自 init_fs_context 通过 sget_fc 转移到 sb->s_fs_info) */
     if (ctx) {
         strncpy(sbi->master_addr, ctx->master_addr, sizeof(sbi->master_addr) - 1);
         sbi->master_port = ctx->master_port;
@@ -3124,12 +3129,16 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->volume_port = ctx->volume_port;
         strncpy(sbi->filer_addr, ctx->filer_addr, sizeof(sbi->filer_addr) - 1);
         sbi->filer_port = ctx->filer_port;
+        /* 释放 init_fs_context 分配的 ctx, 释放后 sb->s_fs_info 仍指向已释放内存,
+         * 必须在下方设置 sb->s_fs_info = sbi 之前完成 */
+        kfree(ctx);
+        ctx = NULL;
     }
 
     /* 初始化 inode 号分配器 (从 100 开始，1 是 root) */
     atomic_set(&sbi->next_ino, 100);
 
-    /* 设置超级块 */
+    /* 设置超级块 (覆盖 sb->s_fs_info, 之前指向已释放的 ctx) */
     sb->s_fs_info = sbi;
     sb->s_op = &powerfs_super_ops;
     sb->s_magic = POWERFS_SUPER_MAGIC;
@@ -3167,36 +3176,118 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     powerfs_net_pool_init();
 
     /* 配置 Filer 节点 (Delta Sync 的主节点).
-     * mount 无参数时 ctx->filer_addr 为空, 此时 fallback 到模块参数
-     * g_server_addr/g_server_port (由 insmod 传入), 保证 pool 非空,
-     * 否则 leader_check_work/monitor_work 会一直报 "no leader found". */
+     * Filer 列表获取策略 (优先级递减):
+     *   1. 若配置了 master_addr, 调用 powerfs_net_discover_filers 从
+     *      Master 动态发现 filer 列表 (支持几百个 filer 的扩展场景).
+     *   2. 发现失败时, 回退到 sbi->filer_addr / g_server_addr 手动解析
+     *      (逗号分隔多地址), 保证向后兼容.
+     *
+     * 注意: ctx 已在上方 kfree, 这里使用 sbi 中保存的挂载参数.
+     * Master 节点也加入连接池 (供后续 Master 交互使用, 如 GetTopology). */
     {
-        const char *faddr = (ctx && ctx->filer_addr[0]) ?
-                            ctx->filer_addr : powerfs_net_get_server_addr();
-        __u16 fport = (ctx && ctx->filer_addr[0]) ?
-                      ctx->filer_port : powerfs_net_get_server_port();
-        if (faddr && faddr[0]) {
-            powerfs_net_add_server(faddr, fport,
-                                  POWERFS_NET_SERVER_FILER);
-            /* 标记为 leader (单 Filer 模式) */
-            powerfs_net_set_primary(faddr, fport);
+        const char *maddr = (sbi->master_addr[0]) ? sbi->master_addr : NULL;
+        __u16 mport = sbi->master_port ? sbi->master_port : 9334;
+        int discovered = 0;
+
+        /* 先添加 Master 到连接池 (discover_filers 需要) */
+        if (maddr) {
+            char mbuf[256];
+            char *mp, *mtok;
+            strncpy(mbuf, maddr, sizeof(mbuf) - 1);
+            mbuf[sizeof(mbuf) - 1] = '\0';
+            mp = mbuf;
+            while ((mtok = strsep(&mp, ",")) != NULL) {
+                while (*mtok == ' ') mtok++;
+                if (mtok[0] == '\0') continue;
+                powerfs_net_add_server(mtok, mport,
+                                      POWERFS_NET_SERVER_MASTER);
+                pr_info("powerfs: added master %s:%u\n", mtok, mport);
+            }
+        }
+
+        /* 尝试从 Master 发现 filer 列表 */
+        if (maddr) {
+            discovered = powerfs_net_discover_filers(maddr, mport);
+            if (discovered > 0) {
+                pr_info("powerfs: discovered %d filers via Master\n",
+                        discovered);
+            } else {
+                pr_warn("powerfs: Master filer discovery failed (%d), "
+                        "falling back to manual filer_addr\n", discovered);
+            }
+        }
+
+        /* 回退: 手动解析 filer_addr / g_server_addr */
+        if (discovered <= 0) {
+            const char *faddr = (sbi->filer_addr[0]) ?
+                                sbi->filer_addr :
+                                powerfs_net_get_server_addr();
+            __u16 fport = (sbi->filer_addr[0]) ?
+                          sbi->filer_port :
+                          powerfs_net_get_server_port();
+            if (faddr && faddr[0]) {
+                char addr_buf[256];
+                char *p, *tok;
+                bool first = true;
+
+                strncpy(addr_buf, faddr, sizeof(addr_buf) - 1);
+                addr_buf[sizeof(addr_buf) - 1] = '\0';
+
+                p = addr_buf;
+                while ((tok = strsep(&p, ",")) != NULL) {
+                    if (tok[0] == '\0')
+                        continue;
+                    while (*tok == ' ')
+                        tok++;
+                    if (tok[0] == '\0')
+                        continue;
+                    powerfs_net_add_server(tok, fport,
+                                          POWERFS_NET_SERVER_FILER);
+                    if (first) {
+                        powerfs_net_set_primary(tok, fport);
+                        first = false;
+                    }
+                    pr_info("powerfs: added filer %s:%u (manual)\n",
+                            tok, fport);
+                }
+            }
         }
     }
 
-    /* 配置 Master 节点 */
-    if (ctx && ctx->master_addr[0]) {
-        powerfs_net_add_server(ctx->master_addr, ctx->master_port,
-                              POWERFS_NET_SERVER_MASTER);
-    }
-
-    /* 配置 Volume 节点 */
-    if (ctx && ctx->volume_addr[0]) {
-        powerfs_net_add_server(ctx->volume_addr, ctx->volume_port,
-                              POWERFS_NET_SERVER_VOLUME);
+    /* 配置 Volume 节点 (支持逗号分隔多地址) */
+    if (sbi->volume_addr[0]) {
+        char vbuf[256];
+        char *vp, *vtok;
+        strncpy(vbuf, sbi->volume_addr, sizeof(vbuf) - 1);
+        vbuf[sizeof(vbuf) - 1] = '\0';
+        vp = vbuf;
+        while ((vtok = strsep(&vp, ",")) != NULL) {
+            while (*vtok == ' ') vtok++;
+            if (vtok[0] == '\0') continue;
+            powerfs_net_add_server(vtok, sbi->volume_port,
+                                  POWERFS_NET_SERVER_VOLUME);
+            pr_info("powerfs: added volume %s:%u\n", vtok,
+                    sbi->volume_port);
+        }
     }
 
     /* 启动 Delta Sync 监控 (leader 探测 + 健康检查) */
     powerfs_net_start_monitor();
+
+    /* 初始化新连接池: 从 g_pool.servers[] 创建 per-filer 连接,
+     * 并行连接所有 filer, 启动健康监控.
+     * 新架构: per-conn 状态机 + shard 路由 + 事件驱动.
+     * 旧 g_conn 路径保留为 fallback. */
+    {
+        int pool_ret = powerfs_conn_pool_init(NULL, 0);
+        if (pool_ret == 0) {
+            powerfs_conn_start_monitor();
+            pr_info("powerfs: new connection pool initialized\n");
+        } else {
+            pr_warn("powerfs: new connection pool init failed (%d), using legacy path\n",
+                    pool_ret);
+        }
+    }
 
     pr_info("powerfs: fill_super done, root ino=%lu\n", root->i_ino);
     pr_info("powerfs: powerfs_net pool initialized (Delta Sync ready)\n");
