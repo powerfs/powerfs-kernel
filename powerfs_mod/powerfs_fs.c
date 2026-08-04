@@ -3271,21 +3271,27 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         }
     }
 
-    /* 启动 Delta Sync 监控 (leader 探测 + 健康检查) */
-    powerfs_net_start_monitor();
-
-    /* 初始化新连接池: 从 g_pool.servers[] 创建 per-filer 连接,
-     * 并行连接所有 filer, 启动健康监控.
-     * 新架构: per-conn 状态机 + shard 路由 + 事件驱动.
-     * 旧 g_conn 路径保留为 fallback. */
+    /* 初始化新连接池并启动健康监控.
+     *
+     * 新架构 (per-conn 状态机 + shard 路由 + 事件驱动) 为首选路径;
+     * 旧 g_conn 单连接 + 旧 monitor 仅在连接池初始化失败时作为 fallback.
+     *
+     * 重要: 新旧 monitor 共享 g_pool.monitor_work 与 monitoring 标志, 二者互斥.
+     * 之前无条件先调用 powerfs_net_start_monitor() 置 monitoring=true, 会使
+     * powerfs_conn_start_monitor() 直接 return, 导致新的 per-filer 健康监控
+     * (powerfs_conn_health_monitor_fn) 从不运行 —— filer 死亡只能靠 I/O 发送
+     * 失败被动发现, 且旧 monitor 在 discovery 路径下因 g_conn 从未连接而空转.
+     * 因此必须根据连接池初始化结果二选一, 绝不同时启动. */
     {
         int pool_ret = powerfs_conn_pool_init(NULL, 0);
         if (pool_ret == 0) {
             powerfs_conn_start_monitor();
-            pr_info("powerfs: new connection pool initialized\n");
+            pr_info("powerfs: new connection pool initialized (per-filer health monitor active)\n");
         } else {
-            pr_warn("powerfs: new connection pool init failed (%d), using legacy path\n",
+            pr_warn("powerfs: new connection pool init failed (%d), using legacy g_conn path\n",
                     pool_ret);
+            /* fallback: 旧 g_conn 单连接, 由旧 monitor 负责 leader 探测 + 健康检查 */
+            powerfs_net_start_monitor();
         }
     }
 

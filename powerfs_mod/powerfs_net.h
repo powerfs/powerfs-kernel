@@ -280,13 +280,31 @@ int  powerfs_tlv_dec_string(struct powerfs_tlv_dec *dec, __u8 field,
 int  powerfs_tlv_dec_skip(struct powerfs_tlv_dec *dec, size_t length);
 bool powerfs_tlv_dec_is_empty(const struct powerfs_tlv_dec *dec);
 
-/* ========== powerfs-net 连接管理 ========== */
+/* ========== powerfs-net 连接管理 (v2: sk 回调 + per-CPU 调度器) ========== */
 
 /* 服务器类型 (前置声明: 新架构 struct powerfs_net_server_conn 需要) */
 enum powerfs_net_server_type {
     POWERFS_NET_SERVER_FILER = 0,
     POWERFS_NET_SERVER_MASTER = 1,
     POWERFS_NET_SERVER_VOLUME = 2,
+};
+
+/* === v2: per-CPU 调度器 (参照 Lustre ksock_sched) ===
+ *
+ * 每个 CPU 一个调度器线程, 服务按 addr hash 分配到本调度器的所有连接.
+ * 线程数固定 = num_online_cpus(), 与连接数无关 (解决 v1 的 N 连接 N 线程问题).
+ *
+ * 调度器消费两个队列:
+ *   rx_conns: sk_data_ready 回调投递的"有数据可收"连接
+ *   tx_conns: sk_write_space 回调/do_send 投递的"可写待发"连接
+ * 空闲时 wait_event 睡眠, 回调 wake_up 唤醒. */
+struct powerfs_net_sched {
+    spinlock_t          lock;       /* 保护 rx_conns/tx_conns (spin_lock_bh) */
+    struct list_head    rx_conns;   /* 数据就绪待收的连接 */
+    struct list_head    tx_conns;   /* 可写待发的连接 */
+    wait_queue_head_t   waitq;      /* 调度器线程等待队列 */
+    int                 cpt;        /* 所属 CPU 编号 (0 .. num_online_cpus-1) */
+    struct task_struct *task;       /* 调度器线程 (pfs_scheduler_thread) */
 };
 
 /* ========== 连接池状态机 (Phase 1: 新架构) ========== */
@@ -343,6 +361,9 @@ struct powerfs_request {
     /* === 链表节点 === */
     /* 挂到 filer->pending_reqs (发送顺序) 或 shard pending 队列 */
     struct list_head list_node;
+    /* v2: 挂到 conn->tx_queue (待发送队列, 调度器消费).
+     * 与 list_node 独立: 请求可同时在 pending_reqs (等响应) 和 tx_queue (待发送) */
+    struct list_head tx_list;
 
     /* === 请求标识 === */
     __u32 seq;                   /* 序列号 (per-conn, 由 submit 分配) */
@@ -422,6 +443,32 @@ struct powerfs_net_server_conn {
     /* req_tree: 按 seq 查找请求 (红黑树, O(log n), 用于 reply 匹配) */
     struct rb_root req_tree;
     spinlock_t req_lock;        /* 保护 pending_reqs + req_tree */
+
+    /* === v2 回调驱动 (替换 v1 的 per-conn RX 线程) === */
+    struct work_struct disconnect_work;  /* sk_state_change/error_report 或收发错误触发的清理 work */
+    struct powerfs_net_sched *sched;     /* 归属的调度器 (按 addr hash 到 CPU) */
+    struct list_head          rx_list;   /* 挂到 sched->rx_conns */
+    struct list_head          tx_list;   /* 挂到 sched->tx_conns */
+    bool                      rx_ready;  /* 回调置位: 有数据可收 */
+    bool                      rx_scheduled; /* 已在 rx_conns 中 (防重复投递) */
+    bool                      tx_ready;  /* 回调置位: 有空间可发 */
+    bool                      tx_scheduled; /* 已在 tx_conns 中 */
+    struct list_head          tx_queue;  /* 待发送请求队列 (do_send 入队, 调度器消费) */
+    spinlock_t                tx_lock;   /* 保护 tx_queue */
+
+    /* === v2 sk 回调保存 (竞态处理, 参照 Lustre socklnd_lib.c) ===
+     * disconnect 时恢复原始回调, 防止 socket 比模块长寿导致 UAF */
+    void (*saved_data_ready)(struct sock *);
+    void (*saved_write_space)(struct sock *);
+    void (*saved_state_change)(struct sock *);
+    void (*saved_error_report)(struct sock *);
+
+    /* === v2 调度器引用计数 ===
+     * kref 用于调度器持引用: 回调投递到 rx_conns/tx_conns 时 get,
+     * 调度器处理完 put. disconnect 等 kref refcount==1 (只剩 owner 引用)
+     * 才 sock_release, 防止调度器在飞时 UAF.
+     * (sock_users 字段保留但 v2 不再使用, do_send 不直接碰 sock) */
+    struct kref kref;
 
     /* === 指数退避 (参照 Ceph con->delay) === */
     unsigned long reconnect_delay;  /* 当前退避间隔 (jiffies) */
@@ -712,6 +759,13 @@ struct powerfs_net_pool {
     struct delayed_work monitor_work;
     bool monitoring;
     atomic_t stopping;
+
+    /* === v2: per-CPU 调度器数组 (参照 Lustre ksocknal_data.ksnd_schedulers) ===
+     * schedulers[i] 服务 addr hash % num_sched == i 的所有连接.
+     * global_lock 保护 sk_user_data 解引用 (回调 read_lock_bh vs set/reset write_lock_bh) */
+    struct powerfs_net_sched *schedulers;
+    int                        num_sched;
+    rwlock_t                   global_lock;
 
     /* === 旧字段 (兼容期, 逐步移除) === */
     struct powerfs_net_server_entry servers[POWERFS_NET_MAX_SERVERS];
