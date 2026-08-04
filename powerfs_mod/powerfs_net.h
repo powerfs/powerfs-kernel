@@ -598,23 +598,6 @@ void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
 int powerfs_request_submit(struct powerfs_request *req);
 
 /*
- * 断连时标记重发 (参照 Ceph con_fault: list_splice_init + requeue)
- *
- * 不取消请求, 而是标记 needs_resend=true.
- * 重连成功后, resend_pending 自动重发这些请求.
- * 对于等待 completion 的调用者, 不会被唤醒 (继续等待重发结果).
- */
-void powerfs_request_mark_resend_on_conn(struct powerfs_net_server_conn *conn);
-
-/*
- * 重连成功后重发待重发请求 (参照 Ceph con_fault_finish)
- *
- * 遍历 pending_reqs, 对 needs_resend=true 的请求重新发送.
- * 超过 MAX_ATTEMPTS 的请求标记 -ETIMEDOUT 并完成.
- */
-void powerfs_request_resend_pending(struct powerfs_net_server_conn *conn);
-
-/*
  * 派发 shard pending 队列中的请求 (找到新 leader 后调用)
  */
 void powerfs_shard_route_dispatch_pending(u64 shard_id);
