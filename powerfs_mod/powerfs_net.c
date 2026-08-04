@@ -787,10 +787,14 @@ void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
     if (new_state == CONN_RECONNECTING || new_state == CONN_FAULT) {
         if (filer_idx >= 0)
             powerfs_shard_route_on_filer_disconnect(filer_idx);
-    } else if (new_state == CONN_CONNECTED && old_state == CONN_RECONNECTING) {
+    } else if (new_state == CONN_CONNECTED &&
+               (old_state == CONN_RECONNECTING || old_state == CONN_CONNECTING)) {
         if (filer_idx >= 0)
             powerfs_shard_route_on_filer_reconnect(filer_idx);
-        /* 重连成功: 重置退避, 重发待重发请求 (参照 Ceph con_fault_finish) */
+        /* 重连成功: 重置退避, 重发待重发请求 (参照 Ceph con_fault_finish).
+         * 条件含 CONNECTING: connect_one 先设 CONNECTING 再设 CONNECTED,
+         *   old_state 是 CONNECTING 不是 RECONNECTING.
+         * 首次连接 (INIT→CONNECTING→CONNECTED) 时 pending_reqs 为空, no-op. */
         conn->reconnect_delay = 0;
         powerfs_request_resend_pending(conn);
     }
@@ -1008,6 +1012,8 @@ static void pfs_state_change(struct sock *sk)
     read_lock_bh(&g_pool.global_lock);
     conn = sk->sk_user_data;
     if (conn) {
+        pr_info("powerfs: state_change %s:%u sk_state=%d sk_err=%d\n",
+                conn->addr, conn->port, sk->sk_state, sk->sk_err);
         if (sk->sk_state == TCP_CLOSE_WAIT || sk->sk_state == TCP_CLOSE)
             schedule_work(&conn->disconnect_work);   /* process context 清理 */
     } else {
@@ -1024,8 +1030,8 @@ static void pfs_error_report(struct sock *sk)
     read_lock_bh(&g_pool.global_lock);
     conn = sk->sk_user_data;
     if (conn) {
-        pr_debug("powerfs: error_report %s:%u sk_err=%d\n",
-                 conn->addr, conn->port, sk->sk_err);
+        pr_info("powerfs: error_report %s:%u sk_err=%d\n",
+                conn->addr, conn->port, sk->sk_err);
         schedule_work(&conn->disconnect_work);
     } else {
         sk->sk_error_report(sk);           /* NULL: 调原始回调 */
@@ -1524,30 +1530,18 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
         kernel_sock_shutdown(sock, SHUT_RDWR);
 
     /* 4. 标记在途请求重发 (置 needs_resend, 供重连后 resend_pending 使用).
-     *    冗余于步骤5 (请求会被摘除), 但保持与 set_state(FAULT) 路径一致. */
+     *    请求保留在 pending_reqs/req_tree 中, 不摘除不 complete.
+     *    do_send 在 wait_for_completion_timeout 上继续等待, 直到:
+     *      a. 重连成功 → resend_pending 重发 → 调度器 RX 收到响应 → complete
+     *      b. 重连失败 → set_state(FAULT) → 以 -ENOTCONN complete
+     *      c. do_send 超时 (30s) → 以 -ETIMEDOUT complete
+     *    (参照 Ceph con_fault: 不取消请求, 标记 r_needs_resend,
+     *     重连后 con_fault_finish 重发) */
     powerfs_request_mark_resend_on_conn(conn);
 
-    /* 5. 唤醒在途请求的 submit: 以 -ENOTCONN complete, 让其立即重试其他 filer
-     *    (不等本 conn 重连, 避免旧设计 30s 超时). 锁外 complete 避免锁序问题. */
-    {
-        struct powerfs_request *req, *tmp;
-        LIST_HEAD(wake_list);
-        spin_lock(&conn->req_lock);
-        list_for_each_entry_safe(req, tmp, &conn->pending_reqs, list_node) {
-            list_del_init(&req->list_node);
-            powerfs_req_tree_remove(conn, req);
-            req->error = -ENOTCONN;
-            list_add_tail(&req->list_node, &wake_list);
-        }
-        spin_unlock(&conn->req_lock);
-        list_for_each_entry_safe(req, tmp, &wake_list, list_node) {
-            list_del_init(&req->list_node);
-            complete(&req->done);
-        }
-    }
-
-    /* 6. v2: 排空 tx_queue (调度器可能已取走部分, 剩余的以 -ENOTCONN complete).
-     *    do_send 入 tx_queue 后若 disconnect, 请求可能仍在 tx_queue 未发送. */
+    /* 5. v2: 排空 tx_queue (调度器可能已取走部分, 剩余的从队列摘除).
+     *    请求仍在 pending_reqs 中 (步骤 4 未摘除), 等 resend_pending 重新入 tx_queue.
+     *    tx_queue 摘除防止调度器在断连的 sock 上发送 (shutdown 后 sendmsg 返回错误). */
     {
         struct powerfs_request *req, *tmp;
         LIST_HEAD(tx_drain);
@@ -1556,13 +1550,12 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
         spin_unlock(&conn->tx_lock);
         list_for_each_entry_safe(req, tmp, &tx_drain, tx_list) {
             list_del_init(&req->tx_list);
-            /* 已在步骤5 以 -ENOTCONN complete 的请求 (从 pending_reqs 摘除),
-             * 不重复 complete; 仍在 pending_reqs 的请求此处也不重复.
-             * 仅从 tx_queue 摘除即可, pending 侧已统一处理. */
+            /* 仅从 tx_queue 摘除, 不 complete: 请求仍在 pending_reqs 中,
+             * 等 resend_pending (重连后) 重新入 tx_queue 重发. */
         }
     }
 
-    /* 7. v2: 退役 sock 前, 等待调度器放下 conn (kref refcount==1, 即只剩 owner 引用).
+    /* 6. v2: 退役 sock 前, 等待调度器放下 conn (kref refcount==1, 即只剩 owner 引用).
      *    调度器若正在 process_receive/transmit (持 conn 引用), 此处等待其完成.
      *    shutdown 已使 recv/send 返回错误, 调度器很快退出处理并 put. */
     spin_lock(&conn->state_lock);
@@ -2164,7 +2157,12 @@ static int powerfs_request_do_send(struct powerfs_request *req,
 
     /* 等待调度器 complete (异步收发, 流水线).
      * 超时 3x RECV_TIMEOUT (30s): 兜底防止调度器异常未 complete.
-     * 正常情况下调度器 RX 收到响应即 complete, 或 disconnect_one/FAULT 以 -ENOTCONN complete. */
+     * 完成路径:
+     *   a. 正常: 调度器 RX 收到响应 → complete
+     *   b. 断连: disconnect_one 标记 needs_resend (不 complete), 等 resend_pending
+     *      重连成功后重发 → 调度器 RX 收到响应 → complete
+     *   c. FAULT: set_state(FAULT) 以 -ENOTCONN complete (重连彻底失败)
+     *   d. 超时: 30s 未收到响应 → -ETIMEDOUT */
     {
         long wr = wait_for_completion_timeout(&req->done,
                     msecs_to_jiffies(POWERFS_NET_RECV_TIMEOUT * 3));
