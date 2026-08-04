@@ -233,9 +233,12 @@ static struct socket *powerfs_net_create_tcp_socket(void)
         return NULL;
     }
 
-    /* 设置 socket 选项 */
+    /* 设置 socket 选项.
+     * sk_sndtimeo 初始用 CONNECT_TIMEOUT (3s): kernel_connect 用此超时,
+     * filer 不可达时快速失败, 避免多 filer 串行 connect 累积阻塞.
+     * connect_one 成功后改回 SEND_TIMEOUT (10s) 用于后续 send. */
     sock->sk->sk_rcvtimeo = msecs_to_jiffies(POWERFS_NET_RECV_TIMEOUT);
-    sock->sk->sk_sndtimeo = msecs_to_jiffies(POWERFS_NET_SEND_TIMEOUT);
+    sock->sk->sk_sndtimeo = msecs_to_jiffies(POWERFS_NET_CONNECT_TIMEOUT);
 
     /* 启用 TCP_NODELAY 减少延迟 */
     tcp_sock_set_nodelay(sock->sk);
@@ -1013,7 +1016,7 @@ static void pfs_state_change(struct sock *sk)
         pr_info("powerfs: state_change %s:%u sk_state=%d sk_err=%d\n",
                 conn->addr, conn->port, sk->sk_state, sk->sk_err);
         if (sk->sk_state == TCP_CLOSE_WAIT || sk->sk_state == TCP_CLOSE)
-            schedule_work(&conn->disconnect_work);   /* process context 清理 */
+            queue_work(g_pool.reconn_wq, &conn->disconnect_work);   /* process context 清理 */
     } else {
         sk->sk_state_change(sk);           /* NULL: 调原始回调 */
     }
@@ -1030,7 +1033,7 @@ static void pfs_error_report(struct sock *sk)
     if (conn) {
         pr_info("powerfs: error_report %s:%u sk_err=%d\n",
                 conn->addr, conn->port, sk->sk_err);
-        schedule_work(&conn->disconnect_work);
+        queue_work(g_pool.reconn_wq, &conn->disconnect_work);
     } else {
         sk->sk_error_report(sk);           /* NULL: 调原始回调 */
     }
@@ -1211,7 +1214,7 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn)
         pr_err("powerfs: scheduler RX %s:%u OOM\n", conn->addr, conn->port);
         kfree(body);
         kfree(data_buf);
-        schedule_work(&conn->disconnect_work);
+        queue_work(g_pool.reconn_wq, &conn->disconnect_work);
         return;
     }
 
@@ -1236,7 +1239,7 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn)
                 conn->addr, conn->port, ret);
         kfree(body);
         kfree(data_buf);
-        schedule_work(&conn->disconnect_work);
+        queue_work(g_pool.reconn_wq, &conn->disconnect_work);
         return;
     }
 
@@ -1254,14 +1257,21 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn)
         return;
     }
 
-    /* 按 seq 查找请求并 complete (锁外 complete 避免锁序问题) */
+    /* 按 seq 查找请求, 摘出队列后放锁, 锁外 memcpy + complete.
+     * (参考 pfs_process_transmit 的 "摘出-放锁-处理" 模式)
+     * memcpy 大块 READ 响应可能耗时, 持 req_lock 会阻塞 do_send 入队
+     * 和 disconnect_one 取消路径. */
     spin_lock(&conn->req_lock);
     req = powerfs_req_tree_lookup(conn, hdr.seq);
     if (req) {
         if (!list_empty(&req->list_node))
             list_del_init(&req->list_node);
         powerfs_req_tree_remove(conn, req);
+    }
+    spin_unlock(&conn->req_lock);
 
+    if (req) {
+        /* 锁外填充响应数据 */
         req->resp_status = hdr.status;
         req->error = 0;
         req->resp_body_len = 0;
@@ -1276,10 +1286,6 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn)
             memcpy(req->resp_data, data_buf, c);
             req->resp_data_len = c;
         }
-    }
-    spin_unlock(&conn->req_lock);
-
-    if (req) {
         complete(&req->done);
     } else {
         pr_debug("powerfs: RX %s:%u: no pending req for seq=%u\n",
@@ -1311,7 +1317,7 @@ static void pfs_process_transmit(struct powerfs_net_server_conn *conn)
 
     sock = conn->sock;
     if (!sock) {
-        schedule_work(&conn->disconnect_work);
+        queue_work(g_pool.reconn_wq, &conn->disconnect_work);
         return;
     }
 
@@ -1354,7 +1360,7 @@ static void pfs_process_transmit(struct powerfs_net_server_conn *conn)
         spin_unlock(&conn->req_lock);
         req->error = -ENOTCONN;
         complete(&req->done);
-        schedule_work(&conn->disconnect_work);
+        queue_work(g_pool.reconn_wq, &conn->disconnect_work);
         return;
     }
 
@@ -1465,6 +1471,9 @@ int powerfs_conn_connect_one(struct powerfs_net_server_conn *conn)
 
     /* 设置 socket recv 超时为 10s (调度器 process context recv 用) */
     sock->sk->sk_rcvtimeo = msecs_to_jiffies(POWERFS_NET_RECV_TIMEOUT);
+    /* connect 阶段用 CONNECT_TIMEOUT (3s), 连接成功后改回 SEND_TIMEOUT (10s)
+     * 供后续 kernel_sendmsg 使用. */
+    sock->sk->sk_sndtimeo = msecs_to_jiffies(POWERFS_NET_SEND_TIMEOUT);
 
     conn->sock = sock;
     powerfs_conn_set_state(conn, CONN_CONNECTED);
@@ -1591,7 +1600,7 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
 
     /* 8. 调度重连 (stopping 时不调度, 由 pool_exit 主导清理) */
     if (!atomic_read(&g_pool.stopping))
-        schedule_delayed_work(&conn->reconnect_work,
+        queue_delayed_work(g_pool.reconn_wq, &conn->reconnect_work,
                               msecs_to_jiffies(POWERFS_NET_BASE_DELAY));
 }
 EXPORT_SYMBOL_GPL(powerfs_conn_disconnect_one);
@@ -1618,7 +1627,7 @@ static void powerfs_conn_reconnect_work_fn(struct work_struct *work)
         conn->reconnect_count = 0;
         conn->reconnect_delay = msecs_to_jiffies(30000);
         if (!atomic_read(&g_pool.stopping))
-            schedule_delayed_work(&conn->reconnect_work,
+            queue_delayed_work(g_pool.reconn_wq, &conn->reconnect_work,
                 conn->reconnect_delay);
         return;
     }
@@ -1641,7 +1650,7 @@ static void powerfs_conn_reconnect_work_fn(struct work_struct *work)
                                          msecs_to_jiffies(POWERFS_NET_MAX_DELAY));
 
         if (!atomic_read(&g_pool.stopping))
-            schedule_delayed_work(&conn->reconnect_work,
+            queue_delayed_work(g_pool.reconn_wq, &conn->reconnect_work,
                 conn->reconnect_delay);
     }
 }
@@ -1659,6 +1668,18 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         g_pool.master_set = true;
     }
     atomic_set(&g_pool.stopping, 0);
+
+    /* v2: 创建独立重连/断连 workqueue.
+     * WQ_UNBOUND: work 在不同 CPU 并行, 避免多 filer 重连串行阻塞.
+     * (system_wq 是 WQ_UNBOUND 但共享, 多 filer connect 各阻塞 3s 会累积) */
+    if (!g_pool.reconn_wq) {
+        g_pool.reconn_wq = alloc_workqueue("powerfs_reconn",
+                                            WQ_UNBOUND | WQ_FREEZABLE, 0);
+        if (!g_pool.reconn_wq) {
+            pr_err("powerfs: failed to create reconnect workqueue\n");
+            return -ENOMEM;
+        }
+    }
 
     /* v2: 初始化 per-CPU 调度器 (必须在创建 conn 之前, 因 conn->sched =
      * pfs_pick_sched(addr) 依赖 schedulers[] 已分配). 幂等: 已分配则跳过. */
@@ -1734,7 +1755,7 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
 
     /* 4. 并行连接所有 filer */
     for (i = 0; i < g_pool.filer_count; i++) {
-        schedule_delayed_work(&g_pool.filers[i].reconnect_work, 0);
+        queue_delayed_work(g_pool.reconn_wq, &g_pool.filers[i].reconnect_work, 0);
     }
 
     /* 5. 等待至少一个 filer 连接成功 (30s 超时) */
@@ -1797,6 +1818,13 @@ void powerfs_conn_pool_exit(void)
      * 放在此处而非 pool_exit: 确保 disconnect_one 的 kref wait 不会因
      * 调度器线程已退出而死等 (调度器线程退出前会 put 完所有在飞引用). */
     powerfs_sched_exit();
+
+    /* 销毁独立 workqueue (所有 work 已 cancel, 安全销毁).
+     * destroy_workqueue 会 flush + 等待所有 pending work 完成. */
+    if (g_pool.reconn_wq) {
+        destroy_workqueue(g_pool.reconn_wq);
+        g_pool.reconn_wq = NULL;
+    }
 }
 EXPORT_SYMBOL_GPL(powerfs_conn_pool_exit);
 

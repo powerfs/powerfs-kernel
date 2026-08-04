@@ -48,8 +48,8 @@
 #define POWERFS_NET_MAX_DATA    (256 * 1024)  /* 256KB data */
 
 /* 连接超时 (ms) */
-#define POWERFS_NET_CONNECT_TIMEOUT  5000
-#define POWERFS_NET_SEND_TIMEOUT     10000
+#define POWERFS_NET_CONNECT_TIMEOUT  3000   /* connect: 3s, fast fail on unreachable filer */
+#define POWERFS_NET_SEND_TIMEOUT     10000  /* post-connect send timeout: 10s */
 #define POWERFS_NET_RECV_TIMEOUT     10000
 
 /* 最大重连次数 (per-conn 状态机使用) */
@@ -643,6 +643,13 @@ struct powerfs_net_pool {
     bool master_set;
 
     atomic_t stopping;
+
+    /* === v2: 独立重连/断连 workqueue ===
+     * 重连 work 中 kernel_connect 可能阻塞 3s, 多 filer 同时重连时
+     * 若共享 system_wq 会串行执行, 累积超过 workqueue lockup 阈值.
+     * 用 WQ_UNBOUND 让 work 并行在不同 CPU 上跑, 互不阻塞.
+     * disconnect_work 也放这里 (sk 回调调度, 同样不应阻塞 system_wq). */
+    struct workqueue_struct *reconn_wq;
 
     /* === v2: per-CPU 调度器数组 (参照 Lustre ksocknal_data.ksnd_schedulers) ===
      * schedulers[i] 服务 addr hash % num_sched == i 的所有连接.
