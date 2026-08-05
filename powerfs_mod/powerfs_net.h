@@ -189,6 +189,7 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_ENTRIES = 0x23,
     POWERFS_NET_FLD_COUNT = 0x24,
     POWERFS_NET_FLD_ENTRY = 0x25,
+    POWERFS_NET_FLD_VERSION = 0x19,  /* matches Rust FieldId::Version */
 
     /* Delta 同步字段 */
     POWERFS_NET_FLD_CLIENT_ID = 0x30,

@@ -346,6 +346,11 @@ struct super_block *powerfs_get_sb(void);
 /* inode 查找 (powerfs_fs.c) */
 struct inode *powerfs_find_inode(struct super_block *sb, u64 ino);
 
+/* Invalidate one inode's page cache and attribute cache.
+ * Called from powerfs_net.c when a NOTIFY frame is received from Filer.
+ * Returns 0 on success, -ENOENT if inode not in cache, negative on error. */
+int powerfs_invalidate_one(u64 ino);
+
 /* invalidate 通知处理 (powerfs_transport.c) */
 struct powerfs_invalidate_req;  /* 前向声明 */
 int powerfs_handle_invalidate(struct powerfs_invalidate_req *req);

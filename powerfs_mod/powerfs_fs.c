@@ -440,6 +440,59 @@ struct inode *powerfs_find_inode(struct super_block *sb, u64 ino)
 }
 
 /*
+ * powerfs_invalidate_one - Invalidate one inode's caches
+ *
+ * Called from the powerfs-net RX path when a NOTIFY frame arrives
+ * from the Filer (triggered by another client's metadata mutation).
+ *
+ * Actions:
+ *   1. Look up the inode in the VFS inode hash (ilookup5). If not
+ *      cached locally, nothing to invalidate — return 0.
+ *   2. invalidate_inode_pages2() to drop clean pages and force
+ *      re-read from the Filer/Volume on next access.
+ *   3. For directories, call powerfs_invalidate_dir_lease() so the
+ *      next readdir re-fetches entries.
+ *
+ * We intentionally do NOT d_drop() here: the Fuser-side Invalidate
+ * only carries (inode, version), so we don't know if the inode was
+ * deleted or merely modified.  The next lookup/getattr will fetch
+ * fresh metadata; if the inode no longer exists on the Filer, the
+ * lookup returns negative and VFS evicts the dentry naturally.
+ *
+ * Must be called in process context (workqueue / tasklet work),
+ * not in softirq — invalidate_inode_pages2 may sleep.
+ */
+int powerfs_invalidate_one(u64 ino)
+{
+    struct super_block *sb = powerfs_get_sb();
+    struct inode *inode;
+    int ret;
+
+    if (!sb)
+        return -ENODEV;
+
+    inode = powerfs_find_inode(sb, ino);
+    if (!inode)
+        return 0;  /* not cached, nothing to invalidate */
+
+    /* Drop clean page-cache pages so the next read re-fetches. */
+    ret = invalidate_inode_pages2(inode->i_mapping);
+    if (ret)
+        pr_debug("powerfs: invalidate_one ino=%llu pages2 ret=%d\n",
+                 ino, ret);
+
+    /* For directories, expire the readdir lease so next readdir
+     * re-fetches entries from the Filer. */
+    if (S_ISDIR(inode->i_mode))
+        powerfs_invalidate_dir_lease(inode);
+
+    pr_debug("powerfs: invalidate_one ino=%llu done\n", ino);
+    iput(inode);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_invalidate_one);
+
+/*
  * powerfs_init_inode - 初始化新 inode 的字段
  *
  * 当 powerfs_iget 返回 I_NEW 状态的 inode 时，

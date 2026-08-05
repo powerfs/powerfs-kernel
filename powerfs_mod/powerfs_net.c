@@ -1430,10 +1430,34 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn)
     }
 
     /* 异步通知帧 (seq=0 或 NOTIFY flag): invalidate 等主动推送.
-     * TODO: 接入 invalidate 分发; 当前仅丢弃. */
+     * Filer 在元数据变更后推送 Invalidate(inode, version) 到所有
+     * 订阅客户端, 客户端据此失效本地 page cache 和目录 lease. */
     if ((hdr.flags & POWERFS_NET_FLAG_NOTIFY) || hdr.seq == 0) {
+        __u64 ino = 0;
+        __u64 version = 0;
+
         pr_debug("powerfs: RX %s:%u: async notify seq=%u flags=0x%02x\n",
                  conn->addr, conn->port, hdr.seq, hdr.flags);
+
+        /* Parse TLV body: Ino(0x07) + Version(0x19) */
+        if (body && body_len > 0) {
+            struct powerfs_tlv_dec dec;
+            powerfs_tlv_dec_init(&dec, body, body_len);
+            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_INO, &ino);
+            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_VERSION, &version);
+        }
+
+        if (ino != 0) {
+            pr_info("powerfs: invalidate ino=%llu version=%llu\n",
+                    ino, version);
+            /* powerfs_invalidate_one() calls invalidate_inode_pages2()
+             * which may sleep — safe here because we're in workqueue
+             * (process context), not softirq. */
+            powerfs_invalidate_one(ino);
+        } else {
+            pr_warn("powerfs: notify frame missing Ino field\n");
+        }
+
         kfree(body);
         kfree(data_buf);
         /* 通知帧处理后, 若缓冲区仍有数据, 标记 rx_ready 让调度器继续收 */
