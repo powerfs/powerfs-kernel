@@ -38,6 +38,19 @@
 #define POWERFS_STRIPE_SIZE     (64 * 1024 * 1024)   /* 64MB */
 #define POWERFS_LEASE_DURATION  (30 * HZ)
 
+/* ========== writepages 批量写配置 ==========
+ *
+ * 通过 mount option `write_batch_kb` 配置单次 work item 收集的脏页总量:
+ *   - 默认 64KB (16 pages): 普通TCP网络安全值
+ *   - ROCE 网络推荐 1MB (256 pages): 降低 work item 数量, 提升吞吐
+ *   - 最大 stripe size 64MB (16384 pages): 单 stripe 一次提交, 内存压力大
+ *
+ * 范围: 4KB (1 page) ~ POWERFS_STRIPE_SIZE (64MB)
+ * 注意: max_active=4 时, 64MB 批次最多持 65536 页 (256MB) 内存 */
+#define POWERFS_WRITE_BATCH_DEFAULT_KB   64                      /* 64KB = 16 pages */
+#define POWERFS_WRITE_BATCH_MIN_KB       4                       /* 4KB = 1 page */
+#define POWERFS_WRITE_BATCH_MAX_KB       (POWERFS_STRIPE_SIZE / 1024)  /* 64MB = 65536 KB */
+
 /* ========== 前向声明 ========== */
 
 struct powerfs_sb_info;
@@ -148,6 +161,7 @@ struct powerfs_inode_info {
     u32 chunk_count;
     u64 content_size;
     u64 volume_id;
+    u64 file_key;   /* needle_id (base, chunk N = file_key + N), from Master Assign or GetAttr */
 
     /* 缓存有效性 */
     bool cache_valid;
@@ -238,6 +252,16 @@ struct powerfs_sb_info {
 
     /* 是否初始化完成 */
     bool initialized;
+
+    /* Stage C: writeback 异步 workqueue.
+     * writepage 提交异步写请求到此 workqueue, 避免在 writeback
+     * 上下文同步等待网络. fill_super 创建, kill_sb 销毁. */
+    struct workqueue_struct *writeback_wq;
+
+    /* writepages 批量大小 (页数), 由 mount option write_batch_kb 决定.
+     * 单次 work item 最多收集这么多脏页, 减少网络往返和 work item 数量.
+     * 默认 16 (64KB), ROCE 可设为 256 (1MB) ~ 16384 (64MB stripe). */
+    int write_batch_pages;
 };
 
 #define POWERFS_SB_INFO(sb) ((struct powerfs_sb_info *)(sb)->s_fs_info)
@@ -290,6 +314,7 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx);
 
 /* 地址空间操作 (page cache) */
 int powerfs_writepage(struct page *page, struct writeback_control *wbc);
+int powerfs_writepages(struct address_space *mapping, struct writeback_control *wbc);
 int powerfs_write_begin(struct file *file, struct address_space *mapping,
                         loff_t pos, unsigned int len, struct page **pagep,
                         void **fsdata);

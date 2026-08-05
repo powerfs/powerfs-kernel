@@ -530,7 +530,7 @@ int powerfs_comm_send_request(struct powerfs_msg_header *req_hdr,
     }
 
     /* 发送请求并等待响应 */
-    ret = powerfs_net_send_request(net_msg_type,
+    ret = powerfs_net_send_request(net_msg_type, req_hdr->ino,
                                     body, body_len,
                                     NULL, 0,  /* TODO: write 数据 */
                                     resp_body, 1024,

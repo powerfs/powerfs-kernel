@@ -44,7 +44,7 @@
 #define POWERFS_NET_HEADER_SIZE 28
 #define POWERFS_NET_MAX_FRAME   (1024 * 1024)  /* 1MB - 适合内核 */
 #define POWERFS_NET_MAX_TLV     65535  /* 64KB - 1 */
-#define POWERFS_NET_MAX_BODY    (64 * 1024)  /* 64KB body */
+#define POWERFS_NET_MAX_BODY    (256 * 1024)  /* 256KB body (容 netfs 128KB 预读响应) */
 #define POWERFS_NET_MAX_DATA    (256 * 1024)  /* 256KB data */
 
 /* 连接超时 (ms) */
@@ -204,6 +204,15 @@ enum powerfs_net_field_id {
     /* Rename 字段 */
     POWERFS_NET_FLD_NEW_PARENT_INO = 0x50,
     POWERFS_NET_FLD_NEW_NAME = 0x51,
+
+    /* Lease Token (Volume Server lease validation, matches Rust FieldId::LeaseToken) */
+    POWERFS_NET_FLD_LEASE_TOKEN = 0x80,
+
+    /* Volume / Needle 字段 (数据直连 Volume Server) */
+    POWERFS_NET_FLD_VOLUME_ID = 0x92,   /* volume_id (u64), needle 操作中复用 Ino 字段 */
+    POWERFS_NET_FLD_FILE_KEY = 0x94,    /* needle_id / file_key (u64) */
+    POWERFS_NET_FLD_CHUNKS = 0x96,      /* chunks 列表 (JSON, GetAttr 响应) */
+    POWERFS_NET_FLD_INODE_V2 = 0x97,    /* inode (u64), needle 操作中与 FileKey 并存 */
 };
 
 /* ========== 帧头结构 (28 字节, packed) ========== */
@@ -644,6 +653,17 @@ struct powerfs_net_pool {
     struct powerfs_net_server_conn volumes[POWERFS_NET_MAX_VOLUMES];
     int volume_count;
 
+    /* === Volume 路由表: volume_id → volume conn idx ===
+     * 从 Master GetTopology 获取, 用于 ReadNeedle 按 volume_id 找到正确的
+     * Volume Server 连接. WriteNeedle 由 Master Assign 直接返回 volume addr,
+     * 不依赖此表. */
+    struct {
+        __u64 volume_id;
+        int conn_idx;
+    } vol_routes[POWERFS_NET_MAX_VOLUMES];
+    int vol_route_count;
+    spinlock_t vol_route_lock;
+
     /* === Shard 路由表 === */
     struct powerfs_shard_route shard_route;
 
@@ -668,10 +688,14 @@ struct powerfs_net_pool {
     struct workqueue_struct *reconn_wq;
 
     /* === v2: per-CPU 调度器数组 (参照 Lustre ksocknal_data.ksnd_schedulers) ===
-     * schedulers[i] 服务 addr hash % num_sched == i 的所有连接.
+     * schedulers[i] 服务 addr hash % num_sched == i 的所有 filer 连接.
+     * vol_schedulers[j] 服务 addr hash % num_vol_sched == j 的所有 volume 连接.
+     * 分离设计: 避免数据 I/O (volume) 饿死元数据 (filer) 操作.
      * global_lock 保护 sk_user_data 解引用 (回调 read_lock_bh vs set/reset write_lock_bh) */
-    struct powerfs_net_sched *schedulers;
+    struct powerfs_net_sched *schedulers;       /* filer (元数据) 调度器池 */
     int                        num_sched;
+    struct powerfs_net_sched *vol_schedulers;   /* volume (数据) 调度器池 (P3.1) */
+    int                        num_vol_sched;
     rwlock_t                   global_lock;
 
     /* === 旧字段 (兼容期, 逐步移除) === */
@@ -762,7 +786,7 @@ int powerfs_net_pick_timeout(int short_timeout_ms);
  *
  * 返回: >=0 成功 (0=OK, >0=协议状态码), <0 错误 (-errno)
  */
-int powerfs_net_send_request(__u16 msg_type,
+int powerfs_net_send_request(__u16 msg_type, u64 route_inode,
                              const __u8 *body, size_t body_len,
                              const __u8 *data, size_t data_len,
                              __u8 *resp_body, size_t resp_body_cap,
@@ -770,6 +794,8 @@ int powerfs_net_send_request(__u16 msg_type,
                              int timeout_ms,
                              size_t *resp_body_len_out,
                              size_t *resp_data_len_out);
+
+u64 powerfs_calc_shard_id(u64 inode);
 
 /* ========== 便捷方法 ========== */
 
@@ -787,24 +813,28 @@ struct powerfs_net_dir_entry {
     __u32 nlink;
 };
 
-/* LOOKUP (返回完整属性含时间戳).
+/* LOOKUP (返回完整属性含时间戳 + volume_id/file_key 用于数据直连).
  * powerfs_net_lookup 用默认 10s 超时 (兼容旧调用方).
  * powerfs_net_lookup_timeout 由调用方指定超时 (Phase 1: lookup 在断连窗口内
- * 用 2s 短超时, 见 powerfs_net_pick_timeout). */
+ * 用 2s 短超时, 见 powerfs_net_pick_timeout).
+ * volume_id/file_key: 输出, 用于直连 Volume Server 读写数据 (目录为 0). */
 int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
                        __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
                        __u64 *size, __u32 *nlink,
-                       __u64 *mtime, __u64 *atime, __u64 *ctime);
+                       __u64 *mtime, __u64 *atime, __u64 *ctime,
+                       __u64 *volume_id, __u64 *file_key);
 int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
                                __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
                                __u64 *size, __u32 *nlink,
                                __u64 *mtime, __u64 *atime, __u64 *ctime,
+                               __u64 *volume_id, __u64 *file_key,
                                int timeout_ms);
 
-/* GETATTR (返回完整属性含时间戳) */
+/* GETATTR (返回完整属性含时间戳 + volume_id/file_key 用于数据直连) */
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
                          __u64 *size, __u32 *nlink,
-                         __u64 *mtime, __u64 *atime, __u64 *ctime);
+                         __u64 *mtime, __u64 *atime, __u64 *ctime,
+                         __u64 *volume_id, __u64 *file_key);
 
 /* SETATTR */
 int powerfs_net_setattr(__u64 ino, __u32 mode_valid, __u32 mode,
@@ -813,7 +843,8 @@ int powerfs_net_setattr(__u64 ino, __u32 mode_valid, __u32 mode,
 /* CREATE / MKDIR */
 int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
                         __u32 mode, __u32 uid, __u32 gid, bool is_dir,
-                        __u64 *ino_ret);
+                        __u64 *ino_ret,
+                        __u64 *volume_id_ret, __u64 *file_key_ret);
 
 /* UNLINK / RMDIR */
 int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,
@@ -834,12 +865,18 @@ int powerfs_net_readdir_timeout(__u64 dir_ino, const char *last_name, __u64 limi
                                 __u32 max_entries, __u32 *actual_count,
                                 bool *has_more, int timeout_ms);
 
-/* READ */
-int powerfs_net_read(__u64 ino, __u64 offset, __u32 length,
+/* READ (直连 Volume Server, 不经过 Filer).
+ * volume_id/file_key: 从 lookup/getattr 获取的数据直连标识.
+ * needle 模型: 整存整取, 内部按 offset/length 截取. */
+int powerfs_net_read(__u64 ino, __u64 volume_id, __u64 file_key,
+                     __u64 offset, __u32 length,
                      __u8 *buf, size_t buf_cap, __u32 *read_len);
 
-/* WRITE */
-int powerfs_net_write(__u64 ino, __u64 offset, const __u8 *data, size_t data_len,
+/* WRITE (直连 Volume Server, 不经过 Filer).
+ * volume_id/file_key: 从 lookup/getattr 获取的数据直连标识.
+ * needle 模型: write_needle 整体替换, 内部 read-modify-write 处理 partial write. */
+int powerfs_net_write(__u64 ino, __u64 volume_id, __u64 file_key,
+                      __u64 offset, const __u8 *data, size_t data_len,
                       __u32 *written);
 
 /* STATFS */
@@ -857,6 +894,58 @@ int powerfs_net_link(__u64 ino, __u64 dir_ino, const char *name, size_t name_len
 
 /* PING (连接健康检查) */
 int powerfs_net_ping(void);
+
+/* ========== Volume 直连 API (数据读写不经过 Filer) ==========
+ *
+ * 架构: 内核客户端 → powerfs-net → Volume Server (WriteNeedle/ReadNeedle)
+ * Filer 只负责元数据 (Lookup/GetAttr/Create 等) + chunk 映射管理.
+ * 客户端从 GetAttr 响应的 Chunks 字段获取 (volume_id, needle_id) 后直连 volume.
+ */
+
+/* 获取 volume 连接数量 */
+int powerfs_net_get_volume_count(void);
+
+/* 获取 volume 连接 (by index, 0..volume_count-1) */
+struct powerfs_net_server_conn *powerfs_net_get_volume_conn(int idx);
+
+/* 按 volume_id 查找 volume 连接 (通过 vol_routes 路由表) */
+struct powerfs_net_server_conn *powerfs_net_find_volume_conn(__u64 volume_id);
+
+/* 发送请求直连到 volume server (bypass shard routing).
+ * vol_idx: volume 连接索引 (-1 = 按 volume_id 自动查找)
+ * volume_id: 用于路由查找 (vol_idx < 0 时使用)
+ * 其他参数同 powerfs_net_send_request */
+int powerfs_net_send_to_volume(int vol_idx, __u64 volume_id,
+                                __u16 msg_type,
+                                const __u8 *body, size_t body_len,
+                                const __u8 *data, size_t data_len,
+                                __u8 *resp_body, size_t resp_body_cap,
+                                __u8 *resp_data, size_t resp_data_cap,
+                                int timeout_ms,
+                                size_t *resp_body_len_out,
+                                size_t *resp_data_len_out);
+
+/* WriteNeedle: 直连 volume 写数据.
+ * volume_id: 目标 volume
+ * file_key: needle ID
+ * inode: 用于 lease 校验 (lease 按 inode 注册, 非 needle)
+ * data/data_len: 写入数据
+ * 返回 0 成功, <0 错误 */
+int powerfs_net_write_needle(__u64 volume_id, __u64 file_key, __u64 inode,
+                             const __u8 *data, size_t data_len);
+
+/* ReadNeedle: 直连 volume 读数据.
+ * volume_id: 目标 volume
+ * file_key: needle ID
+ * buf/buf_cap: 读取缓冲区
+ * read_len: 输出, 实际读取长度
+ * 返回 0 成功, <0 错误 */
+int powerfs_net_read_needle(__u64 volume_id, __u64 file_key,
+                            __u8 *buf, size_t buf_cap, __u32 *read_len);
+
+/* 从 Master GetTopology 获取 volume 路由表 (volume_id → addr).
+ * 在 pool_init 后调用, 填充 vol_routes[] 用于 ReadNeedle 路由. */
+int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port);
 
 /* ========== 初始化/清理 ========== */
 

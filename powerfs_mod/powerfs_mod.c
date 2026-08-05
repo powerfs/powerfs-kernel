@@ -56,6 +56,10 @@ static ushort filer_port = 9334;
 module_param(filer_port, ushort, 0644);
 MODULE_PARM_DESC(filer_port, "Filer powerfs-net port (default 9334)");
 
+ushort shard_count = 2;  /* 默认 2, 对齐 Filer 配置 */
+module_param(shard_count, ushort, 0644);
+MODULE_PARM_DESC(shard_count, "Filer shard count for metadata routing (default 2)");
+
 /* ========== fs_context 参数解析 ========== */
 
 enum powerfs_param {
@@ -65,6 +69,7 @@ enum powerfs_param {
     Opt_volume_port,
     Opt_filer_addr,
     Opt_filer_port,
+    Opt_write_batch_kb,
 };
 
 static const struct fs_parameter_spec powerfs_fs_parameters[] = {
@@ -74,6 +79,7 @@ static const struct fs_parameter_spec powerfs_fs_parameters[] = {
     fsparam_u32("volume_port",     Opt_volume_port),
     fsparam_string("filer_addr",   Opt_filer_addr),
     fsparam_u32("filer_port",      Opt_filer_port),
+    fsparam_u32("write_batch_kb",  Opt_write_batch_kb),
     {}
 };
 
@@ -84,6 +90,7 @@ struct powerfs_ctx {
     u16  volume_port;
     char filer_addr[64];
     u16  filer_port;
+    u32  write_batch_kb;
 };
 
 /* ========== 外部函数声明 (在 powerfs_fs.c 中定义) ========== */
@@ -134,6 +141,10 @@ static int powerfs_parse_param(struct fs_context *fc, struct fs_parameter *param
     case Opt_filer_port:
         ctx->filer_port = (u16)result.uint_32;
         break;
+    case Opt_write_batch_kb:
+        ctx->write_batch_kb = result.uint_32;
+        pr_info("powerfs: write_batch_kb = %u\n", ctx->write_batch_kb);
+        break;
     }
 
     return 0;
@@ -167,7 +178,8 @@ static int powerfs_init_fs_context(struct fs_context *fc)
 {
     struct powerfs_ctx *ctx;
 
-    pr_info("powerfs: init_fs_context called, master_addr=%s\n", master_addr);
+    pr_info("powerfs: init_fs_context called, master_addr=%s, shard_count=%u\n",
+            master_addr, shard_count);
 
     ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
     if (!ctx)
@@ -180,6 +192,10 @@ static int powerfs_init_fs_context(struct fs_context *fc)
     ctx->volume_port = volume_port;
     strncpy(ctx->filer_addr, filer_addr, sizeof(ctx->filer_addr) - 1);
     ctx->filer_port = filer_port;
+
+    /* writepages 批量大小默认 64KB (16 pages).
+     * ROCE 网络可挂载时设为 1024 (1MB) ~ 65536 (64MB stripe). */
+    ctx->write_batch_kb = POWERFS_WRITE_BATCH_DEFAULT_KB;
 
     fc->s_fs_info = ctx;
     fc->ops = &powerfs_ctx_ops;

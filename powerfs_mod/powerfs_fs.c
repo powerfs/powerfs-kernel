@@ -30,14 +30,92 @@
 #include <linux/list_lru.h>
 #include <linux/backing-dev.h>
 #include <linux/ramfs.h>
-#include <linux/writeback.h>     /* folio_mark_dirty (set_page_dirty 未导出到运行内核) */
+#include <linux/writeback.h>     /* folio_mark_dirty, writeback_control */
+#include <linux/pagevec.h>       /* pagevec_lookup_range_tag (writepages 批量遍历) */
 
 #include "powerfs.h"
 #include "powerfs_comm.h"
 #include "powerfs_net.h"
 
-/* netfs 请求操作 (Step 2 实现 issue_read，Step 0 先空声明) */
-static const struct netfs_request_ops powerfs_netfs_ops;
+/* ========== netfs 请求操作 (Stage C: 对接 netfs 子系统) ==========
+ *
+ * 参照 fs/ceph/addr.c 的 ceph_netfs_issue_read 实现.
+ *
+ * read 路径改造:
+ *   - powerfs_aops.read_folio = netfs_read_folio (netfs 提供)
+ *   - powerfs_aops.readahead  = netfs_readahead  (netfs 提供)
+ *   - powerfs_netfs_ops.issue_read = powerfs_netfs_issue_read (实际网络读取)
+ *
+ * netfs 子系统管理 folio 生命周期 (锁定/解锁/uptodate), filesystem 只需
+ * 在 issue_read 中填充数据并调用 netfs_subreq_terminated 完成.
+ *
+ * 基本功能阶段: issue_read 中同步调用 powerfs_net_read, 简单但会阻塞
+ * 当前进程. 后续可改为异步 (提交网络请求 -> 回调 netfs_subreq_terminated).
+ */
+
+static void powerfs_netfs_issue_read(struct netfs_io_subrequest *subreq)
+{
+    struct netfs_io_request *rreq = subreq->rreq;
+    struct inode *inode = rreq->inode;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    size_t len = subreq->len;
+    loff_t start = subreq->start;
+    struct iov_iter iter;
+    void *buf;
+    __u32 read_len = 0;
+    __u64 volume_id, file_key;
+    int err;
+
+    pr_debug("powerfs: netfs_issue_read ino=%lu start=%llu len=%zu\n",
+             inode->i_ino, (unsigned long long)start, len);
+
+    /* 超出文件大小的部分: 由 netfs 处理 (设置 NETFS_SREQ_CLEAR_TAIL),
+     * issue_read 只读取有效数据部分 */
+    if (start >= rreq->i_size) {
+        netfs_subreq_terminated(subreq, 0, false);
+        return;
+    }
+    if (start + len > rreq->i_size)
+        len = rreq->i_size - start;
+
+    /* 数据直连: 从 inode 获取 volume_id/file_key */
+    spin_lock(&pi->i_lock);
+    volume_id = pi->volume_id;
+    file_key = pi->file_key;
+    spin_unlock(&pi->i_lock);
+
+    /* 基本功能阶段: 同步读取到临时 buffer, 再拷贝到 xarray 中的 folio.
+     * 后续优化: 直接从 xarray 映射 folio, 避免额外拷贝 (参照 ceph). */
+    buf = kvmalloc(len, GFP_KERNEL);
+    if (!buf) {
+        netfs_subreq_terminated(subreq, -ENOMEM, false);
+        return;
+    }
+
+    err = powerfs_net_read(inode->i_ino, volume_id, file_key,
+                           start, len, buf, len, &read_len);
+    if (err) {
+        pr_warn("powerfs: netfs_issue_read ino=%lu start=%llu len=%zu failed: %d\n",
+                inode->i_ino, (unsigned long long)start, len, err);
+        kvfree(buf);
+        netfs_subreq_terminated(subreq, err, false);
+        return;
+    }
+
+    /* 拷贝到 xarray 中的 folio (netfs 已预先分配并锁定 folio) */
+    if (read_len > 0) {
+        iov_iter_xarray(&iter, ITER_DEST, &rreq->mapping->i_pages,
+                        start, read_len);
+        copy_to_iter(buf, read_len, &iter);
+    }
+
+    kvfree(buf);
+    netfs_subreq_terminated(subreq, read_len, false);
+}
+
+static const struct netfs_request_ops powerfs_netfs_ops = {
+    .issue_read = powerfs_netfs_issue_read,
+};
 
 /* ========== 全局 slab 缓存 (参考 ceph 全局 cache) ========== */
 
@@ -511,6 +589,7 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->chunk_count = 0;
     pi->content_size = 0;
     pi->volume_id = 0;
+    pi->file_key = 0;
     pi->shutdown = false;
 
     /* 初始化目录缓存字段 */
@@ -639,6 +718,16 @@ static int powerfs_write_inode(struct inode *inode, struct writeback_control *wb
     if ((u64)i_size == last_synced)
         return 0;
 
+    /* 等待所有 pending 的异步 writeback 完成, 确保数据已写入 Filer 后
+     * 再发送 setattr(SIZE). 否则 Filer 可能先收到 setattr 将文件扩展
+     * (零填充), 然后异步写到达覆盖数据 -- 但若 Filer 的 setattr 截断
+     * 已有数据, 则先到的写会被丢失.
+     *
+     * VFS writeback 顺序: do_writepages → write_inode → filemap_fdatawait
+     * do_writepages 提交异步 work 后立即返回, write_inode 此刻发 setattr
+     * 时数据可能尚未到达 Filer. 显式等待确保顺序正确. */
+    filemap_fdatawait_range(inode->i_mapping, 0, LLONG_MAX);
+
     /* 先请求 Filer 同步 size, 成功后才更新本地 content_size.
      * 断连时 powerfs_net_setattr 返回 -ENOTCONN, writeback 会重试.
      * 之前断连时 return 0 (假装成功) 导致 size 未同步, remount 后不一致. */
@@ -758,6 +847,7 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
         __u64 size = 0;
         __u32 nlink = 0;
         __u64 mtime = 0, atime = 0, ctime = 0;
+        __u64 volume_id = 0, file_key = 0;
         int timeout_ms;
 
         pr_debug("powerfs: lookup '%pd' via powerfs_net\n", dentry);
@@ -770,12 +860,13 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
          * hung_task_timeout=120s, 60s 不会触发 hung task. */
         timeout_ms = 60000;  /* 60s: 覆盖 Docker 容器重启 + Raft 选主 */
 
-        /* 通过 powerfs_net 直接查询 (含时间戳) */
+        /* 通过 powerfs_net 直接查询 (含时间戳 + volume_id/file_key) */
         err = powerfs_net_lookup_timeout(dir->i_ino, dentry->d_name.name,
                                           strlen(dentry->d_name.name),
                                           &ino, &mode, &uid, &gid,
                                           &size, &nlink,
                                           &mtime, &atime, &ctime,
+                                          &volume_id, &file_key,
                                           timeout_ms);
 
         /* 断连/重连期间超时或网络不可达, 返回 -EAGAIN 让 VFS/应用层重试.
@@ -829,6 +920,10 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
                     struct powerfs_inode_info *pi = POWERFS_I(inode);
                     spin_lock(&pi->i_lock);
                     pi->cache_valid = true;
+                    /* 数据直连: 存储 volume_id/file_key 用于 ReadNeedle/WriteNeedle.
+                     * 目录的 volume_id/file_key 为 0 (无数据). */
+                    pi->volume_id = volume_id;
+                    pi->file_key = file_key;
                     spin_unlock(&pi->i_lock);
                 }
 
@@ -905,6 +1000,7 @@ static int powerfs_mknod(struct user_namespace *idmap, struct inode *dir,
     struct powerfs_inode_info *dpi = POWERFS_I(dir);
     struct inode *inode;
     u64 new_ino;
+    u64 mknod_volume_id = 0, mknod_file_key = 0;  /* P3.4: Filer 自分配, 存入 inode */
     int type;
 
     (void)idmap;
@@ -920,17 +1016,26 @@ static int powerfs_mknod(struct user_namespace *idmap, struct inode *dir,
      */
     if (S_ISREG(mode) || S_ISDIR(mode)) {
         u64 remote_ino = 0;
+        u64 volume_id = 0, file_key = 0;
         int rerr = powerfs_net_create(dir->i_ino, dentry->d_name.name,
                                        dentry->d_name.len, mode,
                                        from_kuid(&init_user_ns, current_fsuid()),
                                        from_kgid(&init_user_ns, current_fsgid()),
-                                       S_ISDIR(mode), &remote_ino);
+                                       S_ISDIR(mode), &remote_ino,
+                                       &volume_id, &file_key);
         if (rerr) {
             pr_warn("powerfs: net_create '%pd' failed: %d\n", dentry, rerr);
             return rerr;
         }
         new_ino = remote_ino ? remote_ino
                              : (u64)atomic_inc_return(&sbi->next_ino) + POWERFS_INO_START;
+        /*
+         * P3.4: 保存 Filer 自分配的 volume_id + needle_id 到 mknod 局部变量,
+         * inode 创建后写入 powerfs_inode_info, 供后续直连 volume 读写.
+         * 目录无数据, volume_id/file_key 为 0 (Filer handle_mkdir 不分配).
+         */
+        mknod_volume_id = volume_id;
+        mknod_file_key = file_key;
     } else {
         new_ino = atomic_inc_return(&sbi->next_ino) + POWERFS_INO_START;
     }
@@ -940,6 +1045,17 @@ static int powerfs_mknod(struct user_namespace *idmap, struct inode *dir,
                                dir->i_ino, dentry->d_name.name);
     if (!inode)
         return -ENOSPC;
+
+    /* P3.4: 将 Filer 分配的 volume_id + needle_id 存入 inode 私有数据 */
+    if (S_ISREG(mode) && mknod_volume_id != 0) {
+        struct powerfs_inode_info *pi = POWERFS_I(inode);
+        spin_lock(&pi->i_lock);
+        pi->volume_id = mknod_volume_id;
+        pi->file_key = mknod_file_key;
+        spin_unlock(&pi->i_lock);
+        pr_debug("powerfs: create '%pd' ino=%lu volume_id=%llu file_key=%llu\n",
+                 dentry, inode->i_ino, mknod_volume_id, mknod_file_key);
+    }
 
     /* 关联 dentry 和 inode */
     d_add(dentry, inode);
@@ -2160,286 +2276,504 @@ static const struct file_operations powerfs_dir_operations = {
 
 /* ========== 地址空间操作 (page cache) ========== */
 
-/*
- * powerfs_read_folio - 读取页面
+/* powerfs_read_folio 已移除 (Stage C): read 路径由 netfs_read_folio +
+ * powerfs_netfs_issue_read 接管, 参照 ceph_aops.read_folio = netfs_read_folio. */
+
+/* ========== Stage C: writepages 批量异步写入 ==========
  *
- * 当 powerfs_net 连接时: 从 filer 读取数据填充 folio (跨 client 可见),
- *   remount 后读取持久化数据由此完成.
- * 未连接时: 本地缓存模式, 零填充.
+ * 参照 ceph_writepages_start 模式, 批量收集脏页减少 work item 数量:
+ *   1. writepages 遍历脏页, 收集到 powerfs_writepage_work 批量结构
+ *   2. batch 满 (sbi->write_batch_pages 页) 或遍历完成时提交 work item
+ *   3. workqueue 线程串行发送 batch 内所有页面
+ *   4. max_active=4 限制全局并发 worker 数
+ *
+ * 批量大小可配 (mount option write_batch_kb):
+ *   - 默认 64KB (16 pages): TCP 网络
+ *   - ROCE 推荐 1MB (256 pages): 高吞吐
+ *   - 最大 stripe size 64MB (16384 pages): 单 stripe 一次提交
+ *
+ * 性能: 1MB 文件, batch=1MB → 1 个 work item (vs 旧方案 256 个)
+ *
+ * work 结构体使用 kvmalloc 单块分配 (header + 3 个动态数组), 因为
+ * max 可达 16384 页 (数组 ~384KB, 超过 kmalloc 上限). */
+
+struct powerfs_writepage_work {
+    struct work_struct work;
+    struct inode *inode;
+    int num_pages;
+    int max_pages;
+    struct page **pages;     /* max_pages 项, 紧随结构体后 */
+    loff_t *offsets;         /* max_pages 项, 紧随 pages 后 */
+    size_t *counts;          /* max_pages 项, 紧随 offsets 后 */
+};
+
+/*
+ * powerfs_alloc_write_batch - 分配批量写 work 结构 (含动态数组)
+ *
+ * 单块 kvmalloc: [header][pages[]][offsets[]][counts[]]
+ * 大批量 (如 64MB=16384 页) 时数组 ~384KB, 需 kvmalloc 自动回退 vmalloc.
  */
-static int powerfs_read_folio(struct file *file, struct folio *folio)
+static struct powerfs_writepage_work *
+powerfs_alloc_write_batch(int max_pages, gfp_t gfp)
 {
-    struct inode *inode = folio->mapping->host;
-    loff_t offset = folio_pos(folio);
-    size_t count = folio_size(folio);
-    __u32 read_len = 0;
-    char *kaddr;
-    int err;
+    struct powerfs_writepage_work *batch;
+    size_t arr_sz = (size_t)max_pages *
+                    (sizeof(struct page *) + sizeof(loff_t) + sizeof(size_t));
+    size_t sz = sizeof(*batch) + arr_sz;
 
-    pr_debug("powerfs: read_folio ino=%lu index=%lu\n",
-             inode->i_ino, folio->index);
+    batch = kvmalloc(sz, gfp | __GFP_ZERO);
+    if (!batch)
+        return NULL;
 
-    /* 本地缓存模式: 零填充 */
-    if (!powerfs_net_is_connected()) {
-        folio_zero_range(folio, 0, count);
-        folio_mark_uptodate(folio);
-        folio_unlock(folio);
-        return 0;
-    }
-
-    /* 超出文件大小的部分零填充 */
-    if (offset >= i_size_read(inode)) {
-        folio_zero_range(folio, 0, count);
-        folio_mark_uptodate(folio);
-        folio_unlock(folio);
-        return 0;
-    }
-
-    kaddr = kmap_local_folio(folio, 0);
-    err = powerfs_net_read(inode->i_ino, offset, count, kaddr, count, &read_len);
-    kunmap_local(kaddr);
-
-    if (err) {
-        pr_warn("powerfs: read_folio ino=%lu offset=%llu failed: %d\n",
-                inode->i_ino, offset, err);
-        /* 读失败时零填充, 避免向上层传播 IO error 导致读路径死锁 */
-        folio_zero_range(folio, 0, count);
-    } else if (read_len < count) {
-        /* 不足部分零填充 */
-        folio_zero_range(folio, read_len, count - read_len);
-    }
-
-    folio_mark_uptodate(folio);
-    folio_unlock(folio);
-    return 0;
+    batch->max_pages = max_pages;
+    batch->num_pages = 0;
+    batch->pages = (struct page **)(batch + 1);
+    batch->offsets = (loff_t *)(batch->pages + max_pages);
+    batch->counts = (size_t *)(batch->offsets + max_pages);
+    return batch;
 }
 
 /*
- * powerfs_writepage - 写入页面
+ * powerfs_writepage_work_fn - 批量异步写 workqueue 函数
  *
- * 当 powerfs_net 连接时: 同步将页数据写到 filer (filer 转发 volume server),
- *   实现数据持久化; fsync/release 触发 writeback 时由此完成刷盘.
- * 未连接时: 本地缓存模式, 仅标记干净.
+ * 直连 Volume Server (WriteNeedle), 按 needle (chunk) 分组批量写:
+ *   1. 遍历 batch 内页面 (按 offset 升序), 按 needle_id 分组
+ *   2. 每个 needle: read-modify-write (读现有 needle → 合并页面 → 整体写回)
+ *   3. 同一 needle 的页面只做一次 read + 一次 write
+ *
+ * needle 模型: write_needle 整体替换 needle 内容, 不支持 partial write.
+ * 因此需 read-modify-write: 读现有 needle (若存在), 拷贝脏页到对应位置, 写回.
+ *
+ * 性能: 1MB 文件 (全在 1 个 needle) → 1 次 read + 1 次 write (vs 逐页 256 次).
+ */
+static void powerfs_writepage_work_fn(struct work_struct *work)
+{
+    struct powerfs_writepage_work *wpw =
+        container_of(work, struct powerfs_writepage_work, work);
+    struct inode *inode = wpw->inode;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    __u64 volume_id, file_key;
+    __u8 *needle_buf = NULL;
+    __u64 current_needle_id = 0;
+    bool needle_loaded = false;   /* needle_buf 是否已为 current_needle_id 加载 */
+    __u32 needle_len = 0;         /* current_needle_id 的内容长度 */
+    int needle_start_idx = 0;     /* 当前 needle 组的首页索引 */
+    int i;
+
+    /* 数据直连: 从 inode 获取 volume_id/file_key */
+    spin_lock(&pi->i_lock);
+    volume_id = pi->volume_id;
+    file_key = pi->file_key;
+    spin_unlock(&pi->i_lock);
+
+    if (!volume_id || !file_key) {
+        pr_warn("powerfs: writepage_work ino=%lu no volume mapping\n",
+                inode->i_ino);
+        goto fail_all;
+    }
+
+    if (powerfs_net_is_stopping())
+        goto fail_all;
+
+    /* needle_buf: 2MB chunk buffer, 用于 read-modify-write.
+     * 一个 batch 内复用, 避免逐页分配. */
+    needle_buf = kvmalloc(POWERFS_CHUNK_SIZE, GFP_KERNEL);
+    if (!needle_buf)
+        goto fail_all;
+
+    for (i = 0; i < wpw->num_pages; i++) {
+        struct page *page = wpw->pages[i];
+        loff_t offset = wpw->offsets[i];
+        size_t count = wpw->counts[i];
+        __u64 needle_id;
+        size_t offset_in_needle;
+
+        if (count == 0) {
+            end_page_writeback(page);
+            put_page(page);
+            /* 若中间有空页, 不影响 needle 分组逻辑 */
+            continue;
+        }
+
+        needle_id = file_key + offset / POWERFS_CHUNK_SIZE;
+        offset_in_needle = offset % POWERFS_CHUNK_SIZE;
+
+        /* needle 边界切换: 写回前一个 needle, 加载新 needle */
+        if (!needle_loaded) {
+            current_needle_id = needle_id;
+            needle_start_idx = i;
+            memset(needle_buf, 0, POWERFS_CHUNK_SIZE);
+            needle_len = 0;
+
+            /* read-modify-write: 先读现有 needle (不存在则全零) */
+            {
+                __u32 existing_len = 0;
+                int rerr = powerfs_net_read_needle(volume_id, needle_id,
+                                                    needle_buf,
+                                                    POWERFS_CHUNK_SIZE,
+                                                    &existing_len);
+                if (rerr < 0 && rerr != -ENOENT) {
+                    pr_warn("powerfs: writepage rmw read_needle vid=%llu nid=%llu err=%d, continue with zero\n",
+                            (unsigned long long)volume_id,
+                            (unsigned long long)needle_id, rerr);
+                } else if (rerr == 0) {
+                    needle_len = existing_len;
+                }
+            }
+            needle_loaded = true;
+        } else if (needle_id != current_needle_id) {
+            /* needle 切换: 写回旧 needle, 完成其页面, 加载新 needle */
+            int err = powerfs_net_write_needle(volume_id, current_needle_id,
+                                                inode->i_ino,
+                                                needle_buf, needle_len);
+            {
+                int j;
+                for (j = needle_start_idx; j < i; j++) {
+                    struct page *p = wpw->pages[j];
+                    if (wpw->counts[j] == 0) continue;
+                    if (err < 0) {
+                        SetPageError(p);
+                        mapping_set_error(p->mapping, err);
+                    }
+                    end_page_writeback(p);
+                    put_page(p);
+                }
+            }
+            if (err < 0)
+                pr_warn("powerfs: writepage write_needle vid=%llu nid=%llu err=%d\n",
+                        (unsigned long long)volume_id,
+                        (unsigned long long)current_needle_id, err);
+
+            /* 加载新 needle */
+            current_needle_id = needle_id;
+            needle_start_idx = i;
+            memset(needle_buf, 0, POWERFS_CHUNK_SIZE);
+            needle_len = 0;
+            {
+                __u32 existing_len = 0;
+                int rerr = powerfs_net_read_needle(volume_id, needle_id,
+                                                    needle_buf,
+                                                    POWERFS_CHUNK_SIZE,
+                                                    &existing_len);
+                if (rerr < 0 && rerr != -ENOENT) {
+                    pr_warn("powerfs: writepage rmw read_needle vid=%llu nid=%llu err=%d, continue with zero\n",
+                            (unsigned long long)volume_id,
+                            (unsigned long long)needle_id, rerr);
+                } else if (rerr == 0) {
+                    needle_len = existing_len;
+                }
+            }
+        }
+
+        /* 拷贝页面数据到 needle_buf 对应位置 */
+        {
+            char *kaddr = kmap_local_page(page);
+            memcpy(needle_buf + offset_in_needle, kaddr, count);
+            kunmap_local(kaddr);
+        }
+
+        /* 扩展 needle 长度 (若写入超出原有内容) */
+        if (offset_in_needle + count > needle_len)
+            needle_len = offset_in_needle + count;
+    }
+
+    /* 写回最后一个 needle 并完成其页面 */
+    if (needle_loaded) {
+        int err = powerfs_net_write_needle(volume_id, current_needle_id,
+                                            inode->i_ino,
+                                            needle_buf, needle_len);
+        int j;
+        for (j = needle_start_idx; j < wpw->num_pages; j++) {
+            struct page *p = wpw->pages[j];
+            if (wpw->counts[j] == 0) {
+                /* 已完成的空页跳过 */
+                continue;
+            }
+            if (err < 0) {
+                SetPageError(p);
+                mapping_set_error(p->mapping, err);
+            }
+            end_page_writeback(p);
+            put_page(p);
+        }
+        if (err < 0)
+            pr_warn("powerfs: writepage final write_needle vid=%llu nid=%llu err=%d\n",
+                    (unsigned long long)volume_id,
+                    (unsigned long long)current_needle_id, err);
+    }
+
+    kvfree(needle_buf);
+    iput(inode);
+    kvfree(wpw);
+    return;
+
+fail_all:
+    for (i = 0; i < wpw->num_pages; i++) {
+        SetPageError(wpw->pages[i]);
+        mapping_set_error(wpw->pages[i]->mapping, -EIO);
+        end_page_writeback(wpw->pages[i]);
+        put_page(wpw->pages[i]);
+    }
+    if (needle_buf)
+        kvfree(needle_buf);
+    iput(inode);
+    kvfree(wpw);
+}
+
+/*
+ * powerfs_writepages - 批量 writeback 入口
+ *
+ * 自己遍历脏页 (pagevec_lookup_range_tag), 批量收集到 work item.
+ * 替代 VFS 默认的 write_cache_pages + writepage 逐页模式.
+ *
+ * 并发控制:
+ *   - max_active=4 限制全局并发 worker (workqueue 级)
+ *   - batch 内串行发送 (单 work item 内页面顺序写)
+ *   - writepages 由 writeback 子系统串行调用 (per-inode 不会并发)
+ */
+int powerfs_writepages(struct address_space *mapping,
+                               struct writeback_control *wbc)
+{
+    struct inode *inode = mapping->host;
+    struct super_block *sb = inode->i_sb;
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    struct pagevec pvec;
+    pgoff_t index = wbc->range_start >> PAGE_SHIFT;
+    pgoff_t end = wbc->range_end >> PAGE_SHIFT;
+    struct powerfs_writepage_work *batch = NULL;
+    int batch_pages = sbi->write_batch_pages;
+    int ret = 0;
+
+    if (powerfs_net_is_stopping())
+        return 0;
+
+    pagevec_init(&pvec);
+
+    while (index <= end) {
+        int nr_pages, i;
+
+        nr_pages = pagevec_lookup_range_tag(&pvec, mapping, &index,
+                                             end, PAGECACHE_TAG_DIRTY);
+        if (!nr_pages)
+            break;
+
+        for (i = 0; i < nr_pages; i++) {
+            struct page *page = pvec.pages[i];
+            loff_t offset;
+            size_t count = PAGE_SIZE;
+
+            lock_page(page);
+            if (!PageDirty(page)) {
+                unlock_page(page);
+                continue;
+            }
+
+            clear_page_dirty_for_io(page);
+
+            offset = page_offset(page);
+            if (offset >= i_size_read(inode)) {
+                unlock_page(page);
+                continue;
+            }
+            if (offset + count > i_size_read(inode))
+                count = i_size_read(inode) - offset;
+
+            /* 分配 batch (如果当前没有 pending) */
+            if (!batch) {
+                batch = powerfs_alloc_write_batch(batch_pages, GFP_NOFS);
+                if (!batch) {
+                    redirty_page_for_writepage(wbc, page);
+                    unlock_page(page);
+                    continue;
+                }
+                INIT_WORK(&batch->work, powerfs_writepage_work_fn);
+                batch->inode = igrab(inode);
+            }
+
+            /* 添加页面到 batch */
+            get_page(page);
+            batch->pages[batch->num_pages] = page;
+            batch->offsets[batch->num_pages] = offset;
+            batch->counts[batch->num_pages] = count;
+            batch->num_pages++;
+
+            set_page_writeback(page);
+            unlock_page(page);
+
+            /* batch 满了，提交到 workqueue */
+            if (batch->num_pages >= batch_pages) {
+                queue_work(sbi->writeback_wq, &batch->work);
+                batch = NULL;
+            }
+
+            wbc->nr_to_write--;
+            if (wbc->nr_to_write <= 0)
+                goto done;
+        }
+        pagevec_release(&pvec);
+        cond_resched();
+    }
+
+done:
+    pagevec_release(&pvec);
+
+    /* 提交剩余的 batch */
+    if (batch) {
+        if (batch->num_pages > 0)
+            queue_work(sbi->writeback_wq, &batch->work);
+        else {
+            iput(batch->inode);
+            kvfree(batch);
+        }
+    }
+
+    return ret;
+}
+
+/*
+ * powerfs_writepage - 单页 writeback (fallback, VFS 内部路径使用)
+ *
+ * writepages 注册后, VFS 优先调用 writepages. writepage 仅作为 fallback:
+ *   - migrate_pages 等内核内部路径可能直接调用 writepage
+ *   - 保持与旧接口兼容
  */
 int powerfs_writepage(struct page *page, struct writeback_control *wbc)
 {
     struct inode *inode = page->mapping->host;
+    struct super_block *sb = inode->i_sb;
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    struct powerfs_writepage_work *wpw;
     loff_t offset = page_offset(page);
     size_t count = PAGE_SIZE;
-    __u32 written = 0;
-    char *kaddr;
-    int err = 0;
 
-    pr_debug("powerfs: writepage ino=%lu index=%lu\n",
-             inode->i_ino, page->index);
-
-    /* 本地缓存模式: 直接标记干净 */
-    if (!powerfs_net_is_connected()) {
-        end_page_writeback(page);
+    if (powerfs_net_is_stopping()) {
+        redirty_page_for_writepage(wbc, page);
+        unlock_page(page);
         return 0;
     }
 
-    /* 超出文件大小的页不写 */
     if (offset >= i_size_read(inode)) {
-        end_page_writeback(page);
+        unlock_page(page);
         return 0;
     }
-    /* 最后一页截断到 i_size */
     if (offset + count > i_size_read(inode))
         count = i_size_read(inode) - offset;
 
-    kaddr = kmap_local_page(page);
-    err = powerfs_net_write(inode->i_ino, offset, kaddr, count, &written);
-    kunmap_local(kaddr);
-
-    if (err) {
-        pr_warn("powerfs: writepage ino=%lu offset=%llu failed: %d\n",
-                inode->i_ino, offset, err);
-        SetPageError(page);
-        mapping_set_error(page->mapping, err);
+    wpw = powerfs_alloc_write_batch(1, GFP_NOFS);
+    if (!wpw) {
+        redirty_page_for_writepage(wbc, page);
+        unlock_page(page);
+        return 0;
     }
 
-    end_page_writeback(page);
-    return err;
+    INIT_WORK(&wpw->work, powerfs_writepage_work_fn);
+    wpw->inode = igrab(inode);
+    get_page(page);
+    wpw->pages[0] = page;
+    wpw->offsets[0] = offset;
+    wpw->counts[0] = count;
+    wpw->num_pages = 1;
+
+    set_page_writeback(page);
+    unlock_page(page);
+    queue_work(sbi->writeback_wq, &wpw->work);
+
+    return 0;
 }
 
 /*
- * powerfs_write_begin - 写开始 (准备页面)
+ * powerfs_write_begin - 写开始 (Stage C: 对接 netfs 子系统)
  *
- * 参考 ramfs_write_begin / __generic_write_begin
+ * 参照 ceph_write_begin (fs/ceph/addr.c):
+ *   调用 netfs_write_begin 让 netfs 管理页面准备, 包括:
+ *   - 分配并锁定 folio
+ *   - 若 folio 不在 page cache 或非 uptodate, 通过 issue_read
+ *     从 Filer 拉取现有数据 (处理 partial write 的 read-modify-write)
+ *   - folio 返回时已锁定, 调用者写入后通过 write_end 解锁
  *
- * 对于纯内存模式，我们可以直接使用 grab_cache_page_write_begin
+ * 替代旧的 grab_cache_page_write_begin + zero_user 方案:
+ *   旧方案对 partial write (offset/len 未覆盖整页) 会丢失未写入部分
+ *   的现有数据, 因为 zero_user 把整页清零. netfs_write_begin 会先读取
+ *   现有数据, write_end 只更新写入部分, 保证 read-modify-write 正确性.
  */
 int powerfs_write_begin(struct file *file, struct address_space *mapping,
                          loff_t pos, unsigned int len, struct page **pagep,
                          void **fsdata)
 {
     struct inode *inode = mapping->host;
-    pgoff_t index = pos >> PAGE_SHIFT;
-    struct page *page;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct folio *folio = NULL;
     int ret;
 
     pr_debug("powerfs: write_begin ino=%lu pos=%lld len=%u\n",
              inode->i_ino, pos, len);
 
-    page = grab_cache_page_write_begin(mapping, index);
-    if (!page)
-        return -ENOMEM;
+    ret = netfs_write_begin(&pi->netfs, file, inode->i_mapping,
+                            pos, len, &folio, NULL);
+    if (ret < 0)
+        return ret;
 
-    *pagep = page;
+    WARN_ON_ONCE(!folio_test_locked(folio));
+    *pagep = &folio->page;
     *fsdata = NULL;
-
-    /*
-     * 如果页面不是最新的，直接清零整个页面
-     *
-     * 参考 ramfs_write_begin: 不从后端读取，直接清零
-     *
-     * 原因:
-     *   1. 数据存储在 page cache 中，write_end 会更新 page cache
-     *   2. read_folio 会在首次读取时从代理加载（如果页面不在 page cache）
-     *   3. write_begin 中调用 read_folio 会导致同步通信，
-     *      在高并发下可能死锁（write_begin 持有 page 锁，
-     *      read_folio 尝试释放/重新获取 page 锁，与并发 read 竞争）
-     *   4. write 操作会覆盖整个页面，不需要保留旧数据
-     */
-    if (!PageUptodate(page)) {
-        zero_user(page, 0, PAGE_SIZE);
-        SetPageUptodate(page);
-    }
-
     return 0;
 }
 
 /*
- * powerfs_write_end - 写结束 (完成写入)
+ * powerfs_write_end - 写结束 (Stage C: 纯 page cache 更新, 无网络 IO)
  *
- * 参考 ceph_write_end / generic_write_end
+ * 参照 ceph_write_end (fs/ceph/addr.c):
+ *   - 标记 folio uptodate
+ *   - 更新本地 i_size (i_size_write + mark_inode_dirty)
+ *   - folio_mark_dirty 让 writeback 子系统负责持久化
+ *   - 不做任何网络 IO, 数据持久化由 writepage 异步完成,
+ *     i_size 同步由 write_inode (writeback 时) 完成
  *
- * 为了确保数据一致性，write_end 直接同步数据到后端。
- * 这确保了 write() 系统调用返回后，数据已经可以被 read() 获取。
- *
- * 同步策略:
- *   - 异步模式: 仅更新 page cache，由 writepage 后台异步通知代理
- *
- * 注意: 之前使用同步通信 (powerfs_comm_send_request) 等待代理响应，
- *       但在高并发下会导致 SQ 队列满 + RCU stall in __d_lookup。
- *       现在改为纯异步：write_end 仅更新 page cache，
- *       数据持久化由 writepage 异步通知代理完成。
+ * 替代旧的同步写方案:
+ *   旧方案在 write_end 中同步调用 powerfs_net_write + powerfs_net_setattr,
+ *   导致 write() 系统调用阻塞在网络往返上, 高并发下性能差.
+ *   Stage C 改为纯 page cache 更新, write() 立即返回,
+ *   持久化推迟到 writeback (writepage + write_inode).
  */
 int powerfs_write_end(struct file *file, struct address_space *mapping,
                        loff_t pos, unsigned int len, unsigned int copied,
                        struct page *page, void *fsdata)
 {
     struct inode *inode = mapping->host;
-    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct folio *folio = page_folio(page);
     loff_t end_pos = pos + copied;
-    loff_t new_size;
 
     pr_debug("powerfs: write_end ino=%lu pos=%lld copied=%u (async)\n",
              inode->i_ino, pos, copied);
 
     if (copied > 0) {
-        /* 更新文件大小 */
-        new_size = i_size_read(inode);
-        if (end_pos > new_size) {
-            new_size = end_pos;
-            i_size_write(inode, new_size);
+        /* folio 必须 uptodate 才能 mark_dirty (参考 ceph_write_end).
+         *
+         * netfs_write_begin 对新文件 (pos >= i_size) 会跳过 issue_read,
+         * folio 不是 uptodate (netfs_skip_folio_read 返回 true 但只清零
+         * 不标记 uptodate). 此时若 copied == len (整 folio 写入), 标记
+         * uptodate 继续; 若 copied < len (partial write), 返回 0 让 VFS
+         * 重试 (需要先读取现有数据). */
+        if (!folio_test_uptodate(folio)) {
+            if (copied < len) {
+                copied = 0;
+                goto out;
+            }
+            folio_mark_uptodate(folio);
+        }
+        /* 更新本地 i_size. Filer 端 i_size 由 write_inode 在 writeback
+         * 时通过 setattr 同步 (pi->content_size 跟踪上次同步值). */
+        if (end_pos > i_size_read(inode)) {
+            i_size_write(inode, end_pos);
             mark_inode_dirty(inode);
         }
-
-        /*
-         * 异步模式: 仅标记页面为脏，由 writepage 后台异步通知代理
-         * 这样 write 系统调用立即返回，不会因代理处理慢而阻塞
-         *
-         * 注意: folio_mark_dirty 内部通过 mapping->a_ops->dirty_folio()
-         * 间接调用 (mm/page-writeback.c). 若 a_ops 未设置 .dirty_folio
-         * 则 NULL 间接调用 → powerfs_write_end+0x45 NULL instruction
-         * fetch oops. 根因是 powerfs_aops 接口不完整, 已在 aops 表中
-         * 补 .dirty_folio = filemap_dirty_folio 修复 (参考 nfs/btrfs).
-         */
-        if (!PageUptodate(page))
-            SetPageUptodate(page);
-        folio_mark_dirty(page_folio(page));
-
-        /*
-         * 同步数据 + i_size 到 Filer:
-         *
-         * 基本功能阶段采用同步写: write_end 直接调用 powerfs_net_write
-         * 将本页数据持久化到 Filer 的 inline data store, 保证 write()
-         * 返回后数据可被跨 mount session 读取.
-         *
-         * 不依赖 writepage 异步刷盘的原因:
-         *   - writepage 由 VM writeback 触发, 时机不可控 (内存充裕时
-         *     可能永远不触发), umount/sync 路径在本地缓存模式下也可能
-         *     跳过网络写 → remount 后数据丢失.
-         *   - 高并发同步写的 SQ 队列满问题来自旧 comm 层
-         *     (powerfs_comm_send_request), 新 net 层 (powerfs_net_write)
-         *     使用独立 TCP 连接 + send_recv_mutex 串行化, 不涉及 SQ.
-         *
-         * 后续优化可改回异步 (writepage 刷盘 + fsync 同步), 但需确保
-         * umount 路径触发并等待 writeback 完成.
-         */
-        if (powerfs_net_is_connected()) {
-            __u32 written = 0;
-            /* pos % PAGE_SIZE gives the offset within the page where the
-             * new data was written. kaddr points to the page start, so we
-             * must add the in-page offset to send the actual written bytes
-             * (not bytes from the beginning of the page, which would be
-             * stale data from prior writes in the same page). This was the
-             * root cause of append-write corruption: all appends sent the
-             * first chunk's bytes because kaddr[0..copied) was used
-             * regardless of the write position within the page. */
-            size_t off_in_page = pos & (PAGE_SIZE - 1);
-            char *kaddr = kmap_local_page(page);
-            int wret = powerfs_net_write(inode->i_ino, pos,
-                                         kaddr + off_in_page, copied, &written);
-            kunmap_local(kaddr);
-            if (wret < 0) {
-                pr_warn("powerfs: write_end net_write ino=%lu pos=%lld len=%u failed: %d\n",
-                        inode->i_ino, pos, copied, wret);
-                /* 写失败: 保持 dirty, 让 writeback 重试 */
-            } else {
-                /* 写成功: 清除 dirty, 避免 close 时重复触发 writeback.
-                 *
-                 * 根因: write_end 已同步将数据持久化到 filer, 若不清 dirty,
-                 * close 触发 writeback -> powerfs_writepage -> powerfs_net_write
-                 * 重复写. 更严重的是 writepage 在 writeback 上下文执行,
-                 * 网络阻塞会导致整个 writeback 子系统卡死, 进而导致 close
-                 * 阻塞, RCU stall in d_lookup (411s+).
-                 *
-                 * 参照 ceph_write_end (fs/ceph/addr.c): ceph 使用 netfs 机制,
-                 * write_end 不做网络 IO, 数据持久化由 writeback 完成.
-                 * powerfs 基本功能阶段采用同步写, 写成功后必须 clear dirty
-                 * 避免重复 writeback. */
-                folio_clear_dirty(page_folio(page));
-            }
-        }
-
-        /*
-         * 同步 i_size 到 Filer:
-         *   writepage 只刷数据页, sync 命令只触发 writeback 不触发 fsync,
-         *   若不在 write_end 同步 size, Filer 端 i_size 永远为 0, remount
-         *   后 lookup 返回 size=0, read_folio zero fill → 数据丢失.
-         *
-         *   用 pi->content_size 跟踪上次同步值, 仅在变化时 setattr,
-         *   避免每次 write_end 都网络往返. write_end 在用户进程上下文
-         *   (持有 page lock 但可睡眠, GFP_KERNEL), 调用 net_setattr 安全.
-         *   不用 write_inode: writeback 上下文调用网络 IO 会与 writepage
-         *   串行化卡死 (send_recv_mutex).
-         */
-        if (powerfs_net_is_connected() && (u64)new_size != pi->content_size) {
-            int sret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
-                                            0, 0, 0, (u64)new_size);
-            if (sret < 0)
-                pr_warn("powerfs: write_end setattr ino=%lu size=%llu failed: %d\n",
-                        inode->i_ino, (u64)new_size, sret);
-            else
-                pi->content_size = (u64)new_size;
-        }
+        /* 标记 folio 脏, 由 writeback 子系统触发 writepages 异步刷盘 */
+        folio_mark_dirty(folio);
     }
 
-    unlock_page(page);
-    put_page(page);
+out:
+    folio_unlock(folio);
+    folio_put(folio);
 
     return copied;
 }
@@ -2463,8 +2797,10 @@ sector_t powerfs_bmap(struct address_space *mapping, sector_t block)
  * 我们不使用 buffer_heads, 故用 filemap_dirty_folio (与 nfs/btrfs/zonefs 一致).
  */
 static const struct address_space_operations powerfs_aops = {
-    .read_folio    = powerfs_read_folio,
-    .writepage     = powerfs_writepage,
+    .read_folio    = netfs_read_folio,   /* Stage C: netfs 子系统管理 folio 生命周期 */
+    .readahead     = netfs_readahead,    /* Stage C: 批量预读 */
+    .writepages    = powerfs_writepages,  /* 批量 writeback (优先于 writepage) */
+    .writepage     = powerfs_writepage,   /* fallback: migrate_pages 等内部路径 */
     .write_begin   = powerfs_write_begin,
     .write_end     = powerfs_write_end,
     .dirty_folio   = filemap_dirty_folio,
@@ -2591,6 +2927,7 @@ static const struct super_operations powerfs_super_ops = {
     .alloc_inode   = powerfs_alloc_inode,
     .free_inode    = powerfs_free_inode,
     .evict_inode   = powerfs_evict_inode,
+    .write_inode   = powerfs_write_inode,  /* Stage C: writeback 时同步 i_size 到 Filer */
     .statfs        = powerfs_statfs,
     .drop_inode    = generic_delete_inode,
     .show_options  = powerfs_show_options,
@@ -2662,6 +2999,7 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         u16  volume_port;
         char filer_addr[64];
         u16  filer_port;
+        u32  write_batch_kb;
     };
     /* 注意: sget_fc() 会将 fc->s_fs_info 转移到 sb->s_fs_info, 然后将
      * fc->s_fs_info 置 NULL. 因此必须从 sb->s_fs_info 获取 ctx, 而不是
@@ -2670,6 +3008,8 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     struct powerfs_ctx_simple *ctx = sb->s_fs_info;
     struct powerfs_sb_info *sbi;
     struct inode *root;
+    u32 batch_kb = POWERFS_WRITE_BATCH_DEFAULT_KB;
+    int ret;
 
     pr_info("powerfs: fill_super (sb->s_fs_info=%px, master_addr='%s')\n",
             ctx, ctx ? ctx->master_addr : "(null)");
@@ -2689,11 +3029,29 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->volume_port = ctx->volume_port;
         strncpy(sbi->filer_addr, ctx->filer_addr, sizeof(sbi->filer_addr) - 1);
         sbi->filer_port = ctx->filer_port;
+        batch_kb = ctx->write_batch_kb;
         /* 释放 init_fs_context 分配的 ctx, 释放后 sb->s_fs_info 仍指向已释放内存,
          * 必须在下方设置 sb->s_fs_info = sbi 之前完成 */
         kfree(ctx);
         ctx = NULL;
     }
+
+    /* 验证并转换 write_batch_kb → write_batch_pages.
+     * 范围: 4KB (1 page) ~ 64MB (stripe size, 16384 pages).
+     * 越界值 clamp 到合法范围并告警, 不拒绝挂载 (避免配置笔误导致不可用). */
+    if (batch_kb < POWERFS_WRITE_BATCH_MIN_KB) {
+        pr_warn("powerfs: write_batch_kb=%u too small, clamped to %d\n",
+                batch_kb, POWERFS_WRITE_BATCH_MIN_KB);
+        batch_kb = POWERFS_WRITE_BATCH_MIN_KB;
+    } else if (batch_kb > POWERFS_WRITE_BATCH_MAX_KB) {
+        pr_warn("powerfs: write_batch_kb=%u too large, clamped to %d\n",
+                batch_kb, POWERFS_WRITE_BATCH_MAX_KB);
+        batch_kb = POWERFS_WRITE_BATCH_MAX_KB;
+    }
+    /* 转换为页数: kb * 1024 / PAGE_SIZE = kb / (PAGE_SIZE/1024) = kb / 4 */
+    sbi->write_batch_pages = (int)(batch_kb * 1024 / PAGE_SIZE);
+    pr_info("powerfs: write_batch_kb=%u → write_batch_pages=%d\n",
+            batch_kb, sbi->write_batch_pages);
 
     /* 初始化 inode 号分配器 (从 100 开始，1 是 root) */
     atomic_set(&sbi->next_ino, 100);
@@ -2706,6 +3064,22 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     sb->s_blocksize_bits = 12;
     sb->s_maxbytes = MAX_LFS_FILESIZE;
     sb->s_time_gran = 1;
+
+    /* Stage C: 设置 BDI 支持 writeback.
+     *
+     * super_setup_bdi 创建独立的 backing_dev_info 并设置 BDI_CAP_WRITEBACK.
+     * 没有 BDI_CAP_WRITEBACK, mapping_can_writeback() 返回 false,
+     * folio_account_dirtied 不增加 dirty 统计, writeback 子系统不扫描
+     * dirty folio, 导致 sync/fsync 不触发 writepage, 数据无法持久化.
+     *
+     * 参考: ceph_fill_super (fs/ceph/super.c) 调用 super_setup_bdi.
+     * ramfs 不需要 (纯内存, 无 writeback). */
+    ret = super_setup_bdi(sb);
+    if (ret) {
+        pr_err("powerfs: super_setup_bdi failed: %d\n", ret);
+        kfree(sbi);
+        return ret;
+    }
 
     /* 设置默认 dentry operations (所有 dentry 共享) */
     powerfs_set_sb_dentry_ops(sb);
@@ -2731,6 +3105,18 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
     /* 设置全局超级块指针 (供通信层使用) */
     g_powerfs_sb = sb;
+
+    /* Stage C: 创建 writeback 异步 workqueue.
+     * 使用 WQ_UNBOUND 提高扩展性 (work 不绑定到特定 CPU).
+     * max_active=4 限制并发: powerfs_net_write 是同步网络调用, 过多并发
+     * worker 会压垮单连接 (256 页 1MB 文件曾导致 132 个 worker 线程锁死). */
+    sbi->writeback_wq = alloc_workqueue("powerfs_wb",
+                                        WQ_UNBOUND | WQ_MEM_RECLAIM, 4);
+    if (!sbi->writeback_wq) {
+        pr_err("powerfs: failed to create writeback workqueue\n");
+        /* 注意: 此处不清理, kill_sb 会处理. */
+        return -ENOMEM;
+    }
 
     /* === 初始化 powerfs_net 连接池 (多节点 Delta Sync) === */
     powerfs_net_pool_init();
@@ -2831,14 +3217,34 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
      *
      * 新架构 (per-conn 状态机 + shard 路由 + 事件驱动) 为唯一路径.
      * 旧 g_conn 单连接 fallback 已移除, pool_init 失败直接返回错误.
-     * 断连检测由 sk_state_change 回调 + TCP keepalive 取代, 无需健康监控线程. */
+     * 断连检测由 sk_state_change 回调 + TCP keepalive 取代, 无需健康监控线程.
+     *
+     * P3.2: 传入 master_addr, 让 g_pool.master_addr 被设置, 供后续
+     * discover_volumes 及其他需要 Master 交互的场景使用. */
     {
-        int pool_ret = powerfs_conn_pool_init(NULL, 0);
+        const char *maddr = sbi->master_addr[0] ? sbi->master_addr : NULL;
+        __u16 mport = sbi->master_port ? sbi->master_port : 9334;
+        int pool_ret = powerfs_conn_pool_init(maddr, mport);
         if (pool_ret != 0) {
             pr_err("powerfs: connection pool init failed (%d)\n", pool_ret);
             return pool_ret;
         }
         pr_info("powerfs: new connection pool initialized (sk callback + keepalive)\n");
+
+        /* P3.3: 从 Master GetTopology 发现 volume 路由表 (volume_id → conn_idx).
+         * 前提: volume 连接已由 conn_pool_init 建立 (g_pool.volumes[] 已填充).
+         * discover_volumes 按 addr 匹配已建立连接, 建立路由映射.
+         * 失败不挂载失败: filer 元数据仍可用, 数据读写等 volume 上线后恢复. */
+        if (maddr) {
+            int vol_ret = powerfs_net_discover_volumes(maddr, mport);
+            if (vol_ret < 0) {
+                pr_warn("powerfs: discover_volumes failed: %d "
+                        "(volume data IO will fail until routes established)\n",
+                        vol_ret);
+            } else {
+                pr_info("powerfs: volume routes discovered via Master\n");
+            }
+        }
     }
 
     pr_info("powerfs: fill_super done, root ino=%lu\n", root->i_ino);
@@ -2858,16 +3264,27 @@ void powerfs_kill_sb_super(struct super_block *sb)
     if (g_powerfs_sb == sb)
         g_powerfs_sb = NULL;
 
-    /* 1. 先 sync 脏 inode (网络仍可用, write_inode 能同步 size 到 Filer).
+    /* 1. 先 sync 脏 inode (网络仍可用, write_inode 能同步 size 到 Filer,
+     *    writepage 异步 work 也会执行网络写).
      *    如果先关闭网络, write_inode 的 setattr 会失败, inode 保持 dirty,
      *    evict_inodes 无法驱逐, 导致 umount 挂起或内存泄漏. */
     sync_filesystem(sb);
 
-    /* 2. 设置 stopping 标志: 让 send_request 立即返回 -ENOTCONN,
+    /* 2. 销毁 writeback workqueue (Stage C).
+     *    sync_filesystem 已触发 writeback 并等待 PageWriteback 清除,
+     *    此时 workqueue 中所有 work 应已完成. destroy_workqueue 会
+     *    drain 剩余 work (若有), 然后销毁. 必须在关闭网络前销毁,
+     *    否则 work_fn 中的 powerfs_net_write 访问已关闭的网络. */
+    if (sbi && sbi->writeback_wq) {
+        destroy_workqueue(sbi->writeback_wq);
+        sbi->writeback_wq = NULL;
+    }
+
+    /* 3. 设置 stopping 标志: 让 send_request 立即返回 -ENOTCONN,
      *    阻止 reconnect_work 在 g_pool 清零后访问野指针. */
     powerfs_net_set_stopping();
 
-    /* 3. 关闭所有连接 (g_pool 会被清零) */
+    /* 4. 关闭所有连接 (g_pool 会被清零) */
     powerfs_net_pool_cleanup();
 
     if (sbi) {
@@ -2875,7 +3292,7 @@ void powerfs_kill_sb_super(struct super_block *sb)
         sb->s_fs_info = NULL;
     }
 
-    /* 4. kill_anon_super 会再次 sync (但已无脏数据) + shrink_dcache + evict_inodes */
+    /* 5. kill_anon_super 会再次 sync (但已无脏数据) + shrink_dcache + evict_inodes */
     kill_anon_super(sb);
 }
 
