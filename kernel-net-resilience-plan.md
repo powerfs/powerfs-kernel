@@ -3242,20 +3242,27 @@ static int powerfs_lookup_timeout_for_current_state(void)
 ### 16.4 优先级排序与依赖关系
 
 ```
-Stage B (断连恢复优化) ──┐
-                         ├──→ 重新验证 test_stage2_disconnect.sh
-Stage C (writeback 优化) ─┘
-                         │
-Stage D (文件 lease 锁) ──┤
-                         ├──→ Phase 3 (Filer push invalidation)
-Stage E (测试脚本优化) ──┘
+Stage C (writeback 优化) ──→ Stage D (文件 lease 锁) ──┐
+                                                        ├──→ Phase 3 (Filer push invalidation)
+Stage B (断连恢复优化) ─────────────────────────────────┤
+                                                        │
+Stage E (测试脚本优化) ─────────────────────────────────┘
 ```
 
-**建议实施顺序**:
-1. **Stage B** (断连恢复优化): 最紧急, 直接解决测试 1 失败
-2. **Stage E** (测试脚本优化): 配合 Stage B 验证, 工作量小
-3. **Stage C** (writeback 优化): 性能关键, 但不影响正确性
-4. **Stage D** (文件 lease 锁): 数据一致性保障, 依赖 Stage C 的 netfs 基础设施
+**实施顺序: C → D → B → E** (持续进步, 架构优先):
+
+1. **Stage C** (writeback 优化): 架构基础, 同步写改异步 netfs, 为后续 lease 锁和性能优化打基础
+   - 当前 `write_end` 同步写 + `folio_clear_dirty` 是 workaround, 需彻底解决
+   - netfs 基础设施建好后, Stage D 的 read/write 路径才能正确对接 lease 检查
+2. **Stage D** (文件 lease 锁): 数据一致性保障, 依赖 Stage C 的 netfs read/write 路径
+   - `powerfs_read_folio` / `powerfs_write_begin` 需在 netfs 框架内检查 lease
+   - lease_tree 管理 + 续约 work + evict_inode 释放
+3. **Stage B** (断连恢复优化): 参数调优, 在架构稳定后微调
+   - connect/BASE_DELAY/MAX_RECONNECT/FAULT 间隔调整
+   - hung_task_timeout 增大, lookup 超时延长
+   - 此阶段验证 test_stage2_disconnect.sh 测试 1 通过
+4. **Stage E** (测试脚本优化): 最后收尾, 兜底 -EAGAIN 和 SSH 超时
+   - 架构和参数都稳定后, 测试脚本做最后适配
 
 ### 16.5 Stage B 具体修改清单
 
