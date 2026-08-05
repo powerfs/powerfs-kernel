@@ -3127,3 +3127,168 @@ static int powerfs_lookup_timeout_for_current_state(void)
 4. **d_revalidate fast-path 是否要检查 inode cache_valid**: 方案中加了检查, 但若 inode cache_valid 已被本地 mutation 清零, dentry lease 未过期也会被强制重 lookup. 这是正确的 (mutation 后属性可能变), 但会损失部分 fast-path 收益. 可选: 不检查 inode cache_valid, 只看 dentry lease, 让 getattr 路径自己处理 inode 失效.
 
 请确认以上 4 点后开始 Phase 1 实施.
+
+## 十六、Phase 1 实施结果与后继任务规划
+
+### 16.1 Phase 1 实施结果 (commit 9c5f792)
+
+**已实施修改**:
+1. **d_revalidate RCU fast-path**: lease 有效时返回 1 继续 RCU 模式查找, 避免 d_lock 竞争导致的 RCU stall in `__d_lookup`
+2. **write_end 清除 dirty**: 同步写成功后 `folio_clear_dirty`, 避免 close 触发重复 writeback 导致网络阻塞和 close 卡死
+3. **lookup 超时 60s**: 从动态 2-10s 改为固定 60s, 覆盖 Docker 容器重启 + Raft 选主 + 内核重连
+4. **FAULT 重试 5s**: 从 30s 减为 5s, 加快 filer 恢复
+5. **shard route 唤醒所有 pending**: filer 重连时唤醒所有 CHECKING/UNKNOWN 状态 shard 的排队请求, 处理 Raft leader 变更
+6. **connect 超时 5s**: 从 3s 增为 5s, 容器重启后网络稳定留足时间
+
+**test_stage2_disconnect.sh 测试结果**:
+
+| 测试项 | 结果 | 说明 |
+|--------|------|------|
+| 测试 0: 单 filer 断连容错 | **全部 PASS** | 连接池隔离正确, 其他 filer 仍可写, 恢复后自动重连 |
+| 测试 1: 全 filer 断连恢复 | **FAIL** | 写请求未在 80s 内完成 |
+| 测试 2: 数据一致性 | 部分 FAIL | 读回为空 (因测试 1 写入失败), 追加写和新文件创建 PASS |
+| 测试 3: 第二次断连恢复 | 部分 FAIL | 写请求 1s 完成 (走 filer-3), 但内核重连日志未捕获 |
+
+### 16.2 测试 1 失败根因分析
+
+**dmesg 时间线**:
+```
+208s: 全 filer 断连, lookup 请求入队列等待
+272s: 第一次 lookup 60s 超时 → -EAGAIN → VFS 重试 (第二次入队列)
+333s: 第二次 lookup 60s 超时 → -EAGAIN → shell 退出, 写失败
+353s: filer-1/2 才重连成功 (太晚)
+```
+
+**核心矛盾**: filer 恢复需要 **145s** (208s→353s), 而 lookup 超时 60s + VFS 重试 60s = 120s 仍不够覆盖.
+
+**filer 恢复慢的原因分解**:
+1. Docker 容器重启 ~20s (不可控)
+2. powerfs-net 服务启动 ~20s (Docker healthcheck 通过后端口仍未监听)
+3. 内核重连每轮: 3 次 connect × 5s 超时 + 退避 1+2s = 18s/轮
+4. FAULT 状态 5s 后重试, 但实际一轮 (含 connect 超时) 需 ~20s
+5. 需 2-3 轮重试才在 filer 服务启动后连接成功
+
+**hung_task_timeout 限制**: QEMU 设置 `hung_task_timeout=120s`, lookup 超时不能超过 120s.
+
+### 16.3 后继任务规划
+
+#### Stage B: 断连恢复时间优化 (优先级: 高)
+
+目标: 将 filer 恢复时间从 145s 降至 60s 以内, 使 lookup 60s 超时能覆盖.
+
+| 优化项 | 当前值 | 目标值 | 预期收益 |
+|--------|--------|--------|----------|
+| `POWERFS_NET_CONNECT_TIMEOUT` | 5000ms | 3000ms | 每轮节省 6s (3次×2s) |
+| `POWERFS_NET_BASE_DELAY` | 1000ms | 500ms | 退避减少 1.5s/轮 |
+| FAULT 重试间隔 | 5000ms | 2000ms | 每轮节省 3s |
+| `POWERFS_NET_MAX_RECONNECT` | 3 | 2 | 每轮减少 1 次 connect (省 3-5s) |
+| QEMU `hung_task_timeout` | 120s | 300s | 允许 lookup 超时延长到 150s |
+
+预期效果: filer 恢复时间 145s → ~70s, 配合 lookup 60s + VFS 重试 60s = 120s 可覆盖.
+
+**实施步骤**:
+1. 调整 `powerfs_net.h` 中超时常量
+2. 修改 QEMU 启动参数 `hung_task_timeout=300`
+3. 可选: lookup 超时从 60s 延长到 90s (hung_task_timeout=300s 内安全)
+4. 重新运行 test_stage2_disconnect.sh 验证
+
+#### Stage C: writeback 优化 (优先级: 高)
+
+**当前问题**: `powerfs_write_end` 采用同步写 (直接调 `powerfs_net_write`), 写成功后 `folio_clear_dirty` 避免 close 重复 writeback. 但同步写在 write_end 上下文阻塞应用进程, 高并发下性能差.
+
+**优化目标**: 参考 ceph netfs 机制, 将数据持久化推迟到 writeback 异步完成.
+
+**实施方案 (分步)**:
+
+**Step 1: writepage/writepages 异步写入** (基本功能阶段)
+- 实现 `powerfs_writepage` / powerfs_writepages`: 从 page cache 取脏页, 异步发送到 filer
+- `write_end` 不再做网络 IO, 仅标记 folio dirty (移除 `folio_clear_dirty` workaround)
+- writeback 由内核 `writeback` 线程触发, 不阻塞应用进程
+- 风险: writeback 上下文不能睡眠等待网络, 需用 `NETFS_REQUEST` 机制或自定义 async writeback
+
+**Step 2: netfs_read_folio + netfs_write_begin 对接** (性能优化)
+- `powerfs_netfs_ops.issue_read` 实现: 从 filer 拉取数据填充 page cache
+- `powerfs_write_begin` 对接 netfs: 检查 page cache, miss 时异步拉取
+- 参考 `fs/ceph/addr.c` 的 `ceph_netfs_read_request_ops`
+
+**Step 3: writeback 与网络解耦** (鲁棒性)
+- writeback 上下文 (`powerfs_writepage`) 不能同步等待网络响应
+- 方案 A: writepage 提交异步写请求, 设置 `PageWriteback` 标志, 收到响应后 `end_page_writeback`
+- 方案 B: 使用 netfs_write_request_ops, 让 netfs 子系统管理 writeback 生命周期
+- 断连期间 writeback 请求入队列等待, 不阻塞 writeback 线程
+
+**关键约束**:
+- writeback 上下文禁止 `mutex_lock` / `GFP_KERNEL` 分配 (持 `i_rwsem` 或 page lock)
+- 网络请求需在 workqueue 中执行, writepage 仅提交请求
+- 参照 `fs/ceph/addr.c` 和 `fs/nfs/write.c` 的 async writeback 模式
+
+#### Stage D: 文件 Lease 锁实现 (优先级: 中)
+
+**当前状态**: `powerfs_inode_info` 已预留 `lease_tree` 和 `lease_renew_work_func` 结构, 但未实现.
+
+**实施方案**:
+1. `lease_tree` 红黑树 (按 stripe_start 排序), `spinlock` 保护
+2. `powerfs_lease_renew_work_func`: 周期扫描 `lease_tree`, 对快过期 lease 调 `powerfs_net_renew_lease`
+3. `powerfs_read_folio` / `powerfs_write_begin`: 先检查 `lease_tree` 是否有有效 lease, miss 则 acquire
+4. `powerfs_evict_inode`: 释放所有 lease
+5. Filer 侧已支持 (`powerfs-volume/src/range_lease.rs`), 内核侧对接即可
+
+#### Stage E: 测试脚本优化 (优先级: 低)
+
+1. **写命令 -EAGAIN 重试**: 后台写命令用 `until` 循环重试, 兜底 -EAGAIN
+2. **SSH 检查超时**: 避免因 VM 短暂忙碌误判写请求失败
+3. **dmesg 基线对比**: 更精确捕获重连日志窗口
+
+### 16.4 优先级排序与依赖关系
+
+```
+Stage B (断连恢复优化) ──┐
+                         ├──→ 重新验证 test_stage2_disconnect.sh
+Stage C (writeback 优化) ─┘
+                         │
+Stage D (文件 lease 锁) ──┤
+                         ├──→ Phase 3 (Filer push invalidation)
+Stage E (测试脚本优化) ──┘
+```
+
+**建议实施顺序**:
+1. **Stage B** (断连恢复优化): 最紧急, 直接解决测试 1 失败
+2. **Stage E** (测试脚本优化): 配合 Stage B 验证, 工作量小
+3. **Stage C** (writeback 优化): 性能关键, 但不影响正确性
+4. **Stage D** (文件 lease 锁): 数据一致性保障, 依赖 Stage C 的 netfs 基础设施
+
+### 16.5 Stage B 具体修改清单
+
+**文件**: `powerfs_mod/powerfs_net.h`
+```c
+#define POWERFS_NET_CONNECT_TIMEOUT  3000   /* connect: 3s (从 5s 降低) */
+#define POWERFS_NET_BASE_DELAY       500    /* 初始退避 500ms (从 1s 降低) */
+#define POWERFS_NET_MAX_RECONNECT    2      /* 最多重连 2 次 (从 3 降低) */
+```
+
+**文件**: `powerfs_mod/powerfs_net.c`
+```c
+/* FAULT 重试间隔: 5s → 2s */
+conn->reconnect_delay = msecs_to_jiffies(2000);
+```
+
+**文件**: `vm/run_qemu.sh`
+```bash
+CMDLINE="${CMDLINE} hung_task_timeout=300"  /* 从 120 改为 300 */
+```
+
+**文件**: `powerfs_mod/powerfs_fs.c` (可选)
+```c
+timeout_ms = 90000;  /* lookup: 60s → 90s (hung_task_timeout=300s 内安全) */
+```
+
+### 16.6 风险评估
+
+| 风险 | 评估 | 缓解 |
+|---|---|---|
+| connect 超时 3s 在网络抖动时误判 | 低 (EINPROGRESS 超时后才返回) | 配合 BASE_DELAY 500ms 快速重试 |
+| MAX_RECONNECT=2 可能不够 | 低 (FAULT 后 2s 重试, 无限循环) | FAULT 状态自动重试, 不会永久失败 |
+| hung_task_timeout=300s 掩盖真实死锁 | 中 | 配合 KASAN + debugfs 监控, 不影响开发期调试 |
+| writeback 异步化引入数据丢失 | 中 | 参照 ceph/nfs 成熟模式, 充分测试 |
+| 文件 lease 锁与 page cache 一致性 | 中 | 依赖 netfs 子系统管理 page cache 生命周期 |
+
