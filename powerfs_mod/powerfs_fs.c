@@ -179,12 +179,22 @@ int powerfs_d_revalidate(struct dentry *dentry, unsigned int flags)
     struct inode *inode;
     struct powerfs_inode_info *pi;
 
-    /* RCU 模式: 退出到非 RCU 模式重试 (参考 ceph_d_revalidate).
-     * 返回 -ECHILD 让 VFS 退出 RCU 路径查找, 改用引用计数保护的非 RCU 模式.
-     * 这样 dentry 不会被 shrinker 在 RCU reader 期间释放, 避免 UAF.
-     * 代价: 路径查找需 d_lock + 引用计数, 但网络文件系统安全性优先. */
+    /* RCU 模式 fast-path: 检查 dentry lease 有效性.
+     *
+     * 之前始终返回 -ECHILD 退出 RCU 模式, 导致 VFS 频繁切换到非 RCU 模式
+     * (d_lookup), 在高并发下 d_lock 竞争加剧, 触发 RCU stall in __d_lookup.
+     *
+     * 优化: lease 有效时返回 1, VFS 继续在 RCU 模式查找 (__d_lookup_rcu),
+     * 无需 d_lock. lease 无效时返回 -ECHILD, 退出 RCU 模式重新验证.
+     *
+     * 安全性: d_release 使用 call_rcu 延迟释放 di, RCU reader 访问
+     * dentry->d_fsdata 和 di->lease_expire 安全 (grace period 内 di 有效).
+     * dentry 本身在 RCU path walk 期间不会被释放 (VFS 持有 rcu_read_lock). */
     if (flags & LOOKUP_RCU) {
-        return -ECHILD;
+        di = dentry->d_fsdata;
+        if (di && time_before(jiffies, READ_ONCE(di->lease_expire)))
+            return 1;  /* lease 有效, RCU 模式安全 */
+        return -ECHILD;  /* lease 无效或 di 为 NULL, 退出 RCU 模式 */
     }
 
     /* 获取 dentry 私有数据 */
@@ -752,11 +762,13 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
 
         pr_debug("powerfs: lookup '%pd' via powerfs_net\n", dentry);
 
-        /* Phase 1: 短超时策略.
-         * 正常连接: 10s (RPC 充足时间).
-         * 断连/重连中或最近断连窗口内: 2s (快速失败, 让 VFS/应用层重试,
-         *   避免 hung task). 超时返回 -EAGAIN (见下). */
-        timeout_ms = powerfs_net_pick_timeout(POWERFS_LOOKUP_TIMEOUT_MS);
+        /* Phase 1: 超时策略.
+         * lookup 是 open/create/stat/unlink 等关键路径的必经之路.
+         * 断连期间请求入队列等待 filer 重连, 不立即返回错误.
+         * 超时设为 60s 覆盖: Docker 容器重启 (~20s) + Raft 选主 (~5s)
+         * + 内核重连 (~5s) + FAULT 重试 (5s) = ~35s, 留足余量.
+         * hung_task_timeout=120s, 60s 不会触发 hung task. */
+        timeout_ms = 60000;  /* 60s: 覆盖 Docker 容器重启 + Raft 选主 */
 
         /* 通过 powerfs_net 直接查询 (含时间戳) */
         err = powerfs_net_lookup_timeout(dir->i_ino, dentry->d_name.name,
@@ -766,13 +778,12 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
                                           &mtime, &atime, &ctime,
                                           timeout_ms);
 
-        /* Phase 1: 断连/重连期间超时或网络不可达, 返回 -EAGAIN 让 VFS/应用层重试.
-         * - ETIMEDOUT: 短超时内未收到响应 (断连中/重连中/filer 慢)
+        /* 断连/重连期间超时或网络不可达, 返回 -EAGAIN 让 VFS/应用层重试.
+         * - ETIMEDOUT: 60s 内未收到响应 (filer 长时间不可用)
          * - ENOTCONN: disconnect_one 已 complete(-ENOTCONN) (在途请求被取消)
          * - ESHUTDOWN: pool 正在 stopping
-         * 注意: lookup 返回 ERR_PTR(-EAGAIN) 时 VFS 会透传给 userspace,
-         *       应用层需重试 (NFS 风格). Phase 3 接入 callback 后可改为
-         *       返回负 dentry. */
+         * 注意: 60s 超时已覆盖 Docker 容器重启场景, 正常情况下 filer 会在
+         *       ~30s 内重连, 请求在队列中被 dispatch_pending 唤醒并完成. */
         if (err == -ETIMEDOUT || err == -ENOTCONN || err == -ESHUTDOWN) {
             pr_warn("powerfs: lookup '%pd' transient error %d (timeout_ms=%d), "
                     "return -EAGAIN for retry\n",
@@ -2386,6 +2397,21 @@ int powerfs_write_end(struct file *file, struct address_space *mapping,
             if (wret < 0) {
                 pr_warn("powerfs: write_end net_write ino=%lu pos=%lld len=%u failed: %d\n",
                         inode->i_ino, pos, copied, wret);
+                /* 写失败: 保持 dirty, 让 writeback 重试 */
+            } else {
+                /* 写成功: 清除 dirty, 避免 close 时重复触发 writeback.
+                 *
+                 * 根因: write_end 已同步将数据持久化到 filer, 若不清 dirty,
+                 * close 触发 writeback -> powerfs_writepage -> powerfs_net_write
+                 * 重复写. 更严重的是 writepage 在 writeback 上下文执行,
+                 * 网络阻塞会导致整个 writeback 子系统卡死, 进而导致 close
+                 * 阻塞, RCU stall in d_lookup (411s+).
+                 *
+                 * 参照 ceph_write_end (fs/ceph/addr.c): ceph 使用 netfs 机制,
+                 * write_end 不做网络 IO, 数据持久化由 writeback 完成.
+                 * powerfs 基本功能阶段采用同步写, 写成功后必须 clear dirty
+                 * 避免重复 writeback. */
+                folio_clear_dirty(page_folio(page));
             }
         }
 

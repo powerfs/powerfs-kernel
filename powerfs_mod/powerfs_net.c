@@ -672,20 +672,67 @@ EXPORT_SYMBOL_GPL(powerfs_shard_route_on_filer_disconnect);
 void powerfs_shard_route_on_filer_reconnect(int filer_idx)
 {
     int i;
+    bool need_wakeup[POWERFS_MAX_SHARDS] = {false};
 
     if (filer_idx < 0 || filer_idx >= g_pool.filer_count)
         return;
 
     spin_lock(&g_pool.shard_route.lock);
     for (i = 0; i < POWERFS_MAX_SHARDS; i++) {
-        if (g_pool.shard_route.entries[i].leader_filer_idx == filer_idx &&
+        if (g_pool.shard_route.entries[i].leader_filer_idx == filer_idx) {
+            if (g_pool.shard_route.entries[i].state == ROUTE_UNKNOWN) {
+                g_pool.shard_route.entries[i].state = ROUTE_CHECKING;
+                pr_info("powerfs: shard %d route -> CHECKING (filer %d up)\n",
+                        i, filer_idx);
+            }
+        }
+        /* Wake up pending requests for ALL shards in CHECKING or UNKNOWN
+         * state, not just those where this filer is the leader.
+         * Reason: Raft leader may have changed during the outage. The old
+         * leader (stored in leader_filer_idx) might still be down, but
+         * this reconnected filer might be the new leader. Waking up
+         * pending requests lets the submit loop retry with any connected
+         * filer, which will either succeed or return REDIRECT to the
+         * new leader. */
+        if (g_pool.shard_route.entries[i].state == ROUTE_CHECKING ||
             g_pool.shard_route.entries[i].state == ROUTE_UNKNOWN) {
-            g_pool.shard_route.entries[i].state = ROUTE_CHECKING;
-            pr_info("powerfs: shard %d route -> CHECKING (filer %d up)\n",
-                    i, filer_idx);
+            need_wakeup[i] = true;
         }
     }
     spin_unlock(&g_pool.shard_route.lock);
+
+    /* Wake up pending requests outside the route lock.
+     * For shards where this filer is the leader, use dispatch_pending
+     * (which sets req->filer to the leader connection).
+     * For other shards, directly complete with -EAGAIN to let the
+     * submit loop find any connected filer. */
+    for (i = 0; i < POWERFS_MAX_SHARDS; i++) {
+        if (!need_wakeup[i])
+            continue;
+
+        if (g_pool.shard_route.entries[i].leader_filer_idx == filer_idx) {
+            /* Leader filer reconnected: use dispatch_pending (sets filer) */
+            powerfs_shard_route_dispatch_pending(i);
+        } else {
+            /* Non-leader filer reconnected: wake up with -EAGAIN so
+             * submit loop retries and finds any connected filer */
+            struct powerfs_request *req, *tmp;
+            LIST_HEAD(wake_list);
+
+            spin_lock(&g_pool.shard_route.entries[i].req_lock);
+            list_splice_init(&g_pool.shard_route.entries[i].pending_reqs,
+                             &wake_list);
+            spin_unlock(&g_pool.shard_route.entries[i].req_lock);
+
+            list_for_each_entry_safe(req, tmp, &wake_list, list_node) {
+                list_del_init(&req->list_node);
+                req->error = -EAGAIN;
+                pr_debug("powerfs: wake req seq=%u shard=%d -> -EAGAIN (non-leader filer %d up)\n",
+                         req->seq, i, filer_idx);
+                complete(&req->done);
+            }
+        }
+    }
 }
 EXPORT_SYMBOL_GPL(powerfs_shard_route_on_filer_reconnect);
 
@@ -1651,13 +1698,16 @@ static void powerfs_conn_reconnect_work_fn(struct work_struct *work)
         return;
 
     if (conn->reconnect_count >= POWERFS_NET_MAX_RECONNECT) {
-        pr_err("powerfs: filer %s:%u reconnect failed %d times, FAULT, will retry in 30s\n",
+        pr_err("powerfs: filer %s:%u reconnect failed %d times, FAULT, will retry in 5s\n",
                conn->addr, conn->port, conn->reconnect_count);
         powerfs_conn_set_state(conn, CONN_FAULT);
-        /* 30 秒后自动重试, 避免永久 FAULT.
-         * 重置计数, 下次从 attempt 1 开始. */
+        /* 5 秒后自动重试, 避免永久 FAULT.
+         * 重置计数, 下次从 attempt 1 开始.
+         * 注意: 之前是 30s, 但 30s 超过 lookup 的 60s deadline,
+         * 导致断连期间排队的请求在 filer 重连前就超时.
+         * 5s 加快恢复速度, 配合 60s lookup 超时覆盖 filer 重启场景. */
         conn->reconnect_count = 0;
-        conn->reconnect_delay = msecs_to_jiffies(30000);
+        conn->reconnect_delay = msecs_to_jiffies(5000);
         if (!atomic_read(&g_pool.stopping))
             queue_delayed_work(g_pool.reconn_wq, &conn->reconnect_work,
                 conn->reconnect_delay);

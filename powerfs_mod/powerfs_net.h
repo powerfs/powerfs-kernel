@@ -48,7 +48,7 @@
 #define POWERFS_NET_MAX_DATA    (256 * 1024)  /* 256KB data */
 
 /* 连接超时 (ms) */
-#define POWERFS_NET_CONNECT_TIMEOUT  3000   /* connect: 3s, fast fail on unreachable filer */
+#define POWERFS_NET_CONNECT_TIMEOUT  5000   /* connect: 5s (容器重启后网络需时间稳定) */
 #define POWERFS_NET_SEND_TIMEOUT     10000  /* post-connect send timeout: 10s */
 #define POWERFS_NET_RECV_TIMEOUT     10000
 
