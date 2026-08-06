@@ -436,6 +436,44 @@ bool powerfs_tlv_dec_is_empty(const struct powerfs_tlv_dec *dec)
     return dec->pos >= dec->len;
 }
 
+/**
+ * powerfs_tlv_dec_find_u64 - 在整个 TLV buffer 中查找指定字段的 u64 值
+ *
+ * 与 powerfs_tlv_dec_u64 不同, 此函数从头扫描所有字段, 不依赖顺序.
+ * 用于 Filer 响应中字段顺序可能与客户端期望不一致的场景.
+ *
+ * 注意: 调用后 dec->pos 会定位在找到的字段数据之后; 未找到时恢复原位.
+ */
+int powerfs_tlv_dec_find_u64(struct powerfs_tlv_dec *dec, __u8 field, __u64 *val)
+{
+    size_t saved_pos = dec->pos;
+    __u8 cur_field;
+    size_t cur_len;
+    int ret;
+    int i;
+
+    dec->pos = 0;
+    while (dec->pos < dec->len) {
+        ret = powerfs_tlv_dec_next(dec, &cur_field, &cur_len);
+        if (ret)
+            break;
+
+        if (cur_field == field && cur_len == 8) {
+            *val = 0;
+            for (i = 0; i < 8; i++)
+                *val |= (__u64)dec->buf[dec->pos + i] << (i * 8);
+            dec->pos += 8;
+            return 0;
+        }
+        /* 跳过非目标字段的数据 */
+        dec->pos += cur_len;
+    }
+
+    /* 未找到, 恢复原始位置 */
+    dec->pos = saved_pos;
+    return -ENOENT;
+}
+
 /* ========== 导出符号 ========== */
 
 EXPORT_SYMBOL_GPL(powerfs_tlv_enc_init);
@@ -456,3 +494,4 @@ EXPORT_SYMBOL_GPL(powerfs_tlv_dec_u64);
 EXPORT_SYMBOL_GPL(powerfs_tlv_dec_string);
 EXPORT_SYMBOL_GPL(powerfs_tlv_dec_skip);
 EXPORT_SYMBOL_GPL(powerfs_tlv_dec_is_empty);
+EXPORT_SYMBOL_GPL(powerfs_tlv_dec_find_u64);

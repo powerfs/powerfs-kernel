@@ -166,6 +166,7 @@ struct powerfs_inode_info {
     /* 缓存有效性 */
     bool cache_valid;
     unsigned long cache_expire;
+    bool need_refresh;  /* NOTIFY 置位: 需异步 getattr 刷新元数据 */
 
     /* 目录缓存 */
     bool dir_complete;

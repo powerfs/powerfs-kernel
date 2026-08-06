@@ -226,7 +226,8 @@ struct powerfs_net_frame_hdr {
     __u16 msg_type;     /* 消息类型 (little-endian) */
     __u16 status;       /* 状态码 (little-endian) */
     __u32 data_len;     /* body + data 总长度 (little-endian) */
-    __u8 reserved[6];   /* 保留 */
+    __u32 body_len;     /* body 段长度 (data 段 = data_len - body_len) */
+    __u8 reserved[2];   /* 保留 */
     __le32 header_crc;  /* CRC32C (little-endian) */
 } __attribute__((packed));
 
@@ -294,6 +295,7 @@ int  powerfs_tlv_dec_string(struct powerfs_tlv_dec *dec, __u8 field,
                             char *str, size_t max_len);
 int  powerfs_tlv_dec_skip(struct powerfs_tlv_dec *dec, size_t length);
 bool powerfs_tlv_dec_is_empty(const struct powerfs_tlv_dec *dec);
+int  powerfs_tlv_dec_find_u64(struct powerfs_tlv_dec *dec, __u8 field, __u64 *val);
 
 /* ========== powerfs-net 连接管理 (v2: sk 回调 + per-CPU 调度器) ========== */
 
@@ -961,7 +963,8 @@ __u32 powerfs_crc32c(const __u8 *data, size_t len);
 /* 帧头编解码 */
 void powerfs_net_frame_hdr_encode(struct powerfs_net_frame_hdr *hdr,
                                    __u16 msg_type, __u8 flags,
-                                   __u32 seq, __u16 status, __u32 data_len);
+                                   __u32 seq, __u16 status,
+                                   __u32 body_len, __u32 data_len);
 bool powerfs_net_frame_hdr_decode(const __u8 *buf, size_t len,
                                    struct powerfs_net_frame_hdr *hdr);
 

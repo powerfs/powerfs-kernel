@@ -148,12 +148,15 @@ EXPORT_SYMBOL_GPL(powerfs_crc32c);
 
 /**
  * powerfs_net_frame_hdr_encode - 编码帧头 (28 字节)
+ *
+ * @body_len: body 段长度 (TLV 部分)
+ * @data_len: body + data 总长度 (data 段 = data_len - body_len)
  */
 void powerfs_net_frame_hdr_encode(struct powerfs_net_frame_hdr *hdr,
                                    __u16 msg_type, __u8 flags,
-                                   __u32 seq, __u16 status, __u32 data_len)
+                                   __u32 seq, __u16 status,
+                                   __u32 body_len, __u32 data_len)
 {
-    __u32 crc_buf[7];  /* 前 24 字节 (6 u32) 的 CRC 计算缓冲 */
     __u32 crc;
 
     /* 填充字段.
@@ -174,8 +177,11 @@ void powerfs_net_frame_hdr_encode(struct powerfs_net_frame_hdr *hdr,
     /* status: little-endian */
     hdr->status = cpu_to_le16(status);
 
-    /* data_len: little-endian */
+    /* data_len: body + data 总长度 (little-endian) */
     hdr->data_len = cpu_to_le32(data_len);
+
+    /* body_len: body 段长度 (little-endian), 接收端据此切分 body/data */
+    hdr->body_len = cpu_to_le32(body_len);
 
     /* reserved */
     memset(hdr->reserved, 0, sizeof(hdr->reserved));
@@ -217,6 +223,7 @@ bool powerfs_net_frame_hdr_decode(const __u8 *buf, size_t len,
     hdr->msg_type = le16_to_cpu(hdr->msg_type);
     hdr->status = le16_to_cpu(hdr->status);
     hdr->data_len = le32_to_cpu(hdr->data_len);
+    hdr->body_len = le32_to_cpu(hdr->body_len);
 
     return true;
 }
@@ -290,7 +297,7 @@ static int powerfs_net_tcp_connect(struct socket *sock, const char *addr,
         return ret;
     }
 
-    pr_info("powerfs: connected to %s:%u\n", addr, port);
+    pr_debug("powerfs: connected to %s:%u\n", addr, port);
     return 0;
 }
 
@@ -367,8 +374,10 @@ EXPORT_SYMBOL_GPL(powerfs_net_frame_send);
  *
  * 接收流程:
  *   1. 先接收 28 字节帧头
- *   2. 解析 data_len
- *   3. 接收 body (data_len 字节)
+ *   2. 解析 data_len (总长度) 和 body_len (body 段长度)
+ *   3. 接收 data_len 字节, 按 body_len 切分到 body_buf 和 data_buf
+ *
+ * 注意: body/data 边界由帧头 body_len 字段决定 (不再依赖 body_cap hack).
  */
 int powerfs_net_frame_recv(struct socket *sock,
                             struct powerfs_net_frame_hdr *hdr,
@@ -380,7 +389,7 @@ int powerfs_net_frame_recv(struct socket *sock,
     struct kvec vec;
     struct msghdr msg = {};
     ssize_t received;
-    size_t total_data;
+    size_t total_data, body_sz, data_sz;
 
     if (!sock)
         return -ENOTCONN;
@@ -417,63 +426,50 @@ int powerfs_net_frame_recv(struct socket *sock,
         return -EINVAL;
     }
 
-    /* 3. 接收 body + data */
+    /* 3. 按 body_len 切分 body 和 data */
     total_data = hdr->data_len;
-    if (total_data == 0) {
-        if (body_len) *body_len = 0;
-        if (data_len) *data_len = 0;
-        return 0;
-    }
+    body_sz = hdr->body_len;
+    if (body_sz > total_data)
+        body_sz = total_data;  /* 防御: body_len 异常时钳制 */
+    data_sz = total_data - body_sz;
 
-    if (total_data > body_cap + data_cap) {
-        pr_err("powerfs: frame data too large: %zu > %zu\n",
-               total_data, body_cap + data_cap);
+    if (body_sz > body_cap) {
+        pr_err("powerfs: body section too large: %zu > %zu\n",
+               body_sz, body_cap);
+        return -E2BIG;
+    }
+    if (data_sz > data_cap) {
+        pr_err("powerfs: data section too large: %zu > %zu\n",
+               data_sz, data_cap);
         return -E2BIG;
     }
 
-    /* 接收数据 (MSG_WAITALL 确保收到完整数据, 避免短读导致流错位) */
-    if (total_data <= body_cap) {
-        /* 全部放入 body */
+    /* 接收 body 段 */
+    if (body_sz > 0) {
         vec.iov_base = body_buf;
-        vec.iov_len = total_data;
-
-        received = kernel_recvmsg(sock, &msg, &vec, 1, total_data, MSG_WAITALL);
+        vec.iov_len = body_sz;
+        received = kernel_recvmsg(sock, &msg, &vec, 1, body_sz, MSG_WAITALL);
         if (received < 0)
             return received;
-        if (body_len) *body_len = received;
-        if (data_len) *data_len = 0;
+        if (body_len)
+            *body_len = received;
     } else {
-        /* body 填满，剩余放 data.
-         * 注意: 必须用实际 received 计算 remaining, 不能用 body_cap,
-         * 否则短读场景 remaining 算错 -> 多读/少读 -> 数据流错位. */
-        size_t remaining;
+        if (body_len)
+            *body_len = 0;
+    }
 
-        vec.iov_base = body_buf;
-        vec.iov_len = body_cap;
-
-        received = kernel_recvmsg(sock, &msg, &vec, 1, body_cap, MSG_WAITALL);
+    /* 接收 data 段 */
+    if (data_sz > 0) {
+        vec.iov_base = data_buf;
+        vec.iov_len = data_sz;
+        received = kernel_recvmsg(sock, &msg, &vec, 1, data_sz, MSG_WAITALL);
         if (received < 0)
             return received;
-        if (body_len) *body_len = received;
-
-        remaining = total_data - received;
-        if (remaining > data_cap) {
-            pr_err("powerfs: data section too large: %zu > %zu (received=%zd)\n",
-                   remaining, data_cap, received);
-            return -E2BIG;
-        }
-
-        if (remaining > 0) {
-            vec.iov_base = data_buf;
-            vec.iov_len = remaining;
-
-            received = kernel_recvmsg(sock, &msg, &vec, 1, remaining, MSG_WAITALL);
-            if (received < 0)
-                return received;
-            if (data_len) *data_len = received;
-        } else {
-            if (data_len) *data_len = 0;
-        }
+        if (data_len)
+            *data_len = received;
+    } else {
+        if (data_len)
+            *data_len = 0;
     }
 
     return 0;
@@ -536,7 +532,7 @@ static int powerfs_net_do_handshake(struct socket *sock)
         return -EPERM;
     }
 
-    pr_info("powerfs: handshake OK, server_id=%llu\n",
+    pr_debug("powerfs: handshake OK, server_id=%llu\n",
             (unsigned long long)le64_to_cpu(resp.server_id));
 
     return 0;
@@ -654,7 +650,7 @@ static int powerfs_conn_do_handshake(struct socket *sock,
     conn->server_id = le64_to_cpu(resp.server_id);
     conn->server_features = le32_to_cpu(resp.features);
 
-    pr_info("powerfs: conn handshake OK, server_id=%llu\n",
+    pr_debug("powerfs: conn handshake OK, server_id=%llu\n",
             (unsigned long long)conn->server_id);
     return 0;
 }
@@ -673,7 +669,7 @@ void powerfs_shard_route_on_filer_disconnect(int filer_idx)
         if (g_pool.shard_route.entries[i].leader_filer_idx == filer_idx &&
             g_pool.shard_route.entries[i].state == ROUTE_VALID) {
             g_pool.shard_route.entries[i].state = ROUTE_CHECKING;
-            pr_info("powerfs: shard %d route -> CHECKING (filer %d down)\n",
+            pr_debug("powerfs: shard %d route -> CHECKING (filer %d down)\n",
                     i, filer_idx);
         }
     }
@@ -694,7 +690,7 @@ void powerfs_shard_route_on_filer_reconnect(int filer_idx)
         if (g_pool.shard_route.entries[i].leader_filer_idx == filer_idx) {
             if (g_pool.shard_route.entries[i].state == ROUTE_UNKNOWN) {
                 g_pool.shard_route.entries[i].state = ROUTE_CHECKING;
-                pr_info("powerfs: shard %d route -> CHECKING (filer %d up)\n",
+                pr_debug("powerfs: shard %d route -> CHECKING (filer %d up)\n",
                         i, filer_idx);
             }
         }
@@ -761,7 +757,7 @@ void powerfs_shard_route_update(u64 shard_id, int filer_idx)
     g_pool.shard_route.entries[shard_id].state = ROUTE_VALID;
     spin_unlock(&g_pool.shard_route.lock);
 
-    pr_info("powerfs: shard %llu route -> VALID (filer %d)\n",
+    pr_debug("powerfs: shard %llu route -> VALID (filer %d)\n",
             (unsigned long long)shard_id, filer_idx);
 
     /* 若从不为 VALID 的状态切换到 VALID, 派发等待中的请求到新 leader */
@@ -880,7 +876,7 @@ void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
     spin_unlock(&conn->state_lock);
 
     if (old_state != new_state)
-        pr_info("powerfs: filer %s:%u state %s -> %s\n",
+        pr_debug("powerfs: filer %s:%u state %s -> %s\n",
                 conn->addr, conn->port,
                 powerfs_conn_state_str(old_state),
                 powerfs_conn_state_str(new_state));
@@ -926,7 +922,7 @@ void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
         }
 
         if (cancelled)
-            pr_info("powerfs: cancelled pending requests on filer %s:%u FAULT\n",
+            pr_debug("powerfs: cancelled pending requests on filer %s:%u FAULT\n",
                     conn->addr, conn->port);
     }
 
@@ -1060,7 +1056,7 @@ static int powerfs_sched_init(void)
         }
     }
 
-    pr_info("powerfs: started %d filer scheduler threads (num_online_cpus=%d)\n",
+    pr_debug("powerfs: started %d filer scheduler threads (num_online_cpus=%d)\n",
             g_pool.num_sched, num_online_cpus());
 
     /* P3.1: 初始化 volume 调度器池 (独立于 filer, 避免数据 I/O 饿死元数据) */
@@ -1110,7 +1106,7 @@ static int powerfs_sched_init(void)
         }
     }
 
-    pr_info("powerfs: started %d volume scheduler threads\n",
+    pr_debug("powerfs: started %d volume scheduler threads\n",
             g_pool.num_vol_sched);
     return 0;
 }
@@ -1137,7 +1133,7 @@ static void powerfs_sched_exit(void)
         kfree(g_pool.vol_schedulers);
         g_pool.vol_schedulers = NULL;
         g_pool.num_vol_sched = 0;
-        pr_info("powerfs: volume scheduler threads stopped\n");
+        pr_debug("powerfs: volume scheduler threads stopped\n");
     }
 
     if (!g_pool.schedulers)
@@ -1158,7 +1154,7 @@ static void powerfs_sched_exit(void)
     kfree(g_pool.schedulers);
     g_pool.schedulers = NULL;
     g_pool.num_sched = 0;
-    pr_info("powerfs: filer scheduler threads stopped\n");
+    pr_debug("powerfs: filer scheduler threads stopped\n");
 }
 
 /* === sk 回调 (softirq 上下文, 仅标记+投递+wake_up, 参照 Lustre socklnd_lib.c:448) === */
@@ -1199,7 +1195,7 @@ static void pfs_state_change(struct sock *sk)
     read_lock_bh(&g_pool.global_lock);
     conn = sk->sk_user_data;
     if (conn) {
-        pr_info("powerfs: state_change %s:%u sk_state=%d sk_err=%d\n",
+        pr_debug("powerfs: state_change %s:%u sk_state=%d sk_err=%d\n",
                 conn->addr, conn->port, sk->sk_state, sk->sk_err);
         if (sk->sk_state == TCP_CLOSE_WAIT || sk->sk_state == TCP_CLOSE)
             queue_work(g_pool.reconn_wq, &conn->disconnect_work);   /* process context 清理 */
@@ -1217,7 +1213,7 @@ static void pfs_error_report(struct sock *sk)
     read_lock_bh(&g_pool.global_lock);
     conn = sk->sk_user_data;
     if (conn) {
-        pr_info("powerfs: error_report %s:%u sk_err=%d\n",
+        pr_debug("powerfs: error_report %s:%u sk_err=%d\n",
                 conn->addr, conn->port, sk->sk_err);
         queue_work(g_pool.reconn_wq, &conn->disconnect_work);
     } else {
@@ -1421,7 +1417,7 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn)
     }
     if (ret < 0) {
         /* EOF/RST/keepalive失败/错误 → 断连 */
-        pr_info("powerfs: scheduler RX %s:%u recv error %d, scheduling disconnect\n",
+        pr_debug("powerfs: scheduler RX %s:%u recv error %d, scheduling disconnect\n",
                 conn->addr, conn->port, ret);
         kfree(body);
         kfree(data_buf);
@@ -1448,7 +1444,7 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn)
         }
 
         if (ino != 0) {
-            pr_info("powerfs: invalidate ino=%llu version=%llu\n",
+            pr_debug("powerfs: invalidate ino=%llu version=%llu\n",
                     ino, version);
             /* powerfs_invalidate_one() calls invalidate_inode_pages2()
              * which may sleep — safe here because we're in workqueue
@@ -1544,6 +1540,7 @@ static void pfs_process_transmit(struct powerfs_net_server_conn *conn)
     powerfs_net_frame_hdr_encode(&hdr, req->msg_type,
                                   POWERFS_NET_FLAG_REQUEST,
                                   req->seq, 0,
+                                  req->req_body_len,
                                   req->req_body_len + req->req_data_len);
 
     ret = powerfs_net_frame_send(sock, &hdr,
@@ -1696,7 +1693,7 @@ int powerfs_conn_connect_one(struct powerfs_net_server_conn *conn)
      * 断连期间的请求由主线程在 submit 循环中自己重试, 不需要重连线程重发. */
     pfs_conn_set_callbacks(conn);
 
-    pr_info("powerfs: filer %s:%u connected (v2 scheduler)\n", conn->addr, conn->port);
+    pr_debug("powerfs: filer %s:%u connected (v2 scheduler)\n", conn->addr, conn->port);
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_conn_connect_one);
@@ -1721,7 +1718,7 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
     sock = conn->sock;  /* 保存 sock 指针, 暂不置 NULL (调度器仍在使用) */
     spin_unlock(&conn->state_lock);
 
-    pr_info("powerfs: filer %s:%u state CONNECTED -> RECONNECTING (disconnect)\n",
+    pr_debug("powerfs: filer %s:%u state CONNECTED -> RECONNECTING (disconnect)\n",
             conn->addr, conn->port);
 
     /* Phase 1: 记录断连时间戳, 供 powerfs_net_recently_disconnected 判断.
@@ -1810,7 +1807,7 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
     /* 唤醒可能在等待重连完成的请求 (兼容旧 submit 路径, 新设计不再等待) */
     wake_up(&conn->reconnect_wq);
 
-    pr_info("powerfs: filer %s:%u disconnected (v2 scheduler)\n", conn->addr, conn->port);
+    pr_debug("powerfs: filer %s:%u disconnected (v2 scheduler)\n", conn->addr, conn->port);
 
     /* 8. 调度重连 (stopping 时不调度, 由 pool_exit 主导清理) */
     if (!atomic_read(&g_pool.stopping))
@@ -1833,8 +1830,9 @@ static void powerfs_conn_reconnect_work_fn(struct work_struct *work)
         return;
 
     if (conn->reconnect_count >= POWERFS_NET_MAX_RECONNECT) {
-        pr_err("powerfs: filer %s:%u reconnect failed %d times, FAULT, will retry in 5s\n",
-               conn->addr, conn->port, conn->reconnect_count);
+        const char *ctype = (conn->type == POWERFS_NET_SERVER_VOLUME) ? "volume" : "filer";
+        pr_err("powerfs: %s %s:%u reconnect failed %d times, FAULT, will retry in 5s\n",
+               ctype, conn->addr, conn->port, conn->reconnect_count);
         powerfs_conn_set_state(conn, CONN_FAULT);
         /* 5 秒后自动重试, 避免永久 FAULT.
          * 重置计数, 下次从 attempt 1 开始.
@@ -1850,13 +1848,17 @@ static void powerfs_conn_reconnect_work_fn(struct work_struct *work)
     }
 
     conn->reconnect_count++;
-    pr_info("powerfs: reconnecting filer %s:%u (attempt %d/%d)\n",
-            conn->addr, conn->port, conn->reconnect_count,
-            POWERFS_NET_MAX_RECONNECT);
+    {
+        const char *ctype = (conn->type == POWERFS_NET_SERVER_VOLUME) ? "volume" : "filer";
+        pr_debug("powerfs: reconnecting %s %s:%u (attempt %d/%d)\n",
+                ctype, conn->addr, conn->port, conn->reconnect_count,
+                POWERFS_NET_MAX_RECONNECT);
+    }
 
     ret = powerfs_conn_connect_one(conn);
     if (ret == 0) {
-        pr_info("powerfs: filer %s:%u reconnected\n", conn->addr, conn->port);
+        const char *ctype = (conn->type == POWERFS_NET_SERVER_VOLUME) ? "volume" : "filer";
+        pr_debug("powerfs: %s %s:%u reconnected\n", ctype, conn->addr, conn->port);
     } else {
         /* 指数退避: BASE_DELAY * 2^(attempt-1), 上限 MAX_DELAY
          * (参照 Ceph con->delay). 成功连接时在 connect_one 中归零. */
@@ -1968,7 +1970,7 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         g_pool.filer_count++;
     }
 
-    pr_info("powerfs: connection pool: %d filers\n", g_pool.filer_count);
+    pr_debug("powerfs: connection pool: %d filers\n", g_pool.filer_count);
 
     /* 3b. 从现有 servers[] 列表初始化 volume 连接 (与 filer 同模式) */
     g_pool.volume_count = 0;
@@ -2021,7 +2023,7 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         g_pool.volume_count++;
     }
 
-    pr_info("powerfs: connection pool: %d volumes\n", g_pool.volume_count);
+    pr_debug("powerfs: connection pool: %d volumes\n", g_pool.volume_count);
 
     /* 4. 并行连接所有 filer */
     for (i = 0; i < g_pool.filer_count; i++) {
@@ -2039,7 +2041,7 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         while (max_wait-- > 0) {
             for (i = 0; i < g_pool.filer_count; i++) {
                 if (g_pool.filers[i].state == CONN_CONNECTED) {
-                    pr_info("powerfs: at least one filer connected\n");
+                    pr_debug("powerfs: at least one filer connected\n");
                     return 0;
                 }
             }
@@ -2258,7 +2260,7 @@ void powerfs_shard_route_dispatch_pending(u64 shard_id)
     list_for_each_entry(req, &dispatch_list, list_node)
         count++;
 
-    pr_info("powerfs: dispatching %d pending requests for shard %llu to filer %s:%u\n",
+    pr_debug("powerfs: dispatching %d pending requests for shard %llu to filer %s:%u\n",
             count, (unsigned long long)shard_id, conn->addr, conn->port);
 
     /* 3. 重新派发每个请求.
@@ -2535,7 +2537,7 @@ int powerfs_request_submit(struct powerfs_request *req)
             list_add_tail(&req->list_node, &entry->pending_reqs);
             spin_unlock(&entry->req_lock);
 
-            pr_info("powerfs: no filer available for shard %llu, queueing req msg_type=%u\n",
+            pr_debug("powerfs: no filer available for shard %llu, queueing req msg_type=%u\n",
                     (unsigned long long)req->shard_id, req->msg_type);
 
             /* 等待派发 (route_update -> dispatch_pending) 或超时 */
@@ -2624,14 +2626,14 @@ int powerfs_request_submit(struct powerfs_request *req)
             if (powerfs_net_parse_redirect(req->resp_body, req->resp_body_len,
                                             leader_addr, sizeof(leader_addr),
                                             &leader_port) == 0) {
-                pr_info("powerfs: redirect to leader %s:%u\n",
+                pr_debug("powerfs: redirect to leader %s:%u\n",
                         leader_addr, leader_port);
 
                 /* 检测 self-redirect (filer 选举中, 返回自身地址) */
                 if (strcmp(leader_addr, conn->addr) == 0 &&
                     leader_port == conn->port) {
                     self_redirect = true;
-                    pr_info("powerfs: self-redirect detected on filer %s:%u (election in progress), switching to ROUTE_CHECKING\n",
+                    pr_debug("powerfs: self-redirect detected on filer %s:%u (election in progress), switching to ROUTE_CHECKING\n",
                             conn->addr, conn->port);
                 }
 
@@ -2666,7 +2668,7 @@ int powerfs_request_submit(struct powerfs_request *req)
                     /* 指数退避: 200ms * 2^min(attempt, 4), 上限 2000ms */
                     backoff = min(200ul * (1UL << min(attempt, 4)),
                                   2000ul);
-                    pr_info("powerfs: self-redirect on filer %s:%u, backing off %lu ms (attempt %d)\n",
+                    pr_debug("powerfs: self-redirect on filer %s:%u, backing off %lu ms (attempt %d)\n",
                             conn->addr, conn->port, backoff, attempt);
 
                     reinit_completion(&req->done);
@@ -2879,10 +2881,13 @@ int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
         powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_MTIME, mtime);
         powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_ATIME, atime);
         powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_CTIME, ctime);
-        /* 数据直连: 解析 volume_id/file_key (Filer encode_chunks_fields 输出).
-         * 目录无 chunks, volume_id/file_key 保持 0. */
-        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, volume_id);
-        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_FILE_KEY, file_key);
+        /* 数据直连: 使用 find 方式解析 volume_id/file_key, 不依赖字段顺序.
+         * Filer lookup 响应在 CTIME 后还有 Name, Chunks(JSON), Fid, VolumeId,
+         * Cookie, FileKey 等字段, 顺序解析会因 Name/Chunks 等中间字段而失败. */
+        if (volume_id)
+            powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, volume_id);
+        if (file_key)
+            powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_FILE_KEY, file_key);
     }
 
     return 0;
@@ -2938,7 +2943,12 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
         return net_status_to_errno((__u16)ret);
 
     if (resp_body_len > 0) {
+        __u64 tmp_ino = 0;
         powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        /* Filer getattr 响应: Ino, Mode, Uid, Gid, Size, Nlink, Mtime, Atime, Ctime,
+         * Name, [Chunks(JSON), Fid, VolumeId, Cookie, FileKey...]
+         * 跳过 Ino (客户端已知), 然后按顺序解析属性字段 */
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_INO, &tmp_ino);
         powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_MODE, mode);
         powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_UID, uid);
         powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_GID, gid);
@@ -2947,9 +2957,12 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
         powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_MTIME, mtime);
         powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_ATIME, atime);
         powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_CTIME, ctime);
-        /* 数据直连: 解析 volume_id/file_key (Filer encode_chunks_fields 输出) */
-        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, volume_id);
-        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_FILE_KEY, file_key);
+        /* 使用 find 方式解析 volume_id/file_key, 不依赖字段顺序.
+         * CTIME 后有 Name, Chunks(JSON), Fid 等中间字段. */
+        if (volume_id)
+            powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, volume_id);
+        if (file_key)
+            powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_FILE_KEY, file_key);
     }
 
     return 0;
@@ -3013,12 +3026,14 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
 
     if (resp_body_len > 0) {
         powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
-        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_INO, ino_ret);
-        /* P3.4: 解析 Filer 自分配 volume_id + needle_id (仅 CREATE 响应包含) */
+        /* 使用 find 方式解析, 不依赖字段顺序
+         * (Filer create 响应: Ino, Mode, Name, VolumeId, FileKey) */
+        if (ino_ret)
+            powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_INO, ino_ret);
         if (volume_id_ret)
-            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, volume_id_ret);
+            powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, volume_id_ret);
         if (file_key_ret)
-            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_FILE_KEY, file_key_ret);
+            powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_FILE_KEY, file_key_ret);
     }
 
     return 0;
@@ -3601,7 +3616,7 @@ int powerfs_net_init(void)
 
     g_initialized = true;
 
-    pr_info("powerfs: net subsystem initialized\n");
+    pr_debug("powerfs: net subsystem initialized\n");
     return 0;
 }
 
@@ -3623,7 +3638,7 @@ void powerfs_net_exit(void)
 
     g_initialized = false;
 
-    pr_info("powerfs: net subsystem exited\n");
+    pr_debug("powerfs: net subsystem exited\n");
 }
 
 /* ========== 导出符号 ========== */
@@ -3687,7 +3702,7 @@ int powerfs_net_pool_init(void)
 
     g_pool_initialized = true;
 
-    pr_info("powerfs: connection pool initialized\n");
+    pr_debug("powerfs: connection pool initialized\n");
     return 0;
 }
 
@@ -3702,7 +3717,7 @@ void powerfs_net_pool_exit(void)
     mutex_destroy(&g_pool.pool_lock);
     g_pool_initialized = false;
 
-    pr_info("powerfs: connection pool exited\n");
+    pr_debug("powerfs: connection pool exited\n");
 }
 
 /**
@@ -3765,7 +3780,7 @@ void powerfs_net_pool_cleanup(void)
 
     mutex_unlock(&g_pool.pool_lock);
 
-    pr_info("powerfs: connection pool cleaned up\n");
+    pr_debug("powerfs: connection pool cleaned up\n");
 }
 
 /**
@@ -3810,7 +3825,7 @@ int powerfs_net_add_server(const char *addr, __u16 port,
 
     mutex_unlock(&g_pool.pool_lock);
 
-    pr_info("powerfs: added server %s:%u (type=%d)\n", addr, port, type);
+    pr_debug("powerfs: added server %s:%u (type=%d)\n", addr, port, type);
     return idx;
 }
 
@@ -3854,7 +3869,7 @@ int powerfs_net_remove_server(const char *addr, __u16 port)
     mutex_unlock(&g_pool.pool_lock);
 
     if (removed >= 0) {
-        pr_info("powerfs: removed server %s:%u\n", addr, port);
+        pr_debug("powerfs: removed server %s:%u\n", addr, port);
         return 0;
     }
     return -ENOENT;
@@ -3952,7 +3967,7 @@ int powerfs_net_set_filers(const char *addrs, const char *ports)
         }
     }
 
-    pr_info("powerfs: set %d filer addresses\n", count);
+    pr_debug("powerfs: set %d filer addresses\n", count);
     return count > 0 ? 0 : -ENOENT;
 }
 
@@ -4014,7 +4029,7 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
         if (tok[0] == '\0')
             continue;
 
-        pr_info("powerfs: trying master %s:%u for filer discovery\n",
+        pr_debug("powerfs: trying master %s:%u for filer discovery\n",
                 tok, master_port);
 
         /* 1. Connect to Master */
@@ -4040,7 +4055,7 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
         powerfs_net_frame_hdr_encode(&hdr,
                                       POWERFS_NET_MSG_LIST_FILERS,
                                       POWERFS_NET_FLAG_REQUEST,
-                                      seq, 0, 0);
+                                      seq, 0, 0, 0);
 
         ret = powerfs_net_frame_send(sock, &hdr, NULL, 0, NULL, 0);
         if (ret < 0) {
@@ -4085,7 +4100,7 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
                                           sizeof(redirect_addr) - 1);
             if (rret == 0) {
                 redirect_addr[sizeof(redirect_addr) - 1] = '\0';
-                pr_info("powerfs: master redirect to %s\n",
+                pr_debug("powerfs: master redirect to %s\n",
                         redirect_addr);
 
                 /* Retry with redirect address */
@@ -4110,7 +4125,7 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
                 powerfs_net_frame_hdr_encode(&hdr,
                                               POWERFS_NET_MSG_LIST_FILERS,
                                               POWERFS_NET_FLAG_REQUEST,
-                                              seq, 0, 0);
+                                              seq, 0, 0, 0);
 
                 ret = powerfs_net_frame_send(sock, &hdr, NULL, 0, NULL, 0);
                 if (ret < 0) {
@@ -4165,7 +4180,7 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
                 continue;
             }
 
-            pr_info("powerfs: master returned %llu filers\n",
+            pr_debug("powerfs: master returned %llu filers\n",
                     (u64)count);
 
             for (j = 0; j < (int)count; j++) {
@@ -4193,14 +4208,14 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
                 faddr[sizeof(faddr) - 1] = '\0';
 
                 if (!healthy) {
-                    pr_info("powerfs: skipping unhealthy filer %s:%llu\n",
+                    pr_debug("powerfs: skipping unhealthy filer %s:%llu\n",
                             faddr, (u64)fport);
                     continue;
                 }
 
                 powerfs_net_add_server(faddr, (__u16)fport,
                                        POWERFS_NET_SERVER_FILER);
-                pr_info("powerfs: discovered filer %s:%llu\n",
+                pr_debug("powerfs: discovered filer %s:%llu\n",
                         faddr, (u64)fport);
                 filers_added++;
             }
@@ -4212,7 +4227,7 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
 
     kfree(resp_body);
 
-    pr_info("powerfs: filer discovery complete, %d filers added\n",
+    pr_debug("powerfs: filer discovery complete, %d filers added\n",
             filers_added);
     return filers_added > 0 ? filers_added : -ENOTCONN;
 }
@@ -4446,7 +4461,7 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
         if (tok[0] == '\0')
             continue;
 
-        pr_info("powerfs: discover_volumes: trying master %s:%u\n", tok, master_port);
+        pr_debug("powerfs: discover_volumes: trying master %s:%u\n", tok, master_port);
 
         sock = powerfs_net_create_tcp_socket();
         if (!sock)
@@ -4468,7 +4483,7 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
         powerfs_net_frame_hdr_encode(&hdr,
                                       POWERFS_NET_MSG_GET_TOPOLOGY,
                                       POWERFS_NET_FLAG_REQUEST,
-                                      seq, 0, 0);
+                                      seq, 0, 0, 0);
 
         ret = powerfs_net_frame_send(sock, &hdr, NULL, 0, NULL, 0);
         if (ret < 0) {
@@ -4505,7 +4520,7 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
                                         redirect_addr,
                                         sizeof(redirect_addr) - 1) == 0) {
                 redirect_addr[sizeof(redirect_addr) - 1] = '\0';
-                pr_info("powerfs: discover_volumes redirect to %s\n", redirect_addr);
+                pr_debug("powerfs: discover_volumes redirect to %s\n", redirect_addr);
 
                 sock = powerfs_net_create_tcp_socket();
                 if (!sock)
@@ -4524,7 +4539,7 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
                 powerfs_net_frame_hdr_encode(&hdr,
                                               POWERFS_NET_MSG_GET_TOPOLOGY,
                                               POWERFS_NET_FLAG_REQUEST,
-                                              seq, 0, 0);
+                                              seq, 0, 0, 0);
                 ret = powerfs_net_frame_send(sock, &hdr, NULL, 0, NULL, 0);
                 if (ret < 0) {
                     powerfs_net_close_socket(sock);
@@ -4567,7 +4582,7 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
             continue;
         }
 
-        pr_info("powerfs: master returned %llu volume routes\n", (u64)count);
+        pr_debug("powerfs: master returned %llu volume routes\n", (u64)count);
 
         spin_lock(&g_pool.vol_route_lock);
         g_pool.vol_route_count = 0;
@@ -4603,7 +4618,7 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
                 g_pool.vol_routes[g_pool.vol_route_count].conn_idx = conn_idx;
                 g_pool.vol_route_count++;
                 routes_added++;
-                pr_info("powerfs: vol_route: volume_id=%llu → conn[%d] (%s)\n",
+                pr_debug("powerfs: vol_route: volume_id=%llu → conn[%d] (%s)\n",
                         (unsigned long long)vid, conn_idx, vaddr);
             } else {
                 pr_warn("powerfs: vol_route: volume_id=%llu addr=%s no matching conn\n",
@@ -4612,7 +4627,7 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
         }
         spin_unlock(&g_pool.vol_route_lock);
 
-        pr_info("powerfs: discover_volumes complete, %d routes added\n",
+        pr_debug("powerfs: discover_volumes complete, %d routes added\n",
                 routes_added);
         kfree(resp_body);
         return routes_added > 0 ? 0 : -ENOTCONN;
