@@ -178,6 +178,10 @@ static void powerfs_clear_dir_entries(struct inode *dir);
 
 /* lease 续约 work 函数 (前向声明，Step 2 实现真实续约) */
 static void powerfs_lease_renew_work_func(struct work_struct *work);
+/* lease 释放 (evict_inode 调用, 定义在 lease 管理段) */
+static void release_all_leases(struct inode *inode);
+/* lease 获取 (写路径调用, 定义在 lease 管理段) */
+static int ensure_lease(struct inode *inode, loff_t offset);
 
 /* ========== Dentry operations 实现 ========== */
 
@@ -853,10 +857,13 @@ void powerfs_evict_inode(struct inode *inode)
      *    参考 ceph_evict_inode: cancel_writeback 是在 clear_inode 之前 */
     cancel_delayed_work_sync(&pi->lease_renew_work);
 
-    /* 3. VFS 清理 */
+    /* 3. 释放所有 lease (通知 volume server, 必须在 clear_inode 之前) */
+    release_all_leases(inode);
+
+    /* 4. VFS 清理 */
     clear_inode(inode);
 
-    /* 4. 释放所有 lease (rbtree 遍历) — Step 1 实现，Step 0 先清空 */
+    /* 5. 清理残留 lease (release_all_leases 批量限制, 可能有剩余) */
     while (!RB_EMPTY_ROOT(&pi->lease_tree)) {
         struct rb_node *n = rb_first(&pi->lease_tree);
         rb_erase(n, &pi->lease_tree);
@@ -957,10 +964,341 @@ static int powerfs_write_inode(struct inode *inode, struct writeback_control *wb
     return 0;
 }
 
-/* Step 0 stub: lease 续约 work 函数（Step 2 实现真实续约逻辑） */
+/* Phase 3: lease 续约 work 函数.
+ *
+ * 每次触发时扫描 inode 的 lease_tree, 对即将过期的 lease (剩余有效期 <
+ * POWERFS_LEASE_RENEW_THRESHOLD) 发送续约请求.
+ *
+ * 设计要点 (参考 Ceph cap renew + GFS2 glock queue_delayed_work):
+ *   - delayed_work 按 inode 独立调度, 不同 inode 的续约互不阻塞
+ *   - 两阶段: 锁内收集待续约 lease → 解锁逐个续约 → 重新加锁更新
+ *   - 续约失败不删除 lease: lease 自然过期后由 acquire 路径重新获取
+ *   - shutting_down 时停止重调度, 避免 destroy_workqueue flush 循环
+ *
+ * 调度策略:
+ *   - 下次触发 = earliest_expiry - RENEW_THRESHOLD
+ *   - 最小间隔 1s, 避免过于频繁的重调度
+ *
+ * 批量大小: POWERFS_LEASE_RENEW_BATCH 限制单次收集的 lease 数.
+ *   一个 inode 的 lease 数 = file_size / STRIPE_SIZE, 多数文件 1 个,
+ *   1GB 文件 16 个. 批量不够时剩余 lease 下次 work 触发时续约. */
+#define POWERFS_LEASE_RENEW_BATCH  16
+
+/*
+ * Lease 管理函数 (Phase 3: 强一致性写)
+ *
+ * ensure_lease: 写路径中获取 per-stripe lease (Follower→Leader)
+ * release_lease: close 时释放单个 stripe lease
+ * release_all_leases: inode 销毁时释放所有 lease
+ */
+
+/* 在 lease_tree 中查找 stripe_start 对应的 lease (调用方持有 lease_lock) */
+static struct powerfs_lease *powerfs_lease_find(struct powerfs_inode_info *pi,
+                                                 u64 stripe_start)
+{
+    struct rb_node *n = pi->lease_tree.rb_node;
+    while (n) {
+        struct powerfs_lease *l = rb_entry(n, struct powerfs_lease, node);
+        if (stripe_start < l->stripe_start)
+            n = n->rb_left;
+        else if (stripe_start > l->stripe_start)
+            n = n->rb_right;
+        else
+            return l;
+    }
+    return NULL;
+}
+
+/* 将 lease 插入 lease_tree (调用方持有 lease_lock) */
+static void powerfs_lease_insert(struct powerfs_inode_info *pi,
+                                  struct powerfs_lease *lease)
+{
+    struct rb_node **p = &pi->lease_tree.rb_node;
+    struct rb_node *parent = NULL;
+    while (*p) {
+        struct powerfs_lease *l = rb_entry(*p, struct powerfs_lease, node);
+        parent = *p;
+        if (lease->stripe_start < l->stripe_start)
+            p = &(*p)->rb_left;
+        else if (lease->stripe_start > l->stripe_start)
+            p = &(*p)->rb_right;
+        else
+            return; /* 已存在, 不插入 */
+    }
+    rb_link_node(&lease->node, parent, p);
+    rb_insert_color(&lease->node, &pi->lease_tree);
+}
+
+/*
+ * ensure_lease - 确保持有指定 offset 所在 stripe 的 lease
+ *
+ * 写路径调用: 在写入数据前获取 lease, 保证强一致性.
+ * stripe_start = (offset / STRIPE_SIZE) * STRIPE_SIZE
+ * 如果 lease 已存在且未过期, 直接返回 (快速路径).
+ * 如果 lease 已过期或不存在, 向 volume server 请求获取.
+ *
+ * 返回 0 成功, 负值错误.
+ */
+static int ensure_lease(struct inode *inode, loff_t offset)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct super_block *sb = inode->i_sb;
+    struct powerfs_sb_info *sbi = sb ? POWERFS_SB_INFO(sb) : NULL;
+    u64 stripe_start = (offset / POWERFS_STRIPE_SIZE) * POWERFS_STRIPE_SIZE;
+    struct powerfs_lease *lease, *old = NULL;
+    unsigned long now = jiffies;
+    size_t token_len;
+    int ret;
+
+    /* 快速路径: 持有有效 lease */
+    spin_lock(&pi->lease_lock);
+    lease = powerfs_lease_find(pi, stripe_start);
+    if (lease && time_after(lease->expire_jiffies, now)) {
+        spin_unlock(&pi->lease_lock);
+        return 0;
+    }
+    /* 过期 lease: 移除并稍后释放 */
+    if (lease) {
+        rb_erase(&lease->node, &pi->lease_tree);
+        old = lease;
+    }
+    spin_unlock(&pi->lease_lock);
+
+    /* 锁外释放过期 lease (网络操作) */
+    if (old) {
+        powerfs_net_release_lease(pi->volume_id, inode->i_ino,
+                                   old->token, strlen(old->token), NULL);
+        kfree(old);
+    }
+
+    /* 分配新 lease */
+    lease = kzalloc(sizeof(*lease), GFP_NOFS);
+    if (!lease)
+        return -ENOMEM;
+
+    lease->stripe_start = stripe_start;
+    lease->stripe_count = 1;
+    lease->exclusive = true;
+    token_len = sizeof(lease->token);
+
+    /* 向 volume server 请求 lease (网络操作, 锁外) */
+    ret = powerfs_net_acquire_lease(pi->volume_id, inode->i_ino,
+                                     stripe_start, 1, NULL,
+                                     lease->token, &token_len,
+                                     &lease->epoch, &lease->content_size,
+                                     &lease->expire_jiffies);
+    if (ret) {
+        pr_warn("powerfs: ensure_lease failed ino=%lu stripe=%llu: %d\n",
+                inode->i_ino, (unsigned long long)stripe_start, ret);
+        kfree(lease);
+        return ret;
+    }
+
+    /* 插入 lease_tree */
+    spin_lock(&pi->lease_lock);
+    /* 如果在此期间有人插入了相同 stripe 的 lease, 保留旧的 */
+    if (!powerfs_lease_find(pi, stripe_start)) {
+        powerfs_lease_insert(pi, lease);
+        lease = NULL; /* 被树接管 */
+    }
+    spin_unlock(&pi->lease_lock);
+
+    if (lease) {
+        /* 竞争失败, 释放多余的 lease */
+        powerfs_net_release_lease(pi->volume_id, inode->i_ino,
+                                   lease->token, strlen(lease->token), NULL);
+        kfree(lease);
+    }
+
+    /* 调度续约工作 (首次获取 lease 时启动) */
+    if (sbi && sbi->lease_wq && !sbi->shutting_down) {
+        unsigned long delay = lease ?
+            0 : (POWERFS_LEASE_DURATION - POWERFS_LEASE_RENEW_THRESHOLD);
+        queue_delayed_work(sbi->lease_wq, &pi->lease_renew_work, delay);
+    }
+
+    return 0;
+}
+
+/*
+ * release_all_leases - 释放 inode 的所有 lease (close/evict 时调用)
+ *
+ * 锁内收集 lease 列表, 锁外逐个释放 (网络操作).
+ */
+static void release_all_leases(struct inode *inode)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct powerfs_lease *leases[POWERFS_LEASE_RENEW_BATCH];
+    int count = 0, i;
+    struct rb_node *n;
+
+    /* 收集所有 lease (锁内) */
+    spin_lock(&pi->lease_lock);
+    while (!RB_EMPTY_ROOT(&pi->lease_tree) && count < POWERFS_LEASE_RENEW_BATCH) {
+        n = rb_first(&pi->lease_tree);
+        rb_erase(n, &pi->lease_tree);
+        leases[count++] = rb_entry(n, struct powerfs_lease, node);
+    }
+    spin_unlock(&pi->lease_lock);
+
+    /* 释放 lease (锁外, 网络操作) */
+    for (i = 0; i < count; i++) {
+        powerfs_net_release_lease(pi->volume_id, inode->i_ino,
+                                   leases[i]->token,
+                                   strlen(leases[i]->token), NULL);
+        kfree(leases[i]);
+    }
+}
+
 static void powerfs_lease_renew_work_func(struct work_struct *work)
 {
-    /* Step 0: 无操作，Step 2 实现 lease 续约 */
+    struct delayed_work *dw = to_delayed_work(work);
+    struct powerfs_inode_info *pi =
+        container_of(dw, struct powerfs_inode_info, lease_renew_work);
+    struct inode *inode = &pi->netfs.inode;
+    struct super_block *sb = inode->i_sb;
+    struct powerfs_sb_info *sbi = sb ? POWERFS_SB_INFO(sb) : NULL;
+    struct rb_node *n;
+    unsigned long now = jiffies;
+    unsigned long earliest_expiry = 0;
+    bool has_lease = false;
+
+    /* 待续约 lease 信息 (锁内收集, 锁外续约) */
+    struct {
+        u64 stripe_start;
+        char token[64];
+        size_t token_len;
+    } renew_list[POWERFS_LEASE_RENEW_BATCH];
+    int renew_count = 0;
+    u64 volume_id;
+    int i;
+
+    /* 卸载中或 workqueue 已销毁: 停止续约, 不重调度 */
+    if (!sbi || !sbi->lease_wq || sbi->shutting_down || pi->shutdown)
+        return;
+
+    /* Phase 1: 锁内扫描, 收集需要续约的 lease 信息 + 跟踪最早过期时间.
+     * 不在锁内执行网络 I/O: spinlock 不可睡眠, 网络 RPC 可阻塞 5s. */
+    spin_lock(&pi->lease_lock);
+    volume_id = pi->volume_id;
+    for (n = rb_first(&pi->lease_tree); n; n = rb_next(n)) {
+        struct powerfs_lease *lease =
+            rb_entry(n, struct powerfs_lease, node);
+
+        has_lease = true;
+
+        /* 跟踪最早过期时间 (用于重调度) */
+        if (earliest_expiry == 0 ||
+            time_before(lease->expire_jiffies, earliest_expiry))
+            earliest_expiry = lease->expire_jiffies;
+
+        /* 检查是否需要续约: 剩余有效期 < RENEW_THRESHOLD */
+        if (time_after(now + POWERFS_LEASE_RENEW_THRESHOLD,
+                       lease->expire_jiffies)) {
+            if (renew_count < POWERFS_LEASE_RENEW_BATCH) {
+                renew_list[renew_count].stripe_start = lease->stripe_start;
+                memcpy(renew_list[renew_count].token, lease->token, 64);
+                renew_list[renew_count].token_len =
+                    strnlen(renew_list[renew_count].token, 64);
+                renew_count++;
+            }
+            /* 批量满时剩余 lease 下次 work 处理 */
+        }
+    }
+    spin_unlock(&pi->lease_lock);
+
+    /* Phase 2: 锁外逐个发送续约请求 (网络 I/O 可睡眠) */
+    for (i = 0; i < renew_count; i++) {
+        unsigned long new_expire = 0;
+        int ret;
+
+        ret = powerfs_net_renew_lease(volume_id, inode->i_ino,
+                                      renew_list[i].token,
+                                      renew_list[i].token_len,
+                                      &new_expire);
+        if (ret == 0) {
+            /* Phase 3: 重新加锁, 按 stripe_start 查找并更新 */
+            spin_lock(&pi->lease_lock);
+            for (n = rb_first(&pi->lease_tree); n; n = rb_next(n)) {
+                struct powerfs_lease *l =
+                    rb_entry(n, struct powerfs_lease, node);
+                if (l->stripe_start == renew_list[i].stripe_start) {
+                    l->expire_jiffies = new_expire;
+                    pr_debug("powerfs: lease renewed ino=%lu stripe=%llu\n",
+                             inode->i_ino,
+                             (unsigned long long)l->stripe_start);
+                    break;
+                }
+            }
+            spin_unlock(&pi->lease_lock);
+        } else {
+            /* 续约失败: 可能是连接断开导致 volume server 释放了 lease
+             * (on_disconnect → disconnect_holder), 或者 lease 已过期被
+             * cleanup_expired 清理. 重新获取 lease (acquire_lease). */
+            char new_token[64];
+            size_t new_token_len = sizeof(new_token);
+            u64 new_epoch = 0;
+            u64 new_content_size = 0;
+            unsigned long new_expire = 0;
+            int acq_ret;
+
+            pr_warn("powerfs: lease renew failed ino=%lu stripe=%llu "
+                    "err=%d, re-acquiring...\n",
+                    inode->i_ino,
+                    (unsigned long long)renew_list[i].stripe_start,
+                    ret);
+
+            acq_ret = powerfs_net_acquire_lease(volume_id, inode->i_ino,
+                                                renew_list[i].stripe_start,
+                                                1, NULL,
+                                                new_token, &new_token_len,
+                                                &new_epoch, &new_content_size,
+                                                &new_expire);
+            if (acq_ret == 0) {
+                /* 重新获取成功: 更新 lease token 和 expire */
+                spin_lock(&pi->lease_lock);
+                for (n = rb_first(&pi->lease_tree); n; n = rb_next(n)) {
+                    struct powerfs_lease *l =
+                        rb_entry(n, struct powerfs_lease, node);
+                    if (l->stripe_start == renew_list[i].stripe_start) {
+                        memcpy(l->token, new_token, new_token_len + 1);
+                        l->epoch = new_epoch;
+                        l->content_size = new_content_size;
+                        l->expire_jiffies = new_expire;
+                        pr_info("powerfs: lease re-acquired ino=%lu "
+                                "stripe=%llu\n",
+                                inode->i_ino,
+                                (unsigned long long)l->stripe_start);
+                        break;
+                    }
+                }
+                spin_unlock(&pi->lease_lock);
+            } else {
+                pr_warn("powerfs: lease re-acquire failed ino=%lu "
+                        "stripe=%llu err=%d\n",
+                        inode->i_ino,
+                        (unsigned long long)renew_list[i].stripe_start,
+                        acq_ret);
+            }
+        }
+    }
+
+    /* 重调度: 在最早过期时间前 RENEW_THRESHOLD 触发下次续约.
+     * 若没有 lease, 不重调度 (由 acquire 路径重新启动). */
+    if (has_lease && !sbi->shutting_down && sbi->lease_wq) {
+        unsigned long delay;
+
+        if (time_before(now + POWERFS_LEASE_RENEW_THRESHOLD,
+                        earliest_expiry)) {
+            /* lease 还远未到续约时间 */
+            delay = earliest_expiry - POWERFS_LEASE_RENEW_THRESHOLD - now;
+        } else {
+            /* lease 已在续约窗口内或已过期, 短延迟后重试 */
+            delay = HZ;  /* 1s */
+        }
+
+        queue_delayed_work(sbi->lease_wq, &pi->lease_renew_work, delay);
+    }
 }
 
 /* ========== Inode 创建辅助函数 ========== */
@@ -1063,12 +1401,17 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
         pr_debug("powerfs: lookup '%pd' via powerfs_net\n", dentry);
 
         /* Phase 1: 超时策略.
-         * lookup 是 open/create/stat/unlink 等关键路径的必经之路.
-         * 断连期间请求入队列等待 filer 重连, 不立即返回错误.
-         * 超时设为 60s 覆盖: Docker 容器重启 (~20s) + Raft 选主 (~5s)
-         * + 内核重连 (~5s) + FAULT 重试 (5s) = ~35s, 留足余量.
-         * hung_task_timeout=120s, 60s 不会触发 hung task. */
-        timeout_ms = 60000;  /* 60s: 覆盖 Docker 容器重启 + Raft 选主 */
+         *
+         * lookup 在 VFS 持有 dir->i_rwsem 读锁时调用, 长超时会阻塞
+         * 整个目录的所有操作. 使用固定 2s 短超时:
+         *   - 正常 RPC 在 LAN 内 <10ms, 2s 足够
+         *   - 断连/filer 重启时快速返回 -EAGAIN, VFS 上层自动重试
+         *   - 不使用 powerfs_net_pick_timeout (自适应 10s), 因为
+         *     lookup 在 i_rwsem 内, 必须快速释放锁
+         *
+         * 重试由 VFS 上层处理 (namei.c __lookup_slow 循环),
+         * 每次重试间隔由 VFS 调度, 提供自然退避. */
+        timeout_ms = POWERFS_LOOKUP_TIMEOUT_MS;  /* 2s: short timeout under i_rwsem */
 
         /* 通过 powerfs_net 直接查询 (含时间戳 + volume_id/file_key) */
         err = powerfs_net_lookup_timeout(dir->i_ino, dentry->d_name.name,
@@ -1080,11 +1423,13 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
                                           timeout_ms);
 
         /* 断连/重连期间超时或网络不可达, 返回 -EAGAIN 让 VFS/应用层重试.
-         * - ETIMEDOUT: 60s 内未收到响应 (filer 长时间不可用)
+         * - ETIMEDOUT: 2s 内未收到响应 (filer 不可达或繁忙)
          * - ENOTCONN: disconnect_one 已 complete(-ENOTCONN) (在途请求被取消)
          * - ESHUTDOWN: pool 正在 stopping
-         * 注意: 60s 超时已覆盖 Docker 容器重启场景, 正常情况下 filer 会在
-         *       ~30s 内重连, 请求在队列中被 dispatch_pending 唤醒并完成. */
+         *
+         * 2s 短超时策略: 不等待 filer 重启完成, 快速返回 -EAGAIN 让 VFS 重试.
+         * VFS 的 __lookup_slow 循环会自动重试, 每次重试间隔由调度器决定,
+         * filer 恢复后下一次 lookup 即可成功. 避免在 i_rwsem 读锁内长时间阻塞. */
         if (err == -ETIMEDOUT || err == -ENOTCONN || err == -ESHUTDOWN) {
             pr_warn("powerfs: lookup '%pd' transient error %d (timeout_ms=%d), "
                     "return -EAGAIN for retry\n",
@@ -2605,6 +2950,9 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     __u32 needle_len = 0;         /* current_needle_id 的内容长度 */
     int needle_start_idx = 0;     /* 当前 needle 组的首页索引 */
     int i;
+    /* Phase 3: lease token (ensure_lease 获取, WriteNeedle 携带) */
+    char lease_token[64] = {0};
+    size_t lease_token_len = 0;
 
     /* 数据直连: 从 inode 获取 volume_id/file_key */
     spin_lock(&pi->i_lock);
@@ -2630,6 +2978,28 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     needle_buf = kvmalloc(POWERFS_CHUNK_SIZE, GFP_KERNEL);
     if (!needle_buf)
         goto fail_all;
+
+    /* Phase 3: 获取写入区域的 lease (强一致性保证).
+     * ensure_lease 按 offset 计算 stripe_start, 向 volume server 请求.
+     * 失败时降级 (无 lease 继续写入), 只打印警告. */
+    if (wpw->num_pages > 0) {
+        int lease_ret = ensure_lease(inode, wpw->offsets[0]);
+        if (lease_ret) {
+            pr_warn("powerfs: writepage_work ensure_lease ino=%lu: %d\n",
+                    inode->i_ino, lease_ret);
+        } else {
+            u64 ss = div_u64(wpw->offsets[0], POWERFS_STRIPE_SIZE)
+                     * POWERFS_STRIPE_SIZE;
+            struct powerfs_lease *l;
+            spin_lock(&pi->lease_lock);
+            l = powerfs_lease_find(pi, ss);
+            if (l && time_after(l->expire_jiffies, jiffies)) {
+                strncpy(lease_token, l->token, sizeof(lease_token) - 1);
+                lease_token_len = strlen(lease_token);
+            }
+            spin_unlock(&pi->lease_lock);
+        }
+    }
 
     for (i = 0; i < wpw->num_pages; i++) {
         struct page *page = wpw->pages[i];
@@ -2675,7 +3045,9 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
             /* needle 切换: 写回旧 needle, 完成其页面, 加载新 needle */
             int err = powerfs_net_write_needle(volume_id, current_needle_id,
                                                 inode->i_ino,
-                                                needle_buf, needle_len);
+                                                needle_buf, needle_len,
+                                                lease_token_len > 0 ? lease_token : NULL,
+                                                lease_token_len);
             {
                 int j;
                 for (j = needle_start_idx; j < i; j++) {
@@ -2735,7 +3107,9 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     if (needle_loaded) {
         int err = powerfs_net_write_needle(volume_id, current_needle_id,
                                             inode->i_ino,
-                                            needle_buf, needle_len);
+                                            needle_buf, needle_len,
+                                            lease_token_len > 0 ? lease_token : NULL,
+                                            lease_token_len);
         int j;
         pr_debug("powerfs: writepage_work_fn write_needle vid=%llu nid=%llu len=%u err=%d\n",
                 (unsigned long long)volume_id,
@@ -3374,6 +3748,7 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     }
 
     sbi->initialized = true;
+    sbi->shutting_down = false;
 
     /* 设置全局超级块指针 (供通信层使用) */
     g_powerfs_sb = sb;
@@ -3395,6 +3770,19 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
                                           WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
     if (!powerfs_refresh_wq) {
         pr_err("powerfs: failed to create refresh workqueue\n");
+        return -ENOMEM;
+    }
+
+    /* Phase 3: lease 续约 workqueue.
+     * WQ_HIGHPRI: lease 过期即丢锁导致写失败, 续约延迟敏感,
+     *   参考 GFS2 glock_workqueue (fs/gfs2/glock.c:2462).
+     * WQ_MEM_RECLAIM | WQ_UNBOUND: 参考 nfsiod/GFS2.
+     * max_active=0: 内核默认, 不同 inode 的 lease 续约可并发,
+     *   无全局顺序依赖 (不同于 Ceph cap_wq max_active=1 串行). */
+    sbi->lease_wq = alloc_workqueue("powerfs_lease",
+                                     WQ_UNBOUND | WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
+    if (!sbi->lease_wq) {
+        pr_err("powerfs: failed to create lease workqueue\n");
         return -ENOMEM;
     }
 
@@ -3476,7 +3864,10 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         }
     }
 
-    /* 配置 Volume 节点 (支持逗号分隔多地址) */
+    /* P3.3a: 配置 Volume 节点作为 fallback (支持逗号分隔多地址).
+     * 主路径: discover_volumes 从 Master GetTopology 自动发现并建立连接.
+     * fallback: 当 Master 不可达时, 使用 volume_addr 模块参数建立的连接.
+     * volume_addr 未配置时, 完全依赖 Master 动态发现 (设计目标). */
     if (sbi->volume_addr[0]) {
         char vbuf[256];
         char *vp, *vtok;
@@ -3511,9 +3902,11 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         }
         pr_debug("powerfs: new connection pool initialized (sk callback + keepalive)\n");
 
-        /* P3.3: 从 Master GetTopology 发现 volume 路由表 (volume_id → conn_idx).
-         * 前提: volume 连接已由 conn_pool_init 建立 (g_pool.volumes[] 已填充).
-         * discover_volumes 按 addr 匹配已建立连接, 建立路由映射.
+        /* P3.3a: 从 Master GetTopology 发现 volume 路由表 (volume_id → conn_idx).
+         * 主路径: discover_volumes 从 Master 获取拓扑, 精确匹配已有连接,
+         *         未匹配的自动建立新连接 (不依赖 volume_addr 模块参数).
+         * fallback: volume_addr 模块参数建立的连接 (上面已 add_server)
+         *           在 Master 不可达时作为备用连接.
          * 失败不挂载失败: filer 元数据仍可用, 数据读写等 volume 上线后恢复. */
         if (maddr) {
             int vol_ret = powerfs_net_discover_volumes(maddr, mport);
@@ -3521,6 +3914,10 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
                 pr_warn("powerfs: discover_volumes failed: %d "
                         "(volume data IO will fail until routes established)\n",
                         vol_ret);
+                if (sbi->volume_addr[0]) {
+                    pr_info("powerfs: volume_addr fallback connections active "
+                            "(no route mapping until Master reachable)\n");
+                }
             } else {
                 pr_debug("powerfs: volume routes discovered via Master\n");
             }
@@ -3550,6 +3947,12 @@ void powerfs_kill_sb_super(struct super_block *sb)
      *    evict_inodes 无法驱逐, 导致 umount 挂起或内存泄漏. */
     sync_filesystem(sb);
 
+    /* 1b. Phase 3: 设置 shutting_down 标志.
+     *    lease_renew_work_func 检查此标志, 避免在 destroy_workqueue(lease_wq)
+     *    期间重新排队导致 flush 循环. 必须在销毁 lease_wq 之前设置. */
+    if (sbi)
+        sbi->shutting_down = true;
+
     /* 2. 销毁 writeback workqueue (Stage C).
      *    sync_filesystem 已触发 writeback 并等待 PageWriteback 清除,
      *    此时 workqueue 中所有 work 应已完成. destroy_workqueue 会
@@ -3560,7 +3963,16 @@ void powerfs_kill_sb_super(struct super_block *sb)
         sbi->writeback_wq = NULL;
     }
 
-    /* 2b. 销毁 inode 刷新工作队列 (NOTIFY → getattr) */
+    /* 2b. 销毁 lease 续约工作队列.
+     *    必须在关闭网络前销毁 (renew_work_fn 发网络请求).
+     *    destroy_workqueue 会 flush 所有 pending delayed_work,
+     *    之后 evict_inode 的 cancel_delayed_work_sync 仅取消定时器, 安全. */
+    if (sbi && sbi->lease_wq) {
+        destroy_workqueue(sbi->lease_wq);
+        sbi->lease_wq = NULL;
+    }
+
+    /* 2c. 销毁 inode 刷新工作队列 (NOTIFY → getattr) */
     if (powerfs_refresh_wq) {
         destroy_workqueue(powerfs_refresh_wq);
         powerfs_refresh_wq = NULL;

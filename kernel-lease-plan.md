@@ -1703,3 +1703,108 @@ host:2223 转发的包无法到达 guest sshd。
 **修复**: `build_initramfs.sh` init 脚本增加 eth1 配置
 `ip addr add 10.0.2.15/24 dev eth1`（QEMU user-net 默认网段）。
 
+### Step 2 Lease 协议值修复验证结果（2026-08-06）
+
+环境: 内核 6.2.0 + powerfs.ko + QEMU(KVM) + 后端 filer/volume/master 容器集群
+
+**根因**: 内核 lease 消息的 msg_type 值与 Rust 端 `powerfs-net/src/protocol.rs`
+MsgType 枚举不匹配，导致 volume server 无法识别 lease 请求。
+
+| 内核常量 | 修复前 | Rust 端值 | 修复后 |
+|----------|--------|-----------|--------|
+| `POWERFS_NET_MSG_ACQUIRE_LEASE` | 0x0069 | `AcquireLease = 0x0080` (0x69=AssignNeedle) | 0x0080 |
+| `POWERFS_NET_MSG_RELEASE_LEASE` | 0x006a | `ReleaseLease = 0x0081` | 0x0081 |
+| `POWERFS_NET_MSG_RENEW_LEASE` | (用 RANGE_LEASE 0x67) | `RenewLease = 0x0082` | 0x0082 (新增) |
+
+**TLV 字段对齐修复**:
+
+| 字段 | 内核修复前 | volume server 期望 | 修复后 |
+|------|-----------|-------------------|--------|
+| stripe_count | `COUNT` (0x24) | `Limit` (0x20) | `LIMIT` |
+| exclusive | 未发送 | `Mode` (0x03) u64 | `MODE=1` |
+| LeaseDuration(请求) | u32 秒 | u64 毫秒 | u64 毫秒 |
+| LeaseToken(响应) | `LEASE_TOKEN` (0x80) | `LeaseId` (0x40) | `LEASE_ID` |
+
+**验证结果**:
+
+| 步骤 | 操作 | 结果 |
+|------|------|------|
+| 1 | `mount -t powerfs none /mnt/pfs` | OK |
+| 2 | `echo 'lease test' > /mnt/pfs/lease_test.txt` | OK |
+| 3 | `cat /mnt/pfs/lease_test.txt` | OK，内容一致 |
+| 4 | `dd if=/dev/urandom of=/mnt/pfs/lease_big.bin bs=1M count=5` | OK，5242880 字节 |
+| 5 | volume server 日志 `NET_ACQUIRE_LEASE` | OK，volume-2 正确处理请求 |
+| 6 | dmesg `ensure_lease failed -107` | 修复前持续刷屏，修复后消失 |
+
+**结论**: Lease 协议值和 TLV 字段修复生效，ACQUIRE_LEASE 请求被 volume server
+正确识别和处理，lease token 成功返回内核。
+
+**遗留问题**（独立于 lease 协议，属 volume 路由层）:
+1. **volume 路由不一致**: ACQUIRE_LEASE 发到 volume-2，但 WriteNeedle/RenewLease
+   经 fallback 路由到 volume-3，导致 `Lease holder mismatch`。
+   根因: `vol_routes[]` 未填充（discover_volumes 日志未出现），fallback 返回
+   第一个已连接的 volume server。
+2. **invalid frame header**: volume-3 日志偶现 `read_frame error: Protocol("invalid
+   frame header")`，可能导致连接关闭后所有请求 -107。
+3. **lease renew 持续失败 -121**: renew_lease 路由到错误的 volume server，
+   返回 SERVER_ERROR → -EREMOTEIO。
+
+### Step 3 TLV 字段顺序 + Lease 续约完整修复验证结果（2026-08-06）
+
+环境: 内核 6.2.0 + powerfs.ko + QEMU(KVM) + 后端 filer/volume/master 容器集群
+
+**根因 1: TLV 字段顺序错位**
+
+TlvDecoder 是按顺序读取的（`next_field()` → 比对 `FieldId` → 不匹配则 pos 不推进
+value，导致后续全部错位）。内核 lease 请求发送 `Ino(volume_id) + InodeV2(ino)`
+两个字段，但 volume server 期望 `Ino(inode) + Offset(stripe_start)`，导致：
+- srv 把 volume_id 当成 inode 注册 lease
+- 后续 Offset/Limit/ClientId/Mode 全部错位解析失败
+- write_needle 用真实 inode 验证 lease，与注册的 volume_id 不匹配，报
+  "Lease holder mismatch"
+
+**根因 2: WriteNeedle 缺少 ClientId**
+
+内核 write_needle 未发送 ClientId 字段，volume server 用 `session_client_id`
+（TCP 连接数字 session id）作为 holder，与 acquire_lease 注册的 "kernel-client"
+不匹配，导致所有带 lease 的写失败。
+
+**根因 3: 连接断开导致 lease 被释放**
+
+`invalid frame header` 导致连接断开，volume server 的 `on_disconnect` 回调
+自动释放该 client 的所有 lease（`disconnect_holder`）。内核重连后 lease 已
+不存在，renew 全部失败。
+
+**修复内容**:
+
+| 函数 | 修复前 | 修复后 |
+|------|--------|--------|
+| `acquire_lease` | Ino(volume_id)+InodeV2(ino)+Offset+Limit+Mode+Duration+[ClientId] | Ino(inode)+Offset+Limit+ClientId+Mode+Duration |
+| `renew_lease` | Ino(volume_id)+InodeV2(ino)+LeaseToken+Duration | LeaseToken+ClientId+Duration |
+| `release_lease` | Ino(volume_id)+InodeV2(ino)+LeaseToken+[ClientId] | LeaseToken+ClientId |
+| `write_needle` | Ino(volume_id)+FileKey+InodeV2+[LeaseToken] | Ino(volume_id)+FileKey+InodeV2+[LeaseToken]+ClientId |
+| `lease_renew_work_func` | renew 失败只打日志，等待下次重试 | renew 失败自动 re-acquire lease |
+
+ClientId 统一使用 "kernel-client"（与 FUSE 客户端的 `config.client_id` 对应），
+确保 acquire_lease / write_needle / renew_lease / release_lease 的 holder 一致。
+
+**验证结果**:
+
+| 步骤 | 操作 | 结果 |
+|------|------|------|
+| 1 | `mount -t powerfs none /mnt/powerfs` | OK, 12 routes added |
+| 2 | `echo 'lease test' > /mnt/powerfs/lease_test.txt` | OK |
+| 3 | `cat /mnt/powerfs/lease_test.txt` | OK, 内容一致 |
+| 4 | `dd if=/dev/urandom of=/mnt/powerfs/lease_big.bin bs=1M count=5` | OK, 5MB |
+| 5 | volume server `NET_ACQUIRE_LEASE` | inode=1000001008 (正确), client=kernel-client (正确), exclusive=true (正确) |
+| 6 | volume server `NET_WRITE_NEEDLE` | holder=kernel-client, has_lease=true, **无 "Lease holder mismatch"** |
+| 7 | volume server `NET_RENEW_LEASE` (acquire+20s) | token=lease-450, **无 failed 日志** |
+| 8 | volume server `NET_RENEW_LEASE` (acquire+40s) | token=lease-450, **无 failed 日志** |
+| 9 | `md5sum` 两次读取 5MB 文件 | 一致: 242d4e224c2c76b8f3e1c05e7c60310c |
+| 10 | volume server 连接状态 | **无 invalid frame header, 无 disconnect** |
+
+**结论**: TLV 字段顺序、ClientId 一致性、renew 失败 re-acquire 三项修复全部
+生效。Lease 获取 → WriteNeedle 验证 → Lease 续约 完整链路正常工作，无
+"Lease holder mismatch"、无连接断开、续约间隔 20s（lease_duration 30s -
+renew_threshold 10s）符合预期。
+

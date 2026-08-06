@@ -37,6 +37,10 @@
 #define POWERFS_CHUNK_SIZE      (2 * 1024 * 1024)    /* 2MB */
 #define POWERFS_STRIPE_SIZE     (64 * 1024 * 1024)   /* 64MB */
 #define POWERFS_LEASE_DURATION  (30 * HZ)
+/* Phase 3: lease 续约阈值. 当 lease 剩余有效期 < 阈值时触发续约.
+ * 设为 DURATION/3 (10s): 在过期前 10s 续约, 留足网络往返 + 重试时间.
+ * 参考 Ceph cap renew 在 expiry 前主动续约. */
+#define POWERFS_LEASE_RENEW_THRESHOLD (POWERFS_LEASE_DURATION / 3)
 
 /* ========== writepages 批量写配置 ==========
  *
@@ -161,7 +165,7 @@ struct powerfs_inode_info {
     u32 chunk_count;
     u64 content_size;
     u64 volume_id;
-    u64 file_key;   /* needle_id (base, chunk N = file_key + N), from Master Assign or GetAttr */
+    u64 file_key;   /* needle_id (base, chunk N = file_key + N), from Filer Create or GetAttr */
 
     /* 缓存有效性 */
     bool cache_valid;
@@ -254,10 +258,23 @@ struct powerfs_sb_info {
     /* 是否初始化完成 */
     bool initialized;
 
+    /* Phase 3: 卸载标志. kill_sb_super 设置为 true, lease_renew_work_func
+     * 检查此标志避免在 destroy_workqueue 期间重新排队导致 flush 循环. */
+    bool shutting_down;
+
     /* Stage C: writeback 异步 workqueue.
      * writepage 提交异步写请求到此 workqueue, 避免在 writeback
      * 上下文同步等待网络. fill_super 创建, kill_sb 销毁. */
     struct workqueue_struct *writeback_wq;
+
+    /* Phase 3: lease 续约 workqueue (delayed_work 调度).
+     * WQ_HIGHPRI: lease 续约延迟敏感 (过期即丢锁导致写失败), 参考 GFS2
+     *   glock_workqueue (fs/gfs2/glock.c:2462).
+     * WQ_MEM_RECLAIM: writeback 路径内存回收安全.
+     * WQ_UNBOUND: 不绑 CPU, 提升扩展性.
+     * 不使用 max_active=1 串行: lease 按 stripe 独立, 无全局顺序依赖,
+     *   不同 inode 的续约可并发 (参考 GFS2 glock max_active=0). */
+    struct workqueue_struct *lease_wq;
 
     /* writepages 批量大小 (页数), 由 mount option write_batch_kb 决定.
      * 单次 work item 最多收集这么多脏页, 减少网络往返和 work item 数量.

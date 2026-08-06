@@ -59,6 +59,12 @@
 #define POWERFS_LOOKUP_TIMEOUT_MS       2000    /* lookup: 2s */
 #define POWERFS_READDIR_TIMEOUT_MS      5000    /* readdir: 5s */
 
+/* Phase 2: 元数据操作短超时 (ms).
+ * create/unlink/rename/symlink/link 等在 VFS 持有 i_rwsem 写锁时调用,
+ * 必须快速完成或失败, 避免长时间阻塞目录操作.
+ * 5s 足够覆盖正常 LAN RPC (<10ms) + 重连 (3s) + 重试. */
+#define POWERFS_META_TIMEOUT_MS         5000    /* metadata ops: 5s */
+
 /* 断连窗口: 断连后 5s 内视为 "最近断连", lookup/readdir 用短超时 */
 #define POWERFS_RECENT_DISCONNECT_MS    5000
 
@@ -115,7 +121,6 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_STATFS = 0x0040,
 
     /* Master 操作 */
-    POWERFS_NET_MSG_ASSIGN = 0x0050,
     POWERFS_NET_MSG_LOOKUP_VOLUME = 0x0051,
     POWERFS_NET_MSG_HEARTBEAT = 0x0052,
     POWERFS_NET_MSG_KEEP_CONNECTED = 0x0053,
@@ -135,6 +140,15 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_READ_NEEDLE_BLOB = 0x0066,
     POWERFS_NET_MSG_RANGE_LEASE = 0x0067,
     POWERFS_NET_MSG_VOLUME_STATUS = 0x0068,
+    /* Lease 消息值必须与 powerfs-net/src/protocol.rs MsgType 枚举一致:
+     *   0x0069 在 Rust 端是 AssignNeedle, 不是 AcquireLease.
+     *   AcquireLease=0x0080, ReleaseLease=0x0081, RenewLease=0x0082.
+     * 之前内核误用 0x0069 导致 volume server 把 ACQUIRE_LEASE 当作
+     * AssignNeedle 处理 (unsupported), 继而触发 invalid frame header
+     * 关闭连接, 所有后续 WriteNeedle/ReadNeedle 超时 (-ENOTCONN). */
+    POWERFS_NET_MSG_ACQUIRE_LEASE = 0x0080,
+    POWERFS_NET_MSG_RELEASE_LEASE = 0x0081,
+    POWERFS_NET_MSG_RENEW_LEASE = 0x0082,
 };
 
 /* ========== 响应状态码 ========== */
@@ -214,6 +228,8 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_FILE_KEY = 0x94,    /* needle_id / file_key (u64) */
     POWERFS_NET_FLD_CHUNKS = 0x96,      /* chunks 列表 (JSON, GetAttr 响应) */
     POWERFS_NET_FLD_INODE_V2 = 0x97,    /* inode (u64), needle 操作中与 FileKey 并存 */
+    POWERFS_NET_FLD_USED_SPACE = 0x98,  /* used space (u64), matches Rust FieldId::UsedSpace */
+    POWERFS_NET_FLD_FILE_COUNT = 0x99,  /* file count (u64), matches Rust FieldId::FileCount */
 };
 
 /* ========== 帧头结构 (28 字节, packed) ========== */
@@ -658,7 +674,7 @@ struct powerfs_net_pool {
 
     /* === Volume 路由表: volume_id → volume conn idx ===
      * 从 Master GetTopology 获取, 用于 ReadNeedle 按 volume_id 找到正确的
-     * Volume Server 连接. WriteNeedle 由 Master Assign 直接返回 volume addr,
+     * Volume Server 连接. WriteNeedle 由 Filer Create 返回 volume addr,
      * 不依赖此表. */
     struct {
         __u64 volume_id;
@@ -935,7 +951,8 @@ int powerfs_net_send_to_volume(int vol_idx, __u64 volume_id,
  * data/data_len: 写入数据
  * 返回 0 成功, <0 错误 */
 int powerfs_net_write_needle(__u64 volume_id, __u64 file_key, __u64 inode,
-                             const __u8 *data, size_t data_len);
+                             const __u8 *data, size_t data_len,
+                             const char *lease_token, size_t token_len);
 
 /* ReadNeedle: 直连 volume 读数据.
  * volume_id: 目标 volume
@@ -949,6 +966,47 @@ int powerfs_net_read_needle(__u64 volume_id, __u64 file_key,
 /* 从 Master GetTopology 获取 volume 路由表 (volume_id → addr).
  * 在 pool_init 后调用, 填充 vol_routes[] 用于 ReadNeedle 路由. */
 int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port);
+
+/* Phase 3: RangeLease 续约 (直连 volume server).
+ * volume_id: 目标 volume (路由查找)
+ * ino: inode 号 (lease 按 inode + stripe 注册)
+ * token: lease token (acquire 时返回)
+ * token_len: token 实际长度
+ * new_expire_jiffies: 输出, 续约成功后的新过期时间 (jiffies)
+ * 返回 0 成功, <0 错误 (网络不可达/token 失效等) */
+int powerfs_net_renew_lease(__u64 volume_id, __u64 ino,
+                            const char *token, size_t token_len,
+                            unsigned long *new_expire_jiffies);
+
+/* Phase 3: RangeLease 获取 (直连 volume server).
+ * volume_id: 目标 volume (路由查找)
+ * ino: inode 号 (lease 按 inode + stripe 注册)
+ * stripe_start: stripe 起始偏移 (bytes, 64MB 对齐)
+ * stripe_count: stripe 数量 (通常为 1)
+ * client_id: 持有者标识 (用于冲突检测)
+ * token_out: 输出, lease token (调用方提供 >=64 字节缓冲区)
+ * token_len_out: 输出, token 实际长度
+ * epoch_out: 输出, lease epoch
+ * content_size_out: 输出, 当前 content_size (避免额外 getattr)
+ * expire_jiffies_out: 输出, 过期时间 (jiffies)
+ * 返回 0 成功, <0 错误 */
+int powerfs_net_acquire_lease(__u64 volume_id, __u64 ino,
+                              __u64 stripe_start, __u64 stripe_count,
+                              const char *client_id,
+                              char *token_out, size_t *token_len_out,
+                              __u64 *epoch_out, __u64 *content_size_out,
+                              unsigned long *expire_jiffies_out);
+
+/* Phase 3: RangeLease 释放 (直连 volume server).
+ * volume_id: 目标 volume
+ * ino: inode 号
+ * token: lease token (acquire 时返回)
+ * token_len: token 实际长度
+ * client_id: 持有者标识
+ * 返回 0 成功, <0 错误 */
+int powerfs_net_release_lease(__u64 volume_id, __u64 ino,
+                              const char *token, size_t token_len,
+                              const char *client_id);
 
 /* ========== 初始化/清理 ========== */
 

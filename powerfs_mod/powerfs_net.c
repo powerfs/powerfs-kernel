@@ -2353,16 +2353,51 @@ static int powerfs_request_do_send(struct powerfs_request *req,
 
     pfs_tx_schedule(conn);
 
-    /* 等待调度器 complete (异步收发, 流水线).
-     * 超时 3x RECV_TIMEOUT (30s): 兜底防止调度器异常未 complete.
+    /* Phase 2: 等待调度器 complete (异步收发, 流水线).
+     *
+     * 改进 (vs Phase 1):
+     *   1. wait_for_completion_killable_timeout: SIGKILL 可中断, 避免 D-state
+     *   2. deadline-based 超时: 尊重调用方传入的 timeout_ms, 不再硬编码 30s
+     *   3. 上限仍为 30s (RECV_TIMEOUT * 3): 防止 deadline 过大
+     *
      * 完成路径:
      *   a. 正常: 调度器 RX 收到响应 → complete
      *   b. 断连: disconnect_one 以 -ENOTCONN complete, 主线程在 submit 中重试
      *   c. FAULT: set_state(FAULT) 以 -ENOTCONN complete (重连彻底失败)
-     *   d. 超时: 30s 未收到响应 → -ETIMEDOUT */
+     *   d. 超时: deadline 到期 → -ETIMEDOUT
+     *   e. 信号: SIGKILL 中断 → -EINTR */
     {
-        long wr = wait_for_completion_timeout(&req->done,
-                    msecs_to_jiffies(POWERFS_NET_RECV_TIMEOUT * 3));
+        unsigned long do_send_deadline;
+        long wr;
+
+        if (req->deadline)
+            do_send_deadline = min(req->deadline,
+                jiffies + msecs_to_jiffies(POWERFS_NET_RECV_TIMEOUT * 3));
+        else
+            do_send_deadline = jiffies +
+                msecs_to_jiffies(POWERFS_NET_RECV_TIMEOUT * 3);
+
+        wr = wait_for_completion_killable_timeout(&req->done,
+                    do_send_deadline - jiffies);
+
+        if (wr < 0) {
+            /* 被信号中断 (SIGKILL): 从队列摘除, 返回 -EINTR.
+             * 与超时同样的清理逻辑, 防止迟到响应误匹配. */
+            pr_warn("powerfs: req seq=%u msg_type=%u interrupted by signal on filer %s:%u\n",
+                    seq, req->msg_type, conn->addr, conn->port);
+            spin_lock(&conn->req_lock);
+            if (!list_empty(&req->list_node)) {
+                list_del_init(&req->list_node);
+                powerfs_req_tree_remove(conn, req);
+                req->error = -EINTR;
+            }
+            spin_unlock(&conn->req_lock);
+            spin_lock(&conn->tx_lock);
+            if (!list_empty(&req->tx_list))
+                list_del_init(&req->tx_list);
+            spin_unlock(&conn->tx_lock);
+            return req->error;
+        }
 
         if (wr == 0) {
             /* 超时: 请求可能仍在 pending_reqs/tx_queue (无人 complete).
@@ -2540,9 +2575,10 @@ int powerfs_request_submit(struct powerfs_request *req)
             pr_debug("powerfs: no filer available for shard %llu, queueing req msg_type=%u\n",
                     (unsigned long long)req->shard_id, req->msg_type);
 
-            /* 等待派发 (route_update -> dispatch_pending) 或超时 */
+            /* Phase 2: 等待派发 (route_update -> dispatch_pending) 或超时.
+             * 使用 killable wait: SIGKILL 可中断, 避免 D-state. */
             reinit_completion(&req->done);
-            wait_ret = wait_for_completion_timeout(&req->done,
+            wait_ret = wait_for_completion_killable_timeout(&req->done,
                 deadline - jiffies);
 
             /* 从 pending 队列移除 (如果还在) */
@@ -2550,6 +2586,14 @@ int powerfs_request_submit(struct powerfs_request *req)
             if (!list_empty(&req->list_node))
                 list_del_init(&req->list_node);
             spin_unlock(&entry->req_lock);
+
+            if (wait_ret < 0) {
+                /* 被信号中断: 返回 -EINTR, 不再重试 */
+                pr_warn("powerfs: req msg_type=%u shard=%llu interrupted by signal\n",
+                        req->msg_type, (unsigned long long)req->shard_id);
+                req->error = -EINTR;
+                return -EINTR;
+            }
 
             if (wait_ret == 0 && req->error == 0) {
                 /* 超时且未被派发/取消 */
@@ -2626,8 +2670,9 @@ int powerfs_request_submit(struct powerfs_request *req)
             if (powerfs_net_parse_redirect(req->resp_body, req->resp_body_len,
                                             leader_addr, sizeof(leader_addr),
                                             &leader_port) == 0) {
-                pr_debug("powerfs: redirect to leader %s:%u\n",
-                        leader_addr, leader_port);
+                pr_warn("powerfs: redirect to leader %s:%u (from %s:%u, filer_count=%d)\n",
+                        leader_addr, leader_port, conn->addr, conn->port,
+                        g_pool.filer_count);
 
                 /* 检测 self-redirect (filer 选举中, 返回自身地址) */
                 if (strcmp(leader_addr, conn->addr) == 0 &&
@@ -2678,7 +2723,16 @@ int powerfs_request_submit(struct powerfs_request *req)
                 }
             }
             /* redirect 解析失败或 filer 未找到 */
-            pr_warn("powerfs: redirect failed, no leader filer found\n");
+            {
+                int fi;
+                pr_warn("powerfs: redirect failed, no leader filer found (body_len=%zu, filer_count=%d)\n",
+                        req->resp_body_len, g_pool.filer_count);
+                for (fi = 0; fi < g_pool.filer_count && fi < 8; fi++) {
+                    pr_warn("powerfs:   filer[%d]: addr=%s port=%u in_use=%d\n",
+                            fi, g_pool.filers[fi].addr, g_pool.filers[fi].port,
+                            g_pool.filers[fi].in_use);
+                }
+            }
             req->error = -EAGAIN;
             complete(&req->done);
             return -EAGAIN;
@@ -3017,7 +3071,7 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
                                     resp_body, sizeof(resp_body),
-                                    NULL, 0, 10000,
+                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
                                     &resp_body_len, NULL);
     if (ret < 0)
         return ret;
@@ -3060,7 +3114,7 @@ int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
                                     NULL, 0,
-                                    NULL, 0, 10000,
+                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
                                     NULL, NULL);
     if (ret < 0)
         return ret;
@@ -3090,7 +3144,7 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
                                     NULL, 0,
-                                    NULL, 0, 5000,
+                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
                                     NULL, NULL);
     if (ret < 0)
         return ret;
@@ -3397,9 +3451,10 @@ int powerfs_net_write(__u64 ino, __u64 volume_id, __u64 file_key,
     if (offset_in_needle + data_len > existing_len)
         existing_len = offset_in_needle + data_len;
 
-    /* 整体写回 needle */
+    /* 整体写回 needle (read-modify-write 路径无 lease token, 传 NULL) */
     ret = powerfs_net_write_needle(volume_id, needle_id, ino,
-                                    needle_buf, existing_len);
+                                    needle_buf, existing_len,
+                                    NULL, 0);
     kvfree(needle_buf);
 
     if (ret < 0) {
@@ -3497,7 +3552,7 @@ int powerfs_net_symlink(__u64 dir_ino, const char *name, size_t name_len,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
                                     resp_body, sizeof(resp_body),
-                                    NULL, 0, 10000,
+                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
                                     &resp_body_len, NULL);
     if (ret < 0)
         return ret;
@@ -3565,7 +3620,7 @@ int powerfs_net_link(__u64 ino, __u64 dir_ino, const char *name, size_t name_len
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
                                     NULL, 0,
-                                    NULL, 0, 10000,
+                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
                                     NULL, NULL);
     if (ret < 0)
         return ret;
@@ -4207,6 +4262,25 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
 
                 faddr[sizeof(faddr) - 1] = '\0';
 
+                /* master 返回的 address 可能是 "ip:port" 格式 (filer 注册时
+                 * 用 advertise_addr), 而连接池期望 addr=纯 IP + port=端口.
+                 * 去掉 faddr 中的端口部分, 统一用 Blksize 字段的 fport. */
+                {
+                    char *colon = strrchr(faddr, ':');
+                    if (colon) {
+                        /* IPv6 地址可能含多个 ':', 但 filer 地址是 IPv4,
+                         * 只处理最后一个 ':' 后面是纯数字的情况 */
+                        char *endp;
+                        unsigned long vp = simple_strtoul(colon + 1, &endp, 10);
+                        if (*endp == '\0' && vp > 0 && vp <= 0xFFFF) {
+                            *colon = '\0';
+                            /* 若 Blksize 字段未返回端口, 用 addr 中的端口 */
+                            if (fport == 0)
+                                fport = vp;
+                        }
+                    }
+                }
+
                 if (!healthy) {
                     pr_debug("powerfs: skipping unhealthy filer %s:%llu\n",
                             faddr, (u64)fport);
@@ -4270,8 +4344,12 @@ struct powerfs_net_server_conn *powerfs_net_find_volume_conn(__u64 volume_id)
     /* Fallback: vol_routes 未命中, 尝试所有 volume 连接 (首个已连接的) */
     for (i = 0; i < g_pool.volume_count; i++) {
         struct powerfs_net_server_conn *conn = &g_pool.volumes[i];
-        if (conn->in_use && conn->state == CONN_CONNECTED)
+        if (conn->in_use && conn->state == CONN_CONNECTED) {
+            pr_warn("powerfs: find_volume_conn: volume_id=%llu not in vol_routes (%d routes), fallback to volumes[%d] %s:%u\n",
+                    (unsigned long long)volume_id, g_pool.vol_route_count,
+                    i, conn->addr, conn->port);
             return conn;
+        }
     }
     return NULL;
 }
@@ -4347,13 +4425,15 @@ int powerfs_net_send_to_volume(int vol_idx, __u64 volume_id,
 /*
  * powerfs_net_write_needle - 直连 volume 写数据 (WriteNeedle)
  *
- * TLV 编码: Ino(volume_id) + FileKey + Inode + DataLen(data)
+ * TLV 编码: Ino(volume_id) + FileKey + Inode + [LeaseToken] + DataLen(data)
  * 与 Volume Server handle_write_needle 匹配.
+ * lease_token: 可选, 非 NULL 且 token_len>0 时发送, Volume Server 校验.
  */
 int powerfs_net_write_needle(__u64 volume_id, __u64 file_key, __u64 inode,
-                             const __u8 *data, size_t data_len)
+                             const __u8 *data, size_t data_len,
+                             const char *lease_token, size_t token_len)
 {
-    __u8 body[128];
+    __u8 body[256];
     struct powerfs_tlv_enc enc;
     __u8 resp_body[64];
     size_t resp_body_len = 0;
@@ -4363,6 +4443,17 @@ int powerfs_net_write_needle(__u64 volume_id, __u64 file_key, __u64 inode,
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, volume_id);
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_FILE_KEY, file_key);
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INODE_V2, inode);
+    /* Lease token (可选): Volume Server 校验 lease 有效性 */
+    if (lease_token && token_len > 0 && token_len < 64)
+        powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_LEASE_TOKEN,
+                               lease_token, token_len);
+    /* ClientId: 必须与 acquire_lease 的 client_id 一致, 否则 volume server
+     * validate_token_with_grace_period 报 "Lease holder mismatch".
+     * 之前内核未发送 ClientId, volume server 用 session_client_id (TCP 连接
+     * 的数字 session id) 作为 holder, 与 acquire_lease 注册的 "kernel-client"
+     * 不匹配, 导致所有带 lease 的写失败. */
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                           "kernel-client", strlen("kernel-client"));
     /* DataLen 字段标识 data 段存在; Volume Server 用 next_bytes(DataLen) 读取 */
 
     ret = powerfs_net_send_to_volume(-1, volume_id,
@@ -4418,6 +4509,242 @@ int powerfs_net_read_needle(__u64 volume_id, __u64 file_key,
 
     return 0;
 }
+
+/*
+ * powerfs_net_renew_lease - RangeLease 续约 (Phase 3)
+ *
+ * 直连 volume server 发送 RANGE_LEASE 续约请求.
+ * TLV 编码: Ino(volume_id) + Inode + LeaseToken + LeaseDuration
+ * 响应: LeaseDuration (新有效期, 秒) + LeaseEpoch (新 epoch)
+ *
+ * 续约超时设为 5s (POWERFS_META_TIMEOUT_MS): lease 续约属管理类操作,
+ * 短超时快速失败, 由 lease_renew_work_func 决定是否重试.
+ * 断连/超时返回负值, 调用方不更新 expire_jiffies, lease 自然过期后
+ * 由 acquire 路径重新获取.
+ */
+int powerfs_net_renew_lease(__u64 volume_id, __u64 ino,
+                            const char *token, size_t token_len,
+                            unsigned long *new_expire_jiffies)
+{
+    __u8 body[256];
+    struct powerfs_tlv_enc enc;
+    __u8 resp_body[128];
+    size_t resp_body_len = 0;
+    struct powerfs_tlv_dec dec;
+    __u32 lease_duration_sec = 0;
+    int ret;
+
+    if (!token || token_len == 0 || token_len >= 64)
+        return -EINVAL;
+
+    /* TLV 字段顺序与 FUSE 客户端 renew_lease 一致:
+     *   LeaseToken + ClientId + LeaseDuration
+     * volume server handle_renew_lease 按相同顺序读取.
+     * 之前内核多发 Ino(volume_id) + InodeV2(ino) 在前, 导致 LeaseToken
+     * 字段错位, renew 全部失败 (-EREMOTEIO). */
+    powerfs_tlv_enc_init(&enc, body, sizeof(body));
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_LEASE_TOKEN,
+                           token, token_len);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                           "kernel-client", strlen("kernel-client"));
+    /* 请求续约有效期: POWERFS_LEASE_DURATION 转换为毫秒 (u64, 与 volume server
+     * handle_renew_lease 的 next_u64(LeaseDuration) 一致). 之前用 u32 秒,
+     * volume server next_u64 解析失败, 用默认 30000ms. */
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_LEASE_DURATION,
+                        jiffies_to_msecs(POWERFS_LEASE_DURATION));
+
+    ret = powerfs_net_send_to_volume(-1, volume_id,
+                                      POWERFS_NET_MSG_RENEW_LEASE,
+                                      body, powerfs_tlv_enc_len(&enc),
+                                      NULL, 0,
+                                      resp_body, sizeof(resp_body),
+                                      NULL, 0,
+                                      POWERFS_META_TIMEOUT_MS,
+                                      &resp_body_len, NULL);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return net_status_to_errno((__u16)ret);
+
+    /* 解析响应: LeaseDuration (volume server 返回 u64 毫秒). */
+    {
+        __u64 duration_ms = 0;
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_LEASE_DURATION, &duration_ms);
+        if (duration_ms > 0)
+            lease_duration_sec = duration_ms / 1000;
+        else
+            lease_duration_sec = jiffies_to_msecs(POWERFS_LEASE_DURATION) / 1000;
+    }
+
+    if (new_expire_jiffies)
+        *new_expire_jiffies = jiffies +
+            msecs_to_jiffies(lease_duration_sec * 1000);
+
+    return 0;
+}
+
+/*
+ * powerfs_net_acquire_lease - RangeLease 获取 (Phase 3)
+ *
+ * 直连 volume server 发送 ACQUIRE_LEASE 请求.
+ * TLV 编码: Ino(volume_id) + Inode + Offset(stripe_start) + Count(stripe_count) + LeaseDuration
+ * 响应: LeaseToken + LeaseDuration + LeaseEpoch + ContentSize
+ *
+ * 超时设为 5s (POWERFS_META_TIMEOUT_MS): lease 获取属管理类操作.
+ * 断连/超时返回负值, 调用方可重试或降级.
+ */
+int powerfs_net_acquire_lease(__u64 volume_id, __u64 ino,
+                              __u64 stripe_start, __u64 stripe_count,
+                              const char *client_id,
+                              char *token_out, size_t *token_len_out,
+                              __u64 *epoch_out, __u64 *content_size_out,
+                              unsigned long *expire_jiffies_out)
+{
+    __u8 body[256];
+    struct powerfs_tlv_enc enc;
+    __u8 resp_body[256];
+    size_t resp_body_len = 0;
+    struct powerfs_tlv_dec dec;
+    __u32 lease_duration_sec = 0;
+    int ret;
+
+    if (!token_out || !token_len_out || *token_len_out < 64)
+        return -EINVAL;
+
+    /* TLV 字段顺序必须与 FUSE 客户端 (volume_client.rs acquire_lease) 和
+     * volume server (net_handler.rs handle_acquire_lease) 完全一致, 因为
+     * TlvDecoder 是按顺序读取的 (next_field → 比对 FieldId → 不匹配则
+     * pos 不推进 value, 导致后续全部错位).
+     *
+     * FUSE 客户端顺序: Ino(inode) + Offset + Limit + ClientId + Mode + LeaseDuration
+     * volume server  顺序: Ino(inode) + Offset + Limit + ClientId + Mode + LeaseDuration
+     *
+     * 注意: Ino(0x07) 发送的是 inode (不是 volume_id), volume server 的
+     * range_lease_mgr 按 inode 管理 lease, 不需要 volume_id.
+     * 之前内核误发 Ino=volume_id + InodeV2=ino 两个字段, 导致:
+     *   1) srv 把 volume_id 当成 inode 注册 lease
+     *   2) 第二个字段 InodeV2(0x97) 与 srv 期望的 Offset(0x0E) 不匹配,
+     *      pos 卡在 InodeV2 value 开头, 后续 Offset/Limit/ClientId/Mode
+     *      全部错位解析失败 (exclusive 误解析为 false, client_id 误解析为空)
+     *   3) write_needle 用真实 inode 验证 lease, 与注册的 volume_id 不匹配,
+     *      报 "Lease holder mismatch".
+     */
+    powerfs_tlv_enc_init(&enc, body, sizeof(body));
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_OFFSET, stripe_start);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_LIMIT, stripe_count);
+    if (client_id && client_id[0])
+        powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                               client_id, strlen(client_id));
+    else
+        powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                               "kernel-client", strlen("kernel-client"));
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_MODE, 1); /* exclusive */
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_LEASE_DURATION,
+                        jiffies_to_msecs(POWERFS_LEASE_DURATION));
+
+    ret = powerfs_net_send_to_volume(-1, volume_id,
+                                      POWERFS_NET_MSG_ACQUIRE_LEASE,
+                                      body, powerfs_tlv_enc_len(&enc),
+                                      NULL, 0,
+                                      resp_body, sizeof(resp_body),
+                                      NULL, 0,
+                                      POWERFS_META_TIMEOUT_MS,
+                                      &resp_body_len, NULL);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return net_status_to_errno((__u16)ret);
+
+    /* 解析响应: LeaseId. volume server handle_acquire_lease 用
+     * FieldId::LeaseId(0x40) 返回 token, 不是 FieldId::LeaseToken(0x80). */
+    powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+    ret = powerfs_tlv_dec_string(&dec, POWERFS_NET_FLD_LEASE_ID,
+                                  token_out, *token_len_out);
+    if (ret < 0) {
+        pr_err("powerfs: acquire_lease: failed to parse token: %d\n", ret);
+        return -EIO;
+    }
+    *token_len_out = strlen(token_out);
+
+    /* 解析响应: LeaseDuration (volume server 返回 u64 毫秒) */
+    {
+        __u64 duration_ms = 0;
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_LEASE_DURATION, &duration_ms);
+        if (duration_ms > 0)
+            lease_duration_sec = duration_ms / 1000;
+        else
+            lease_duration_sec = jiffies_to_msecs(POWERFS_LEASE_DURATION) / 1000;
+    }
+
+    powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+    if (epoch_out)
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_LEASE_EPOCH, epoch_out);
+
+    powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+    if (content_size_out)
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_CONTENT_SIZE,
+                            content_size_out);
+
+    if (expire_jiffies_out)
+        *expire_jiffies_out = jiffies +
+            msecs_to_jiffies(lease_duration_sec * 1000);
+
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_acquire_lease);
+
+/*
+ * powerfs_net_release_lease - RangeLease 释放 (Phase 3)
+ *
+ * 直连 volume server 发送 RELEASE_LEASE 请求.
+ * TLV 编码: Ino(volume_id) + Inode + LeaseToken + ClientId
+ * 响应: 只看 status (无 body)
+ */
+int powerfs_net_release_lease(__u64 volume_id, __u64 ino,
+                              const char *token, size_t token_len,
+                              const char *client_id)
+{
+    __u8 body[256];
+    struct powerfs_tlv_enc enc;
+    size_t resp_body_len = 0;
+    int ret;
+
+    if (!token || token_len == 0 || token_len >= 64)
+        return -EINVAL;
+
+    /* TLV 字段顺序与 FUSE 客户端 release_lease_remote_with_token 一致:
+     *   LeaseToken + ClientId
+     * volume server handle_release_lease 按相同顺序读取.
+     * 之前内核多发 Ino(volume_id) + InodeV2(ino) 在前, 导致 LeaseToken
+     * 字段错位, release 失败. */
+    powerfs_tlv_enc_init(&enc, body, sizeof(body));
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_LEASE_TOKEN,
+                           token, token_len);
+    if (client_id && client_id[0])
+        powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                               client_id, strlen(client_id));
+    else
+        powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                               "kernel-client", strlen("kernel-client"));
+
+    ret = powerfs_net_send_to_volume(-1, volume_id,
+                                      POWERFS_NET_MSG_RELEASE_LEASE,
+                                      body, powerfs_tlv_enc_len(&enc),
+                                      NULL, 0,
+                                      NULL, 0, NULL, 0,
+                                      POWERFS_META_TIMEOUT_MS,
+                                      &resp_body_len, NULL);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return net_status_to_errno((__u16)ret);
+
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_release_lease);
 
 /*
  * powerfs_net_discover_volumes - 从 Master GetTopology 获取 volume 路由表
@@ -4584,51 +4911,167 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
 
         pr_debug("powerfs: master returned %llu volume routes\n", (u64)count);
 
-        spin_lock(&g_pool.vol_route_lock);
-        g_pool.vol_route_count = 0;
+        /* P3.3a: 解析拓扑到临时数组 (无锁, 避免 spinlock 内调用睡眠函数).
+         * 未匹配的 route 自动建立新连接, volume_addr 降级为 fallback. */
+        {
+            struct {
+                __u64 volume_id;
+                char addr[64];
+            } routes_tmp[POWERFS_NET_MAX_VOLUMES];
+            int route_count_tmp = 0;
+            int j;
 
-        for (i = 0; i < (int)count && i < POWERFS_NET_MAX_VOLUMES; i++) {
-            __u64 vid = 0, vsize = 0;
-            char vaddr[64] = {0};
-            int j, conn_idx = -1;
+            /* 1. 解析所有 routes 到临时数组.
+             * master 编码顺序: VolumeId + Owner(addr) + Size + UsedSpace + FileCount
+             * 必须按顺序解析全部 5 个字段, 否则 dec->pos 错位导致后续条目解析失败. */
+            for (i = 0; i < (int)count && i < POWERFS_NET_MAX_VOLUMES; i++) {
+                __u64 vid = 0, vsize = 0, vused = 0, vfiles = 0;
+                char vaddr[64] = {0};
 
-            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, &vid);
-            powerfs_tlv_dec_string(&dec, POWERFS_NET_FLD_OWNER, vaddr,
-                                    sizeof(vaddr) - 1);
-            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_SIZE, &vsize);
+                powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, &vid);
+                powerfs_tlv_dec_string(&dec, POWERFS_NET_FLD_OWNER, vaddr,
+                                        sizeof(vaddr) - 1);
+                powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_SIZE, &vsize);
+                powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_USED_SPACE, &vused);
+                powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_FILE_COUNT, &vfiles);
+                vaddr[sizeof(vaddr) - 1] = '\0';
 
-            vaddr[sizeof(vaddr) - 1] = '\0';
-
-            /* 按 addr 匹配 volume 连接 */
-            for (j = 0; j < g_pool.volume_count; j++) {
-                char conn_addr[80];
-                /* vaddr 格式 "ip:port", conn->addr 只有 ip */
-                snprintf(conn_addr, sizeof(conn_addr), "%s:%u",
-                         g_pool.volumes[j].addr, g_pool.volumes[j].port);
-                if (strcmp(conn_addr, vaddr) == 0 ||
-                    strncmp(g_pool.volumes[j].addr, vaddr,
-                            strlen(g_pool.volumes[j].addr)) == 0) {
-                    conn_idx = j;
-                    break;
+                /* 跳过 addr 为空的无效条目 (避免 vol_route invalid 警告刷屏) */
+                if (vaddr[0] == '\0') {
+                    pr_warn("powerfs: discover_volumes: skip empty addr route vid=%llu\n",
+                            (unsigned long long)vid);
+                    continue;
                 }
+
+                routes_tmp[route_count_tmp].volume_id = vid;
+                strncpy(routes_tmp[route_count_tmp].addr, vaddr,
+                        sizeof(routes_tmp[route_count_tmp].addr) - 1);
+                routes_tmp[route_count_tmp].addr[sizeof(routes_tmp[route_count_tmp].addr) - 1] = '\0';
+                route_count_tmp++;
             }
 
-            if (conn_idx >= 0) {
+            /* 2. 对每个 route: 精确匹配已有连接, 未匹配则自动建连.
+             * P3.3a: 移除前缀匹配隐患 (strncmp), 只用 strcmp 精确匹配. */
+            spin_lock(&g_pool.vol_route_lock);
+            g_pool.vol_route_count = 0;
+
+            for (i = 0; i < route_count_tmp; i++) {
+                __u64 vid = routes_tmp[i].volume_id;
+                char *vaddr = routes_tmp[i].addr;
+                int conn_idx = -1;
+
+                /* 精确匹配 "ip:port" */
+                for (j = 0; j < g_pool.volume_count; j++) {
+                    char conn_addr[80];
+                    snprintf(conn_addr, sizeof(conn_addr), "%s:%u",
+                             g_pool.volumes[j].addr, g_pool.volumes[j].port);
+                    if (strcmp(conn_addr, vaddr) == 0) {
+                        conn_idx = j;
+                        break;
+                    }
+                }
+
+                if (conn_idx < 0) {
+                    /* P3.3a: 未匹配 → 自动建立新连接.
+                     * 释放 vol_route_lock (spinlock 不可睡眠),
+                     * 用 pool_lock (mutex) 保护 volumes[] 修改. */
+                    char v_ip[64] = {0};
+                    __u16 v_port = 0;
+                    char *colon;
+                    struct powerfs_net_server_conn *conn;
+                    int ip_len;
+
+                    spin_unlock(&g_pool.vol_route_lock);
+
+                    /* 解析 "ip:net_port" */
+                    colon = strrchr(vaddr, ':');
+                    if (!colon) {
+                        pr_warn("powerfs: vol_route: volume_id=%llu addr=%s invalid (no port)\n",
+                                (unsigned long long)vid, vaddr);
+                        spin_lock(&g_pool.vol_route_lock);
+                        continue;
+                    }
+                    ip_len = min_t(int, (int)(colon - vaddr), (int)(sizeof(v_ip) - 1));
+                    memcpy(v_ip, vaddr, ip_len);
+                    v_ip[ip_len] = '\0';
+                    v_port = (__u16)simple_strtoul(colon + 1, NULL, 10);
+
+                    /* 添加到 volumes[] (mutex 保护, 可睡眠) */
+                    mutex_lock(&g_pool.pool_lock);
+                    if (g_pool.volume_count >= POWERFS_NET_MAX_VOLUMES) {
+                        mutex_unlock(&g_pool.pool_lock);
+                        pr_warn("powerfs: vol_route: volume pool full, cannot add %s\n",
+                                vaddr);
+                        spin_lock(&g_pool.vol_route_lock);
+                        continue;
+                    }
+
+                    conn_idx = g_pool.volume_count;
+                    conn = &g_pool.volumes[conn_idx];
+                    memset(conn, 0, sizeof(*conn));
+
+                    strncpy(conn->addr, v_ip, sizeof(conn->addr) - 1);
+                    conn->port = v_port;
+                    conn->type = POWERFS_NET_SERVER_VOLUME;
+                    conn->in_use = true;
+                    conn->sock = NULL;
+                    conn->state = CONN_INIT;
+                    atomic_set(&conn->seq_counter, 1);
+                    conn->reconnect_count = 0;
+                    conn->reconnect_delay = 0;
+
+                    spin_lock_init(&conn->state_lock);
+                    init_waitqueue_head(&conn->sock_user_wq);
+                    init_waitqueue_head(&conn->reconnect_wq);
+                    INIT_DELAYED_WORK(&conn->reconnect_work,
+                                      powerfs_conn_reconnect_work_fn);
+                    INIT_LIST_HEAD(&conn->pending_reqs);
+                    conn->req_tree = RB_ROOT;
+                    spin_lock_init(&conn->req_lock);
+                    INIT_WORK(&conn->disconnect_work,
+                              powerfs_conn_disconnect_work_fn);
+                    conn->sched = pfs_pick_vol_sched(conn->addr);
+                    INIT_LIST_HEAD(&conn->rx_list);
+                    INIT_LIST_HEAD(&conn->tx_list);
+                    conn->rx_ready = 0;
+                    conn->rx_scheduled = 0;
+                    conn->tx_ready = 0;
+                    conn->tx_scheduled = 0;
+                    INIT_LIST_HEAD(&conn->tx_queue);
+                    spin_lock_init(&conn->tx_lock);
+                    conn->saved_data_ready = NULL;
+                    conn->saved_write_space = NULL;
+                    conn->saved_state_change = NULL;
+                    conn->saved_error_report = NULL;
+                    kref_init(&conn->kref);
+
+                    g_pool.volume_count++;
+                    mutex_unlock(&g_pool.pool_lock);
+
+                    /* 后台建立连接 (不阻塞 mount) */
+                    queue_delayed_work(g_pool.reconn_wq,
+                                       &conn->reconnect_work, 0);
+
+                    pr_info("powerfs: vol_route: auto-connected "
+                            "volume_id=%llu addr=%s:%u\n",
+                            (unsigned long long)vid, v_ip, v_port);
+
+                    spin_lock(&g_pool.vol_route_lock);
+                }
+
+                /* 建立 volume_id → conn_idx 映射 */
                 g_pool.vol_routes[g_pool.vol_route_count].volume_id = vid;
                 g_pool.vol_routes[g_pool.vol_route_count].conn_idx = conn_idx;
                 g_pool.vol_route_count++;
                 routes_added++;
                 pr_debug("powerfs: vol_route: volume_id=%llu → conn[%d] (%s)\n",
                         (unsigned long long)vid, conn_idx, vaddr);
-            } else {
-                pr_warn("powerfs: vol_route: volume_id=%llu addr=%s no matching conn\n",
-                        (unsigned long long)vid, vaddr);
             }
+            spin_unlock(&g_pool.vol_route_lock);
         }
-        spin_unlock(&g_pool.vol_route_lock);
 
-        pr_debug("powerfs: discover_volumes complete, %d routes added\n",
-                routes_added);
+        pr_info("powerfs: discover_volumes complete, %d routes added (vol_route_count=%d)\n",
+                routes_added, g_pool.vol_route_count);
         kfree(resp_body);
         return routes_added > 0 ? 0 : -ENOTCONN;
     }
@@ -4665,3 +5108,4 @@ EXPORT_SYMBOL_GPL(powerfs_net_send_to_volume);
 EXPORT_SYMBOL_GPL(powerfs_net_write_needle);
 EXPORT_SYMBOL_GPL(powerfs_net_read_needle);
 EXPORT_SYMBOL_GPL(powerfs_net_discover_volumes);
+EXPORT_SYMBOL_GPL(powerfs_net_renew_lease);
