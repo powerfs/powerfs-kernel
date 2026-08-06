@@ -81,8 +81,8 @@ static void powerfs_req_tree_remove(struct powerfs_net_server_conn *conn,
                                      struct powerfs_request *req);
 
 /* === v2: 调度器 + sk 回调 (前向声明) === */
-static int  pfs_scheduler_thread(void *arg);
-static int  pfs_sched_cansleep(struct powerfs_net_sched *sched);
+static int  pfs_rx_thread_fn(void *arg);
+static int  pfs_tx_thread_fn(void *arg);
 static void pfs_data_ready(struct sock *sk);
 static void pfs_write_space(struct sock *sk);
 static void pfs_state_change(struct sock *sk);
@@ -95,8 +95,13 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn);
 static void pfs_process_transmit(struct powerfs_net_server_conn *conn);
 static void pfs_tx_schedule(struct powerfs_net_server_conn *conn);
 static void pfs_conn_remove_from_sched(struct powerfs_net_server_conn *conn);
+/* v2 RX 非阻塞状态机 helpers */
+static void pfs_rx_reset_partial(struct powerfs_net_server_conn *conn);
+static int  pfs_conn_alloc_rxbuffers(struct powerfs_net_server_conn *conn);
+static void pfs_conn_free_rxbuffers(struct powerfs_net_server_conn *conn);
 static struct powerfs_net_sched *pfs_pick_sched(const char *addr);
-static struct powerfs_net_sched *pfs_pick_vol_sched(const char *addr);
+static struct powerfs_net_sched *pfs_pick_vol_sched(const char *addr,
+                                                    enum powerfs_net_server_type type);
 static int  powerfs_sched_init(void);
 static void powerfs_sched_exit(void);
 
@@ -146,16 +151,29 @@ EXPORT_SYMBOL_GPL(powerfs_crc32c);
 
 /* ========== 帧头编解码 ========== */
 
+/* 计算 route_hash: 高7位=client_id hash, 低1位=channel (防错乱校验).
+ * 服务端收帧时校验 route_hash 是否匹配本连接, 防止帧串到错误连接. */
+static inline __u8 pfs_route_hash(__u64 client_id, __u8 channel)
+{
+    __u64 h = client_id;
+    h ^= h >> 32;
+    h *= 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 32;
+    return ((__u8)(h >> 25) << 1) | (channel & 0x01);
+}
+
 /**
  * powerfs_net_frame_hdr_encode - 编码帧头 (28 字节)
  *
  * @body_len: body 段长度 (TLV 部分)
  * @data_len: body + data 总长度 (data 段 = data_len - body_len)
+ * @route_hash: 目的地hash+channel (防错乱校验)
  */
 void powerfs_net_frame_hdr_encode(struct powerfs_net_frame_hdr *hdr,
                                    __u16 msg_type, __u8 flags,
                                    __u32 seq, __u16 status,
-                                   __u32 body_len, __u32 data_len)
+                                   __u32 body_len, __u32 data_len,
+                                   __u8 route_hash)
 {
     __u32 crc;
 
@@ -183,8 +201,10 @@ void powerfs_net_frame_hdr_encode(struct powerfs_net_frame_hdr *hdr,
     /* body_len: body 段长度 (little-endian), 接收端据此切分 body/data */
     hdr->body_len = cpu_to_le32(body_len);
 
-    /* reserved */
-    memset(hdr->reserved, 0, sizeof(hdr->reserved));
+    /* route_hash: 高7位=client_id hash, 低1位=channel (防错乱校验) */
+    hdr->route_hash = route_hash;
+    /* protocol_ver: 协议版本 (版本升级一致性检查) */
+    hdr->protocol_ver = POWERFS_NET_PROTOCOL_VER;
 
     /* 计算 header_crc (前 24 字节的 CRC32C) */
     crc = powerfs_crc32c((const __u8 *)hdr, 24);
@@ -251,6 +271,13 @@ static struct socket *powerfs_net_create_tcp_socket(void)
      * connect_one 成功后改回 SEND_TIMEOUT (10s) 用于后续 send. */
     sock->sk->sk_rcvtimeo = msecs_to_jiffies(POWERFS_NET_RECV_TIMEOUT);
     sock->sk->sk_sndtimeo = msecs_to_jiffies(POWERFS_NET_CONNECT_TIMEOUT);
+
+    /* 设置大缓冲区: 默认 sk_sndbuf (~208KB) 对 1MB write_needle 帧太小,
+     * 导致 kernel_sendmsg 频繁阻塞等待 TCP 窗口推进.
+     * 设为 2MB 可容纳完整 CHUNK_SIZE (2MB) 数据帧, 配合 MSG_DONTWAIT 实现零阻塞发送.
+     * sk_rcvbuf 同步增大, 确保高并发响应不丢包. */
+    sock->sk->sk_sndbuf = max_t(int, sock->sk->sk_sndbuf, POWERFS_CHUNK_SIZE);
+    sock->sk->sk_rcvbuf = max_t(int, sock->sk->sk_rcvbuf, POWERFS_CHUNK_SIZE);
 
     /* 启用 TCP_NODELAY 减少延迟 */
     tcp_sock_set_nodelay(sock->sk);
@@ -329,8 +356,7 @@ int powerfs_net_frame_send(struct socket *sock,
 {
     struct kvec vec[3];
     int vec_count = 0;
-    struct msghdr msg = {};
-    size_t total_len;
+    size_t total_len, sent_total = 0;
     ssize_t sent;
 
     if (!sock)
@@ -358,16 +384,178 @@ int powerfs_net_frame_send(struct socket *sock,
     if (vec_count > 1) total_len += vec[1].iov_len;
     if (vec_count > 2) total_len += vec[2].iov_len;
 
-    /* 发送 */
-    sent = kernel_sendmsg(sock, &msg, vec, vec_count, total_len);
-    if (sent < 0) {
-        pr_err("powerfs: send failed: %zd\n", sent);
-        return sent;
+    /* 防御: 帧大小不超过 MAX_FRAME (与 Rust MAX_FRAME_SIZE 一致) */
+    if (total_len > POWERFS_NET_MAX_FRAME) {
+        pr_err("powerfs: frame too large: %zu > %d (body=%zu data=%zu)\n",
+               total_len, POWERFS_NET_MAX_FRAME, body_len, data_len);
+        return -EMSGSIZE;
+    }
+
+    /* 循环发送直到所有字节发完.
+     * kernel_sendmsg 对大帧 (如 write_needle 携带 1MB data) 可能只发送
+     * 部分数据 (TCP 发送缓冲区满时返回已接受的字节数 < total_len).
+     * 若不循环发送剩余部分, 接收端 Rust read_exact 会读到错位字节流,
+     * 导致下一帧的 28 字节帧头落在上一帧残留 data 上 -> magic/CRC
+     * 校验失败 -> "invalid frame header" -> 连接断开 (ENOTCONN).
+     *
+     * 此函数用于 discover 路径 (原始 socket, sk_sndtimeo=10s 阻塞模式).
+     * TX 调度器路径使用 pfs_frame_send_nonblock (MSG_DONTWAIT + send_offset). */
+    while (sent_total < total_len) {
+        struct msghdr msg = {};
+
+        sent = kernel_sendmsg(sock, &msg, vec, vec_count,
+                              total_len - sent_total);
+        if (sent < 0) {
+            if (sent == -EINTR)
+                continue;
+            if (sent == -EAGAIN) {
+                pr_warn("powerfs: send EAGAIN (sk_sndtimeo expired, "
+                        "sent=%zu/%zu) -> ENOTCONN to trigger disconnect\n",
+                        sent_total, total_len);
+                return -ENOTCONN;
+            }
+            pr_err("powerfs: send failed: %zd (sent=%zu/%zu)\n",
+                   sent, sent_total, total_len);
+            return sent;
+        }
+        if (sent == 0)
+            return -ECONNRESET;
+
+        sent_total += (size_t)sent;
+
+        /* 调整 kvec: 跳过已发送的字节, 下一轮从剩余部分继续 */
+        if (sent_total < total_len) {
+            size_t to_skip = (size_t)sent;
+            int i;
+            for (i = 0; i < vec_count && to_skip > 0; i++) {
+                if (vec[i].iov_len <= to_skip) {
+                    to_skip -= vec[i].iov_len;
+                    vec[i].iov_len = 0;
+                    vec[i].iov_base = NULL;
+                } else {
+                    vec[i].iov_base = (char *)vec[i].iov_base + to_skip;
+                    vec[i].iov_len -= to_skip;
+                    to_skip = 0;
+                }
+            }
+        }
     }
 
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_net_frame_send);
+
+/**
+ * pfs_frame_send_nonblock - 非阻塞发送帧, 支持 partial send 续传.
+ *
+ * 使用 MSG_DONTWAIT: TCP 缓冲区满时立即返回 -EAGAIN, 不阻塞 TX 线程.
+ * 通过 req->send_offset 跨调用追踪已发送字节, EAGAIN 后重新入队从 offset 继续.
+ *
+ * 返回值:
+ *   0       = 全部发送完成 (req->send_offset 已重置为 0)
+ *   -EAGAIN = 部分发送, 需重新入 tx_queue 等 sk_write_space 回调
+ *   <0      = 不可恢复错误 (触发断连)
+ */
+static int pfs_frame_send_nonblock(struct socket *sock,
+                                   struct powerfs_net_frame_hdr *hdr,
+                                   const __u8 *body, size_t body_len,
+                                   const __u8 *data, size_t data_len,
+                                   struct powerfs_request *req)
+{
+    struct kvec vec[3];
+    int vec_count = 0;
+    int i;
+    size_t total_len, sent_total;
+    ssize_t sent;
+    size_t skip;
+
+    if (!sock)
+        return -ENOTCONN;
+
+    /* 准备 kvec: header + body + data */
+    vec[vec_count].iov_base = hdr;
+    vec[vec_count].iov_len = POWERFS_NET_FRAME_HDR_SIZE;
+    vec_count++;
+    if (body_len > 0 && body) {
+        vec[vec_count].iov_base = (void *)body;
+        vec[vec_count].iov_len = body_len;
+        vec_count++;
+    }
+    if (data_len > 0 && data) {
+        vec[vec_count].iov_base = (void *)data;
+        vec[vec_count].iov_len = data_len;
+        vec_count++;
+    }
+
+    total_len = vec[0].iov_len;
+    if (vec_count > 1) total_len += vec[1].iov_len;
+    if (vec_count > 2) total_len += vec[2].iov_len;
+
+    /* 从上次 partial send 的 offset 继续 */
+    sent_total = req->send_offset;
+    if (sent_total >= total_len)
+        return 0;
+
+    /* 跳过已发送的字节, 调整 kvec 起点 */
+    skip = sent_total;
+    for (i = 0; i < vec_count && skip > 0; i++) {
+        if (vec[i].iov_len <= skip) {
+            skip -= vec[i].iov_len;
+            vec[i].iov_len = 0;
+            vec[i].iov_base = NULL;
+        } else {
+            vec[i].iov_base = (char *)vec[i].iov_base + skip;
+            vec[i].iov_len -= skip;
+            skip = 0;
+        }
+    }
+
+    while (sent_total < total_len) {
+        struct msghdr msg = {
+            .msg_flags = MSG_DONTWAIT,
+        };
+
+        sent = kernel_sendmsg(sock, &msg, vec, vec_count,
+                              total_len - sent_total);
+        if (sent < 0) {
+            if (sent == -EINTR)
+                continue;
+            if (sent == -EAGAIN) {
+                /* TCP 缓冲区满: 保存进度, 返回 EAGAIN 让 TX 线程
+                 * 处理其他连接, 等 sk_write_space 回调重新入队 */
+                req->send_offset = sent_total;
+                return -EAGAIN;
+            }
+            pr_err("powerfs: nonblock send failed: %zd (sent=%zu/%zu)\n",
+                   sent, sent_total, total_len);
+            return sent;
+        }
+        if (sent == 0)
+            return -ECONNRESET;
+
+        sent_total += (size_t)sent;
+
+        /* 调整 kvec: 跳过本轮已发送的字节 */
+        if (sent_total < total_len) {
+            size_t to_skip = (size_t)sent;
+            for (i = 0; i < vec_count && to_skip > 0; i++) {
+                if (vec[i].iov_len <= to_skip) {
+                    to_skip -= vec[i].iov_len;
+                    vec[i].iov_len = 0;
+                    vec[i].iov_base = NULL;
+                } else {
+                    vec[i].iov_base = (char *)vec[i].iov_base + to_skip;
+                    vec[i].iov_len -= to_skip;
+                    to_skip = 0;
+                }
+            }
+        }
+    }
+
+    /* 全部发送完成, 重置 offset */
+    req->send_offset = 0;
+    return 0;
+}
 
 /**
  * powerfs_net_frame_recv - 接收一个完整帧
@@ -493,15 +681,17 @@ static int powerfs_net_do_handshake(struct socket *sock)
     int ret;
     __u64 client_id;
 
-    /* 构造握手请求 (18 字节，裸协议) */
+    /* 构造握手请求 (20 字节，裸协议) */
     memcpy(req.magic, "PFSN", 4);
     req.version = POWERFS_NET_VERSION;
     req.client_type = POWERFS_NET_CLIENT_KERNEL;
+    req.channel = POWERFS_NET_CHANNEL_DATA;
+    req.reserved = 0;
     client_id = atomic_inc_return(&g_discover_seq) + 1000000;
     req.client_id = cpu_to_le64(client_id);
     req.features = 0;
 
-    /* 发送裸握手请求 (18 字节) */
+    /* 发送裸握手请求 (20 字节) */
     memset(&msg, 0, sizeof(msg));
     iov.iov_base = (void *)&req;
     iov.iov_len = sizeof(req);
@@ -608,15 +798,24 @@ static int powerfs_conn_do_handshake(struct socket *sock,
     int ret;
     __u64 client_id;
 
-    /* 构造握手请求 (18 字节，裸协议) */
+    /* 构造握手请求 (20 字节，裸协议) */
     memcpy(req.magic, "PFSN", 4);
     req.version = POWERFS_NET_VERSION;
     req.client_type = POWERFS_NET_CLIENT_KERNEL;
+    /* channel: volume meta 连接标记为 META, 其他标记为 DATA.
+     * 服务端据此区分通路, 收帧时校验 route_hash channel 位. */
+    req.channel = (conn->type == POWERFS_NET_SERVER_VOLUME_META)
+                  ? POWERFS_NET_CHANNEL_META : POWERFS_NET_CHANNEL_DATA;
+    req.reserved = 0;
     client_id = atomic_read(&conn->seq_counter) + 1000000;
     req.client_id = cpu_to_le64(client_id);
     req.features = 0;
 
-    /* 发送裸握手请求 (18 字节) */
+    /* 记录到 conn, 供帧头 route_hash 计算用 */
+    conn->client_id = client_id;
+    conn->channel = req.channel;
+
+    /* 发送裸握手请求 (20 字节) */
     memset(&msg, 0, sizeof(msg));
     iov.iov_base = (void *)&req;
     iov.iov_len = sizeof(req);
@@ -943,8 +1142,8 @@ EXPORT_SYMBOL_GPL(powerfs_conn_set_state);
  * 关键并发安全:
  *   - global_lock (rwlock_t) 保护 sk_user_data 解引用: 回调 read_lock_bh,
  *     set/reset_callbacks write_lock_bh (参照 Lustre socklnd_lib.c:455)
- *   - sched->lock (spinlock_t) 保护 rx_conns/tx_conns: 回调投递和调度器消费
- *     都 spin_lock_bh
+ *   - sched->rx_lock 保护 rx_conns, sched->tx_lock 保护 tx_conns: 回调投递和
+ *     调度器消费都 spin_lock_bh; 两把锁独立, 收发路径互不阻塞
  *   - conn kref: 回调投递时 get, 调度器处理完 put; disconnect 等 kref==1 才
  *     sock_release (防调度器在飞时 UAF)
  */
@@ -988,7 +1187,8 @@ static struct powerfs_net_sched *pfs_pick_sched(const char *addr)
 }
 
 /* P3.1: 按 addr hash 选 volume 调度器 (数据 I/O, 独立于 filer 调度器) */
-static struct powerfs_net_sched *pfs_pick_vol_sched(const char *addr)
+static struct powerfs_net_sched *pfs_pick_vol_sched(const char *addr,
+                                                    enum powerfs_net_server_type type)
 {
     u32 hash = 0;
 
@@ -998,7 +1198,17 @@ static struct powerfs_net_sched *pfs_pick_vol_sched(const char *addr)
         hash = hash * 31 + (u8)(*addr);
         addr++;
     }
-    return &g_pool.vol_schedulers[hash % g_pool.num_vol_sched];
+    /* DATA 和 META 连接使用不同调度器, 防止大帧 DATA 发送阻塞 lease 请求.
+     * 将调度器池对半分: 前半给 DATA, 后半给 META.
+     * num_vol_sched = num_online_cpus(), 每类至少 1 个调度器.
+     * 单 CPU (num_vol_sched==1) 时 data/meta 共用 sched[0], 避免越界. */
+    if (g_pool.num_vol_sched < 2)
+        return &g_pool.vol_schedulers[0];
+    if (type == POWERFS_NET_SERVER_VOLUME_META) {
+        int half = g_pool.num_vol_sched / 2;
+        return &g_pool.vol_schedulers[half + (hash % half)];
+    }
+    return &g_pool.vol_schedulers[hash % (g_pool.num_vol_sched / 2)];
 }
 
 /* 初始化调度器数组: 按 num_online_cpus() 分配 + 启动每 CPU 一个调度器线程
@@ -1028,25 +1238,97 @@ static int powerfs_sched_init(void)
     for (i = 0; i < g_pool.num_sched; i++) {
         struct powerfs_net_sched *sched = &g_pool.schedulers[i];
 
-        spin_lock_init(&sched->lock);
+        spin_lock_init(&sched->rx_lock);
+        spin_lock_init(&sched->tx_lock);
         INIT_LIST_HEAD(&sched->rx_conns);
         INIT_LIST_HEAD(&sched->tx_conns);
-        init_waitqueue_head(&sched->waitq);
+        init_waitqueue_head(&sched->rx_waitq);
+        init_waitqueue_head(&sched->tx_waitq);
         sched->cpt = i;
-        sched->task = kthread_run(pfs_scheduler_thread, sched,
-                                  "pfs_sched/%d", i);
-        if (IS_ERR(sched->task)) {
-            ret = PTR_ERR(sched->task);
-            pr_err("powerfs: failed to start scheduler %d: %d\n", i, ret);
-            sched->task = NULL;
-            /* 回滚已启动的线程 */
+
+        /* Per-sched 复用收帧缓冲 (避免每帧 kvmalloc 2MB) */
+        sched->rx_body_buf = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
+        sched->rx_data_buf = kvmalloc(POWERFS_NET_MAX_DATA, GFP_KERNEL);
+        if (!sched->rx_body_buf || !sched->rx_data_buf) {
+            pr_err("powerfs: OOM rx bufs for filer sched %d\n", i);
+            kfree(sched->rx_body_buf);
+            kvfree(sched->rx_data_buf);
+            sched->rx_body_buf = NULL;
+            sched->rx_data_buf = NULL;
+            while (--i >= 0) {
+                kfree(g_pool.schedulers[i].rx_body_buf);
+                kvfree(g_pool.schedulers[i].rx_data_buf);
+                g_pool.schedulers[i].rx_body_buf = NULL;
+                g_pool.schedulers[i].rx_data_buf = NULL;
+            }
+            kfree(g_pool.schedulers);
+            g_pool.schedulers = NULL;
+            g_pool.num_sched = 0;
+            return -ENOMEM;
+        }
+
+        sched->rx_task = kthread_run(pfs_rx_thread_fn, sched,
+                                     "pfs_rx/%d", i);
+        if (IS_ERR(sched->rx_task)) {
+            ret = PTR_ERR(sched->rx_task);
+            pr_err("powerfs: failed to start rx sched %d: %d\n", i, ret);
+            sched->rx_task = NULL;
+            kfree(sched->rx_body_buf);
+            kvfree(sched->rx_data_buf);
+            sched->rx_body_buf = NULL;
+            sched->rx_data_buf = NULL;
             atomic_set(&g_pool.stopping, 1);
             while (--i >= 0) {
-                wake_up_all(&g_pool.schedulers[i].waitq);
-                if (g_pool.schedulers[i].task) {
-                    kthread_stop(g_pool.schedulers[i].task);
-                    g_pool.schedulers[i].task = NULL;
+                wake_up_all(&g_pool.schedulers[i].rx_waitq);
+                wake_up_all(&g_pool.schedulers[i].tx_waitq);
+                if (g_pool.schedulers[i].rx_task) {
+                    kthread_stop(g_pool.schedulers[i].rx_task);
+                    g_pool.schedulers[i].rx_task = NULL;
                 }
+                if (g_pool.schedulers[i].tx_task) {
+                    kthread_stop(g_pool.schedulers[i].tx_task);
+                    g_pool.schedulers[i].tx_task = NULL;
+                }
+                kfree(g_pool.schedulers[i].rx_body_buf);
+                kvfree(g_pool.schedulers[i].rx_data_buf);
+                g_pool.schedulers[i].rx_body_buf = NULL;
+                g_pool.schedulers[i].rx_data_buf = NULL;
+            }
+            kfree(g_pool.schedulers);
+            g_pool.schedulers = NULL;
+            g_pool.num_sched = 0;
+            atomic_set(&g_pool.stopping, 0);
+            return ret;
+        }
+
+        sched->tx_task = kthread_run(pfs_tx_thread_fn, sched,
+                                     "pfs_tx/%d", i);
+        if (IS_ERR(sched->tx_task)) {
+            ret = PTR_ERR(sched->tx_task);
+            pr_err("powerfs: failed to start tx sched %d: %d\n", i, ret);
+            sched->tx_task = NULL;
+            kfree(sched->rx_body_buf);
+            kvfree(sched->rx_data_buf);
+            sched->rx_body_buf = NULL;
+            sched->rx_data_buf = NULL;
+            kthread_stop(sched->rx_task);
+            sched->rx_task = NULL;
+            atomic_set(&g_pool.stopping, 1);
+            while (--i >= 0) {
+                wake_up_all(&g_pool.schedulers[i].rx_waitq);
+                wake_up_all(&g_pool.schedulers[i].tx_waitq);
+                if (g_pool.schedulers[i].rx_task) {
+                    kthread_stop(g_pool.schedulers[i].rx_task);
+                    g_pool.schedulers[i].rx_task = NULL;
+                }
+                if (g_pool.schedulers[i].tx_task) {
+                    kthread_stop(g_pool.schedulers[i].tx_task);
+                    g_pool.schedulers[i].tx_task = NULL;
+                }
+                kfree(g_pool.schedulers[i].rx_body_buf);
+                kvfree(g_pool.schedulers[i].rx_data_buf);
+                g_pool.schedulers[i].rx_body_buf = NULL;
+                g_pool.schedulers[i].rx_data_buf = NULL;
             }
             kfree(g_pool.schedulers);
             g_pool.schedulers = NULL;
@@ -1077,24 +1359,101 @@ static int powerfs_sched_init(void)
     for (i = 0; i < g_pool.num_vol_sched; i++) {
         struct powerfs_net_sched *sched = &g_pool.vol_schedulers[i];
 
-        spin_lock_init(&sched->lock);
+        spin_lock_init(&sched->rx_lock);
+        spin_lock_init(&sched->tx_lock);
         INIT_LIST_HEAD(&sched->rx_conns);
         INIT_LIST_HEAD(&sched->tx_conns);
-        init_waitqueue_head(&sched->waitq);
+        init_waitqueue_head(&sched->rx_waitq);
+        init_waitqueue_head(&sched->tx_waitq);
         sched->cpt = i;
-        sched->task = kthread_run(pfs_scheduler_thread, sched,
-                                  "pfs_vsched/%d", i);
-        if (IS_ERR(sched->task)) {
-            ret = PTR_ERR(sched->task);
-            pr_err("powerfs: failed to start vol scheduler %d: %d\n", i, ret);
-            sched->task = NULL;
+
+        /* Per-sched 复用收帧缓冲 (同 filer sched) */
+        sched->rx_body_buf = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
+        sched->rx_data_buf = kvmalloc(POWERFS_NET_MAX_DATA, GFP_KERNEL);
+        if (!sched->rx_body_buf || !sched->rx_data_buf) {
+            pr_err("powerfs: OOM rx bufs for vol sched %d\n", i);
+            kfree(sched->rx_body_buf);
+            kvfree(sched->rx_data_buf);
+            sched->rx_body_buf = NULL;
+            sched->rx_data_buf = NULL;
+            while (--i >= 0) {
+                kfree(g_pool.vol_schedulers[i].rx_body_buf);
+                kvfree(g_pool.vol_schedulers[i].rx_data_buf);
+                g_pool.vol_schedulers[i].rx_body_buf = NULL;
+                g_pool.vol_schedulers[i].rx_data_buf = NULL;
+            }
+            kfree(g_pool.vol_schedulers);
+            g_pool.vol_schedulers = NULL;
+            g_pool.num_vol_sched = 0;
+            /* 回滚 filer 调度器 */
+            powerfs_sched_exit();
+            return -ENOMEM;
+        }
+
+        sched->rx_task = kthread_run(pfs_rx_thread_fn, sched,
+                                     "pfs_vrx/%d", i);
+        if (IS_ERR(sched->rx_task)) {
+            ret = PTR_ERR(sched->rx_task);
+            pr_err("powerfs: failed to start vol rx sched %d: %d\n", i, ret);
+            sched->rx_task = NULL;
+            kfree(sched->rx_body_buf);
+            kvfree(sched->rx_data_buf);
+            sched->rx_body_buf = NULL;
+            sched->rx_data_buf = NULL;
             atomic_set(&g_pool.stopping, 1);
             while (--i >= 0) {
-                wake_up_all(&g_pool.vol_schedulers[i].waitq);
-                if (g_pool.vol_schedulers[i].task) {
-                    kthread_stop(g_pool.vol_schedulers[i].task);
-                    g_pool.vol_schedulers[i].task = NULL;
+                wake_up_all(&g_pool.vol_schedulers[i].rx_waitq);
+                wake_up_all(&g_pool.vol_schedulers[i].tx_waitq);
+                if (g_pool.vol_schedulers[i].rx_task) {
+                    kthread_stop(g_pool.vol_schedulers[i].rx_task);
+                    g_pool.vol_schedulers[i].rx_task = NULL;
                 }
+                if (g_pool.vol_schedulers[i].tx_task) {
+                    kthread_stop(g_pool.vol_schedulers[i].tx_task);
+                    g_pool.vol_schedulers[i].tx_task = NULL;
+                }
+                kfree(g_pool.vol_schedulers[i].rx_body_buf);
+                kvfree(g_pool.vol_schedulers[i].rx_data_buf);
+                g_pool.vol_schedulers[i].rx_body_buf = NULL;
+                g_pool.vol_schedulers[i].rx_data_buf = NULL;
+            }
+            kfree(g_pool.vol_schedulers);
+            g_pool.vol_schedulers = NULL;
+            g_pool.num_vol_sched = 0;
+            atomic_set(&g_pool.stopping, 0);
+            /* 回滚 filer 调度器 */
+            powerfs_sched_exit();
+            return ret;
+        }
+
+        sched->tx_task = kthread_run(pfs_tx_thread_fn, sched,
+                                     "pfs_vtx/%d", i);
+        if (IS_ERR(sched->tx_task)) {
+            ret = PTR_ERR(sched->tx_task);
+            pr_err("powerfs: failed to start vol tx sched %d: %d\n", i, ret);
+            sched->tx_task = NULL;
+            kfree(sched->rx_body_buf);
+            kvfree(sched->rx_data_buf);
+            sched->rx_body_buf = NULL;
+            sched->rx_data_buf = NULL;
+            kthread_stop(sched->rx_task);
+            sched->rx_task = NULL;
+            atomic_set(&g_pool.stopping, 1);
+            while (--i >= 0) {
+                wake_up_all(&g_pool.vol_schedulers[i].rx_waitq);
+                wake_up_all(&g_pool.vol_schedulers[i].tx_waitq);
+                if (g_pool.vol_schedulers[i].rx_task) {
+                    kthread_stop(g_pool.vol_schedulers[i].rx_task);
+                    g_pool.vol_schedulers[i].rx_task = NULL;
+                }
+                if (g_pool.vol_schedulers[i].tx_task) {
+                    kthread_stop(g_pool.vol_schedulers[i].tx_task);
+                    g_pool.vol_schedulers[i].tx_task = NULL;
+                }
+                kfree(g_pool.vol_schedulers[i].rx_body_buf);
+                kvfree(g_pool.vol_schedulers[i].rx_data_buf);
+                g_pool.vol_schedulers[i].rx_body_buf = NULL;
+                g_pool.vol_schedulers[i].rx_data_buf = NULL;
             }
             kfree(g_pool.vol_schedulers);
             g_pool.vol_schedulers = NULL;
@@ -1120,14 +1479,24 @@ static void powerfs_sched_exit(void)
     /* P3.1: 先清理 volume 调度器池 */
     if (g_pool.vol_schedulers) {
         atomic_set(&g_pool.stopping, 1);
-        for (i = 0; i < g_pool.num_vol_sched; i++)
-            wake_up_all(&g_pool.vol_schedulers[i].waitq);
+        for (i = 0; i < g_pool.num_vol_sched; i++) {
+            wake_up_all(&g_pool.vol_schedulers[i].rx_waitq);
+            wake_up_all(&g_pool.vol_schedulers[i].tx_waitq);
+        }
 
         for (i = 0; i < g_pool.num_vol_sched; i++) {
-            if (g_pool.vol_schedulers[i].task) {
-                kthread_stop(g_pool.vol_schedulers[i].task);
-                g_pool.vol_schedulers[i].task = NULL;
+            if (g_pool.vol_schedulers[i].rx_task) {
+                kthread_stop(g_pool.vol_schedulers[i].rx_task);
+                g_pool.vol_schedulers[i].rx_task = NULL;
             }
+            if (g_pool.vol_schedulers[i].tx_task) {
+                kthread_stop(g_pool.vol_schedulers[i].tx_task);
+                g_pool.vol_schedulers[i].tx_task = NULL;
+            }
+            kfree(g_pool.vol_schedulers[i].rx_body_buf);
+            kvfree(g_pool.vol_schedulers[i].rx_data_buf);
+            g_pool.vol_schedulers[i].rx_body_buf = NULL;
+            g_pool.vol_schedulers[i].rx_data_buf = NULL;
         }
 
         kfree(g_pool.vol_schedulers);
@@ -1141,14 +1510,24 @@ static void powerfs_sched_exit(void)
 
     /* 确保调度器线程看到 stopping 并退出 (kthread_stop 也会唤醒) */
     atomic_set(&g_pool.stopping, 1);
-    for (i = 0; i < g_pool.num_sched; i++)
-        wake_up_all(&g_pool.schedulers[i].waitq);
+    for (i = 0; i < g_pool.num_sched; i++) {
+        wake_up_all(&g_pool.schedulers[i].rx_waitq);
+        wake_up_all(&g_pool.schedulers[i].tx_waitq);
+    }
 
     for (i = 0; i < g_pool.num_sched; i++) {
-        if (g_pool.schedulers[i].task) {
-            kthread_stop(g_pool.schedulers[i].task);
-            g_pool.schedulers[i].task = NULL;
+        if (g_pool.schedulers[i].rx_task) {
+            kthread_stop(g_pool.schedulers[i].rx_task);
+            g_pool.schedulers[i].rx_task = NULL;
         }
+        if (g_pool.schedulers[i].tx_task) {
+            kthread_stop(g_pool.schedulers[i].tx_task);
+            g_pool.schedulers[i].tx_task = NULL;
+        }
+        kfree(g_pool.schedulers[i].rx_body_buf);
+        kvfree(g_pool.schedulers[i].rx_data_buf);
+        g_pool.schedulers[i].rx_body_buf = NULL;
+        g_pool.schedulers[i].rx_data_buf = NULL;
     }
 
     kfree(g_pool.schedulers);
@@ -1229,33 +1608,33 @@ static void pfs_rx_callback(struct powerfs_net_server_conn *conn)
     if (!sched)
         return;
 
-    spin_lock_bh(&sched->lock);
+    spin_lock_bh(&sched->rx_lock);
     conn->rx_ready = 1;
     if (!conn->rx_scheduled) {
         list_add_tail(&conn->rx_list, &sched->rx_conns);
         conn->rx_scheduled = 1;
         powerfs_conn_get(conn);            /* 调度器持引用 (防收发中拆除) */
-        wake_up(&sched->waitq);
+        wake_up(&sched->rx_waitq);
     }
-    spin_unlock_bh(&sched->lock);
+    spin_unlock_bh(&sched->rx_lock);
 }
 
-/* TX 回调: 标记 tx_ready + 投递到 sched->tx_conns + 唤醒调度器 */
+/* TX 回调: 标记 tx_ready + 投递到 sched->tx_conns + 唤醒 TX 线程 */
 static void pfs_tx_callback(struct powerfs_net_server_conn *conn)
 {
     struct powerfs_net_sched *sched = conn->sched;
     if (!sched)
         return;
 
-    spin_lock_bh(&sched->lock);
+    spin_lock_bh(&sched->tx_lock);
     conn->tx_ready = 1;
     if (!conn->tx_scheduled) {
         list_add_tail(&conn->tx_list, &sched->tx_conns);
         conn->tx_scheduled = 1;
         powerfs_conn_get(conn);
-        wake_up(&sched->waitq);
+        wake_up(&sched->tx_waitq);
     }
-    spin_unlock_bh(&sched->lock);
+    spin_unlock_bh(&sched->tx_lock);
 }
 
 /* 建连: 保存原始回调 + 安装自定义回调 (参照 Lustre ksocknal_lib_save_callback +
@@ -1297,145 +1676,298 @@ static void pfs_conn_reset_callbacks(struct powerfs_net_server_conn *conn)
 /* === 调度器线程 (process context, per-CPU, 参照 Lustre ksocknal_scheduler
  * socklnd_cb.c:1347-1508) === */
 
-static int pfs_sched_cansleep(struct powerfs_net_sched *sched)
-{
-    return list_empty(&sched->rx_conns) && list_empty(&sched->tx_conns);
-}
-
-static int pfs_scheduler_thread(void *arg)
+/* RX 线程: 只处理 rx_conns (收响应), 不受 TX 阻塞影响.
+ * TX 线程在 kernel_sendmsg 阻塞时, RX 线程仍可收响应 → 避免 10s 超时.
+ *
+ * v2: wait_event_interruptible_timeout(500ms) 防回调 race
+ *   (sk_data_ready 在 rx_scheduled=1 期间触发, 可能错过 wake_up).
+ *   超时后回到循环顶重新检查 rx_conns, 不依赖唤醒. */
+static int pfs_rx_thread_fn(void *arg)
 {
     struct powerfs_net_sched *sched = arg;
     struct powerfs_net_server_conn *conn;
 
-    spin_lock_bh(&sched->lock);
+    spin_lock_bh(&sched->rx_lock);
 
     while (!atomic_read(&g_pool.stopping) && !kthread_should_stop()) {
-        bool did = false;
-
-        /* 1. 收: 取 rx 就绪连接 */
         conn = list_first_entry_or_null(&sched->rx_conns,
                                         struct powerfs_net_server_conn,
                                         rx_list);
         if (conn) {
             list_del_init(&conn->rx_list);
-            /* 清 rx_ready: 回调可在释放锁后随时再置位 */
+            spin_unlock_bh(&sched->rx_lock);
+
+            pfs_process_receive(conn);
+
+            /* 重新检查 rx_ready 必须在 rx_lock 下做, 与 sk_data_ready
+             * 回调 (pfs_rx_callback) 互斥. 否则无锁清 rx_ready=0 会
+             * clobber 回调刚设的 rx_ready=1, 导致有数据但 conn 不再
+             * 被投递 → 响应 stall 直到下次数据到达. */
+            spin_lock_bh(&sched->rx_lock);
             conn->rx_ready = 0;
-            spin_unlock_bh(&sched->lock);
-
-            pfs_process_receive(conn);   /* sock_recvmsg → 解帧 → seq 分发 → complete */
-
-            spin_lock_bh(&sched->lock);
-            /* 若收的过程中又有数据/缓冲区仍有数据, 重新挂回 */
+            if (conn->sock && conn->sock->sk &&
+                !skb_queue_empty(&conn->sock->sk->sk_receive_queue))
+                conn->rx_ready = 1;
             if (conn->rx_ready)
                 list_add_tail(&conn->rx_list, &sched->rx_conns);
             else {
                 conn->rx_scheduled = 0;
-                powerfs_conn_put(conn);  /* 释放调度器引用 */
+                powerfs_conn_put(conn);
             }
-            did = true;
+        } else {
+            spin_unlock_bh(&sched->rx_lock);
+            /* 500ms timeout: 即使没收到 wake_up (回调 race), 也定期
+             * 醒来检查 rx_conns, 避免遗漏的 conn 永远等不到处理. */
+            wait_event_interruptible_timeout(sched->rx_waitq,
+                !list_empty(&sched->rx_conns) ||
+                atomic_read(&g_pool.stopping) ||
+                kthread_should_stop(),
+                msecs_to_jiffies(500));
+            spin_lock_bh(&sched->rx_lock);
         }
 
-        /* 2. 发: 取 tx 就绪连接 */
+        if (need_resched()) {
+            spin_unlock_bh(&sched->rx_lock);
+            cond_resched();
+            spin_lock_bh(&sched->rx_lock);
+        }
+    }
+
+    spin_unlock_bh(&sched->rx_lock);
+    return 0;
+}
+
+/* TX 线程: 只处理 tx_conns (发请求), 可在 kernel_sendmsg 阻塞
+ * (sk_sndtimeo=10s) 而不影响 RX. */
+static int pfs_tx_thread_fn(void *arg)
+{
+    struct powerfs_net_sched *sched = arg;
+    struct powerfs_net_server_conn *conn;
+
+    spin_lock_bh(&sched->tx_lock);
+
+    while (!atomic_read(&g_pool.stopping) && !kthread_should_stop()) {
         conn = list_first_entry_or_null(&sched->tx_conns,
                                         struct powerfs_net_server_conn,
                                         tx_list);
         if (conn) {
             list_del_init(&conn->tx_list);
             conn->tx_ready = 0;
-            spin_unlock_bh(&sched->lock);
+            spin_unlock_bh(&sched->tx_lock);
 
-            pfs_process_transmit(conn);  /* 取 tx_queue → kernel_sendmsg */
+            pfs_process_transmit(conn);
 
-            spin_lock_bh(&sched->lock);
-            /* process_transmit 内部处理 EAGAIN: 若仍需发送且可写, 重新挂回 */
+            spin_lock_bh(&sched->tx_lock);
             if (conn->tx_ready)
                 list_add_tail(&conn->tx_list, &sched->tx_conns);
             else {
                 conn->tx_scheduled = 0;
                 powerfs_conn_put(conn);
             }
-            did = true;
-        }
-
-        /* 3. 无事可做 → 等待; 或 hogging CPU → cond_resched */
-        if (!did) {
-            spin_unlock_bh(&sched->lock);
-            wait_event_interruptible(sched->waitq,
-                !pfs_sched_cansleep(sched) ||
+        } else {
+            spin_unlock_bh(&sched->tx_lock);
+            wait_event_interruptible(sched->tx_waitq,
+                !list_empty(&sched->tx_conns) ||
                 atomic_read(&g_pool.stopping) ||
                 kthread_should_stop());
-            spin_lock_bh(&sched->lock);
-        } else if (need_resched()) {
-            spin_unlock_bh(&sched->lock);
+            spin_lock_bh(&sched->tx_lock);
+        }
+
+        if (need_resched()) {
+            spin_unlock_bh(&sched->tx_lock);
             cond_resched();
-            spin_lock_bh(&sched->lock);
+            spin_lock_bh(&sched->tx_lock);
         }
     }
 
-    spin_unlock_bh(&sched->lock);
+    spin_unlock_bh(&sched->tx_lock);
     return 0;
 }
 
-/* === 收: 单帧处理 (从 v1 rx_thread_fn 提取, 调度器调用) ===
+/* === v2 RX 非阻塞状态机 (对齐 TX send_offset 设计) ===
  *
- * 调度器是 process context, 可 kmalloc(GFP_KERNEL). 每帧 kmalloc+free
- * (简单, 避免线程级缓存的生命周期管理). recv 用 sk_rcvtimeo (10s) 非阻塞.
- * recv 返回 <=0 (非 EAGAIN/EINTR) 时 schedule_work(disconnect_work) 并 return. */
-static void pfs_process_receive(struct powerfs_net_server_conn *conn)
+ * 问题: 旧版 pfs_process_receive 用 powerfs_net_frame_recv (MSG_WAITALL +
+ *       sk_rcvtimeo=10s) 收一帧. 大响应 (1MB needle) 分多 TCP 段到达时,
+ *       MSG_WAITALL 阻塞等剩余字节最长 10s, 期间同一 sched 上其他 conn
+ *       的响应全部排队等待 (1MB 文件 10s 延迟根因).
+ * 方案: per-conn 状态机, MSG_DONTWAIT + 断点续收:
+ *   - 每帧分 3 段: hdr(28B) -> body -> data
+ *   - 每段记录已收字节数 (rx_hdr_got/rx_body_got/rx_data_got)
+ *   - EAGAIN 时保留 partial 状态退出, 等 sk_data_ready 下次回调续收
+ *   - 一帧完整后 dispatch (lookup req + complete) + reset, 继续收下一帧
+ *   - 内循环直到 skb_queue 空 (单 conn 最多 64 帧防饿死其他 conn)
+ * buffer 必须在 conn 上 (sched 共享 buffer 切 conn 时 partial 会丢失). */
+
+/* 重置 partial 状态 (新帧开始前 / disconnect / 错误恢复) */
+static void pfs_rx_reset_partial(struct powerfs_net_server_conn *conn)
 {
-    struct powerfs_net_frame_hdr hdr;
-    void *body = NULL;
-    void *data_buf = NULL;
-    size_t body_len = 0, data_len = 0;
+    conn->rx_hdr_got = 0;
+    conn->rx_body_got = 0;
+    conn->rx_data_got = 0;
+    conn->rx_body_total = 0;
+    conn->rx_data_total = 0;
+    conn->rx_phase = 0;
+}
+
+/* 分配 per-conn RX buffer (filer/volume conn init 调用) */
+static int pfs_conn_alloc_rxbuffers(struct powerfs_net_server_conn *conn)
+{
+    conn->rx_body_buf = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
+    if (!conn->rx_body_buf)
+        return -ENOMEM;
+    conn->rx_data_buf = kvmalloc(POWERFS_NET_MAX_DATA, GFP_KERNEL);
+    if (!conn->rx_data_buf) {
+        kfree(conn->rx_body_buf);
+        conn->rx_body_buf = NULL;
+        return -ENOMEM;
+    }
+    pfs_rx_reset_partial(conn);
+    return 0;
+}
+
+/* 释放 per-conn RX buffer (pool_exit / conn 退役调用) */
+static void pfs_conn_free_rxbuffers(struct powerfs_net_server_conn *conn)
+{
+    kfree(conn->rx_body_buf);
+    kvfree(conn->rx_data_buf);
+    conn->rx_body_buf = NULL;
+    conn->rx_data_buf = NULL;
+    pfs_rx_reset_partial(conn);
+}
+
+/* 非阻塞推进一节 (收 hdr / body / data 的剩余字节)
+ * 返回:
+ *   0       - 一帧完整 (rx_phase=3), 调用者应 dispatch + reset
+ *   -EAGAIN - 当前没数据, 保留 partial 状态退出
+ *   <0      - EOF/RST/错误, 触发断连 (调用者 queue disconnect_work) */
+static int pfs_rx_step(struct powerfs_net_server_conn *conn)
+{
+    struct socket *sock = conn->sock;
+    struct kvec vec;
+    struct msghdr msg = {};
+    ssize_t got;
+    size_t want;
+
+    if (!sock)
+        return -ENOTCONN;
+
+    /* 防御: per-conn buffer 必须已分配 (conn init 时分配).
+     * 缺失说明 conn 创建路径漏了 pfs_conn_alloc_rxbuffers, 直接断连避免 oops. */
+    if (WARN_ON_ONCE(!conn->rx_body_buf || !conn->rx_data_buf))
+        return -ENOMEM;
+
+    /* 阶段 0: 收帧头 (28 字节) */
+    if (conn->rx_phase == 0) {
+        want = POWERFS_NET_FRAME_HDR_SIZE - conn->rx_hdr_got;
+        vec.iov_base = conn->rx_hdr_buf + conn->rx_hdr_got;
+        vec.iov_len = want;
+        got = kernel_recvmsg(sock, &msg, &vec, 1, want, MSG_DONTWAIT);
+        if (got == 0)
+            return -ECONNRESET;  /* EOF: 对端关闭 */
+        if (got < 0) {
+            if (got == -EAGAIN || got == -EWOULDBLOCK)
+                return -EAGAIN;
+            return got;
+        }
+        conn->rx_hdr_got += got;
+        if (conn->rx_hdr_got < POWERFS_NET_FRAME_HDR_SIZE)
+            return -EAGAIN;  /* 帧头未收完, 等下次回调 */
+
+        /* 帧头完整, 解码 */
+        if (!powerfs_net_frame_hdr_decode(conn->rx_hdr_buf,
+                                          POWERFS_NET_FRAME_HDR_SIZE,
+                                          &conn->rx_cur_hdr)) {
+            pr_err("powerfs: RX %s:%u invalid frame header\n",
+                   conn->addr, conn->port);
+            return -EINVAL;
+        }
+        /* 解析 body/data 长度 (data_len=总长, body_len=body 段长) */
+        {
+            size_t total = conn->rx_cur_hdr.data_len;
+            size_t body_sz = conn->rx_cur_hdr.body_len;
+            if (body_sz > total)
+                body_sz = total;  /* 防御: body_len 异常时钳制 */
+            conn->rx_body_total = body_sz;
+            conn->rx_data_total = total - body_sz;
+            if (conn->rx_body_total > POWERFS_NET_MAX_BODY ||
+                conn->rx_data_total > POWERFS_NET_MAX_DATA) {
+                pr_err("powerfs: RX %s:%u frame too large body=%zu data=%zu\n",
+                       conn->addr, conn->port,
+                       conn->rx_body_total, conn->rx_data_total);
+                return -E2BIG;
+            }
+        }
+        conn->rx_phase = 1;
+        /* fall through: 继续收 body (非阻塞, 立即试) */
+    }
+
+    /* 阶段 1: 收 body 段 */
+    if (conn->rx_phase == 1) {
+        if (conn->rx_body_total > 0) {
+            want = conn->rx_body_total - conn->rx_body_got;
+            vec.iov_base = conn->rx_body_buf + conn->rx_body_got;
+            vec.iov_len = want;
+            got = kernel_recvmsg(sock, &msg, &vec, 1, want, MSG_DONTWAIT);
+            if (got == 0)
+                return -ECONNRESET;
+            if (got < 0) {
+                if (got == -EAGAIN || got == -EWOULDBLOCK)
+                    return -EAGAIN;
+                return got;
+            }
+            conn->rx_body_got += got;
+            if (conn->rx_body_got < conn->rx_body_total)
+                return -EAGAIN;
+        }
+        conn->rx_phase = 2;
+        /* fall through: 继续收 data */
+    }
+
+    /* 阶段 2: 收 data 段 */
+    if (conn->rx_phase == 2) {
+        if (conn->rx_data_total > 0) {
+            want = conn->rx_data_total - conn->rx_data_got;
+            vec.iov_base = conn->rx_data_buf + conn->rx_data_got;
+            vec.iov_len = want;
+            got = kernel_recvmsg(sock, &msg, &vec, 1, want, MSG_DONTWAIT);
+            if (got == 0)
+                return -ECONNRESET;
+            if (got < 0) {
+                if (got == -EAGAIN || got == -EWOULDBLOCK)
+                    return -EAGAIN;
+                return got;
+            }
+            conn->rx_data_got += got;
+            if (conn->rx_data_got < conn->rx_data_total)
+                return -EAGAIN;
+        }
+        conn->rx_phase = 3;
+        return 0;  /* 一帧完整 */
+    }
+
+    return 0;  /* 已是 phase=3 */
+}
+
+/* 一帧完整后处理: NOTIFY 异步帧 或 按 seq 匹配 pending req + complete.
+ * 锁外 memcpy 大块 READ 响应 (持 req_lock 会阻塞 do_send 入队). */
+static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
+{
+    struct powerfs_net_frame_hdr *hdr = &conn->rx_cur_hdr;
+    void *body = conn->rx_body_buf;
+    void *data = conn->rx_data_buf;
+    size_t body_len = conn->rx_body_got;
+    size_t data_len = conn->rx_data_got;
     struct powerfs_request *req = NULL;
-    int ret;
 
-    body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
-    data_buf = kmalloc(POWERFS_NET_MAX_DATA, GFP_KERNEL);
-    if (!body || !data_buf) {
-        pr_err("powerfs: scheduler RX %s:%u OOM\n", conn->addr, conn->port);
-        kfree(body);
-        kfree(data_buf);
-        queue_work(g_pool.reconn_wq, &conn->disconnect_work);
-        return;
-    }
-
-    /* sk_rcvtimeo=10s: 数据到达才被调度器调用, 正常立即返回.
-     * EOF→-ECONNRESET, 超时→-EAGAIN, 错误→负值. */
-    ret = powerfs_net_frame_recv(conn->sock, &hdr,
-                                  body, POWERFS_NET_MAX_BODY, &body_len,
-                                  data_buf, POWERFS_NET_MAX_DATA, &data_len,
-                                  POWERFS_NET_RECV_TIMEOUT);
-    if (ret == -EAGAIN || ret == -EINTR) {
-        /* 超时/中断: 非断连. 检查 socket 缓冲区是否仍有数据 (回调可能已触发). */
-        kfree(body);
-        kfree(data_buf);
-        if (conn->sock && conn->sock->sk &&
-            !skb_queue_empty(&conn->sock->sk->sk_receive_queue))
-            conn->rx_ready = 1;     /* 缓冲区仍有数据, 让调度器重新投递 */
-        return;
-    }
-    if (ret < 0) {
-        /* EOF/RST/keepalive失败/错误 → 断连 */
-        pr_debug("powerfs: scheduler RX %s:%u recv error %d, scheduling disconnect\n",
-                conn->addr, conn->port, ret);
-        kfree(body);
-        kfree(data_buf);
-        queue_work(g_pool.reconn_wq, &conn->disconnect_work);
-        return;
-    }
-
-    /* 异步通知帧 (seq=0 或 NOTIFY flag): invalidate 等主动推送.
-     * Filer 在元数据变更后推送 Invalidate(inode, version) 到所有
-     * 订阅客户端, 客户端据此失效本地 page cache 和目录 lease. */
-    if ((hdr.flags & POWERFS_NET_FLAG_NOTIFY) || hdr.seq == 0) {
+    /* 异步通知帧 (seq=0 或 NOTIFY flag): invalidate 主动推送.
+     * Filer 元数据变更后推 Invalidate(inode, version) 到所有订阅客户端. */
+    if ((hdr->flags & POWERFS_NET_FLAG_NOTIFY) || hdr->seq == 0) {
         __u64 ino = 0;
         __u64 version = 0;
 
         pr_debug("powerfs: RX %s:%u: async notify seq=%u flags=0x%02x\n",
-                 conn->addr, conn->port, hdr.seq, hdr.flags);
+                 conn->addr, conn->port, hdr->seq, hdr->flags);
 
-        /* Parse TLV body: Ino(0x07) + Version(0x19) */
         if (body && body_len > 0) {
             struct powerfs_tlv_dec dec;
             powerfs_tlv_dec_init(&dec, body, body_len);
@@ -1446,29 +1978,19 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn)
         if (ino != 0) {
             pr_debug("powerfs: invalidate ino=%llu version=%llu\n",
                     ino, version);
-            /* powerfs_invalidate_one() calls invalidate_inode_pages2()
-             * which may sleep — safe here because we're in workqueue
-             * (process context), not softirq. */
+            /* powerfs_invalidate_one() may sleep (invalidate_inode_pages2),
+             * safe here in process context (调度器线程). */
             powerfs_invalidate_one(ino);
         } else {
             pr_warn("powerfs: notify frame missing Ino field\n");
         }
-
-        kfree(body);
-        kfree(data_buf);
-        /* 通知帧处理后, 若缓冲区仍有数据, 标记 rx_ready 让调度器继续收 */
-        if (conn->sock && conn->sock->sk &&
-            !skb_queue_empty(&conn->sock->sk->sk_receive_queue))
-            conn->rx_ready = 1;
         return;
     }
 
     /* 按 seq 查找请求, 摘出队列后放锁, 锁外 memcpy + complete.
-     * (参考 pfs_process_transmit 的 "摘出-放锁-处理" 模式)
-     * memcpy 大块 READ 响应可能耗时, 持 req_lock 会阻塞 do_send 入队
-     * 和 disconnect_one 取消路径. */
+     * (参考 pfs_process_transmit 的 "摘出-放锁-处理" 模式) */
     spin_lock(&conn->req_lock);
-    req = powerfs_req_tree_lookup(conn, hdr.seq);
+    req = powerfs_req_tree_lookup(conn, hdr->seq);
     if (req) {
         if (!list_empty(&req->list_node))
             list_del_init(&req->list_node);
@@ -1477,8 +1999,13 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn)
     spin_unlock(&conn->req_lock);
 
     if (req) {
-        /* 锁外填充响应数据 */
-        req->resp_status = hdr.status;
+        /* 先把日志字段读到本地: complete() 后等待线程可能立即释放 req
+         * (kref_put → kfree), 再读 req->* 会 UAF. */
+        u64 ts_submit = req->ts_submit;
+        u32 seq = req->seq;
+        u16 msg_type = req->msg_type;
+
+        req->resp_status = hdr->status;
         req->error = 0;
         req->resp_body_len = 0;
         if (req->resp_body && body_len > 0) {
@@ -1489,22 +2016,70 @@ static void pfs_process_receive(struct powerfs_net_server_conn *conn)
         req->resp_data_len = 0;
         if (req->resp_data && data_len > 0) {
             size_t c = min(data_len, req->resp_data_cap);
-            memcpy(req->resp_data, data_buf, c);
+            memcpy(req->resp_data, data, c);
             req->resp_data_len = c;
         }
         complete(&req->done);
+
+        /* 响应接收计时: >100ms 打 info (帮助定位大响应延迟).
+         * 用本地变量, req 可能已被等待线程释放. */
+        if (ts_submit) {
+            u64 dur_us = div_u64(ktime_get_ns() - ts_submit, 1000);
+            if (dur_us > 100000)
+                pr_info("powerfs: SLOW_RX seq=%u msg=0x%04x dur=%llums\n",
+                        seq, msg_type, div_u64(dur_us, 1000));
+        }
     } else {
         pr_debug("powerfs: RX %s:%u: no pending req for seq=%u\n",
-                 conn->addr, conn->port, hdr.seq);
+                 conn->addr, conn->port, hdr->seq);
     }
+}
 
-    /* 收完一帧后, 若缓冲区仍有数据, 标记 rx_ready 让调度器继续收 */
-    if (conn->sock && conn->sock->sk &&
-        !skb_queue_empty(&conn->sock->sk->sk_receive_queue))
-        conn->rx_ready = 1;
+/* === 收: 调度器 RX 线程调用, 非阻塞内循环收完所有可用帧 ===
+ *
+ * 设计要点:
+ *   1. MSG_DONTWAIT 永不阻塞 → 单 conn 最多卡一次 syscall (微秒级)
+ *   2. 一帧收不全保留 partial → 大响应可跨多次 sk_data_ready 续收
+ *   3. 内循环 while(1) 直到 skb_queue_empty → 队列空才退 (对齐诉求1)
+ *   4. 单 conn 最多 64 帧后让出 → 防止饿死 sched 上其他 conn
+ *   5. EOF/RST/错误 → queue_work(disconnect_work), reset partial */
+static void pfs_process_receive(struct powerfs_net_server_conn *conn)
+{
+    int ret;
+    int frames = 0;
 
-    kfree(body);
-    kfree(data_buf);
+    while (1) {
+        ret = pfs_rx_step(conn);
+        if (ret == 0) {
+            /* 一帧完整: dispatch + reset, 继续收下一帧 */
+            pfs_rx_dispatch(conn);
+            pfs_rx_reset_partial(conn);
+            frames++;
+            if (frames >= 64) {
+                /* 防止一个 conn 占用 sched 过久, 让出给其他 conn.
+                 * rx_ready 的最终决定交给 pfs_rx_thread_fn 在 rx_lock 下做. */
+                break;
+            }
+            continue;
+        }
+        if (ret == -EAGAIN) {
+            /* 当前没数据. 检查 skb_queue:
+             *   非空 → 继续 (数据已在 queue, 重试 recv)
+             *   空  → break, rx_ready 的最终决定交给 pfs_rx_thread_fn
+             *         在 rx_lock 下做 (避免与 sk_data_ready 回调 race:
+             *         无锁清 rx_ready=0 会 clobber 回调刚设的 rx_ready=1) */
+            if (conn->sock && conn->sock->sk &&
+                !skb_queue_empty(&conn->sock->sk->sk_receive_queue))
+                continue;
+            break;
+        }
+        /* EOF/RST/错误 → 断连, reset partial 状态 */
+        pr_debug("powerfs: scheduler RX %s:%u step error %d, scheduling disconnect\n",
+                conn->addr, conn->port, ret);
+        pfs_rx_reset_partial(conn);
+        queue_work(g_pool.reconn_wq, &conn->disconnect_work);
+        return;
+    }
 }
 
 /* === 发: 从 tx_queue 取请求发送 (调度器调用) ===
@@ -1541,15 +2116,20 @@ static void pfs_process_transmit(struct powerfs_net_server_conn *conn)
                                   POWERFS_NET_FLAG_REQUEST,
                                   req->seq, 0,
                                   req->req_body_len,
-                                  req->req_body_len + req->req_data_len);
+                                  req->req_body_len + req->req_data_len,
+                                  pfs_route_hash(conn->client_id, conn->channel));
 
-    ret = powerfs_net_frame_send(sock, &hdr,
-                                  req->req_body, req->req_body_len,
-                                  req->req_data, req->req_data_len);
+    if (req->ts_submit == 0)
+        req->ts_submit = ktime_get_ns();
+
+    ret = pfs_frame_send_nonblock(sock, &hdr,
+                                   req->req_body, req->req_body_len,
+                                   req->req_data, req->req_data_len, req);
 
     if (ret == -EAGAIN || ret == -ENOMEM) {
-        /* 可写空间不足: 重挂回 tx_queue head, 等 write_space 回调.
-         * 不设置 tx_ready (由 write_space 回调设置), 调度器会清 tx_scheduled. */
+        /* TCP 缓冲区满 (MSG_DONTWAIT): 保留 send_offset, 重挂 tx_queue head.
+         * 等 sk_write_space 回调触发 pfs_tx_schedule 重新调度.
+         * send_offset 保证下次从断点续发, 不会重发 header 导致错位. */
         spin_lock(&conn->tx_lock);
         list_add(&req->tx_list, &conn->tx_queue);
         spin_unlock(&conn->tx_lock);
@@ -1572,14 +2152,23 @@ static void pfs_process_transmit(struct powerfs_net_server_conn *conn)
     }
 
     /* 发送成功: req 留在 pending_reqs/req_tree 等响应.
-     * 若 tx_queue 还有积压, 设置 tx_ready 让调度器重新投递. */
+     * 若 tx_queue 还有积压, 设置 tx_ready 让调度器重新投递.
+     * 不清零 ts_submit: 它记录 do_send 入口时间, RX 收到响应时
+     * pfs_rx_dispatch 用它计算端到端延迟 (SLOW_RX 日志). */
+    if (req->ts_submit) {
+        u64 dur_us = div_u64(ktime_get_ns() - req->ts_submit, 1000);
+        if (dur_us > 50000)  /* >50ms 的大帧发送打 debug 日志 */
+            pr_debug("powerfs: tx done seq=%u msg=%u body=%zu data=%zu dur=%llutus\n",
+                     req->seq, req->msg_type, req->req_body_len,
+                     req->req_data_len, dur_us);
+    }
     spin_lock(&conn->tx_lock);
     if (!list_empty(&conn->tx_queue))
         conn->tx_ready = 1;
     spin_unlock(&conn->tx_lock);
 }
 
-/* do_send / 重发路径调用: 标记 tx_ready + 投递到 tx_conns + 唤醒调度器.
+/* do_send / 重发路径调用: 标记 tx_ready + 投递到 tx_conns + 唤醒 TX 线程.
  * 与 pfs_tx_callback 的核心逻辑相同, 但可从 process context 调用. */
 static void pfs_tx_schedule(struct powerfs_net_server_conn *conn)
 {
@@ -1587,15 +2176,15 @@ static void pfs_tx_schedule(struct powerfs_net_server_conn *conn)
     if (!sched)
         return;
 
-    spin_lock_bh(&sched->lock);
+    spin_lock_bh(&sched->tx_lock);
     conn->tx_ready = 1;
     if (!conn->tx_scheduled) {
         list_add_tail(&conn->tx_list, &sched->tx_conns);
         conn->tx_scheduled = 1;
         powerfs_conn_get(conn);
-        wake_up(&sched->waitq);
+        wake_up(&sched->tx_waitq);
     }
-    spin_unlock_bh(&sched->lock);
+    spin_unlock_bh(&sched->tx_lock);
 }
 
 /* disconnect 调用: 从 sched 的 rx_conns/tx_conns 摘除 conn.
@@ -1610,20 +2199,25 @@ static void pfs_conn_remove_from_sched(struct powerfs_net_server_conn *conn)
     if (!sched)
         return;
 
-    spin_lock_bh(&sched->lock);
+    /* 分别加 rx_lock/tx_lock, 顺序获取不嵌套 → 无死锁风险.
+     * rx_list 和 tx_list 是独立链表节点, 分别归属各自队列, 无共享状态. */
+    spin_lock_bh(&sched->rx_lock);
     if (conn->rx_scheduled && !list_empty(&conn->rx_list)) {
         list_del_init(&conn->rx_list);
         conn->rx_scheduled = 0;
         conn->rx_ready = 0;
         put_rx = true;
     }
+    spin_unlock_bh(&sched->rx_lock);
+
+    spin_lock_bh(&sched->tx_lock);
     if (conn->tx_scheduled && !list_empty(&conn->tx_list)) {
         list_del_init(&conn->tx_list);
         conn->tx_scheduled = 0;
         conn->tx_ready = 0;
         put_tx = true;
     }
-    spin_unlock_bh(&sched->lock);
+    spin_unlock_bh(&sched->tx_lock);
 
     if (put_rx)
         powerfs_conn_put(conn);
@@ -1804,6 +2398,11 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
         powerfs_net_close_socket(sock);
     }
 
+    /* v2: 重置 RX partial 状态 (调度器已退出, kref==1, 安全重置).
+     * 重连后复用同一 conn, 必须清掉旧连接残留的 partial 收帧进度,
+     * 否则下次收帧会从错误偏移开始 → 帧错位. */
+    pfs_rx_reset_partial(conn);
+
     /* 唤醒可能在等待重连完成的请求 (兼容旧 submit 路径, 新设计不再等待) */
     wake_up(&conn->reconnect_wq);
 
@@ -1967,6 +2566,14 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         /* kref=1: owner 引用 (g_pool 持有, disconnect 等 refcount==1 才 sock_release) */
         kref_init(&conn->kref);
 
+        /* v2: per-conn RX buffer (非阻塞状态机需要保留 partial, 不能用 sched 共享) */
+        if (pfs_conn_alloc_rxbuffers(conn)) {
+            pr_err("powerfs: filer %s:%u alloc rx buffers failed\n",
+                   conn->addr, conn->port);
+            conn->in_use = false;
+            continue;
+        }
+
         g_pool.filer_count++;
     }
 
@@ -2005,7 +2612,7 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         spin_lock_init(&conn->req_lock);
         INIT_WORK(&conn->disconnect_work, powerfs_conn_disconnect_work_fn);
         /* P3.1: volume 连接走独立调度器池 (vol_schedulers), 避免数据 I/O 饿死元数据 */
-        conn->sched = pfs_pick_vol_sched(conn->addr);
+        conn->sched = pfs_pick_vol_sched(conn->addr, conn->type);
         INIT_LIST_HEAD(&conn->rx_list);
         INIT_LIST_HEAD(&conn->tx_list);
         conn->rx_ready = 0;
@@ -2019,6 +2626,14 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         conn->saved_state_change = NULL;
         conn->saved_error_report = NULL;
         kref_init(&conn->kref);
+
+        /* v2: per-conn RX buffer (与 filer 同模式, 支持非阻塞断点续收) */
+        if (pfs_conn_alloc_rxbuffers(conn)) {
+            pr_err("powerfs: volume %s:%u alloc rx buffers failed\n",
+                   conn->addr, conn->port);
+            conn->in_use = false;
+            continue;
+        }
 
         g_pool.volume_count++;
     }
@@ -2086,6 +2701,15 @@ void powerfs_conn_pool_exit(void)
         powerfs_conn_disconnect_one(conn);
         cancel_work_sync(&conn->disconnect_work);
         conn->in_use = false;
+    }
+
+    /* v2: 释放 per-conn RX buffer (count 尚未清零, 用 count 循环).
+     * 此时所有连接已 disconnect (kref==1, 调度器已放下 conn), 安全释放. */
+    for (i = 0; i < g_pool.filer_count; i++) {
+        pfs_conn_free_rxbuffers(&g_pool.filers[i]);
+    }
+    for (i = 0; i < g_pool.volume_count; i++) {
+        pfs_conn_free_rxbuffers(&g_pool.volumes[i]);
     }
 
     g_pool.filer_count = 0;
@@ -2330,6 +2954,7 @@ static int powerfs_request_do_send(struct powerfs_request *req,
      * 调度器可能在 send 完成前就收到响应 (流水线), 故先入树再入 tx_queue. */
     seq = atomic_inc_return(&conn->seq_counter);
     req->seq = seq;
+    req->ts_submit = ktime_get_ns();
 
     spin_lock(&conn->req_lock);
     /* 若已在链表上 (异常重入/重发), 先移除 */
@@ -2379,6 +3004,15 @@ static int powerfs_request_do_send(struct powerfs_request *req,
 
         wr = wait_for_completion_killable_timeout(&req->done,
                     do_send_deadline - jiffies);
+
+        /* 计时日志: 定位 1MB writeback 慢的根因 */
+        if (req->ts_submit) {
+            u64 dur_us = div_u64(ktime_get_ns() - req->ts_submit, 1000);
+            if (dur_us > 100000)  /* >100ms 的请求打 info 日志 */
+                pr_info("powerfs: SLOW_REQ seq=%u msg=0x%04x dur=%llums conn=%s:%u\n",
+                        seq, req->msg_type, div_u64(dur_us, 1000),
+                        conn->addr, conn->port);
+        }
 
         if (wr < 0) {
             /* 被信号中断 (SIGKILL): 从队列摘除, 返回 -EINTR.
@@ -3874,6 +4508,7 @@ int powerfs_net_add_server(const char *addr, __u16 port,
         g_pool.master_count++;
         break;
     case POWERFS_NET_SERVER_VOLUME:
+    case POWERFS_NET_SERVER_VOLUME_META:
         g_pool.volume_count++;
         break;
     }
@@ -3906,6 +4541,7 @@ int powerfs_net_remove_server(const char *addr, __u16 port)
                 g_pool.master_count--;
                 break;
             case POWERFS_NET_SERVER_VOLUME:
+            case POWERFS_NET_SERVER_VOLUME_META:
                 g_pool.volume_count--;
                 break;
             }
@@ -4110,7 +4746,7 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
         powerfs_net_frame_hdr_encode(&hdr,
                                       POWERFS_NET_MSG_LIST_FILERS,
                                       POWERFS_NET_FLAG_REQUEST,
-                                      seq, 0, 0, 0);
+                                      seq, 0, 0, 0, 0);
 
         ret = powerfs_net_frame_send(sock, &hdr, NULL, 0, NULL, 0);
         if (ret < 0) {
@@ -4155,6 +4791,11 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
                                           sizeof(redirect_addr) - 1);
             if (rret == 0) {
                 redirect_addr[sizeof(redirect_addr) - 1] = '\0';
+                if (redirect_addr[0] == '\0') {
+                    pr_warn("powerfs: master redirect with empty leader addr (master election in progress?), skipping\n");
+                    powerfs_net_close_socket(sock);
+                    continue;
+                }
                 pr_debug("powerfs: master redirect to %s\n",
                         redirect_addr);
 
@@ -4180,7 +4821,7 @@ int powerfs_net_discover_filers(const char *master_addrs, __u16 master_port)
                 powerfs_net_frame_hdr_encode(&hdr,
                                               POWERFS_NET_MSG_LIST_FILERS,
                                               POWERFS_NET_FLAG_REQUEST,
-                                              seq, 0, 0, 0);
+                                              seq, 0, 0, 0, 0);
 
                 ret = powerfs_net_frame_send(sock, &hdr, NULL, 0, NULL, 0);
                 if (ret < 0) {
@@ -4326,29 +4967,159 @@ struct powerfs_net_server_conn *powerfs_net_get_volume_conn(int idx)
     return &g_pool.volumes[idx];
 }
 
-/* 按 volume_id 查找 volume 连接 (vol_routes 路由表 → fallback 首个已连接) */
-struct powerfs_net_server_conn *powerfs_net_find_volume_conn(__u64 volume_id)
+/* 判断 msg_type 是否走 meta 通路 (lease 小请求).
+ * meta 通路与 data 通路 (write/read needle 大帧) 物理分离,
+ * 避免大帧 kernel_sendmsg 阻塞 lease 续约导致 -110 超时. */
+static bool pfs_is_meta_msg(__u16 msg_type)
+{
+    switch (msg_type) {
+    case POWERFS_NET_MSG_ACQUIRE_LEASE:
+    case POWERFS_NET_MSG_RELEASE_LEASE:
+    case POWERFS_NET_MSG_RENEW_LEASE:
+    case POWERFS_NET_MSG_RANGE_LEASE:
+    case POWERFS_NET_MSG_VOLUME_STATUS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* 在 volumes[] 中按 addr+port+type 精确查找已有连接 (discover_volumes 去重用).
+ * 调用者需确保 volume_count 稳定 (持有 pool_lock 或在初始化阶段). */
+static int pfs_find_vol_conn_by_addr(const char *ip, __u16 port,
+                                     enum powerfs_net_server_type type)
+{
+    int i;
+
+    for (i = 0; i < g_pool.volume_count; i++) {
+        struct powerfs_net_server_conn *conn = &g_pool.volumes[i];
+        if (conn->in_use && conn->type == type &&
+            conn->port == port && strcmp(conn->addr, ip) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* 确保 volume server 连接存在 (查找已有或新建).
+ * data 通路用 POWERFS_NET_SERVER_VOLUME, meta 通路用 POWERFS_NET_SERVER_VOLUME_META.
+ * 两条连接到同一 addr:port 但 type 不同, 各自独立 socket/tx_queue/sched 投递,
+ * 物理隔离 write_needle 大帧与 lease 小请求.
+ * 返回 conn_idx (>=0) 或负错误码. */
+static int pfs_ensure_volume_conn(const char *ip, __u16 port,
+                                  enum powerfs_net_server_type type)
+{
+    struct powerfs_net_server_conn *conn;
+    int idx;
+
+    mutex_lock(&g_pool.pool_lock);
+
+    /* 查找已有连接 (按 addr+port+type 去重) */
+    idx = pfs_find_vol_conn_by_addr(ip, port, type);
+    if (idx >= 0) {
+        mutex_unlock(&g_pool.pool_lock);
+        return idx;
+    }
+
+    /* 新建连接 */
+    if (g_pool.volume_count >= POWERFS_NET_MAX_VOLUMES) {
+        mutex_unlock(&g_pool.pool_lock);
+        pr_warn("powerfs: volume pool full, cannot add %s:%u (type=%d)\n",
+                ip, port, type);
+        return -ENOSPC;
+    }
+
+    idx = g_pool.volume_count;
+    conn = &g_pool.volumes[idx];
+    memset(conn, 0, sizeof(*conn));
+
+    strncpy(conn->addr, ip, sizeof(conn->addr) - 1);
+    conn->port = port;
+    conn->type = type;
+    conn->in_use = true;
+    conn->sock = NULL;
+    conn->state = CONN_INIT;
+    atomic_set(&conn->seq_counter, 1);
+    conn->reconnect_count = 0;
+    conn->reconnect_delay = 0;
+
+    spin_lock_init(&conn->state_lock);
+    init_waitqueue_head(&conn->sock_user_wq);
+    init_waitqueue_head(&conn->reconnect_wq);
+    INIT_DELAYED_WORK(&conn->reconnect_work, powerfs_conn_reconnect_work_fn);
+    INIT_LIST_HEAD(&conn->pending_reqs);
+    conn->req_tree = RB_ROOT;
+    spin_lock_init(&conn->req_lock);
+    INIT_WORK(&conn->disconnect_work, powerfs_conn_disconnect_work_fn);
+    conn->sched = pfs_pick_vol_sched(conn->addr, conn->type);
+    INIT_LIST_HEAD(&conn->rx_list);
+    INIT_LIST_HEAD(&conn->tx_list);
+    conn->rx_ready = 0;
+    conn->rx_scheduled = 0;
+    conn->tx_ready = 0;
+    conn->tx_scheduled = 0;
+    INIT_LIST_HEAD(&conn->tx_queue);
+    spin_lock_init(&conn->tx_lock);
+    conn->saved_data_ready = NULL;
+    conn->saved_write_space = NULL;
+    conn->saved_state_change = NULL;
+    conn->saved_error_report = NULL;
+    kref_init(&conn->kref);
+
+    /* v2: per-conn RX buffer (与 pool_init 路径一致, 支持非阻塞断点续收).
+     * 缺失会导致 pfs_rx_step 写入 NULL iov_base → NULL deref oops. */
+    if (pfs_conn_alloc_rxbuffers(conn)) {
+        pr_err("powerfs: vol_route %s:%u alloc rx buffers failed\n", ip, port);
+        conn->in_use = false;
+        mutex_unlock(&g_pool.pool_lock);
+        return -ENOMEM;
+    }
+
+    g_pool.volume_count++;
+    mutex_unlock(&g_pool.pool_lock);
+
+    /* 后台建立 TCP 连接 (不阻塞 mount) */
+    queue_delayed_work(g_pool.reconn_wq, &conn->reconnect_work, 0);
+
+    pr_info("powerfs: vol_route: auto-connected %s:%u (type=%d, %s)\n",
+            ip, port, type,
+            type == POWERFS_NET_SERVER_VOLUME_META ? "meta" : "data");
+    return idx;
+}
+
+/* 按 volume_id 查找 volume 连接 (vol_routes 路由表 → fallback 首个已连接).
+ * is_meta=true 返回 meta conn (lease), false 返回 data conn (needle). */
+struct powerfs_net_server_conn *powerfs_net_find_volume_conn(__u64 volume_id,
+                                                             bool is_meta)
 {
     int i;
 
     spin_lock(&g_pool.vol_route_lock);
     for (i = 0; i < g_pool.vol_route_count; i++) {
         if (g_pool.vol_routes[i].volume_id == volume_id) {
-            int idx = g_pool.vol_routes[i].conn_idx;
+            int idx = is_meta ? g_pool.vol_routes[i].meta_conn_idx
+                              : g_pool.vol_routes[i].conn_idx;
             spin_unlock(&g_pool.vol_route_lock);
+            if (idx < 0)
+                return NULL;
             return powerfs_net_get_volume_conn(idx);
         }
     }
     spin_unlock(&g_pool.vol_route_lock);
 
-    /* Fallback: vol_routes 未命中, 尝试所有 volume 连接 (首个已连接的) */
-    for (i = 0; i < g_pool.volume_count; i++) {
-        struct powerfs_net_server_conn *conn = &g_pool.volumes[i];
-        if (conn->in_use && conn->state == CONN_CONNECTED) {
-            pr_warn("powerfs: find_volume_conn: volume_id=%llu not in vol_routes (%d routes), fallback to volumes[%d] %s:%u\n",
-                    (unsigned long long)volume_id, g_pool.vol_route_count,
-                    i, conn->addr, conn->port);
-            return conn;
+    /* Fallback: vol_routes 未命中, 按 type 找首个已连接的 volume conn */
+    {
+        enum powerfs_net_server_type want = is_meta
+            ? POWERFS_NET_SERVER_VOLUME_META : POWERFS_NET_SERVER_VOLUME;
+
+        for (i = 0; i < g_pool.volume_count; i++) {
+            struct powerfs_net_server_conn *conn = &g_pool.volumes[i];
+            if (conn->in_use && conn->type == want &&
+                conn->state == CONN_CONNECTED) {
+                pr_warn("powerfs: find_volume_conn: volume_id=%llu not in vol_routes (%d routes), fallback to volumes[%d] %s:%u (meta=%d)\n",
+                        (unsigned long long)volume_id, g_pool.vol_route_count,
+                        i, conn->addr, conn->port, is_meta);
+                return conn;
+            }
         }
     }
     return NULL;
@@ -4380,7 +5151,7 @@ int powerfs_net_send_to_volume(int vol_idx, __u64 volume_id,
     if (vol_idx >= 0)
         conn = powerfs_net_get_volume_conn(vol_idx);
     else
-        conn = powerfs_net_find_volume_conn(volume_id);
+        conn = powerfs_net_find_volume_conn(volume_id, pfs_is_meta_msg(msg_type));
 
     if (!conn) {
         pr_warn("powerfs: send_to_volume: no volume conn for volume_id=%llu\n",
@@ -4810,7 +5581,7 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
         powerfs_net_frame_hdr_encode(&hdr,
                                       POWERFS_NET_MSG_GET_TOPOLOGY,
                                       POWERFS_NET_FLAG_REQUEST,
-                                      seq, 0, 0, 0);
+                                      seq, 0, 0, 0, 0);
 
         ret = powerfs_net_frame_send(sock, &hdr, NULL, 0, NULL, 0);
         if (ret < 0) {
@@ -4866,7 +5637,7 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
                 powerfs_net_frame_hdr_encode(&hdr,
                                               POWERFS_NET_MSG_GET_TOPOLOGY,
                                               POWERFS_NET_FLAG_REQUEST,
-                                              seq, 0, 0, 0);
+                                              seq, 0, 0, 0, 0);
                 ret = powerfs_net_frame_send(sock, &hdr, NULL, 0, NULL, 0);
                 if (ret < 0) {
                     powerfs_net_close_socket(sock);
@@ -4958,114 +5729,52 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
             for (i = 0; i < route_count_tmp; i++) {
                 __u64 vid = routes_tmp[i].volume_id;
                 char *vaddr = routes_tmp[i].addr;
-                int conn_idx = -1;
+                int data_idx = -1, meta_idx = -1;
+                char v_ip[64] = {0};
+                __u16 v_port = 0;
+                char *colon;
+                int ip_len;
 
-                /* 精确匹配 "ip:port" */
-                for (j = 0; j < g_pool.volume_count; j++) {
-                    char conn_addr[80];
-                    snprintf(conn_addr, sizeof(conn_addr), "%s:%u",
-                             g_pool.volumes[j].addr, g_pool.volumes[j].port);
-                    if (strcmp(conn_addr, vaddr) == 0) {
-                        conn_idx = j;
-                        break;
-                    }
+                /* 解析 "ip:net_port" */
+                colon = strrchr(vaddr, ':');
+                if (!colon) {
+                    pr_warn("powerfs: vol_route: volume_id=%llu addr=%s invalid (no port)\n",
+                            (unsigned long long)vid, vaddr);
+                    continue;
+                }
+                ip_len = min_t(int, (int)(colon - vaddr), (int)(sizeof(v_ip) - 1));
+                memcpy(v_ip, vaddr, ip_len);
+                v_ip[ip_len] = '\0';
+                v_port = (__u16)simple_strtoul(colon + 1, NULL, 10);
+
+                /* 释放 vol_route_lock (spinlock 不可睡眠, pfs_ensure_volume_conn
+                 * 内部用 pool_lock mutex 保护 volumes[] 修改) */
+                spin_unlock(&g_pool.vol_route_lock);
+
+                /* data 通路 (write/read needle 大帧) */
+                data_idx = pfs_ensure_volume_conn(v_ip, v_port,
+                                                   POWERFS_NET_SERVER_VOLUME);
+                /* meta 通路 (lease 小请求) — 与 data 物理分离,
+                 * 独立 socket/tx_queue, 不被大帧 kernel_sendmsg 阻塞 */
+                meta_idx = pfs_ensure_volume_conn(v_ip, v_port,
+                                                   POWERFS_NET_SERVER_VOLUME_META);
+
+                spin_lock(&g_pool.vol_route_lock);
+
+                if (data_idx < 0 && meta_idx < 0) {
+                    pr_warn("powerfs: vol_route: failed to create conn for %s\n",
+                            vaddr);
+                    continue;
                 }
 
-                if (conn_idx < 0) {
-                    /* P3.3a: 未匹配 → 自动建立新连接.
-                     * 释放 vol_route_lock (spinlock 不可睡眠),
-                     * 用 pool_lock (mutex) 保护 volumes[] 修改. */
-                    char v_ip[64] = {0};
-                    __u16 v_port = 0;
-                    char *colon;
-                    struct powerfs_net_server_conn *conn;
-                    int ip_len;
-
-                    spin_unlock(&g_pool.vol_route_lock);
-
-                    /* 解析 "ip:net_port" */
-                    colon = strrchr(vaddr, ':');
-                    if (!colon) {
-                        pr_warn("powerfs: vol_route: volume_id=%llu addr=%s invalid (no port)\n",
-                                (unsigned long long)vid, vaddr);
-                        spin_lock(&g_pool.vol_route_lock);
-                        continue;
-                    }
-                    ip_len = min_t(int, (int)(colon - vaddr), (int)(sizeof(v_ip) - 1));
-                    memcpy(v_ip, vaddr, ip_len);
-                    v_ip[ip_len] = '\0';
-                    v_port = (__u16)simple_strtoul(colon + 1, NULL, 10);
-
-                    /* 添加到 volumes[] (mutex 保护, 可睡眠) */
-                    mutex_lock(&g_pool.pool_lock);
-                    if (g_pool.volume_count >= POWERFS_NET_MAX_VOLUMES) {
-                        mutex_unlock(&g_pool.pool_lock);
-                        pr_warn("powerfs: vol_route: volume pool full, cannot add %s\n",
-                                vaddr);
-                        spin_lock(&g_pool.vol_route_lock);
-                        continue;
-                    }
-
-                    conn_idx = g_pool.volume_count;
-                    conn = &g_pool.volumes[conn_idx];
-                    memset(conn, 0, sizeof(*conn));
-
-                    strncpy(conn->addr, v_ip, sizeof(conn->addr) - 1);
-                    conn->port = v_port;
-                    conn->type = POWERFS_NET_SERVER_VOLUME;
-                    conn->in_use = true;
-                    conn->sock = NULL;
-                    conn->state = CONN_INIT;
-                    atomic_set(&conn->seq_counter, 1);
-                    conn->reconnect_count = 0;
-                    conn->reconnect_delay = 0;
-
-                    spin_lock_init(&conn->state_lock);
-                    init_waitqueue_head(&conn->sock_user_wq);
-                    init_waitqueue_head(&conn->reconnect_wq);
-                    INIT_DELAYED_WORK(&conn->reconnect_work,
-                                      powerfs_conn_reconnect_work_fn);
-                    INIT_LIST_HEAD(&conn->pending_reqs);
-                    conn->req_tree = RB_ROOT;
-                    spin_lock_init(&conn->req_lock);
-                    INIT_WORK(&conn->disconnect_work,
-                              powerfs_conn_disconnect_work_fn);
-                    conn->sched = pfs_pick_vol_sched(conn->addr);
-                    INIT_LIST_HEAD(&conn->rx_list);
-                    INIT_LIST_HEAD(&conn->tx_list);
-                    conn->rx_ready = 0;
-                    conn->rx_scheduled = 0;
-                    conn->tx_ready = 0;
-                    conn->tx_scheduled = 0;
-                    INIT_LIST_HEAD(&conn->tx_queue);
-                    spin_lock_init(&conn->tx_lock);
-                    conn->saved_data_ready = NULL;
-                    conn->saved_write_space = NULL;
-                    conn->saved_state_change = NULL;
-                    conn->saved_error_report = NULL;
-                    kref_init(&conn->kref);
-
-                    g_pool.volume_count++;
-                    mutex_unlock(&g_pool.pool_lock);
-
-                    /* 后台建立连接 (不阻塞 mount) */
-                    queue_delayed_work(g_pool.reconn_wq,
-                                       &conn->reconnect_work, 0);
-
-                    pr_info("powerfs: vol_route: auto-connected "
-                            "volume_id=%llu addr=%s:%u\n",
-                            (unsigned long long)vid, v_ip, v_port);
-
-                    spin_lock(&g_pool.vol_route_lock);
-                }
-
-                /* 建立 volume_id → conn_idx 映射 */
+                /* 建立 volume_id → (data_idx, meta_idx) 映射 */
                 g_pool.vol_routes[g_pool.vol_route_count].volume_id = vid;
-                g_pool.vol_routes[g_pool.vol_route_count].conn_idx = conn_idx;
+                g_pool.vol_routes[g_pool.vol_route_count].conn_idx = data_idx;
+                g_pool.vol_routes[g_pool.vol_route_count].meta_conn_idx = meta_idx;
                 g_pool.vol_route_count++;
                 routes_added++;
-                pr_debug("powerfs: vol_route: volume_id=%llu → conn[%d] (%s)\n",
-                        (unsigned long long)vid, conn_idx, vaddr);
+                pr_debug("powerfs: vol_route: volume_id=%llu → data[%d] meta[%d] (%s)\n",
+                        (unsigned long long)vid, data_idx, meta_idx, vaddr);
             }
             spin_unlock(&g_pool.vol_route_lock);
         }

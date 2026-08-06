@@ -1121,6 +1121,42 @@ static int ensure_lease(struct inode *inode, loff_t offset)
 }
 
 /*
+ * powerfs_get_lease_token - 获取指定 offset 所在 stripe 的 lease token
+ *
+ * writeback 路径辅助函数: 先调用 ensure_lease (含快速路径, 已持有则直接返回),
+ * 再从 lease_lock 下读取 token. 用于 batch 内每个 needle 写入前获取对应
+ * stripe 的 lease, 修复旧实现只为 batch 首页 stripe 获取 lease 的问题.
+ *
+ * 返回 0 成功 (token/token_len 已填充), 负值错误.
+ */
+static int powerfs_get_lease_token(struct inode *inode, loff_t offset,
+                                    char *token, size_t *token_len)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    u64 stripe_start = (offset / POWERFS_STRIPE_SIZE) * POWERFS_STRIPE_SIZE;
+    struct powerfs_lease *l;
+    int ret;
+
+    ret = ensure_lease(inode, offset);
+    if (ret)
+        return ret;
+
+    spin_lock(&pi->lease_lock);
+    l = powerfs_lease_find(pi, stripe_start);
+    if (l && time_after(l->expire_jiffies, jiffies)) {
+        strncpy(token, l->token, 63);
+        token[63] = '\0';
+        *token_len = strlen(token);
+        ret = 0;
+    } else {
+        *token_len = 0;
+        ret = -ENOENT;
+    }
+    spin_unlock(&pi->lease_lock);
+    return ret;
+}
+
+/*
  * release_all_leases - 释放 inode 的所有 lease (close/evict 时调用)
  *
  * 锁内收集 lease 列表, 锁外逐个释放 (网络操作).
@@ -2950,7 +2986,10 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     __u32 needle_len = 0;         /* current_needle_id 的内容长度 */
     int needle_start_idx = 0;     /* 当前 needle 组的首页索引 */
     int i;
-    /* Phase 3: lease token (ensure_lease 获取, WriteNeedle 携带) */
+    /* Per-stripe lease cache: 避免同一 stripe 的多个 needle 重复获取 lease.
+     * 每次 needle 切换时, 若 stripe 变化则重新获取 (网络I/O, 锁外);
+     * 否则复用缓存 token. 修复旧实现只为 batch 首页 stripe 获取 lease 的问题. */
+    u64 cached_stripe_start = U64_MAX;
     char lease_token[64] = {0};
     size_t lease_token_len = 0;
 
@@ -2960,9 +2999,16 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     file_key = pi->file_key;
     spin_unlock(&pi->i_lock);
 
-    pr_debug("powerfs: writepage_work_fn ino=%lu num_pages=%d vid=%llu fkey=%llu\n",
+    pr_debug("powerfs: WP_START ino=%lu npages=%d vid=%llu fkey=%llu\n",
             inode->i_ino, wpw->num_pages,
             (unsigned long long)volume_id, (unsigned long long)file_key);
+
+    {
+        u64 ts_start = ktime_get_ns();
+        pr_info("powerfs: WP_START ino=%lu npages=%d ts=%llu\n",
+                inode->i_ino, wpw->num_pages, ts_start);
+        /* 保存 start time 到 wpw 末尾 (临时, 测试后移除) */
+    }
 
     if (!volume_id || !file_key) {
         pr_warn("powerfs: writepage_work ino=%lu no volume mapping\n",
@@ -2974,32 +3020,16 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
         goto fail_all;
 
     /* needle_buf: 2MB chunk buffer, 用于 read-modify-write.
-     * 一个 batch 内复用, 避免逐页分配. */
-    needle_buf = kvmalloc(POWERFS_CHUNK_SIZE, GFP_KERNEL);
+     * 一个 batch 内复用, 避免逐页分配.
+     * GFP_NOFS: writeback 路径中禁止触发文件系统 writeback 回收,
+     * 否则 5 并发 writepage_work_fn 的 kvmalloc 可能触发递归
+     * writeback → powerfs_writepages → writeback_wq, 而 writeback_wq
+     * 的 worker 都在 kvmalloc 中等待内存 → 死锁 (workqueue lockup). */
+    needle_buf = kvmalloc(POWERFS_CHUNK_SIZE, GFP_NOFS);
     if (!needle_buf)
         goto fail_all;
-
-    /* Phase 3: 获取写入区域的 lease (强一致性保证).
-     * ensure_lease 按 offset 计算 stripe_start, 向 volume server 请求.
-     * 失败时降级 (无 lease 继续写入), 只打印警告. */
-    if (wpw->num_pages > 0) {
-        int lease_ret = ensure_lease(inode, wpw->offsets[0]);
-        if (lease_ret) {
-            pr_warn("powerfs: writepage_work ensure_lease ino=%lu: %d\n",
-                    inode->i_ino, lease_ret);
-        } else {
-            u64 ss = div_u64(wpw->offsets[0], POWERFS_STRIPE_SIZE)
-                     * POWERFS_STRIPE_SIZE;
-            struct powerfs_lease *l;
-            spin_lock(&pi->lease_lock);
-            l = powerfs_lease_find(pi, ss);
-            if (l && time_after(l->expire_jiffies, jiffies)) {
-                strncpy(lease_token, l->token, sizeof(lease_token) - 1);
-                lease_token_len = strlen(lease_token);
-            }
-            spin_unlock(&pi->lease_lock);
-        }
-    }
+    pr_info("powerfs: WP_ALLOC ino=%lu buf=%px ts=%llu\n",
+            inode->i_ino, needle_buf, ktime_get_ns());
 
     for (i = 0; i < wpw->num_pages; i++) {
         struct page *page = wpw->pages[i];
@@ -3028,10 +3058,18 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
             /* read-modify-write: 先读现有 needle (不存在则全零) */
             {
                 __u32 existing_len = 0;
-                int rerr = powerfs_net_read_needle(volume_id, needle_id,
+                int rerr;
+                pr_debug("powerfs: WP_READ_BEGIN nid=%llu\n",
+                        (unsigned long long)needle_id);
+                pr_info("powerfs: WP_READ_BEGIN ino=%lu nid=%llu ts=%llu\n",
+                        inode->i_ino, (unsigned long long)needle_id, ktime_get_ns());
+                rerr = powerfs_net_read_needle(volume_id, needle_id,
                                                     needle_buf,
                                                     POWERFS_CHUNK_SIZE,
                                                     &existing_len);
+                pr_info("powerfs: WP_READ_END ino=%lu nid=%llu ret=%d len=%u ts=%llu\n",
+                        inode->i_ino, (unsigned long long)needle_id, rerr,
+                        existing_len, ktime_get_ns());
                 if (rerr < 0 && rerr != -ENOENT) {
                     pr_warn("powerfs: writepage rmw read_needle vid=%llu nid=%llu err=%d, continue with zero\n",
                             (unsigned long long)volume_id,
@@ -3043,7 +3081,27 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
             needle_loaded = true;
         } else if (needle_id != current_needle_id) {
             /* needle 切换: 写回旧 needle, 完成其页面, 加载新 needle */
-            int err = powerfs_net_write_needle(volume_id, current_needle_id,
+            int err;
+            /* 获取旧 needle 所在 stripe 的 lease (per-stripe, 锁外网络I/O).
+             * ensure_lease 内部有快速路径 (已持有则直接返回), 同 stripe
+             * 的多个 needle 只首次触发网络请求. */
+            {
+                loff_t old_offset = wpw->offsets[needle_start_idx];
+                u64 old_stripe = div_u64(old_offset, POWERFS_STRIPE_SIZE)
+                                  * POWERFS_STRIPE_SIZE;
+                if (old_stripe != cached_stripe_start) {
+                    cached_stripe_start = old_stripe;
+                    lease_token_len = 0;
+                    if (powerfs_get_lease_token(inode, old_offset,
+                                                lease_token,
+                                                &lease_token_len)) {
+                        pr_warn("powerfs: writepage lease ino=%lu stripe=%llu, continuing without lease\n",
+                                inode->i_ino,
+                                (unsigned long long)old_stripe);
+                    }
+                }
+            }
+            err = powerfs_net_write_needle(volume_id, current_needle_id,
                                                 inode->i_ino,
                                                 needle_buf, needle_len,
                                                 lease_token_len > 0 ? lease_token : NULL,
@@ -3105,12 +3163,40 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
 
     /* 写回最后一个 needle 并完成其页面 */
     if (needle_loaded) {
-        int err = powerfs_net_write_needle(volume_id, current_needle_id,
+        int err;
+        int j;
+        /* 获取最后一个 needle 所在 stripe 的 lease (per-stripe, 锁外网络I/O) */
+        {
+            loff_t last_offset = wpw->offsets[needle_start_idx];
+            u64 last_stripe = div_u64(last_offset, POWERFS_STRIPE_SIZE)
+                               * POWERFS_STRIPE_SIZE;
+            if (last_stripe != cached_stripe_start) {
+                cached_stripe_start = last_stripe;
+                lease_token_len = 0;
+                if (powerfs_get_lease_token(inode, last_offset,
+                                            lease_token,
+                                            &lease_token_len)) {
+                    pr_warn("powerfs: writepage final lease ino=%lu stripe=%llu, continuing without lease\n",
+                            inode->i_ino,
+                            (unsigned long long)last_stripe);
+                }
+            }
+        }
+        pr_debug("powerfs: WP_WRITE_BEGIN nid=%llu len=%u\n",
+                (unsigned long long)current_needle_id, needle_len);
+        pr_info("powerfs: WP_WRITE_BEGIN ino=%lu nid=%llu len=%u ts=%llu\n",
+                inode->i_ino, (unsigned long long)current_needle_id,
+                needle_len, ktime_get_ns());
+        err = powerfs_net_write_needle(volume_id, current_needle_id,
                                             inode->i_ino,
                                             needle_buf, needle_len,
                                             lease_token_len > 0 ? lease_token : NULL,
                                             lease_token_len);
-        int j;
+        pr_info("powerfs: WP_WRITE_END ino=%lu nid=%llu err=%d ts=%llu\n",
+                inode->i_ino, (unsigned long long)current_needle_id,
+                err, ktime_get_ns());
+        pr_debug("powerfs: WP_WRITE_END nid=%llu err=%d\n",
+                (unsigned long long)current_needle_id, err);
         pr_debug("powerfs: writepage_work_fn write_needle vid=%llu nid=%llu len=%u err=%d\n",
                 (unsigned long long)volume_id,
                 (unsigned long long)current_needle_id, needle_len, err);
@@ -3134,6 +3220,7 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     }
 
     kvfree(needle_buf);
+    pr_info("powerfs: WP_DONE ino=%lu npages=%d\n", inode->i_ino, wpw->num_pages);
     iput(inode);
     kvfree(wpw);
     return;
@@ -3177,6 +3264,8 @@ int powerfs_writepages(struct address_space *mapping,
 
     pr_debug("powerfs: writepages ino=%lu range=%llu-%llu nr_to_write=%ld\n",
             inode->i_ino, wbc->range_start, wbc->range_end, wbc->nr_to_write);
+    pr_info("powerfs: WRITEPAGES ino=%lu nr_to_write=%ld sync_mode=%d\n",
+            inode->i_ino, wbc->nr_to_write, wbc->sync_mode);
 
     if (powerfs_net_is_stopping())
         return 0;
@@ -3241,6 +3330,8 @@ int powerfs_writepages(struct address_space *mapping,
 
             /* batch 满了，提交到 workqueue */
             if (batch->num_pages >= batch_pages) {
+                pr_info("powerfs: BATCH_SUBMIT ino=%lu npages=%d offset=%llu\n",
+                        inode->i_ino, batch->num_pages, (u64)batch->offsets[0]);
                 queue_work(sbi->writeback_wq, &batch->work);
                 batch = NULL;
             }

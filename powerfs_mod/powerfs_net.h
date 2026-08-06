@@ -42,10 +42,10 @@
 #define POWERFS_NET_MAGIC       0x5046534E  /* "PFSN" */
 #define POWERFS_NET_VERSION     0x01
 #define POWERFS_NET_HEADER_SIZE 28
-#define POWERFS_NET_MAX_FRAME   (1024 * 1024)  /* 1MB - 适合内核 */
+#define POWERFS_NET_MAX_FRAME   (4 * 1024 * 1024)  /* 4MB - 与 Rust MAX_FRAME_SIZE 一致 */
 #define POWERFS_NET_MAX_TLV     65535  /* 64KB - 1 */
 #define POWERFS_NET_MAX_BODY    (256 * 1024)  /* 256KB body (容 netfs 128KB 预读响应) */
-#define POWERFS_NET_MAX_DATA    (256 * 1024)  /* 256KB data */
+#define POWERFS_NET_MAX_DATA    (2 * 1024 * 1024)  /* 2MB data (容 POWERFS_CHUNK_SIZE read_needle 响应) */
 
 /* 连接超时 (ms) */
 #define POWERFS_NET_CONNECT_TIMEOUT  5000   /* connect: 5s (容器重启后网络需时间稳定) */
@@ -243,20 +243,31 @@ struct powerfs_net_frame_hdr {
     __u16 status;       /* 状态码 (little-endian) */
     __u32 data_len;     /* body + data 总长度 (little-endian) */
     __u32 body_len;     /* body 段长度 (data 段 = data_len - body_len) */
-    __u8 reserved[2];   /* 保留 */
+    __u8 route_hash;    /* 高7位=目的地hash(client_id), 低1位=channel(0=data,1=meta) */
+    __u8 protocol_ver;  /* 协议版本 (版本升级一致性检查) */
     __le32 header_crc;  /* CRC32C (little-endian) */
 } __attribute__((packed));
 
 /* 编译时断言帧头大小 */
 #define POWERFS_NET_FRAME_HDR_SIZE 28
 
+/* ========== 通路类型 (握手 + 帧头防错乱校验) ========== */
+/* channel 标识连接通路: data (大帧读写) vs meta (lease 小请求).
+ * 握手时填入 HandshakeRequest.channel, 帧头 route_hash 低 1 位也携带.
+ * 服务端收帧时三重校验 (channel/hash/protocol_ver), 不匹配断连. */
+#define POWERFS_NET_CHANNEL_DATA    0   /* data 通路: write_needle/read_needle */
+#define POWERFS_NET_CHANNEL_META    1   /* meta 通路: lease acquire/renew/release */
+#define POWERFS_NET_PROTOCOL_VER    0x01 /* 帧头 protocol_ver, 版本升级一致性检查 */
+
 /* ========== 握手结构 ========== */
 
-/* 握手请求 (18 字节) */
+/* 握手请求 (20 字节) */
 struct powerfs_net_handshake_req {
     __u8 magic[4];       /* "PFSN" */
     __u8 version;        /* 0x01 */
     __u8 client_type;    /* 客户端类型 */
+    __u8 channel;        /* 通路类型: 0=data, 1=meta */
+    __u8 reserved;       /* 对齐 */
     __u64 client_id;     /* 客户端 ID (little-endian) */
     __u32 features;      /* 特性标志 (little-endian) */
 } __attribute__((packed));
@@ -319,7 +330,8 @@ int  powerfs_tlv_dec_find_u64(struct powerfs_tlv_dec *dec, __u8 field, __u64 *va
 enum powerfs_net_server_type {
     POWERFS_NET_SERVER_FILER = 0,
     POWERFS_NET_SERVER_MASTER = 1,
-    POWERFS_NET_SERVER_VOLUME = 2,
+    POWERFS_NET_SERVER_VOLUME = 2,       /* data 通路: write/read/delete needle (大帧) */
+    POWERFS_NET_SERVER_VOLUME_META = 3,  /* meta 通路: lease acquire/renew/release (小请求) */
 };
 
 /* === v2: per-CPU 调度器 (参照 Lustre ksock_sched) ===
@@ -327,17 +339,30 @@ enum powerfs_net_server_type {
  * 每个 CPU 一个调度器线程, 服务按 addr hash 分配到本调度器的所有连接.
  * 线程数固定 = num_online_cpus(), 与连接数无关 (解决 v1 的 N 连接 N 线程问题).
  *
- * 调度器消费两个队列:
- *   rx_conns: sk_data_ready 回调投递的"有数据可收"连接
- *   tx_conns: sk_write_space 回调/do_send 投递的"可写待发"连接
- * 空闲时 wait_event 睡眠, 回调 wake_up 唤醒. */
+ * 调度器消费两个队列 (各自独立锁, 互不阻塞):
+ *   rx_conns: sk_data_ready 回调投递的"有数据可收"连接 (rx_lock 保护)
+ *   tx_conns: sk_write_space 回调/do_send 投递的"可写待发"连接 (tx_lock 保护)
+ * 空闲时 wait_event 睡眠, 回调 wake_up 唤醒.
+ *
+ * 锁拆分原因: RX/TX 线程独立运行, 共用一把锁会让 RX 回调与 TX 回调
+ * 互斥; 拆为两把锁后, 收发路径完全解耦, 无嵌套获取 → 无死锁风险. */
 struct powerfs_net_sched {
-    spinlock_t          lock;       /* 保护 rx_conns/tx_conns (spin_lock_bh) */
-    struct list_head    rx_conns;   /* 数据就绪待收的连接 */
-    struct list_head    tx_conns;   /* 可写待发的连接 */
-    wait_queue_head_t   waitq;      /* 调度器线程等待队列 */
+    spinlock_t          rx_lock;    /* 保护 rx_conns (spin_lock_bh) */
+    spinlock_t          tx_lock;    /* 保护 tx_conns (spin_lock_bh) */
+    struct list_head    rx_conns;   /* 数据就绪待收的连接 (RX 线程消费) */
+    struct list_head    tx_conns;   /* 可写待发的连接 (TX 线程消费) */
+    wait_queue_head_t   rx_waitq;   /* RX 线程等待队列 (sk_data_ready 唤醒) */
+    wait_queue_head_t   tx_waitq;   /* TX 线程等待队列 (sk_write_space/pfs_tx_schedule 唤醒) */
     int                 cpt;        /* 所属 CPU 编号 (0 .. num_online_cpus-1) */
-    struct task_struct *task;       /* 调度器线程 (pfs_scheduler_thread) */
+    struct task_struct *rx_task;    /* RX 线程 (pfs_rx_thread_fn) */
+    struct task_struct *tx_task;    /* TX 线程 (pfs_tx_thread_fn) */
+
+    /* Per-sched 复用收帧缓冲 (避免每帧 kvmalloc 2MB).
+     * RX 线程串行处理各连接, 无并发访问.
+     * lease/getattr 响应只有几百字节, 之前每帧 kvmalloc(2MB) 在
+     * writeback 内存紧张时极慢 (vmalloc 回退建页表) -> 10s+ 延迟. */
+    void               *rx_body_buf;  /* POWERFS_NET_MAX_BODY (256KB) */
+    void               *rx_data_buf;  /* POWERFS_NET_MAX_DATA (2MB) */
 };
 
 /* ========== 连接池状态机 (Phase 1: 新架构) ========== */
@@ -423,11 +448,19 @@ struct powerfs_request {
     int (*callback)(struct powerfs_request *);  /* 异步回调 (可选, NULL=同步) */
     int error;                  /* 最终错误码 (0=成功, <0=错误) */
     unsigned long deadline;     /* 超时 jiffies (0=使用默认) */
+    u64 ts_submit;              /* 调试: do_send 入队时间 (ktime_get_ns, 0=未启用) */
 
     /* === 重发控制 (参照 Ceph r_attempts) === */
     int attempts;               /* 发送尝试次数 */
     bool needs_resend;          /* 断连后标记, 重连后自动重发 */
 #define POWERFS_REQ_MAX_ATTEMPTS  5
+
+    /* === Partial send 追踪 (大帧非阻塞发送) ===
+     * MSG_DONTWAIT 下 kernel_sendmsg 可能只发送部分帧.
+     * send_offset 记录已发送字节数 (跨 header+body+data),
+     * EAGAIN 时保存进度, 重新入 tx_queue 等 sk_write_space 回调.
+     * 下次 pfs_process_transmit 从 offset 继续, 避免重发 header 导致错位. */
+    size_t send_offset;
 
     /* === 关联 === */
     struct powerfs_net_server_conn *filer;  /* 发往哪个 filer (NULL=未绑定) */
@@ -465,6 +498,8 @@ struct powerfs_net_server_conn {
     /* 服务端信息 (握手后) */
     __u64 server_id;
     __u32 server_features;
+    __u64 client_id;            /* 本连接的 client_id (握手时分配, 帧头 route_hash 用) */
+    __u8 channel;               /* 通路类型: 0=data, 1=meta (握手时设置) */
 
     /* === 请求追踪 (参照 Ceph out_queue + out_sent) === */
     /* pending_reqs: 已发送等待响应的请求 (链表, 按发送顺序) */
@@ -484,6 +519,23 @@ struct powerfs_net_server_conn {
     bool                      tx_scheduled; /* 已在 tx_conns 中 */
     struct list_head          tx_queue;  /* 待发送请求队列 (do_send 入队, 调度器消费) */
     spinlock_t                tx_lock;   /* 保护 tx_queue */
+
+    /* === v2 RX 非阻塞状态机 (对齐 TX send_offset 设计) ===
+     * 问题: 大响应 (1MB needle) 分多 TCP 段到达, MSG_WAITALL+sk_rcvtimeo=10s
+     *       会阻塞 sched 上其他 conn 的响应接收 (1MB 文件 10s 延迟根因).
+     * 方案: MSG_DONTWAIT + 断点续收, 每帧分 3 段 (hdr/body/data),
+     *       EAGAIN 时保留 partial 状态退出, 等 sk_data_ready 下次回调续收.
+     * buffer 必须在 conn 上 (sched 共享 buffer 切 conn 时 partial 会丢失). */
+    u8      rx_hdr_buf[POWERFS_NET_FRAME_HDR_SIZE]; /* 28 字节帧头 */
+    size_t  rx_hdr_got;       /* 已收帧头字节 */
+    size_t  rx_body_got;      /* 已收 body 字节 */
+    size_t  rx_data_got;      /* 已收 data 字节 */
+    size_t  rx_body_total;    /* 帧头解析后填入: 本帧 body 段长度 */
+    size_t  rx_data_total;    /* 帧头解析后填入: 本帧 data 段长度 */
+    u8      rx_phase;         /* 0=收hdr, 1=收body, 2=收data, 3=done */
+    struct powerfs_net_frame_hdr rx_cur_hdr;  /* 当前帧头 (解析后) */
+    void   *rx_body_buf;      /* per-conn body buffer (POWERFS_NET_MAX_BODY 256KB) */
+    void   *rx_data_buf;      /* per-conn data buffer (POWERFS_NET_MAX_DATA 2MB) */
 
     /* === v2 sk 回调保存 (竞态处理, 参照 Lustre socklnd_lib.c) ===
      * disconnect 时恢复原始回调, 防止 socket 比模块长寿导致 UAF */
@@ -672,13 +724,16 @@ struct powerfs_net_pool {
     struct powerfs_net_server_conn volumes[POWERFS_NET_MAX_VOLUMES];
     int volume_count;
 
-    /* === Volume 路由表: volume_id → volume conn idx ===
-     * 从 Master GetTopology 获取, 用于 ReadNeedle 按 volume_id 找到正确的
-     * Volume Server 连接. WriteNeedle 由 Filer Create 返回 volume addr,
-     * 不依赖此表. */
+    /* === Volume 路由表: volume_id → (data conn idx, meta conn idx) ===
+     * 从 Master GetTopology 获取, 用于按 volume_id 找到正确的 Volume Server 连接.
+     * 每个 volume server 建两条独立 TCP 连接:
+     *   conn_idx       — data 通路 (write/read needle 大帧, 2MB)
+     *   meta_conn_idx  — meta 通路 (lease acquire/renew/release 小请求)
+     * 物理分离避免 write_needle 大帧阻塞 lease 小请求导致 -110 超时. */
     struct {
         __u64 volume_id;
-        int conn_idx;
+        int conn_idx;        /* data conn (write/read/delete needle) */
+        int meta_conn_idx;   /* meta conn (lease acquire/renew/release) */
     } vol_routes[POWERFS_NET_MAX_VOLUMES];
     int vol_route_count;
     spinlock_t vol_route_lock;
@@ -927,8 +982,9 @@ int powerfs_net_get_volume_count(void);
 /* 获取 volume 连接 (by index, 0..volume_count-1) */
 struct powerfs_net_server_conn *powerfs_net_get_volume_conn(int idx);
 
-/* 按 volume_id 查找 volume 连接 (通过 vol_routes 路由表) */
-struct powerfs_net_server_conn *powerfs_net_find_volume_conn(__u64 volume_id);
+/* 按 volume_id 查找 volume 连接 (通过 vol_routes 路由表).
+ * is_meta=true 返回 meta conn (lease), false 返回 data conn (needle). */
+struct powerfs_net_server_conn *powerfs_net_find_volume_conn(__u64 volume_id, bool is_meta);
 
 /* 发送请求直连到 volume server (bypass shard routing).
  * vol_idx: volume 连接索引 (-1 = 按 volume_id 自动查找)
@@ -1022,7 +1078,8 @@ __u32 powerfs_crc32c(const __u8 *data, size_t len);
 void powerfs_net_frame_hdr_encode(struct powerfs_net_frame_hdr *hdr,
                                    __u16 msg_type, __u8 flags,
                                    __u32 seq, __u16 status,
-                                   __u32 body_len, __u32 data_len);
+                                   __u32 body_len, __u32 data_len,
+                                   __u8 route_hash);
 bool powerfs_net_frame_hdr_decode(const __u8 *buf, size_t len,
                                    struct powerfs_net_frame_hdr *hdr);
 

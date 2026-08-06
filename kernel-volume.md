@@ -201,7 +201,7 @@ g_pool
 | 2.2 needle_id 计数器结构 | `FilerNetHandler` 多 Zone 状态: `zones: RwLock<Vec<ZoneState>>` + `zone_rr: AtomicU32` + `set_zones` + `set_zone_counter` + `alloc_for_new_file` (round-robin) | ✅ 已完成 |
 | 2.3 main.rs 集成 Zone 注册 | Filer 启动时调用 `zone_client::register_filer` 并通过 `set_zones` 注入 FilerNetHandler (多 Zone) | ✅ 已完成 |
 | 2.4 handle_create 改造 | 改用 `alloc_for_new_file` 自分配 needle_id + volume_id (多 Zone round-robin)，并通过 set_chunks 持久化 chunk 映射 | ✅ 已完成 |
-| 2.5 counter 恢复 | Filer 重启时从 chunk 映射恢复 counter = max(counter in zone) + 1 | ⏳ 待办（M） |
+| 2.5 counter 恢复 | Filer 重启时从 chunk 映射恢复 counter = max(counter in zone) + 1 | ✅ 已完成 |
 | 2.6 volume 选择 | 从 zone 映射的物理 volume 中选空闲比例最大的（`zone_client::select_volume`） | ✅ 已完成 |
 | 2.7 删除 volume_client.rs | 不再需要 Filer → Volume Server 通信 | ✅ 已完成 |
 | 2.8 删除 handle_write/handle_read | Filer 不再转发数据 | ✅ 已完成 |
@@ -210,8 +210,8 @@ g_pool
 
 | 步骤 | 说明 | 状态 |
 |------|------|------|
-| 3.1 分离 volume 调度器池 | 新增 `vol_schedulers[]`，volume 连接指向独立调度器（避免数据 I/O 饿死元数据） | ⏳ 待办（H） |
-| 3.2 conn_pool_init 传入 master_addr | 让 `g_pool.master_addr` 可用（discover_volumes 依赖） | ⏳ 待办（H） |
+| 3.1 分离 volume 调度器池 | 新增 `vol_schedulers[]`，volume 连接指向独立调度器（避免数据 I/O 饿死元数据） | ✅ 已完成 |
+| 3.2 conn_pool_init 传入 master_addr | 让 `g_pool.master_addr` 可用（discover_volumes 依赖） | ✅ 已完成 |
 | 3.3 discover_volumes | fill_super 中调用，填充 `vol_routes[]` 路由表 | ✅ 已修复（P3.3a 自动建连） |
 | 3.3a Volume 动态发现修复 | discover_volumes 中自动建立新连接，volume_addr 降级为 fallback | ✅ 已完成（QEMU 验证通过） |
 | 3.3b Lease TLV 字段顺序 + 续约修复 | acquire/renew/release/write_needle 字段顺序对齐 + renew 失败 re-acquire | ✅ 已完成（QEMU 验证通过） |
@@ -830,22 +830,119 @@ Step 10: IO500 测试 + 性能评估文档
 5. **chunk 映射格式**：`set_chunks` 的 `fid_str` 格式 `"volume_id,needle_id"` 需与现有解析逻辑兼容，需确认 `meta_shard_manager.set_chunks` 的实现。
 6. **内核调试**：按用户要求，内核修改必须在 QEMU 中测试，不能直接在 host 上测试，避免系统崩溃。使用 CONFIG_DEBUG_DCACHE + CONFIG_KASAN 辅助定位问题。
 
+#### P3.9 Volume meta/data 通道物理分离 ✅ 已完成（QEMU 验证通过）
+
+**目标**：每个 volume server 建立两条独立 TCP 连接——data 通道（write_needle/read_needle 大帧）和 meta 通道（lease acquire/renew/release 小请求），避免大帧阻塞小请求导致 lease 超时。
+
+**根因**：单连接 model 下，TX 线程发 2MB write_needle 大帧时 `kernel_sendmsg` 可能阻塞 `sk_sndtimeo=10s`，期间同连接的 lease renew 小请求排在 tx_queue 后面等待，导致 lease 续约 -110 ETIMEDOUT → lease 过期 → write_needle lease 校验失败 → 级联超时。
+
+**设计**：
+
+1. 新增 `POWERFS_NET_SERVER_VOLUME_META = 3` 类型，与 `POWERFS_NET_SERVER_VOLUME = 2` 区分
+2. `vol_routes[]` 增加 `meta_conn_idx` 字段，每条路由有 data + meta 两个连接索引
+3. `discover_volumes` 对每个 volume server 调用 `pfs_ensure_volume_conn` 两次（data + meta），建两条独立 TCP 连接
+4. 新增 `pfs_is_meta_msg()` 判断 lease 类请求（ACQUIRE/RENEW/RELEASE/RANGE_LEASE/VOLUME_STATUS）走 meta 通道
+5. `find_volume_conn(is_meta)` / `send_to_volume` 按 msg_type 自动路由到对应通道
+
+**验证结果**：
+- 6 条 TCP 连接（3 volume server × 2）建立成功
+- lease 通过 meta 通道成功（WP_LEASE_END ret=0）
+- lease renew 不再 -110 超时（变为 -121 EREMOTEIO，请求已发出）
+
+**位置**：`kernel/powerfs_mod/powerfs_net.h` + `powerfs_net.c`。
+
+#### P3.10 协议校验与服务端通路状态管理 ⏳ 进行中
+
+**目标**：服务端稳定性第一。握手标记通路类型 + 帧头增加防错乱校验（route_hash + protocol_ver），服务端登记通路状态并收帧校验，防止客户端错乱乱发包。
+
+**设计动机**：
+- 当前服务端对 data/meta 两条连接"偷懒"——不区分通路类型，无法按通路监控和管理
+- 帧头无防错乱校验，万一客户端错乱（帧串到错误连接），服务端无法检测
+- 缺少版本号，版本升级时无法做一致性检查
+
+**方案设计**：
+
+**1. 握手协议扩展**（18B → 20B，增加 channel 字段）：
+
+```c
+struct powerfs_net_handshake_req {
+    __u8 magic[4];       /* "PFSN" */
+    __u8 version;        /* 0x01 */
+    __u8 client_type;    /* Fuse/Kernel/Admin */
+    __u8 channel;        /* 0=data, 1=meta  ← 新增 */
+    __u8 reserved;       /* 对齐 */
+    __u64 client_id;
+    __u32 features;
+} __attribute__((packed));  /* 20 字节 */
+```
+
+服务端握手后登记到 `ClientConn.channel`，知道每条连接是 data 还是 meta 通路。
+
+**2. 帧头利用 reserved 字段**（28B 不变，防错乱校验）：
+
+```c
+struct powerfs_net_frame_hdr {
+    __be32 magic;        /* 4B */
+    __u8 version;        /* 1B */
+    __u8 flags;          /* 1B */
+    __u32 seq;           /* 4B */
+    __u16 msg_type;      /* 2B */
+    __u16 status;        /* 2B */
+    __u32 data_len;      /* 4B */
+    __u32 body_len;      /* 4B */
+    __u8 route_hash;     /* 1B: 高7位=目的地hash, 低1位=channel(0=data,1=meta) ← 原 reserved[0] */
+    __u8 protocol_ver;   /* 1B: 协议版本(版本升级一致性检查) ← 原 reserved[1] */
+    __le32 header_crc;   /* 4B */
+} __attribute__((packed));  /* 28B 不变 */
+```
+
+- **route_hash**：对 `(volume_id, client_id)` 做 hash 取高 7 位，低 1 位是 channel 标识。服务端收帧校验 hash 是否匹配本连接，**防止帧串到错误连接**
+- **protocol_ver**：版本号，服务端校验是否匹配，**版本升级时一致性检查**
+
+**3. 服务端通路状态管理**：
+
+`ClientConn` 增加：
+```rust
+pub channel: u8,       // 0=data, 1=meta (握手登记)
+pub route_hash: u8,    // 握手时登记
+```
+
+收帧三重校验（不匹配 → 拒绝帧 + 断连，保护服务端稳定性）：
+- `route_hash` channel 位匹配连接 channel
+- `route_hash` hash 部分匹配连接登记值
+- `protocol_ver` 匹配服务端版本
+
+监控按通路维度：data 通路 / meta 通路 连接数、QPS、延迟、错误率独立统计。
+
+**4. 改动范围**：
+
+| 层 | 改动 |
+|----|------|
+| 内核握手 | 增加 channel 字段，建 data/meta 连接时分别填 0/1 |
+| 内核帧头 | reserved[2] → route_hash + protocol_ver，发送时填充 |
+| Rust 握手 | HandshakeRequest 增加 channel，ClientConn 记录 |
+| Rust 帧头 | 解析 route_hash + protocol_ver，校验通路匹配 |
+| Rust 收帧 | channel/hash/version 三重校验，不匹配断连 |
+| Rust 监控 | 按通路维度统计连接状态 |
+
 ### 3.6 进度追踪
 
 | 阶段 | 总步骤 | 已完成 | 进行中 | 待办 |
 |------|--------|--------|--------|------|
 | Phase 1: Master | 6 | 5 | 0 | 1 (P1.6) |
 | Phase 2: Filer | 8 | 8 | 0 | 0 |
-| Phase 3: 内核 | 10 | 10 | 0 | 0 |
+| Phase 3: 内核 | 14 | 13 | 1 (P3.10) | 0 |
 | Phase 4: Volume | 3 | 3 | 0 | 0 |
 | Phase 5: FUSE | 3 | 0 | 0 | 3 (低优先级) |
-| **总计** | **30** | **26** | **0** | **4** |
+| **总计** | **34** | **29** | **1** | **4** |
 
 **下一步行动**（按优先级排序）：
 1. ~~**容器集成测试**~~ ✅ 已完成（QEMU 验证通过：基本I/O + 5MB大文件 + MD5一致性 + 目录操作 + 5并发写入，全链路 PASS）
 2. ~~**P1.3 Zone 映射 Raft 持久化**~~ ✅ 已完成（Master 重启后 zone_registry 从 Raft 日志重放恢复，3 zones + next_zone_id=4 验证通过）
 3. ~~**P3.8 删除 powerfs_net_assign**~~ ✅ 已完成（函数已不存在，清理 POWERFS_NET_MSG_ASSIGN 协议常量 + 注释）
-4. **P1.6 删除旧 Assign 接口**（Master assign 仍被 S3/gRPC API 使用，需先迁移到 Zone 模式，暂跳过）
+4. ~~**P3.3b Lease TLV 字段顺序 + 续约修复**~~ ✅ 已完成（acquire/renew/release/write_needle 字段顺序对齐 + renew 失败 re-acquire，QEMU 验证通过）
+5. **内核集成回归测试**（Lease 修复后从简单到复杂全面验证：基本I/O → 大文件 → 并发 → 长时间 Lease 续约）
+6. **P1.6 删除旧 Assign 接口**（Master assign 仍被 S3/gRPC API 使用，需先迁移到 Zone 模式，暂跳过）
 
 ## 4. 各组件改动清单
 
