@@ -50,6 +50,7 @@
 #include "powerfs_net.h"
 #include "powerfs.h"
 #include "powerfs_comm.h"
+#include "powerfs_flow.h"
 
 /* ========== 全局连接上下文 ========== */
 
@@ -1948,6 +1949,25 @@ static int pfs_rx_step(struct powerfs_net_server_conn *conn)
     return 0;  /* 已是 phase=3 */
 }
 
+/* Phase 2: 计算 conn 在 flow controller 中的索引.
+ * filer conns: [0, MAX_FILERS)
+ * volume conns: [MAX_FILERS, MAX_FILERS + MAX_VOLUMES)
+ * -1=无法映射 (跳过流控) */
+static int pfs_conn_flow_idx(struct powerfs_net_server_conn *conn)
+{
+    /* g_pool 是 static, 指针算术计算索引 */
+    if (conn >= &g_pool.filers[0] &&
+        conn < &g_pool.filers[POWERFS_NET_MAX_FILERS]) {
+        return (int)(conn - &g_pool.filers[0]);
+    }
+    if (conn >= &g_pool.volumes[0] &&
+        conn < &g_pool.volumes[POWERFS_NET_MAX_VOLUMES]) {
+        return POWERFS_NET_MAX_FILERS +
+               (int)(conn - &g_pool.volumes[0]);
+    }
+    return -1;
+}
+
 /* 一帧完整后处理: NOTIFY 异步帧 或 按 seq 匹配 pending req + complete.
  * 锁外 memcpy 大块 READ 响应 (持 req_lock 会阻塞 do_send 入队). */
 static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
@@ -1987,6 +2007,16 @@ static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
         return;
     }
 
+    /* Phase 2: 从响应帧 flags bits 6-7 提取 load_factor, 更新 per-conn 统计.
+     * admit() 据此自适应降低并发上限. 必须在 req 处理前完成,
+     * 因为 admit() 在 VFS 入口 (锁外) 调用, 需要最新的 lf 值. */
+    {
+        u8 lf = POWERFS_NET_FLAG_LOAD_FACTOR_GET(hdr->flags);
+        int flow_idx = pfs_conn_flow_idx(conn);
+        if (flow_idx >= 0 && lf > 0)
+            powerfs_flow_on_load_factor(flow_idx, lf);
+    }
+
     /* 按 seq 查找请求, 摘出队列后放锁, 锁外 memcpy + complete.
      * (参考 pfs_process_transmit 的 "摘出-放锁-处理" 模式) */
     spin_lock(&conn->req_lock);
@@ -2004,6 +2034,7 @@ static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
         u64 ts_submit = req->ts_submit;
         u32 seq = req->seq;
         u16 msg_type = req->msg_type;
+        u64 now_ns = ktime_get_ns();
 
         req->resp_status = hdr->status;
         req->error = 0;
@@ -2021,10 +2052,21 @@ static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
         }
         complete(&req->done);
 
+        /* Phase 2: 流控统计 — record_complete (latency + bytes) */
+        {
+            int flow_idx = pfs_conn_flow_idx(conn);
+            u64 lat_ns = ts_submit ? (now_ns - ts_submit) : 0;
+            unsigned int total_bytes = body_len + data_len;
+            bool error = (hdr->status != 0);
+
+            powerfs_flow_record_complete(flow_idx, lat_ns,
+                                         total_bytes, error);
+        }
+
         /* 响应接收计时: >100ms 打 info (帮助定位大响应延迟).
          * 用本地变量, req 可能已被等待线程释放. */
         if (ts_submit) {
-            u64 dur_us = div_u64(ktime_get_ns() - ts_submit, 1000);
+            u64 dur_us = div_u64(now_ns - ts_submit, 1000);
             if (dur_us > 100000)
                 pr_info("powerfs: SLOW_RX seq=%u msg=0x%04x dur=%llums\n",
                         seq, msg_type, div_u64(dur_us, 1000));

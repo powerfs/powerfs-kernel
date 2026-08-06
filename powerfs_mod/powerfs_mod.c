@@ -97,6 +97,10 @@ struct powerfs_ctx {
 
 extern int  powerfs_init_inode_cache(void);
 extern void powerfs_destroy_inode_cache(void);
+
+/* Phase 2: 流控模块 */
+extern int  powerfs_flow_init(void);
+extern void powerfs_flow_exit(void);
 extern int  powerfs_fill_super(struct super_block *sb, struct fs_context *fc);
 extern void powerfs_kill_sb_super(struct super_block *sb);
 
@@ -242,6 +246,12 @@ static int __init powerfs_init(void)
         return ret;
     }
 
+    /* Phase 2: 初始化流控模块 */
+    ret = powerfs_flow_init();
+    if (ret) {
+        pr_warn("powerfs: flow controller init failed (continuing): %d\n", ret);
+    }
+
     /* 初始化通信设备 */
     ret = powerfs_comm_init();
     if (ret) {
@@ -253,6 +263,7 @@ static int __init powerfs_init(void)
     if (ret) {
         pr_err("powerfs: failed to register filesystem: %d\n", ret);
         powerfs_comm_exit();
+        powerfs_flow_exit();
         powerfs_destroy_inode_cache();
         return ret;
     }
@@ -271,6 +282,7 @@ static void __exit powerfs_exit(void)
 
     unregister_filesystem(&powerfs_fs_type);
     powerfs_comm_exit();
+    powerfs_flow_exit();
     powerfs_destroy_inode_cache();
 
     pr_info("powerfs: module unloaded\n");

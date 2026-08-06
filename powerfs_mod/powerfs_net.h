@@ -83,6 +83,14 @@
 #define POWERFS_NET_FLAG_BATCH     0x08
 #define POWERFS_NET_FLAG_ACK       0x10
 
+/* Phase 2: 服务端负载因子编码在 flags bits 6-7 (向后兼容)
+ *   00=空闲(0-25%), 01=正常(25-50%), 10=较忙(50-75%), 11=满载(75%+)
+ * 旧客户端忽略这些位, 旧服务端填 0 (空闲). */
+#define POWERFS_NET_FLAG_LOAD_FACTOR_SHIFT  6
+#define POWERFS_NET_FLAG_LOAD_FACTOR_MASK   0xC0
+#define POWERFS_NET_FLAG_LOAD_FACTOR_GET(f) \
+    (((f) & POWERFS_NET_FLAG_LOAD_FACTOR_MASK) >> POWERFS_NET_FLAG_LOAD_FACTOR_SHIFT)
+
 /* ========== 客户端类型 (握手) ========== */
 
 #define POWERFS_NET_CLIENT_FUSE    0x01

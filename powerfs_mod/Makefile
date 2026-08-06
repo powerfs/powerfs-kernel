@@ -16,7 +16,8 @@ $(MODULE_NAME)-objs := \
     powerfs_net.o \
     powerfs_tlv.o \
     powerfs_transport.o \
-    powerfs_serializer.o
+    powerfs_serializer.o \
+    powerfs_flow.o
 
 # 编译选项
 ccflags-y += -Wall -Wextra -Wno-unused-parameter
