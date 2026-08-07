@@ -1417,11 +1417,6 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
 
     (void)flags;
 
-    /* Phase 2: 流控准入 — 服务器过载时返回 -EAGAIN 让 VFS 重试.
-     * 不在 i_rwsem 读锁内 sleep, 直接返回让 VFS 上层自然退避. */
-    if (powerfs_flow_admit_vfs(POWERFS_FLOW_OP_LOOKUP) != POWERFS_FLOW_ADMIT)
-        return ERR_PTR(-EAGAIN);
-
     pr_debug("powerfs: lookup '%pd' in dir=%lu\n", dentry, dir->i_ino);
 
     /*
@@ -1824,10 +1819,6 @@ static int powerfs_create(struct user_namespace *idmap, struct inode *dir,
     int err;
 
     (void)excl;
-
-    /* Phase 2: 流控准入 — 服务器过载时返回 -EAGAIN */
-    if (powerfs_flow_admit_vfs(POWERFS_FLOW_OP_WRITE) != POWERFS_FLOW_ADMIT)
-        return -EAGAIN;
 
     pr_debug("powerfs: create '%pd' in dir=%lu mode=%o\n",
              dentry, dir->i_ino, mode);
@@ -2694,10 +2685,6 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
     struct powerfs_inode_info *dpi = POWERFS_I(dir);
     struct powerfs_dir_entry *entry, *tmp;
     loff_t pos = 0;
-
-    /* Phase 2: 流控准入 — 服务器过载时返回 -EAGAIN 让 VFS 重试 */
-    if (powerfs_flow_admit_vfs(POWERFS_FLOW_OP_READDIR) != POWERFS_FLOW_ADMIT)
-        return -EAGAIN;
 
     /* 处理 "." 和 ".." */
     if (ctx->pos == 0) {
