@@ -5233,7 +5233,19 @@ int powerfs_net_send_to_volume(int vol_idx, __u64 volume_id,
         req->deadline = jiffies + msecs_to_jiffies(timeout_ms);
 
     /* 直接在 volume 连接上发送 (bypass shard 路由) */
+    {
+        int flow_idx = pfs_conn_flow_idx(conn);
+        powerfs_flow_record_start(flow_idx,
+                                  req->req_body_len + req->req_data_len);
+    }
+
     ret = powerfs_request_do_send(req, conn);
+
+    /* Phase 2: do_send 失败时补 record_complete, 防止 active_reqs 泄漏 */
+    if (ret != 0) {
+        powerfs_flow_record_complete(pfs_conn_flow_idx(conn),
+                                     0, 0, true);
+    }
 
     if (resp_body_len_out)
         *resp_body_len_out = req->resp_body_len;
