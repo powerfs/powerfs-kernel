@@ -36,6 +36,7 @@
 #include "powerfs.h"
 #include "powerfs_comm.h"
 #include "powerfs_net.h"
+#include "powerfs_flow.h"
 
 /* ========== netfs 请求操作 (Stage C: 对接 netfs 子系统) ==========
  *
@@ -69,6 +70,10 @@ static void powerfs_netfs_issue_read(struct netfs_io_subrequest *subreq)
     pr_debug("powerfs: netfs_issue_read ino=%lu start=%llu len=%zu i_size=%llu\n",
             inode->i_ino, (unsigned long long)start, len,
             (unsigned long long)rreq->i_size);
+
+    /* Phase 2: 流控准入 — 读数据路径阻塞等待 (2s 超时).
+     * netfs 持有 folio lock (per-page), 可安全等待. 超时后 proceed. */
+    powerfs_flow_admit_wait(POWERFS_FLOW_OP_READ, 2000);
 
     /* 超出文件大小的部分: 由 netfs 处理 (设置 NETFS_SREQ_CLEAR_TAIL),
      * issue_read 只读取有效数据部分 */
@@ -1412,6 +1417,11 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
 
     (void)flags;
 
+    /* Phase 2: 流控准入 — 服务器过载时返回 -EAGAIN 让 VFS 重试.
+     * 不在 i_rwsem 读锁内 sleep, 直接返回让 VFS 上层自然退避. */
+    if (powerfs_flow_admit_vfs(POWERFS_FLOW_OP_LOOKUP) != POWERFS_FLOW_ADMIT)
+        return ERR_PTR(-EAGAIN);
+
     pr_debug("powerfs: lookup '%pd' in dir=%lu\n", dentry, dir->i_ino);
 
     /*
@@ -1814,6 +1824,10 @@ static int powerfs_create(struct user_namespace *idmap, struct inode *dir,
     int err;
 
     (void)excl;
+
+    /* Phase 2: 流控准入 — 服务器过载时返回 -EAGAIN */
+    if (powerfs_flow_admit_vfs(POWERFS_FLOW_OP_WRITE) != POWERFS_FLOW_ADMIT)
+        return -EAGAIN;
 
     pr_debug("powerfs: create '%pd' in dir=%lu mode=%o\n",
              dentry, dir->i_ino, mode);
@@ -2681,6 +2695,10 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
     struct powerfs_dir_entry *entry, *tmp;
     loff_t pos = 0;
 
+    /* Phase 2: 流控准入 — 服务器过载时返回 -EAGAIN 让 VFS 重试 */
+    if (powerfs_flow_admit_vfs(POWERFS_FLOW_OP_READDIR) != POWERFS_FLOW_ADMIT)
+        return -EAGAIN;
+
     /* 处理 "." 和 ".." */
     if (ctx->pos == 0) {
         if (!dir_emit_dots(file, ctx))
@@ -3262,6 +3280,11 @@ int powerfs_writepages(struct address_space *mapping,
     int batch_pages = sbi->write_batch_pages;
     int ret = 0;
 
+    /* Phase 2: 流控准入 — 数据路径阻塞等待 (5s 超时).
+     * writeback 线程不持有 VFS 目录锁, 可安全等待.
+     * 超时后 proceed (best effort), 不返回错误避免 writeback 卡死. */
+    powerfs_flow_admit_wait(POWERFS_FLOW_OP_WRITEBACK, 5000);
+
     pr_debug("powerfs: writepages ino=%lu range=%llu-%llu nr_to_write=%ld\n",
             inode->i_ino, wbc->range_start, wbc->range_end, wbc->nr_to_write);
     pr_info("powerfs: WRITEPAGES ino=%lu nr_to_write=%ld sync_mode=%d\n",
@@ -3434,6 +3457,11 @@ int powerfs_write_begin(struct file *file, struct address_space *mapping,
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     struct folio *folio = NULL;
     int ret;
+
+    /* Phase 2: 流控准入 — 数据路径阻塞等待 (2s 超时).
+     * generic_perform_write 持有 file 的 i_rwsem (非目录), 可安全等待.
+     * 超时后 proceed (best effort). */
+    powerfs_flow_admit_wait(POWERFS_FLOW_OP_WRITE, 2000);
 
     pr_debug("powerfs: write_begin ino=%lu pos=%lld len=%u i_size=%lld\n",
             inode->i_ino, pos, len, i_size_read(inode));

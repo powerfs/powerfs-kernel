@@ -62,6 +62,81 @@ static void ewma_update(atomic64_t *ewma, u64 new_val)
 
 /* ========== 公开 API ========== */
 
+u8 powerfs_flow_max_load_factor(void)
+{
+    u8 max_lf = 0;
+    int i;
+
+    /* 只扫描 filer conns [0, MAX_FILERS) */
+    for (i = 0; i < POWERFS_NET_MAX_FILERS; i++) {
+        u8 lf = (u8)atomic_read(&g_flow.conns[i].server_load_factor);
+        if (lf > max_lf)
+            max_lf = lf;
+    }
+    return max_lf;
+}
+
+enum powerfs_flow_decision powerfs_flow_admit_vfs(enum powerfs_flow_op op)
+{
+    int global_active;
+    int max;
+    u8 lf;
+
+    global_active = atomic_read(&g_flow.global.active_reqs);
+    lf = powerfs_flow_max_load_factor();
+    max = g_flow.max_active_global;
+
+    /* Phase 2: load_factor 自适应降速 */
+    switch (lf) {
+    case POWERFS_FLOW_LF_OVERLOAD:
+        max = max / 4;         /* 25% */
+        break;
+    case POWERFS_FLOW_LF_BUSY:
+        max = max / 2;         /* 50% */
+        break;
+    case POWERFS_FLOW_LF_NORMAL:
+        max = (max * 3) / 4;   /* 75% */
+        break;
+    case POWERFS_FLOW_LF_IDLE:
+    default:
+        break;                 /* 100% */
+    }
+
+    if (max < 1)
+        max = 1;
+
+    if (global_active >= max) {
+        if (lf >= POWERFS_FLOW_LF_OVERLOAD)
+            return POWERFS_FLOW_REJECT;
+        return POWERFS_FLOW_QUEUE;
+    }
+
+    return POWERFS_FLOW_ADMIT;
+}
+
+int powerfs_flow_admit_wait(enum powerfs_flow_op op, int timeout_ms)
+{
+    long ret;
+
+    /* 快速路径: 立即准入 */
+    if (powerfs_flow_admit_vfs(op) == POWERFS_FLOW_ADMIT)
+        return 0;
+
+    /* 排队路径: 在 admit_wq 上等待, record_complete 唤醒 */
+    ret = wait_event_timeout(g_flow.admit_wq,
+        powerfs_flow_admit_vfs(op) == POWERFS_FLOW_ADMIT,
+        msecs_to_jiffies(timeout_ms));
+
+    if (ret > 0)
+        return 0;  /* 被唤醒, 条件满足 */
+
+    /* 超时: 最后检查一次 */
+    if (powerfs_flow_admit_vfs(op) == POWERFS_FLOW_ADMIT)
+        return 0;
+
+    return -EBUSY;  /* 超时仍未准入 */
+}
+
 int powerfs_flow_init(void)
 {
     int i;
@@ -88,7 +163,10 @@ int powerfs_flow_init(void)
     atomic_set(&g_flow.global.active_conns, 0);
     atomic_set(&g_flow.global.slow_conns, 0);
 
-    /* debugfs: /sys/kernel/debug/powerfs/flow/ */
+    /* 数据路径排队等待队列 */
+    init_waitqueue_head(&g_flow.admit_wq);
+
+    /* debugfs: /sys/kernel/debug/powerfs_flow/ */
     g_flow.debugfs_root = debugfs_create_dir("powerfs_flow", NULL);
     if (IS_ERR_OR_NULL(g_flow.debugfs_root)) {
         pr_warn("powerfs: flow debugfs_create_dir failed\n");
@@ -203,6 +281,9 @@ void powerfs_flow_record_complete(int flow_idx, u64 lat_ns,
     /* 递减在途计数 */
     atomic_dec(&stats->active_reqs);
     atomic_dec(&g_flow.global.active_reqs);
+
+    /* 唤醒数据路径 (admit_wait) 排队等待者 */
+    wake_up(&g_flow.admit_wq);
 
     /* 累计统计 */
     atomic64_inc(&stats->total_reqs);

@@ -18,6 +18,7 @@
 #include <linux/types.h>
 #include <linux/atomic.h>
 #include <linux/time.h>
+#include <linux/wait.h>
 
 #include "powerfs_net.h"
 
@@ -104,6 +105,10 @@ struct powerfs_flow_controller {
     /* 慢连接延迟阈值 (ns) */
     unsigned long slow_lat_thresh_ns;
 
+    /* 等待队列: 数据路径 (read/write) 排队等待 admission.
+     * record_complete 递减 active_reqs 后 wake_up 唤醒等待者. */
+    wait_queue_head_t admit_wq;
+
     /* debugfs 根目录 */
     struct dentry *debugfs_root;
 };
@@ -123,7 +128,52 @@ static inline int powerfs_flow_volume_idx(int vol_idx) {
 }
 
 /*
- * powerfs_flow_admit - VFS 入口准入检查 (锁外调用)
+ * powerfs_flow_admit_vfs - VFS 入口全局准入检查 (锁外调用)
+ *
+ * @op: 操作类型
+ *
+ * 不需要 flow_idx: 使用全局 active_reqs + 所有 filer 连接中最高的
+ * load_factor 进行自适应降速. 适用于 VFS 回调入口 (此时尚未确定
+ * 具体使用哪个 filer 连接).
+ *
+ * 返回决策:
+ *   ADMIT  - 允许执行
+ *   QUEUE  - 排队, 调用方 usleep_range(100, 500) 后重试
+ *   REJECT - 拒绝 (调用方返回 -EAGAIN, 仅在 load_factor=3 满载时)
+ */
+enum powerfs_flow_decision powerfs_flow_admit_vfs(enum powerfs_flow_op op);
+
+/*
+ * powerfs_flow_admit_wait - 阻塞式准入检查 (数据路径专用)
+ *
+ * @op:          操作类型
+ * @timeout_ms:  超时 (毫秒)
+ *
+ * 用于 read/write 等数据路径 (非低延迟路径):
+ *   1. 快速路径: ADMIT 立即返回 0
+ *   2. 排队路径: 在 admit_wq 上等待, record_complete 递减 active_reqs 后唤醒
+ *   3. 超时:     返回 -EBUSY (调用方决定是否继续)
+ *
+ * 返回值:
+ *   0      - 准入通过
+ *   -EBUSY - 超时仍未准入 (调用方可继续或返回错误)
+ *
+ * 注意: 不要在持有 VFS 目录锁 (i_rwsem) 的路径调用!
+ *       lookup/readdir/create 等用 powerfs_flow_admit_vfs + 返回 -EAGAIN.
+ */
+int powerfs_flow_admit_wait(enum powerfs_flow_op op, int timeout_ms);
+
+/*
+ * powerfs_flow_max_load_factor - 获取所有 filer 连接中最高的 load_factor
+ *
+ * 用于 VFS 入口全局准入: 取最坏情况避免向已过载的 filer 发请求.
+ * 只扫描 filer conns [0, MAX_FILERS), 不含 volume conns
+ * (volume 由 writeback 路径单独管理).
+ */
+u8 powerfs_flow_max_load_factor(void);
+
+/*
+ * powerfs_flow_admit - per-conn 准入检查 (已知 flow_idx 时调用)
  *
  * @op:      操作类型
  * @flow_idx: 连接索引 (powerfs_flow_filer_idx / powerfs_flow_volume_idx 返回值)

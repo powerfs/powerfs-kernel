@@ -3305,7 +3305,22 @@ int powerfs_request_submit(struct powerfs_request *req)
         /* 有 filer: 同步 send+recv */
         last_tried_conn = conn;
         req->filer = conn;
+
+        /* Phase 2: 流控 record_start (发送前递增 active 计数) */
+        {
+            int flow_idx = pfs_conn_flow_idx(conn);
+            powerfs_flow_record_start(flow_idx,
+                                      req->req_body_len + req->req_data_len);
+        }
+
         ret = powerfs_request_do_send(req, conn);
+
+        /* Phase 2: do_send 失败 (未走 RX 路径) 时补 record_complete,
+         * 避免 active_reqs 计数泄漏. 成功时 pfs_rx_dispatch 已调 record_complete. */
+        if (ret != 0) {
+            powerfs_flow_record_complete(pfs_conn_flow_idx(conn),
+                                         0, 0, true);
+        }
 
         if (ret == -ENOTCONN) {
             /* 连接断开: route 已降级 (disconnect_one 设了 RECONNECTING,
