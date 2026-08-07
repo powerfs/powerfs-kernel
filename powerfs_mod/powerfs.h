@@ -280,6 +280,12 @@ struct powerfs_sb_info {
      * 单次 work item 最多收集这么多脏页, 减少网络往返和 work item 数量.
      * 默认 16 (64KB), ROCE 可设为 256 (1MB) ~ 16384 (64MB stripe). */
     int write_batch_pages;
+
+    /* writeback 并发限制: 防止过多 work item 同时阻塞在网络 I/O,
+     * 导致内存回收停滞 (mm_percpu_wq lockup).
+     * 每个 work item 占用 2MB needle_buf, 限制为 2 个并发 = 最多 4MB. */
+    atomic_t wb_in_flight;
+#define POWERFS_WB_MAX_IN_FLIGHT  2
 };
 
 #define POWERFS_SB_INFO(sb) ((struct powerfs_sb_info *)(sb)->s_fs_info)
@@ -309,7 +315,8 @@ void powerfs_evict_inode(struct inode *inode);
 int  powerfs_statfs(struct dentry *dentry, struct kstatfs *buf);
 
 /* dentry_operations */
-int  powerfs_d_revalidate(struct dentry *dentry, unsigned int flags);
+int  powerfs_d_revalidate(struct inode *dir, const struct qstr *name,
+                          struct dentry *dentry, unsigned int flags);
 int  powerfs_d_init(struct dentry *dentry);
 void powerfs_d_release(struct dentry *dentry);
 void powerfs_d_prune(struct dentry *dentry);
@@ -319,6 +326,7 @@ int  powerfs_init_inode_cache(void);
 void powerfs_destroy_inode_cache(void);
 int  powerfs_fill_super(struct super_block *sb, struct fs_context *fc);
 void powerfs_kill_sb_super(struct super_block *sb);
+void powerfs_set_sb_dentry_ops(struct super_block *sb);
 
 /* 辅助函数 */
 struct inode *powerfs_create_root(struct super_block *sb);
@@ -333,24 +341,28 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx);
 /* 地址空间操作 (page cache) */
 int powerfs_writepage(struct page *page, struct writeback_control *wbc);
 int powerfs_writepages(struct address_space *mapping, struct writeback_control *wbc);
-int powerfs_write_begin(struct file *file, struct address_space *mapping,
-                        loff_t pos, unsigned int len, struct page **pagep,
+int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
+                        loff_t pos, unsigned int len, struct folio **foliop,
                         void **fsdata);
-int powerfs_write_end(struct file *file, struct address_space *mapping,
+int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                       loff_t pos, unsigned int len, unsigned int copied,
-                      struct page *page, void *fsdata);
+                      struct folio *folio, void *fsdata);
 sector_t powerfs_bmap(struct address_space *mapping, sector_t block);
 
 /* inode 管理 (参考 ceph iget5_locked/ilookup5 机制) */
 struct inode *powerfs_iget(struct super_block *sb, u64 ino);
 struct inode *powerfs_find_inode(struct super_block *sb, u64 ino);
+struct inode *powerfs_new_inode(struct super_block *sb, umode_t mode,
+                                u64 ino, u64 parent_ino, const char *name);
+struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
+                               unsigned int flags);
 int powerfs_init_inode(struct inode *inode, umode_t mode,
                        u64 parent_ino, const char *name);
 
 /* setattr/rename 操作 */
-int powerfs_setattr(struct user_namespace *idmap, struct dentry *dentry,
+int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
                     struct iattr *attr);
-int powerfs_rename(struct user_namespace *idmap,
+int powerfs_rename(struct mnt_idmap *idmap,
                    struct inode *old_dir, struct dentry *old_dentry,
                    struct inode *new_dir, struct dentry *new_dentry,
                    unsigned int flags);

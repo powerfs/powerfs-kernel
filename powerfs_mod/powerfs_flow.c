@@ -117,23 +117,37 @@ enum powerfs_flow_decision powerfs_flow_admit_vfs(enum powerfs_flow_op op)
 int powerfs_flow_admit_wait(enum powerfs_flow_op op, int timeout_ms)
 {
     long ret;
+    int global_active;
 
     /* 快速路径: 立即准入 */
     if (powerfs_flow_admit_vfs(op) == POWERFS_FLOW_ADMIT)
         return 0;
 
     /* 排队路径: 在 admit_wq 上等待, record_complete 唤醒 */
+    global_active = atomic_read(&g_flow.global.active_reqs);
+    atomic64_inc(&g_flow.global.queue_count);
+    pr_info_ratelimited("powerfs: flow queue op=%d active=%d max=%u\n",
+                        op, global_active, g_flow.max_active_global);
+
     ret = wait_event_timeout(g_flow.admit_wq,
         powerfs_flow_admit_vfs(op) == POWERFS_FLOW_ADMIT,
         msecs_to_jiffies(timeout_ms));
 
-    if (ret > 0)
+    if (ret > 0) {
+        atomic64_inc(&g_flow.global.queue_wakeups);
         return 0;  /* 被唤醒, 条件满足 */
+    }
 
     /* 超时: 最后检查一次 */
-    if (powerfs_flow_admit_vfs(op) == POWERFS_FLOW_ADMIT)
+    if (powerfs_flow_admit_vfs(op) == POWERFS_FLOW_ADMIT) {
+        atomic64_inc(&g_flow.global.queue_wakeups);
         return 0;
+    }
 
+    atomic64_inc(&g_flow.global.reject_count);
+    pr_info_ratelimited("powerfs: flow reject op=%d timeout=%dms active=%d\n",
+                        op, timeout_ms,
+                        atomic_read(&g_flow.global.active_reqs));
     return -EBUSY;  /* 超时仍未准入 */
 }
 
@@ -367,6 +381,9 @@ static int flow_global_show(struct seq_file *m, void *v)
     seq_printf(m, "total_errs       %lld\n", atomic64_read(&g_flow.global.total_errs));
     seq_printf(m, "total_bytes_sent %lld\n", atomic64_read(&g_flow.global.total_bytes_sent));
     seq_printf(m, "total_bytes_recv %lld\n", atomic64_read(&g_flow.global.total_bytes_recv));
+    seq_printf(m, "queue_count      %lld\n", atomic64_read(&g_flow.global.queue_count));
+    seq_printf(m, "queue_wakeups    %lld\n", atomic64_read(&g_flow.global.queue_wakeups));
+    seq_printf(m, "reject_count     %lld\n", atomic64_read(&g_flow.global.reject_count));
     seq_printf(m, "max_active_global %u\n", g_flow.max_active_global);
     seq_printf(m, "max_active_per_conn %u\n", g_flow.max_active_per_conn);
     seq_printf(m, "slow_lat_thresh_ns %lu\n", g_flow.slow_lat_thresh_ns);
@@ -426,6 +443,45 @@ static const struct file_operations flow_conns_fops = {
     .release = single_release,
 };
 
+/* debugfs 写入接口: 调整 max_active_global (用于测试触发排队) */
+static ssize_t flow_max_global_write(struct file *file, const char __user *buf,
+                                      size_t count, loff_t *ppos)
+{
+    char kbuf[32];
+    unsigned int val;
+    size_t len = min(count, sizeof(kbuf) - 1);
+
+    if (copy_from_user(kbuf, buf, len))
+        return -EFAULT;
+    kbuf[len] = '\0';
+
+    if (kstrtouint(kbuf, 10, &val) || val == 0)
+        return -EINVAL;
+
+    g_flow.max_active_global = val;
+    pr_info("powerfs: flow max_active_global set to %u\n", val);
+    return count;
+}
+
+static int flow_max_global_show(struct seq_file *m, void *v)
+{
+    seq_printf(m, "%u\n", g_flow.max_active_global);
+    return 0;
+}
+
+static int flow_max_global_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, flow_max_global_show, NULL);
+}
+
+static const struct file_operations flow_max_global_fops = {
+    .open    = flow_max_global_open,
+    .read    = seq_read,
+    .write   = flow_max_global_write,
+    .llseek  = seq_lseek,
+    .release = single_release,
+};
+
 /* 在 powerfs_flow_init 之后注册 debugfs 文件 */
 static void flow_debugfs_init(void)
 {
@@ -435,6 +491,7 @@ static void flow_debugfs_init(void)
 
     debugfs_create_file("global", 0444, root, NULL, &flow_global_fops);
     debugfs_create_file("connections", 0444, root, NULL, &flow_conns_fops);
+    debugfs_create_file("max_active_global", 0644, root, NULL, &flow_max_global_fops);
 }
 
 /* ========== 模块加载钩子 (由 powerfs_mod.c 调用) ========== */

@@ -2,7 +2,7 @@
 # 基于 Linux 6.2 内核 + 内核态 powerfs-net (TCP) 架构
 
 # 内核源码路径 (使用 6.2 内核源码)
-KERNELDIR ?= /home/portion/powerfs/ubuntu-linux-git
+KERNELDIR ?= /home/portion/powerfs/linux-6.17
 
 # PowerFS 模块配置
 PWD := $(shell pwd)

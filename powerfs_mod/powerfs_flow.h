@@ -92,6 +92,9 @@ struct powerfs_flow_global {
     atomic64_t  total_errs;
     atomic64_t  total_bytes_sent;
     atomic64_t  total_bytes_recv;
+    atomic64_t  queue_count;     /* admit_wait 排队触发次数 */
+    atomic64_t  reject_count;    /* admit_wait 超时拒绝次数 */
+    atomic64_t  queue_wakeups;   /* 排队后被唤醒成功次数 */
 };
 
 /* 流控控制器 (全局单例) */
