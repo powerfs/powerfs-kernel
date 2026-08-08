@@ -454,9 +454,18 @@ struct powerfs_request {
     /* === 完成与超时 === */
     struct completion done;     /* 同步等待 */
     int (*callback)(struct powerfs_request *);  /* 异步回调 (可选, NULL=同步) */
+    void *priv;                 /* 异步回调上下文 (调用方设置, callback 内访问) */
     int error;                  /* 最终错误码 (0=成功, <0=错误) */
     unsigned long deadline;     /* 超时 jiffies (0=使用默认) */
     u64 ts_submit;              /* 调试: do_send 入队时间 (ktime_get_ns, 0=未启用) */
+
+    /* === 异步超时 (仅 callback != NULL 时启用) ===
+     * 同步请求用 do_send 内 wait_for_completion_killable_timeout 兜底;
+     * 异步请求无等待线程, 用 delayed_work 在 deadline 到期时触发完成,
+     * 防止请求挂死 (page 永远留在 PageWriteback → hung task).
+     * 在 process context (system_wq) 执行, callback 可睡眠安全. */
+    struct delayed_work timeout_work;
+    bool timer_armed;
 
     /* === 重发控制 (参照 Ceph r_attempts) === */
     int attempts;               /* 发送尝试次数 */
@@ -1026,6 +1035,56 @@ int powerfs_net_write_needle(__u64 volume_id, __u64 file_key, __u64 inode,
  * 返回 0 成功, <0 错误 */
 int powerfs_net_read_needle(__u64 volume_id, __u64 file_key,
                             __u8 *buf, size_t buf_cap, __u32 *read_len);
+
+/* === 异步 WriteNeedle / ReadNeedle (page writeback 异步提交模式) ===
+ *
+ * 与同步版本区别: 入队后立即返回, 不等待响应. 响应到达时由调度器调用
+ * req->callback(req). 调用方通过 req->priv 携带完成上下文.
+ *
+ * 生命周期约定:
+ *   - 调用方提供的缓冲区 (req_body/resp_body/resp_data/data) 必须持久存活,
+ *     直到 callback 被调用后才可释放 (通常放在 callback 所属的 ctx 中).
+ *   - 返回 0: 提交成功, callback 将被调用 (成功或超时/断连), 调用方不得
+ *     再访问传入的 req (由网络层在 callback 触发前管理).
+ *   - 返回 <0: 提交失败 (如无可用连接), callback 不会被调用, 调用方自行
+ *     清理缓冲区与上下文.
+ *   - callback 内必须调用 powerfs_request_free(req) 释放请求对象.
+ *
+ * 超时: 异步请求用 delayed_work 在 deadline 到期时以 -ETIMEDOUT 完成,
+ * 防止 page 永久滞留 PageWriteback 状态. timeout_ms 建议 30000 (30s). */
+
+/* 异步 WriteNeedle.
+ * req_body/req_body_cap: 调用方提供的 TLV body 缓冲区 (函数内编码, 持久存活)
+ * resp_body/resp_body_cap: 调用方提供的响应 body 缓冲区 (持久存活)
+ * data/data_len: 写入数据 (持久存活到 callback)
+ * callback/priv: 完成回调与上下文 */
+int powerfs_net_write_needle_async(__u64 volume_id, __u64 file_key, __u64 inode,
+                                   const __u8 *data, size_t data_len,
+                                   const char *lease_token, size_t token_len,
+                                   __u8 *req_body, size_t req_body_cap,
+                                   __u8 *resp_body, size_t resp_body_cap,
+                                   int timeout_ms,
+                                   int (*callback)(struct powerfs_request *),
+                                   void *priv);
+
+/* 异步 ReadNeedle (writeback RMW 读现有 needle).
+ * req_body/req_body_cap: TLV body 缓冲区 (函数内编码, 持久存活)
+ * resp_data/resp_data_cap: 响应数据缓冲区 (持久存活, scheduler 写入 needle 内容)
+ * callback/priv: 完成回调与上下文 */
+int powerfs_net_read_needle_async(__u64 volume_id, __u64 file_key,
+                                  __u8 *resp_data, size_t resp_data_cap,
+                                  __u8 *req_body, size_t req_body_cap,
+                                  int timeout_ms,
+                                  int (*callback)(struct powerfs_request *),
+                                  void *priv);
+
+/* 统一完成入口: 供内部 RX/disconnect/timeout 路径调用.
+ * 有 callback → 调 callback (异步); 无 callback → complete(&done) (同步).
+ * 同时取消异步超时定时器 (若已武装). */
+void powerfs_req_complete(struct powerfs_request *req);
+
+/* 将 powerfs-net 响应状态码转为 Linux errno (供异步 callback 使用) */
+int net_status_to_errno(__u16 status);
 
 /* 从 Master GetTopology 获取 volume 路由表 (volume_id → addr).
  * 在 pool_init 后调用, 填充 vol_routes[] 用于 ReadNeedle 路由. */

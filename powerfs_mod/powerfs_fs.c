@@ -183,6 +183,8 @@ static void powerfs_clear_dir_entries(struct inode *dir);
 
 /* lease 续约 work 函数 (前向声明，Step 2 实现真实续约) */
 static void powerfs_lease_renew_work_func(struct work_struct *work);
+/* 异步 setattr work 函数 (writeback offload, 定义在 write_inode 之前) */
+static void powerfs_setattr_work_fn(struct work_struct *work);
 /* lease 释放 (evict_inode 调用, 定义在 lease 管理段) */
 static void release_all_leases(struct inode *inode);
 /* lease 获取 (写路径调用, 定义在 lease 管理段) */
@@ -192,6 +194,9 @@ static int ensure_lease(struct inode *inode, loff_t offset);
 
 /*
  * d_init - 新 dentry 创建时分配私有数据
+ *
+ * 目录级 lease 方案: dentry_info 不再维护独立 lease, 仅保留 RCU 释放和
+ * readdir 偏移. dentry 有效性完全依赖父目录 inode 的 dir_lease_expire.
  *
  * 参考 ceph_d_init (fs/ceph/dir.c)
  *
@@ -207,8 +212,6 @@ int powerfs_d_init(struct dentry *dentry)
 
     di->dentry = dentry;
     di->time = jiffies;
-    di->lease_expire = jiffies + POWERFS_DENTRY_LEASE_TTL;
-    INIT_LIST_HEAD(&di->lease_list);
 
     dentry->d_fsdata = di;
 
@@ -238,10 +241,12 @@ static void powerfs_di_free_rcu(struct rcu_head *head)
 /*
  * d_release - dentry 销毁前释放私有数据
  *
- * 参考 ceph_d_release (fs/ceph/dir.c)
+ * 目录级 lease 方案: 不再有 lease_list 需要摘除, 仅做 RCU 延迟释放.
  *
  * 重要: d_fsdata 必须用 call_rcu 延迟释放, 不能裸 kmem_cache_free.
  * 原因: RCU path walk (__d_lookup_rcu + d_revalidate) 可能并发读 d_fsdata.
+ *
+ * 参考 ceph_d_release (fs/ceph/dir.c)
  */
 void powerfs_d_release(struct dentry *dentry)
 {
@@ -252,115 +257,66 @@ void powerfs_d_release(struct dentry *dentry)
 
     pr_debug("powerfs: d_release '%pd' (di=%p)\n", dentry, di);
 
-    /* 从 lease 链表移除 (如果在链表中) */
-    if (!list_empty(&di->lease_list)) {
-        struct powerfs_sb_info *sbi = POWERFS_SB_INFO(dentry->d_sb);
-        if (sbi && sbi->client) {
-            spin_lock(&sbi->client->dentry_lease_lock);
-            list_del_init(&di->lease_list);
-            spin_unlock(&sbi->client->dentry_lease_lock);
-        }
-    }
-
     /* 设置 d_fsdata = NULL 并通过 RCU 延迟释放 di.
-     * RCU reader 在 d_revalidate 中读 d_fsdata 可能看到 NULL (安全:
-     * d_revalidate 检查 !di 返回 1) 或旧指针 (仍有效, 因为 di 还没被 free).
+     * RCU reader 在 d_revalidate 中读 d_fsdata 可看到 NULL (安全:
+     * d_revalidate 不再解引用 di) 或旧指针 (仍有效, 因为 di 还没被 free).
      * grace period 后才真正 free, 保证无 UAF. */
     dentry->d_fsdata = NULL;
     call_rcu(&di->rcu, powerfs_di_free_rcu);
 }
 
-/*
- * d_revalidate - 验证 dentry 缓存是否仍然有效
- *
- * 参考 ceph_d_revalidate (fs/ceph/dir.c)
- *
- * 这是网络文件系统的核心回调：
- *   - 返回 1: dentry 仍然有效，使用缓存
- *   - 返回 0: dentry 已失效，丢弃缓存重新 lookup
- *   - 返回负值: 错误
- */
-
 /* Phase 1 前置声明: 目录 lease 失效 (定义在 readdir 区段, 但 mknod 等更早使用). */
 static void powerfs_invalidate_dir_lease(struct inode *dir);
 
+/*
+ * d_revalidate - 基于父目录 Lease 校验 dentry 有效性
+ *
+ * 核心原则 (目录级 Lease 方案):
+ *   1. RCU 路径: 无锁读取父目录 dir_lease_expire, 有效返回 1, 过期返回 -ECHILD
+ *   2. REF 路径: 统一返回 1 (永不返回 0)
+ *   3. 永不触发 d_invalidate + d_drop + re-lookup 循环
+ *
+ * 为什么永不返回 0:
+ *   return 0 触发 VFS 的 d_invalidate → d_drop → dput → d_alloc_parallel →
+ *   __d_lookup_rcu. 负 dentry 释放路径短 (无 iput), 与 __d_lookup_rcu 的
+ *   RCU 遍历竞态 → dentry 哈希链环 → RCU stall.
+ *   返回 1 让 VFS 使用缓存, stale dentry 由 readdir/shrinker 清理.
+ *
+ * 返回值:
+ *   1: dentry 有效, 使用缓存 (正/负 dentry 无差别)
+ *   -ECHILD: 退出 RCU, 切换 REF 路径 (仅 RCU 模式)
+ *
+ * 参考: ceph_d_revalidate (fs/ceph/dir.c)
+ */
 int powerfs_d_revalidate(struct inode *dir, const struct qstr *name,
                          struct dentry *dentry, unsigned int flags)
 {
-    struct powerfs_dentry_info *di;
-    struct inode *inode;
-    struct powerfs_inode_info *pi;
+    struct powerfs_inode_info *parent_pi;
+    unsigned long lease_expire;
 
-    /* RCU 模式 fast-path: 检查 dentry lease 有效性.
+    /* === RCU 路径: 无锁检查父目录 lease ===
      *
-     * 之前始终返回 -ECHILD 退出 RCU 模式, 导致 VFS 频繁切换到非 RCU 模式
-     * (d_lookup), 在高并发下 d_lock 竞争加剧, 触发 RCU stall in __d_lookup.
-     *
-     * 优化: lease 有效时返回 1, VFS 继续在 RCU 模式查找 (__d_lookup_rcu),
-     * 无需 d_lock. lease 无效时返回 -ECHILD, 退出 RCU 模式重新验证.
-     *
-     * 安全性: d_release 使用 call_rcu 延迟释放 di, RCU reader 访问
-     * dentry->d_fsdata 和 di->lease_expire 安全 (grace period 内 di 有效).
-     * dentry 本身在 RCU path walk 期间不会被释放 (VFS 持有 rcu_read_lock). */
+     * 用 READ_ONCE 读取 dir_lease_expire, 不持任何 spinlock (RCU 临界区禁止
+     * 取 spinlock, 否则会导致 RCU stall).
+     * 值可能略旧 (并发 mutation 刚清零), 但最差情况是放行一个 stale dentry,
+     * 下次访问会纠正, 不会导致 stall. */
     if (flags & LOOKUP_RCU) {
-        /* RCU 安全访问: 参考 ceph_d_revalidate (fs/ceph/dir.c)
-         * - d_inode_rcu: 使用 rcu_dereference 读 d_inode, 防 compiler 优化
-         * - READ_ONCE: 防 d_fsdata 被 d_release 并发置 NULL 时读到撕裂值
-         * VFS 通过 d_seq 保证 dentry 在 RCU 临界区内稳定 */
-        di = READ_ONCE(dentry->d_fsdata);
-        if (di && time_before(jiffies, READ_ONCE(di->lease_expire))) {
-            inode = d_inode_rcu(dentry);
-            if (inode) {
-                pi = POWERFS_I(inode);
-                if (!READ_ONCE(pi->cache_valid))
-                    return -ECHILD;
-            }
-            return 1;
-        }
-        return -ECHILD;
+        if (!dir)
+            return -ECHILD;
+        parent_pi = POWERFS_I(dir);
+        lease_expire = READ_ONCE(parent_pi->dir_lease_expire);
+
+        if (time_before(jiffies, lease_expire))
+            return 1;       /* 父目录 lease 有效: 正/负 dentry 全部放行 */
+        else
+            return -ECHILD; /* lease 过期: 降级 REF 路径 */
     }
 
-    /* 获取 dentry 私有数据 */
-    di = dentry->d_fsdata;
-    if (!di)
-        return 1;
-
-    /* === Phase 1: Dentry lease fast-path ===
-     * dentry lease 未过期: 负 dentry 直接返回 1 (5s 内不再 lookup),
-     * 正 dentry 还需检查 inode cache_valid (本地 mutation 可能已失效).
-     * dentry lease 过期: 让 VFS 调 lookup 重新验证 (返回 0). */
-    if (time_after(jiffies, di->lease_expire)) {
-        /* lease 过期: 让 VFS 重新 lookup. 正 dentry 同时清 cache_valid,
-         * 让后续 getattr 拉取最新属性. 负 dentry 直接 return 0. */
-        inode = d_inode(dentry);
-        if (inode) {
-            pi = POWERFS_I(inode);
-            spin_lock(&pi->i_lock);
-            pi->cache_valid = false;
-            spin_unlock(&pi->i_lock);
-        }
-        pr_debug("powerfs: d_revalidate '%pd' lease expired\n", dentry);
-        return 0;
-    }
-
-    /* lease 未过期 */
-    inode = d_inode(dentry);
-    if (!inode)
-        return 1;   /* 负 dentry, lease 仍有效 */
-
-    /* 正 dentry: 检查 inode 级 cache_valid.
-     * 本地 mutation (mkdir/unlink 等) 会清 cache_valid, 即使 dentry lease
-     * 未过期也要重新 lookup (mutation 后属性/存在性可能变). */
-    pi = POWERFS_I(inode);
-    spin_lock(&pi->i_lock);
-    if (!pi->cache_valid) {
-        spin_unlock(&pi->i_lock);
-        pr_debug("powerfs: d_revalidate '%pd' inode cache invalid\n", dentry);
-        return 0;
-    }
-    spin_unlock(&pi->i_lock);
-
-    pr_debug("powerfs: d_revalidate '%pd' valid\n", dentry);
+    /* === REF 路径: 统一返回 1 ===
+     *
+     * 不在此处做 lease 续约 RPC (d_revalidate 在路径遍历中频繁调用, 内嵌
+     * RPC 会阻塞). lease 续约由 readdir / lookup 统一处理.
+     * stale dentry 通过 readdir 刷新 / shrinker 回收 / 本地 mutation 失效. */
     return 1;
 }
 
@@ -401,7 +357,12 @@ void powerfs_d_prune(struct dentry *dentry)
 
 /* Dentry operations 表
  *
- * 启用 Delta Sync 所需的 d_revalidate 和 d_init/d_release
+ * 目录级 lease 方案:
+ *   - d_revalidate: 检查父目录 lease, 永不返回 0 (避免 RCU stall)
+ *   - d_init: 分配 dentry_info (RCU 释放用)
+ *   - d_release: RCU 延迟释放 dentry_info (防止内存泄漏 + UAF)
+ *   - d_prune: 清父目录 dir_complete (shrinker 回收时目录缓存不再完整)
+ *
  * 参考 ceph dentry_operations
  */
 static const struct dentry_operations powerfs_dentry_operations = {
@@ -735,33 +696,6 @@ int powerfs_init_inode(struct inode *inode, umode_t mode,
     return 0;
 }
 
-/*
- * powerfs_set_dentry_lease - 设置 dentry 租约
- */
-void powerfs_set_dentry_lease(struct dentry *dentry, unsigned long ttl)
-{
-    struct powerfs_dentry_info *di = dentry->d_fsdata;
-
-    if (!di)
-        return;
-
-    di->lease_expire = jiffies + ttl;
-    di->time = jiffies;
-}
-
-/*
- * powerfs_dentry_lease_valid - 检查 dentry 租约是否有效
- */
-bool powerfs_dentry_lease_valid(struct dentry *dentry)
-{
-    struct powerfs_dentry_info *di = dentry->d_fsdata;
-
-    if (!di)
-        return false;
-
-    return time_before(jiffies, di->lease_expire);
-}
-
 /* ========== Inode 生命周期管理 ========== */
 
 /*
@@ -813,6 +747,10 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->file_key = 0;
     pi->shutdown = false;
 
+    /* 异步 setattr work (writeback offload) */
+    INIT_WORK(&pi->setattr_work, powerfs_setattr_work_fn);
+    pi->setattr_pending = false;
+
     /* 初始化目录缓存字段 */
     INIT_LIST_HEAD(&pi->dir_entries);
     mutex_init(&pi->dir_mutex);
@@ -860,9 +798,11 @@ void powerfs_evict_inode(struct inode *inode)
     /* 1. 先截断 page cache (参考 ceph_evict_inode) */
     truncate_inode_pages_final(&inode->i_data);
 
-    /* 2. 取消后台 lease 续约 work（必须在 clear_inode 之前，因为 work 可能引用 inode）
+    /* 2. 取消后台 lease 续约 work 和异步 setattr work
+     *    （必须在 clear_inode 之前，因为 work 可能引用 inode）
      *    参考 ceph_evict_inode: cancel_writeback 是在 clear_inode 之前 */
     cancel_delayed_work_sync(&pi->lease_renew_work);
+    cancel_work_sync(&pi->setattr_work);
 
     /* 3. 释放所有 lease (通知 volume server, 必须在 clear_inode 之前) */
     release_all_leases(inode);
@@ -897,6 +837,47 @@ void powerfs_evict_inode(struct inode *inode)
 }
 
 /*
+ * powerfs_setattr_work_fn - 异步 setattr work 函数 (WQ_UNBOUND 上下文)
+ *
+ * 在 writeback_wq (WQ_UNBOUND) 中执行, 不阻塞 per-CPU writeback workqueue.
+ * 读取最新 i_size (可能已有多次 writeback 累积), 调用 powerfs_net_setattr
+ * 同步到 Filer, 成功后更新 pi->content_size.
+ */
+static void powerfs_setattr_work_fn(struct work_struct *work)
+{
+    struct powerfs_inode_info *pi = container_of(work,
+                                                   struct powerfs_inode_info,
+                                                   setattr_work);
+    struct inode *inode = &pi->netfs.inode;
+    u64 i_size;
+    int ret;
+
+    if (powerfs_net_is_stopping())
+        goto out;
+
+    i_size = i_size_read(inode);
+    if (i_size == 0)
+        goto out;
+
+    ret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
+                               0, 0, 0, i_size);
+    if (ret < 0) {
+        pr_warn("powerfs: async setattr ino=%lu size=%llu failed: %d\n",
+                inode->i_ino, i_size, ret);
+        goto out;  /* content_size 不更新, 下次 writeback 重试 */
+    }
+
+    spin_lock(&pi->i_lock);
+    pi->content_size = i_size;
+    spin_unlock(&pi->i_lock);
+
+out:
+    spin_lock(&pi->i_lock);
+    pi->setattr_pending = false;
+    spin_unlock(&pi->i_lock);
+}
+
+/*
  * powerfs_write_inode - VFS writeback 时同步 inode 元数据到 Filer
  *
  * 作用:
@@ -913,14 +894,19 @@ void powerfs_evict_inode(struct inode *inode)
  *   用 pi->content_size 跟踪上次成功同步的 size, 仅在 i_size 变化时
  *   发送 setattr, 避免每次 writeback 都网络往返.
  *
+ * WB_SYNC_ALL (fsync/sync): 调用方进程上下文, 可安全同步等待网络.
+ * WB_SYNC_NONE (背景 writeback): 内核 per-CPU writeback workqueue,
+ *   必须 offload 到 WQ_UNBOUND, 否则同步网络调用阻塞 per-CPU worker
+ *   导致 workqueue lockup (实测 598s).
+ *
  * 参考: ceph_write_inode (fs/ceph/inode.c) 同步 caps 模式.
  */
 static int powerfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
     struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(inode->i_sb);
     loff_t i_size;
     u64 last_synced;
-    int ret;
 
     if (!S_ISREG(inode->i_mode))
         return 0;
@@ -942,31 +928,35 @@ static int powerfs_write_inode(struct inode *inode, struct writeback_control *wb
     if ((u64)i_size == last_synced)
         return 0;
 
-    /* 等待所有 pending 的异步 writeback 完成, 确保数据已写入 Filer 后
-     * 再发送 setattr(SIZE). 否则 Filer 可能先收到 setattr 将文件扩展
-     * (零填充), 然后异步写到达覆盖数据 -- 但若 Filer 的 setattr 截断
-     * 已有数据, 则先到的写会被丢失.
-     *
-     * VFS writeback 顺序: do_writepages → write_inode → filemap_fdatawait
-     * do_writepages 提交异步 work 后立即返回, write_inode 此刻发 setattr
-     * 时数据可能尚未到达 Filer. 显式等待确保顺序正确. */
-    filemap_fdatawait_range(inode->i_mapping, 0, LLONG_MAX);
+    if (wbc->sync_mode == WB_SYNC_ALL) {
+        /* fsync/sync: 调用方进程上下文, 可安全同步等待网络.
+         * (VFS 在调用者线程中执行, 非 writeback workqueue) */
+        int ret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
+                                       0, 0, 0, (__u64)i_size);
+        if (ret < 0) {
+            pr_warn("powerfs: write_inode sync setattr ino=%lu size=%llu failed: %d\n",
+                    inode->i_ino, (u64)i_size, ret);
+            return ret;
+        }
+        spin_lock(&pi->i_lock);
+        pi->content_size = (u64)i_size;
+        spin_unlock(&pi->i_lock);
+    } else {
+        /* WB_SYNC_NONE (背景 writeback): 内核 per-CPU writeback workqueue,
+         * 必须不能阻塞 — offload 到 WQ_UNBOUND (sbi->writeback_wq).
+         * 若已有 pending work, 跳过 (work 函数会读取最新 i_size).
+         * 返回 0 (不 redirty), setattr 失败时 content_size 不更新, 下次重试. */
+        bool already_pending;
 
-    /* 先请求 Filer 同步 size, 成功后才更新本地 content_size.
-     * 断连时 powerfs_net_setattr 返回 -ENOTCONN, writeback 会重试.
-     * 之前断连时 return 0 (假装成功) 导致 size 未同步, remount 后不一致. */
-    ret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
-                               0, 0, 0, (__u64)i_size);
-    if (ret < 0) {
-        pr_warn("powerfs: write_inode setattr ino=%lu size=%llu failed: %d\n",
-                inode->i_ino, (u64)i_size, ret);
-        return ret;  /* 传播错误, writeback 会 redirty 重试 */
+        spin_lock(&pi->i_lock);
+        already_pending = pi->setattr_pending;
+        if (!already_pending)
+            pi->setattr_pending = true;
+        spin_unlock(&pi->i_lock);
+
+        if (!already_pending)
+            queue_work(sbi->writeback_wq, &pi->setattr_work);
     }
-
-    /* 请求成功后才更新本地记录 */
-    spin_lock(&pi->i_lock);
-    pi->content_size = (u64)i_size;
-    spin_unlock(&pi->i_lock);
 
     return 0;
 }
@@ -1220,6 +1210,10 @@ static void powerfs_lease_renew_work_func(struct work_struct *work)
     if (!sbi || !sbi->lease_wq || sbi->shutting_down || pi->shutdown)
         return;
 
+    /* DEBUG: 禁用 lease renew 以排除法定位 RCU stall.
+     * 直接返回, 不执行续约, 不重调度. */
+    return;
+
     /* Phase 1: 锁内扫描, 收集需要续约的 lease 信息 + 跟踪最早过期时间.
      * 不在锁内执行网络 I/O: spinlock 不可睡眠, 网络 RPC 可阻塞 5s. */
     spin_lock(&pi->lease_lock);
@@ -1304,7 +1298,10 @@ static void powerfs_lease_renew_work_func(struct work_struct *work)
                     struct powerfs_lease *l =
                         rb_entry(n, struct powerfs_lease, node);
                     if (l->stripe_start == renew_list[i].stripe_start) {
-                        memcpy(l->token, new_token, new_token_len + 1);
+                        size_t copy_len = min(new_token_len,
+                                              sizeof(l->token) - 1);
+                        memcpy(l->token, new_token, copy_len);
+                        l->token[copy_len] = '\0';
                         l->epoch = new_epoch;
                         l->content_size = new_content_size;
                         l->expire_jiffies = new_expire;
@@ -1580,14 +1577,11 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
              */
             d_add(dentry, inode);
 
-            /* 更新 dentry 租约时间 */
-            {
-                struct powerfs_dentry_info *di = dentry->d_fsdata;
-                if (di) {
-                    di->lease_expire = jiffies + POWERFS_DENTRY_LEASE_TTL;
-                    di->time = jiffies;
-                }
-            }
+            /* 目录级 lease: lookup 成功后续约父目录 lease.
+             * 一次 RPC 同时完成查询+续约, 后续同目录的 d_revalidate
+             * 全部 RCU 命中, 无网络交互. */
+            WRITE_ONCE(POWERFS_I(dir)->dir_lease_expire,
+                       jiffies + POWERFS_DIR_LEASE_TTL);
 
             pr_debug("powerfs: lookup '%pd' completed\n", dentry);
             total_us = div_u64(ktime_get_ns() - ts_entry, 1000);
@@ -1597,14 +1591,13 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
         }
 
         if (err == -ENOENT) {
-            /* 文件不存在: 添加负 dentry + 设短 lease (5s 内不再重复 lookup).
-             * Phase 1: 负 dentry lease 减少对不存在文件的重复网络请求. */
-            struct powerfs_dentry_info *di;
+            /* 文件不存在: 添加负 dentry.
+             * 目录级 lease: 负 dentry 不再维护独立 TTL, 有效性依赖父目录 lease.
+             * lookup 成功 (即使 ENOENT) 也续约父目录 lease. */
             pr_debug("powerfs: lookup '%pd' not found (powerfs_net)\n", dentry);
             d_add(dentry, NULL);
-            di = dentry->d_fsdata;
-            if (di)
-                di->lease_expire = jiffies + POWERFS_DENTRY_LEASE_TTL;
+            WRITE_ONCE(POWERFS_I(dir)->dir_lease_expire,
+                       jiffies + POWERFS_DIR_LEASE_TTL);
             total_us = div_u64(ktime_get_ns() - ts_entry, 1000);
             pr_info_ratelimited("powerfs: LOOKUP '%pd' enoent net=%lluus total=%lluus\n",
                     dentry, net_dur_us, total_us);
@@ -1698,8 +1691,17 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
                  dentry, inode->i_ino, mknod_volume_id, mknod_file_key);
     }
 
-    /* 关联 dentry 和 inode */
-    d_add(dentry, inode);
+    /* 关联 dentry 和 inode.
+     *
+     * 必须用 d_instantiate, 不能用 d_add! 原因:
+     * powerfs_mknod 被 .create/.mkdir 调用时, dentry 已经被 powerfs_lookup
+     * 通过 d_add 加入 hash 链. 如果再次调用 d_add → __d_rehash →
+     * hlist_bl_add_head_rcu, 会将同一个 dentry 重复插入 hash 链 → 形成环 →
+     * __d_lookup_rcu 无限循环 → RCU stall.
+     *
+     * d_instantiate 只附加 inode (hlist_add_head 到 d_alias), 不操作 d_hash.
+     * 参考: ramfs_mknod (fs/ramfs/inode.c) 也用 d_instantiate. */
+    d_instantiate(dentry, inode);
 
     /* 更新父目录时间戳 */
     {
@@ -1963,8 +1965,8 @@ static int powerfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
         return err;
     }
 
-    /* 关联 dentry 和 inode */
-    d_add(dentry, inode);
+    /* 关联 dentry 和 inode (用 d_instantiate, 不能用 d_add — 见 powerfs_mknod 注释) */
+    d_instantiate(dentry, inode);
 
     /* 更新父目录时间戳 */
     {
@@ -2092,12 +2094,13 @@ static int powerfs_link(struct dentry *old_dentry, struct inode *dir,
 
     /*
      * VFS (vfs_link) 不会自动 inc_nlink, 需要文件系统自己调用.
-     * d_add 不递增 i_count! 每个 dentry 必须持有独立的 i_count
-     * 参考 simple_link / ramfs_link 均在 d_add 前调用 ihold.
+     * d_instantiate 不递增 i_count! 每个 dentry 必须持有独立的 i_count,
+     * 参考 simple_link / ramfs_link 均在 d_instantiate 前调用 ihold.
+     * 用 d_instantiate (不能用 d_add): new_dentry 已被 lookup 路径加入 hash 链.
      */
     inc_nlink(inode);
     ihold(inode);
-    d_add(new_dentry, inode);
+    d_instantiate(new_dentry, inode);
 
     {
         struct timespec64 now = current_time(dir);
@@ -2974,6 +2977,10 @@ struct powerfs_writepage_work {
     struct page **pages;     /* max_pages 项, 紧随结构体后 */
     loff_t *offsets;         /* max_pages 项, 紧随 pages 后 */
     size_t *counts;          /* max_pages 项, 紧随 offsets 后 */
+    /* 异步提交计数: 跟踪尚未完成的 needle 写入. work_fn 持有 +1 ref,
+     * 每个 needle ctx 完成时 dec. 归零时执行 final cleanup (iput/dec/kvfree).
+     * 防止提前归零: work_fn 在所有 ctx 提交后才 dec 自己的 ref. */
+    atomic_t pending_needles;
 };
 
 /*
@@ -3003,17 +3010,265 @@ powerfs_alloc_write_batch(int max_pages, gfp_t gfp)
 }
 
 /*
- * powerfs_writepage_work_fn - 批量异步写 workqueue 函数
+ * ========== Stage D: page writeback 异步提交模式 ==========
  *
- * 直连 Volume Server (WriteNeedle), 按 needle (chunk) 分组批量写:
- *   1. 遍历 batch 内页面 (按 offset 升序), 按 needle_id 分组
- *   2. 每个 needle: read-modify-write (读现有 needle → 合并页面 → 整体写回)
- *   3. 同一 needle 的页面只做一次 read + 一次 write
+ * 旧同步实现 (powerfs_net_write_needle/read_needle) 在 workqueue 线程内
+ * wait_for_completion 等待响应 (最长 30s/请求), 多个 needle 串行 →
+ * workqueue lockup 598s. 新实现将 read_needle + write_needle 改为异步提交:
+ *
+ *   writepage_work_fn (workqueue 线程, 快速返回):
+ *     1. 按 needle_id 分组 batch 内页面
+ *     2. 每个 needle 组: alloc ctx (含 2MB needle_buf), 获取 lease (同步, 快速),
+ *        submit read_needle_async (非阻塞入队)
+ *     3. work_fn 返回, workqueue 线程立即释放
+ *
+ *   read_cb (调度器 RX 上下文, 响应到达时):
+ *     1. 读取结果填入 ctx->needle_buf (scheduler 已完成 memcpy)
+ *     2. 合并脏页数据到 needle_buf (read-modify-write 的 modify)
+ *     3. submit write_needle_async (非阻塞入队)
+ *
+ *   write_cb (调度器 RX 上下文, 写响应到达时):
+ *     1. end_page_writeback + put_page (清除该 needle 的所有页)
+ *     2. free ctx (needle_buf + ctx)
+ *     3. atomic_dec pending_needles; 归零则 final_cleanup (iput/dec/kvfree wpw)
+ *
+ * 引用计数 (pending_needles):
+ *   - 初始 = num_needle_groups + 1 (work_fn 持有 +1 ref)
+ *   - 每个 ctx 完成 (成功或失败) dec 1
+ *   - work_fn 在所有 ctx 提交后 dec 自己的 +1
+ *   - 归零时 final_cleanup, 防止提前归零 (work_fn 仍在访问 wpw)
+ *
+ * 超时兜底: 异步请求用 delayed_work (system_wq) 在 deadline 到期时以
+ *   -ETIMEDOUT 完成, 防止 page 永久滞留 PageWriteback → hung task.
+ */
+
+/* Per-needle 异步上下文 (一个 needle 组对应一个 ctx) */
+struct powerfs_wb_ctx {
+    struct powerfs_writepage_work *wpw;   /* 所属 batch */
+    int needle_start_idx;                  /* wpw->pages 中的起始索引 */
+    int needle_end_idx;                    /* 结束索引 (exclusive) */
+    __u64 volume_id;
+    __u64 needle_id;
+    __u8 *needle_buf;                      /* 2MB, per-ctx (read 写入, write 读出) */
+    __u32 needle_len;                      /* needle 有效数据长度 */
+    char lease_token[64];
+    size_t lease_token_len;
+    /* 持久缓冲区: 异步请求的 req_body / resp_body, 存活到 callback 触发 */
+    __u8 req_body[256];
+    __u8 resp_body[64];
+};
+
+/* 前向声明 */
+static void powerfs_wb_final_cleanup(struct powerfs_writepage_work *wpw);
+static int powerfs_wb_read_cb(struct powerfs_request *req);
+static int powerfs_wb_write_cb(struct powerfs_request *req);
+
+/* powerfs_wb_fail_pages - 失败一个 ctx 范围内的所有页面
+ *
+ * 用于 ctx 分配失败或异步提交失败时, 同步清理页面 (在 work_fn 上下文).
+ * 调用方负责 dec pending_needles + free ctx. */
+static void powerfs_wb_fail_pages(struct powerfs_wb_ctx *ctx, int err)
+{
+    struct powerfs_writepage_work *wpw = ctx->wpw;
+    int j;
+
+    for (j = ctx->needle_start_idx; j < ctx->needle_end_idx; j++) {
+        struct page *p = wpw->pages[j];
+        if (wpw->counts[j] == 0)
+            continue;
+        if (err < 0)
+            mapping_set_error(p->mapping, err);
+        end_page_writeback(p);
+        put_page(p);
+    }
+}
+
+/* powerfs_wb_final_cleanup - 所有 needle 完成后的最终清理
+ *
+ * 释放 batch 级资源: inode 引用, wb_in_flight 计数, wpw 结构.
+ * 由最后一个完成的 ctx (或 work_fn 的自身 ref) 触发. */
+static void powerfs_wb_final_cleanup(struct powerfs_writepage_work *wpw)
+{
+    struct inode *inode = wpw->inode;
+    struct super_block *sb = inode->i_sb;
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+
+    pr_debug("powerfs: WB_FINAL_CLEANUP ino=%lu wb_in_flight=%d\n",
+            inode->i_ino, atomic_read(&sbi->wb_in_flight));
+    atomic_dec(&sbi->wb_in_flight);
+    iput(inode);
+    kvfree(wpw);
+}
+
+/* powerfs_wb_read_cb - read_needle 异步完成回调
+ *
+ * 由 powerfs_req_complete 在调度器 RX 上下文 (process context) 调用.
+ * 1. 处理读取结果 (NOT_FOUND=新 needle, 其他错误=失败页面)
+ * 2. 合并脏页数据到 needle_buf (read-modify-write 的 modify)
+ * 3. 提交 write_needle_async 进入第二阶段
+ *
+ * 注意: 此函数在调度器线程上下文执行, 应避免长时间阻塞. 合并操作是
+ * N×4KB memcpy (16页=64KB ≈ 32µs), 可接受. write_needle_async 仅入队, 不阻塞. */
+static int powerfs_wb_read_cb(struct powerfs_request *req)
+{
+    struct powerfs_wb_ctx *ctx = req->priv;
+    struct powerfs_writepage_work *wpw = ctx->wpw;
+    struct inode *inode = wpw->inode;
+    int ret;
+
+    pr_debug("powerfs: WB_READ_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d)\n",
+            inode->i_ino, (unsigned long long)ctx->needle_id,
+            req->error, req->resp_status,
+            ctx->needle_start_idx, ctx->needle_end_idx);
+
+    /* 解析读取结果 */
+    if (req->error < 0) {
+        /* 网络错误 (断连/超时/截断): 失败页面 */
+        pr_warn("powerfs: wb read_cb ino=%lu nid=%llu net_err=%d\n",
+                inode->i_ino, (unsigned long long)ctx->needle_id,
+                req->error);
+        powerfs_wb_fail_pages(ctx, req->error);
+        powerfs_request_free(req);
+        kvfree(ctx->needle_buf);
+        kfree(ctx);
+        if (atomic_dec_and_test(&wpw->pending_needles))
+            powerfs_wb_final_cleanup(wpw);
+        return 0;
+    }
+
+    if (req->resp_status == POWERFS_NET_STATUS_ERR_NOT_FOUND) {
+        /* needle 不存在 (新文件首次写): 全零 needle, 正常继续 */
+        ctx->needle_len = 0;
+    } else if (req->resp_status != POWERFS_NET_STATUS_OK) {
+        /* 其他服务端错误: 失败页面 */
+        int err = net_status_to_errno(req->resp_status);
+        pr_warn("powerfs: wb read_cb ino=%lu nid=%llu status=%u err=%d\n",
+                inode->i_ino, (unsigned long long)ctx->needle_id,
+                req->resp_status, err);
+        powerfs_wb_fail_pages(ctx, err);
+        powerfs_request_free(req);
+        kvfree(ctx->needle_buf);
+        kfree(ctx);
+        if (atomic_dec_and_test(&wpw->pending_needles))
+            powerfs_wb_final_cleanup(wpw);
+        return 0;
+    } else {
+        /* 读取成功: scheduler 已将 needle 内容写入 ctx->needle_buf */
+        ctx->needle_len = (__u32)req->resp_data_len;
+    }
+
+    powerfs_request_free(req);  /* 释放 read 请求 */
+
+    /* 合并脏页数据到 needle_buf (read-modify-write 的 modify) */
+    {
+        int j;
+        for (j = ctx->needle_start_idx; j < ctx->needle_end_idx; j++) {
+            struct page *page = wpw->pages[j];
+            loff_t offset = wpw->offsets[j];
+            size_t count = wpw->counts[j];
+            size_t offset_in_needle;
+
+            if (count == 0)
+                continue;
+
+            offset_in_needle = offset % POWERFS_CHUNK_SIZE;
+            {
+                char *kaddr = kmap_local_page(page);
+                memcpy(ctx->needle_buf + offset_in_needle, kaddr, count);
+                kunmap_local(kaddr);
+            }
+            if (offset_in_needle + count > ctx->needle_len)
+                ctx->needle_len = offset_in_needle + count;
+        }
+    }
+
+    /* 提交 write_needle_async (第二阶段) */
+    pr_debug("powerfs: WB_WRITE_SUBMIT ino=%lu nid=%llu len=%u\n",
+            inode->i_ino, (unsigned long long)ctx->needle_id,
+            ctx->needle_len);
+    ret = powerfs_net_write_needle_async(
+        ctx->volume_id, ctx->needle_id, inode->i_ino,
+        ctx->needle_buf, ctx->needle_len,
+        ctx->lease_token_len > 0 ? ctx->lease_token : NULL,
+        ctx->lease_token_len,
+        ctx->req_body, sizeof(ctx->req_body),
+        ctx->resp_body, sizeof(ctx->resp_body),
+        30000, powerfs_wb_write_cb, ctx);
+
+    if (ret) {
+        /* 提交失败: callback 不会触发, 手动清理 */
+        pr_warn("powerfs: wb read_cb ino=%lu nid=%llu write submit failed: %d\n",
+                inode->i_ino, (unsigned long long)ctx->needle_id, ret);
+        powerfs_wb_fail_pages(ctx, ret);
+        kvfree(ctx->needle_buf);
+        kfree(ctx);
+        if (atomic_dec_and_test(&wpw->pending_needles))
+            powerfs_wb_final_cleanup(wpw);
+    }
+
+    return 0;
+}
+
+/* powerfs_wb_write_cb - write_needle 异步完成回调
+ *
+ * 写响应到达时调用, 清除该 needle 所有页的 PageWriteback, 释放 ctx.
+ * 最后一个 needle 完成时触发 final_cleanup. */
+static int powerfs_wb_write_cb(struct powerfs_request *req)
+{
+    struct powerfs_wb_ctx *ctx = req->priv;
+    struct powerfs_writepage_work *wpw = ctx->wpw;
+    struct inode *inode = wpw->inode;
+    int err = 0;
+
+    pr_debug("powerfs: WB_WRITE_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d)\n",
+            inode->i_ino, (unsigned long long)ctx->needle_id,
+            req->error, req->resp_status,
+            ctx->needle_start_idx, ctx->needle_end_idx);
+
+    if (req->error < 0) {
+        err = req->error;
+    } else if (req->resp_status != POWERFS_NET_STATUS_OK) {
+        err = net_status_to_errno(req->resp_status);
+    }
+
+    if (err)
+        pr_warn("powerfs: wb write_cb ino=%lu nid=%llu err=%d status=%u\n",
+                inode->i_ino, (unsigned long long)ctx->needle_id,
+                err, req->resp_status);
+
+    /* 完成该 needle 的所有页面 */
+    {
+        int j;
+        for (j = ctx->needle_start_idx; j < ctx->needle_end_idx; j++) {
+            struct page *p = wpw->pages[j];
+            if (wpw->counts[j] == 0)
+                continue;
+            if (err)
+                mapping_set_error(p->mapping, err);
+            end_page_writeback(p);
+            put_page(p);
+        }
+    }
+
+    powerfs_request_free(req);
+    kvfree(ctx->needle_buf);
+    kfree(ctx);
+
+    if (atomic_dec_and_test(&wpw->pending_needles))
+        powerfs_wb_final_cleanup(wpw);
+
+    return 0;
+}
+
+/*
+ * powerfs_writepage_work_fn - 批量异步写 workqueue 函数 (异步提交模式)
+ *
+ * 按 needle_id 分组, 每组创建 ctx 并异步提交 read_needle. work_fn 在所有
+ * ctx 提交后立即返回 (不阻塞等待网络响应), 由 read_cb → write_cb 两阶段
+ * 回调完成实际写入并清除 PageWriteback.
  *
  * needle 模型: write_needle 整体替换 needle 内容, 不支持 partial write.
- * 因此需 read-modify-write: 读现有 needle (若存在), 拷贝脏页到对应位置, 写回.
- *
- * 性能: 1MB 文件 (全在 1 个 needle) → 1 次 read + 1 次 write (vs 逐页 256 次).
+ * 需 read-modify-write: 读现有 needle (异步) → 合并脏页 (read_cb) → 写回 (异步).
  */
 static void powerfs_writepage_work_fn(struct work_struct *work)
 {
@@ -3024,18 +3279,10 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     __u64 volume_id, file_key;
-    __u8 *needle_buf = NULL;
-    __u64 current_needle_id = 0;
-    bool needle_loaded = false;   /* needle_buf 是否已为 current_needle_id 加载 */
-    __u32 needle_len = 0;         /* current_needle_id 的内容长度 */
-    int needle_start_idx = 0;     /* 当前 needle 组的首页索引 */
     int i;
-    /* Per-stripe lease cache: 避免同一 stripe 的多个 needle 重复获取 lease.
-     * 每次 needle 切换时, 若 stripe 变化则重新获取 (网络I/O, 锁外);
-     * 否则复用缓存 token. 修复旧实现只为 batch 首页 stripe 获取 lease 的问题. */
-    u64 cached_stripe_start = U64_MAX;
-    char lease_token[64] = {0};
-    size_t lease_token_len = 0;
+    int num_groups = 0;
+    int group_start = -1;
+    __u64 group_needle_id = 0;
 
     /* 数据直连: 从 inode 获取 volume_id/file_key */
     spin_lock(&pi->i_lock);
@@ -3047,13 +3294,6 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
             inode->i_ino, wpw->num_pages,
             (unsigned long long)volume_id, (unsigned long long)file_key);
 
-    {
-        u64 ts_start = ktime_get_ns();
-        pr_debug("powerfs: WP_START ino=%lu npages=%d ts=%llu\n",
-                inode->i_ino, wpw->num_pages, ts_start);
-        /* 保存 start time 到 wpw 末尾 (临时, 测试后移除) */
-    }
-
     if (!volume_id || !file_key) {
         pr_warn("powerfs: writepage_work ino=%lu no volume mapping\n",
                 inode->i_ino);
@@ -3063,214 +3303,227 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     if (powerfs_net_is_stopping())
         goto fail_all;
 
-    /* needle_buf: 2MB chunk buffer, 用于 read-modify-write.
-     * 一个 batch 内复用, 避免逐页分配.
-     * GFP_NOFS: writeback 路径中禁止触发文件系统 writeback 回收,
-     * 否则 5 并发 writepage_work_fn 的 kvmalloc 可能触发递归
-     * writeback → powerfs_writepages → writeback_wq, 而 writeback_wq
-     * 的 worker 都在 kvmalloc 中等待内存 → 死锁 (workqueue lockup). */
-    needle_buf = kvmalloc(POWERFS_CHUNK_SIZE, GFP_NOFS);
-    if (!needle_buf)
-        goto fail_all;
-    pr_debug("powerfs: WP_ALLOC ino=%lu buf=%px ts=%llu\n",
-            inode->i_ino, needle_buf, ktime_get_ns());
-
+    /* 第一遍: 完成 count==0 的空页, 统计 needle 组数 */
     for (i = 0; i < wpw->num_pages; i++) {
         struct page *page = wpw->pages[i];
         loff_t offset = wpw->offsets[i];
         size_t count = wpw->counts[i];
         __u64 needle_id;
-        size_t offset_in_needle;
 
-        /* 每个 page 之间让出 CPU, 防止长时间占用 workqueue 线程
-         * 导致 RCU grace period 无法完成 (RCU stall). */
         cond_resched();
 
         if (count == 0) {
+            /* 空页: 直接完成, 不参与 needle 分组 */
             end_page_writeback(page);
             put_page(page);
-            /* 若中间有空页, 不影响 needle 分组逻辑 */
             continue;
         }
 
         needle_id = file_key + offset / POWERFS_CHUNK_SIZE;
-        offset_in_needle = offset % POWERFS_CHUNK_SIZE;
 
-        /* needle 边界切换: 写回前一个 needle, 加载新 needle */
-        if (!needle_loaded) {
-            current_needle_id = needle_id;
-            needle_start_idx = i;
-            memset(needle_buf, 0, POWERFS_CHUNK_SIZE);
-            needle_len = 0;
-
-            /* read-modify-write: 先读现有 needle (不存在则全零) */
-            {
-                __u32 existing_len = 0;
-                int rerr;
-                pr_debug("powerfs: WP_READ_BEGIN nid=%llu\n",
-                        (unsigned long long)needle_id);
-                pr_debug("powerfs: WP_READ_BEGIN ino=%lu nid=%llu ts=%llu\n",
-                        inode->i_ino, (unsigned long long)needle_id, ktime_get_ns());
-                rerr = powerfs_net_read_needle(volume_id, needle_id,
-                                                    needle_buf,
-                                                    POWERFS_CHUNK_SIZE,
-                                                    &existing_len);
-                pr_debug("powerfs: WP_READ_END ino=%lu nid=%llu ret=%d len=%u ts=%llu\n",
-                        inode->i_ino, (unsigned long long)needle_id, rerr,
-                        existing_len, ktime_get_ns());
-                if (rerr < 0 && rerr != -ENOENT) {
-                    pr_warn("powerfs: writepage rmw read_needle vid=%llu nid=%llu err=%d, continue with zero\n",
-                            (unsigned long long)volume_id,
-                            (unsigned long long)needle_id, rerr);
-                } else if (rerr == 0) {
-                    needle_len = existing_len;
-                }
-            }
-            needle_loaded = true;
-        } else if (needle_id != current_needle_id) {
-            /* needle 切换: 写回旧 needle, 完成其页面, 加载新 needle */
-            int err;
-            /* 获取旧 needle 所在 stripe 的 lease (per-stripe, 锁外网络I/O).
-             * ensure_lease 内部有快速路径 (已持有则直接返回), 同 stripe
-             * 的多个 needle 只首次触发网络请求. */
-            {
-                loff_t old_offset = wpw->offsets[needle_start_idx];
-                u64 old_stripe = div_u64(old_offset, POWERFS_STRIPE_SIZE)
-                                  * POWERFS_STRIPE_SIZE;
-                if (old_stripe != cached_stripe_start) {
-                    cached_stripe_start = old_stripe;
-                    lease_token_len = 0;
-                    if (powerfs_get_lease_token(inode, old_offset,
-                                                lease_token,
-                                                &lease_token_len)) {
-                        pr_warn("powerfs: writepage lease ino=%lu stripe=%llu, continuing without lease\n",
-                                inode->i_ino,
-                                (unsigned long long)old_stripe);
-                    }
-                }
-            }
-            err = powerfs_net_write_needle(volume_id, current_needle_id,
-                                                inode->i_ino,
-                                                needle_buf, needle_len,
-                                                lease_token_len > 0 ? lease_token : NULL,
-                                                lease_token_len);
-            {
-                int j;
-                for (j = needle_start_idx; j < i; j++) {
-                    struct page *p = wpw->pages[j];
-                    if (wpw->counts[j] == 0) continue;
-                    if (err < 0) {
-                        mapping_set_error(p->mapping, err);
-                    }
-                    end_page_writeback(p);
-                    put_page(p);
-                }
-            }
-            if (err < 0)
-                pr_warn("powerfs: writepage write_needle vid=%llu nid=%llu err=%d\n",
-                        (unsigned long long)volume_id,
-                        (unsigned long long)current_needle_id, err);
-
-            /* 加载新 needle */
-            current_needle_id = needle_id;
-            needle_start_idx = i;
-            memset(needle_buf, 0, POWERFS_CHUNK_SIZE);
-            needle_len = 0;
-            {
-                __u32 existing_len = 0;
-                int rerr = powerfs_net_read_needle(volume_id, needle_id,
-                                                    needle_buf,
-                                                    POWERFS_CHUNK_SIZE,
-                                                    &existing_len);
-                if (rerr < 0 && rerr != -ENOENT) {
-                    pr_warn("powerfs: writepage rmw read_needle vid=%llu nid=%llu err=%d, continue with zero\n",
-                            (unsigned long long)volume_id,
-                            (unsigned long long)needle_id, rerr);
-                } else if (rerr == 0) {
-                    needle_len = existing_len;
-                }
-            }
+        if (group_start < 0) {
+            /* 开始新组 */
+            group_start = i;
+            group_needle_id = needle_id;
+            num_groups++;
+        } else if (needle_id != group_needle_id) {
+            /* needle 切换: 当前组结束, 开始新组 */
+            group_start = i;
+            group_needle_id = needle_id;
+            num_groups++;
         }
-
-        /* 拷贝页面数据到 needle_buf 对应位置 */
-        {
-            char *kaddr = kmap_local_page(page);
-            memcpy(needle_buf + offset_in_needle, kaddr, count);
-            kunmap_local(kaddr);
-            pr_debug("powerfs: writepage memcpy page index=%lu offset=%lld count=%zu needle_buf[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                    page_folio(page)->index, offset, count,
-                    needle_buf[0], needle_buf[1], needle_buf[2], needle_buf[3],
-                    needle_buf[4], needle_buf[5], needle_buf[6], needle_buf[7]);
-        }
-
-        /* 扩展 needle 长度 (若写入超出原有内容) */
-        if (offset_in_needle + count > needle_len)
-            needle_len = offset_in_needle + count;
     }
 
-    /* 写回最后一个 needle 并完成其页面 */
-    if (needle_loaded) {
-        int err;
-        int j;
-        /* 获取最后一个 needle 所在 stripe 的 lease (per-stripe, 锁外网络I/O) */
-        {
-            loff_t last_offset = wpw->offsets[needle_start_idx];
-            u64 last_stripe = div_u64(last_offset, POWERFS_STRIPE_SIZE)
-                               * POWERFS_STRIPE_SIZE;
-            if (last_stripe != cached_stripe_start) {
-                cached_stripe_start = last_stripe;
-                lease_token_len = 0;
-                if (powerfs_get_lease_token(inode, last_offset,
-                                            lease_token,
-                                            &lease_token_len)) {
-                    pr_warn("powerfs: writepage final lease ino=%lu stripe=%llu, continuing without lease\n",
-                            inode->i_ino,
-                            (unsigned long long)last_stripe);
-                }
-            }
-        }
-        pr_debug("powerfs: WP_WRITE_BEGIN nid=%llu len=%u\n",
-                (unsigned long long)current_needle_id, needle_len);
-        pr_debug("powerfs: WP_WRITE_BEGIN ino=%lu nid=%llu len=%u ts=%llu\n",
-                inode->i_ino, (unsigned long long)current_needle_id,
-                needle_len, ktime_get_ns());
-        err = powerfs_net_write_needle(volume_id, current_needle_id,
-                                            inode->i_ino,
-                                            needle_buf, needle_len,
-                                            lease_token_len > 0 ? lease_token : NULL,
-                                            lease_token_len);
-        pr_debug("powerfs: WP_WRITE_END ino=%lu nid=%llu err=%d ts=%llu\n",
-                inode->i_ino, (unsigned long long)current_needle_id,
-                err, ktime_get_ns());
-        pr_debug("powerfs: WP_WRITE_END nid=%llu err=%d\n",
-                (unsigned long long)current_needle_id, err);
-        pr_debug("powerfs: writepage_work_fn write_needle vid=%llu nid=%llu len=%u err=%d\n",
-                (unsigned long long)volume_id,
-                (unsigned long long)current_needle_id, needle_len, err);
-        for (j = needle_start_idx; j < wpw->num_pages; j++) {
-            struct page *p = wpw->pages[j];
-            if (wpw->counts[j] == 0) {
-                /* 已完成的空页跳过 */
+    /* 若无有效页面 (全为 count==0), 直接清理 */
+    if (num_groups == 0) {
+        atomic_dec(&sbi->wb_in_flight);
+        iput(inode);
+        kvfree(wpw);
+        return;
+    }
+
+    /* 设置计数: num_groups + 1 (work_fn 持有 +1 ref, 防止提前归零) */
+    atomic_set(&wpw->pending_needles, num_groups + 1);
+
+    /* 第二遍: 为每个 needle 组创建 ctx 并异步提交 read_needle */
+    {
+        int cur_start = -1;
+        __u64 cur_needle_id = 0;
+
+        for (i = 0; i < wpw->num_pages; i++) {
+            loff_t offset = wpw->offsets[i];
+            size_t count = wpw->counts[i];
+            __u64 needle_id;
+
+            if (count == 0)
                 continue;
+
+            needle_id = file_key + offset / POWERFS_CHUNK_SIZE;
+
+            if (cur_start < 0) {
+                cur_start = i;
+                cur_needle_id = needle_id;
+            } else if (needle_id != cur_needle_id) {
+                /* 提交 [cur_start, i) 这一组 */
+                struct powerfs_wb_ctx *ctx;
+                loff_t group_offset;
+                size_t token_len = 0;
+                int ret;
+
+                ctx = kzalloc(sizeof(*ctx), GFP_NOFS);
+                if (!ctx) {
+                    /* 分配失败: 失败该组页面, dec 计数 (此 ctx 不会回调) */
+                    struct powerfs_wb_ctx fail_ctx = {
+                        .wpw = wpw,
+                        .needle_start_idx = cur_start,
+                        .needle_end_idx = i,
+                    };
+                    powerfs_wb_fail_pages(&fail_ctx, -ENOMEM);
+                    atomic_dec(&wpw->pending_needles);
+                    goto next_group;
+                }
+
+                ctx->needle_buf = kvmalloc(POWERFS_CHUNK_SIZE, GFP_NOFS);
+                if (!ctx->needle_buf) {
+                    struct powerfs_wb_ctx fail_ctx = {
+                        .wpw = wpw,
+                        .needle_start_idx = cur_start,
+                        .needle_end_idx = i,
+                    };
+                    kfree(ctx);
+                    powerfs_wb_fail_pages(&fail_ctx, -ENOMEM);
+                    atomic_dec(&wpw->pending_needles);
+                    goto next_group;
+                }
+                memset(ctx->needle_buf, 0, POWERFS_CHUNK_SIZE);
+
+                ctx->wpw = wpw;
+                ctx->needle_start_idx = cur_start;
+                ctx->needle_end_idx = i;
+                ctx->volume_id = volume_id;
+                ctx->needle_id = cur_needle_id;
+                ctx->needle_len = 0;
+
+                /* 获取 lease (同步, 快速: ensure_lease 有快速路径) */
+                group_offset = wpw->offsets[cur_start];
+                if (powerfs_get_lease_token(inode, group_offset,
+                                            ctx->lease_token,
+                                            &token_len)) {
+                    pr_warn("powerfs: writepage lease ino=%lu stripe=%llu, continuing without lease\n",
+                            inode->i_ino,
+                            (unsigned long long)(group_offset / POWERFS_STRIPE_SIZE
+                                                 * POWERFS_STRIPE_SIZE));
+                }
+                ctx->lease_token_len = token_len;
+
+                /* 异步提交 read_needle (非阻塞) */
+                pr_debug("powerfs: WB_READ_SUBMIT ino=%lu nid=%llu pages=[%d,%d)\n",
+                        inode->i_ino, (unsigned long long)cur_needle_id,
+                        cur_start, i);
+                ret = powerfs_net_read_needle_async(
+                    volume_id, cur_needle_id,
+                    ctx->needle_buf, POWERFS_CHUNK_SIZE,
+                    ctx->req_body, sizeof(ctx->req_body),
+                    30000, powerfs_wb_read_cb, ctx);
+
+                if (ret) {
+                    /* 提交失败: callback 不会触发, 手动清理 */
+                    pr_warn("powerfs: writepage read submit ino=%lu nid=%llu err=%d\n",
+                            inode->i_ino, (unsigned long long)cur_needle_id,
+                            ret);
+                    powerfs_wb_fail_pages(ctx, ret);
+                    kvfree(ctx->needle_buf);
+                    kfree(ctx);
+                    /* dec 计数: 此 ctx 不会回调 */
+                    if (atomic_dec_and_test(&wpw->pending_needles))
+                        powerfs_wb_final_cleanup(wpw);
+                }
+
+next_group:
+                cur_start = i;
+                cur_needle_id = needle_id;
             }
-            if (err < 0) {
-                mapping_set_error(p->mapping, err);
-            }
-            end_page_writeback(p);
-            put_page(p);
         }
-        if (err < 0)
-            pr_warn("powerfs: writepage final write_needle vid=%llu nid=%llu err=%d\n",
-                    (unsigned long long)volume_id,
-                    (unsigned long long)current_needle_id, err);
+
+        /* 提交最后一组 [cur_start, num_pages) */
+        if (cur_start >= 0) {
+            struct powerfs_wb_ctx *ctx;
+            loff_t group_offset;
+            size_t token_len = 0;
+            int ret;
+
+            ctx = kzalloc(sizeof(*ctx), GFP_NOFS);
+            if (!ctx) {
+                struct powerfs_wb_ctx fail_ctx = {
+                    .wpw = wpw,
+                    .needle_start_idx = cur_start,
+                    .needle_end_idx = wpw->num_pages,
+                };
+                powerfs_wb_fail_pages(&fail_ctx, -ENOMEM);
+                atomic_dec(&wpw->pending_needles);
+                goto last_group_done;
+            }
+
+            ctx->needle_buf = kvmalloc(POWERFS_CHUNK_SIZE, GFP_NOFS);
+            if (!ctx->needle_buf) {
+                struct powerfs_wb_ctx fail_ctx = {
+                    .wpw = wpw,
+                    .needle_start_idx = cur_start,
+                    .needle_end_idx = wpw->num_pages,
+                };
+                kfree(ctx);
+                powerfs_wb_fail_pages(&fail_ctx, -ENOMEM);
+                atomic_dec(&wpw->pending_needles);
+                goto last_group_done;
+            }
+            memset(ctx->needle_buf, 0, POWERFS_CHUNK_SIZE);
+
+            ctx->wpw = wpw;
+            ctx->needle_start_idx = cur_start;
+            ctx->needle_end_idx = wpw->num_pages;
+            ctx->volume_id = volume_id;
+            ctx->needle_id = cur_needle_id;
+            ctx->needle_len = 0;
+
+            group_offset = wpw->offsets[cur_start];
+            if (powerfs_get_lease_token(inode, group_offset,
+                                        ctx->lease_token,
+                                        &token_len)) {
+                pr_warn("powerfs: writepage final lease ino=%lu stripe=%llu, continuing without lease\n",
+                        inode->i_ino,
+                        (unsigned long long)(group_offset / POWERFS_STRIPE_SIZE
+                                             * POWERFS_STRIPE_SIZE));
+            }
+            ctx->lease_token_len = token_len;
+
+            ret = powerfs_net_read_needle_async(
+                volume_id, cur_needle_id,
+                ctx->needle_buf, POWERFS_CHUNK_SIZE,
+                ctx->req_body, sizeof(ctx->req_body),
+                30000, powerfs_wb_read_cb, ctx);
+
+            if (ret) {
+                pr_warn("powerfs: writepage read submit ino=%lu nid=%llu err=%d\n",
+                        inode->i_ino, (unsigned long long)cur_needle_id,
+                        ret);
+                powerfs_wb_fail_pages(ctx, ret);
+                kvfree(ctx->needle_buf);
+                kfree(ctx);
+                if (atomic_dec_and_test(&wpw->pending_needles))
+                    powerfs_wb_final_cleanup(wpw);
+            }
+        }
     }
 
-    kvfree(needle_buf);
-    pr_debug("powerfs: WP_DONE ino=%lu npages=%d\n", inode->i_ino, wpw->num_pages);
-    atomic_dec(&sbi->wb_in_flight);
-    iput(inode);
-    kvfree(wpw);
-    return;
+last_group_done:
+    /* work_fn 自身 ref: 所有 ctx 已提交 (或失败已处理), dec 自身引用.
+     * 若所有 ctx 已完成 (极端竞态: 提交后立即回调), 此处归零触发 final_cleanup. */
+    if (atomic_dec_and_test(&wpw->pending_needles))
+        powerfs_wb_final_cleanup(wpw);
+
+    pr_debug("powerfs: WP_SUBMIT_DONE ino=%lu groups=%d\n",
+            inode->i_ino, num_groups);
+    return;  /* workqueue 线程立即释放 */
 
 fail_all:
     for (i = 0; i < wpw->num_pages; i++) {
@@ -3278,8 +3531,6 @@ fail_all:
         end_page_writeback(wpw->pages[i]);
         put_page(wpw->pages[i]);
     }
-    if (needle_buf)
-        kvfree(needle_buf);
     atomic_dec(&sbi->wb_in_flight);
     iput(inode);
     kvfree(wpw);
@@ -3309,24 +3560,27 @@ int powerfs_writepages(struct address_space *mapping,
     int batch_pages = sbi->write_batch_pages;
     int ret = 0;
 
-    pr_debug("powerfs: writepages ino=%lu range=%llu-%llu nr_to_write=%ld\n",
-            inode->i_ino, wbc->range_start, wbc->range_end, wbc->nr_to_write);
+    pr_debug("powerfs: WPAGES ino=%lu range=%llu-%llu nr_to_write=%ld sync_mode=%d\n",
+            inode->i_ino, wbc->range_start, wbc->range_end, wbc->nr_to_write,
+            wbc->sync_mode);
 
     /* 目录无数据页: 跳过 writeback 避免无意义的网络 I/O.
      * 根目录 (ino=1) 的元数据修改 (nlink/mtime) 由 write_inode 同步,
      * 不走 page cache writeback 路径. */
     if (S_ISDIR(inode->i_mode)) {
-        pr_debug("powerfs: writepages skip directory ino=%lu\n", inode->i_ino);
+        pr_debug("powerfs: WPAGES skip directory ino=%lu\n", inode->i_ino);
         return 0;
     }
 
-    if (powerfs_net_is_stopping())
+    if (powerfs_net_is_stopping()) {
+        pr_debug("powerfs: WPAGES net stopping, skip ino=%lu\n", inode->i_ino);
         return 0;
+    }
 
     /* 并发限制: 防止过多 work item 同时阻塞在网络 I/O 导致 workqueue lockup.
      * 如果已有太多 in-flight work item, 让 VFS 稍后重试. */
     if (atomic_read(&sbi->wb_in_flight) >= POWERFS_WB_MAX_IN_FLIGHT) {
-        pr_debug("powerfs: writepages throttled ino=%lu in_flight=%d\n",
+        pr_debug("powerfs: WPAGES throttled ino=%lu in_flight=%d\n",
                 inode->i_ino, atomic_read(&sbi->wb_in_flight));
         wbc->pages_skipped += wbc->nr_to_write;
         return 0;
@@ -3340,11 +3594,11 @@ int powerfs_writepages(struct address_space *mapping,
         nr_pages = filemap_get_folios_tag(mapping, &index, end,
                                            PAGECACHE_TAG_DIRTY, &fbatch);
         if (!nr_pages) {
-            pr_debug("powerfs: writepages no dirty pages found, index=%lu end=%lu\n",
+            pr_debug("powerfs: WPAGES no dirty pages, index=%lu end=%lu\n",
                     index, end);
             break;
         }
-        pr_debug("powerfs: writepages found %d dirty pages, index=%lu\n",
+        pr_debug("powerfs: WPAGES found %d dirty pages, index=%lu\n",
                 nr_pages, index);
 
         for (i = 0; i < nr_pages; i++) {
@@ -3354,6 +3608,7 @@ int powerfs_writepages(struct address_space *mapping,
 
             lock_page(page);
             if (!PageDirty(page)) {
+                pr_debug("powerfs: WPAGES page not dirty, skip\n");
                 unlock_page(page);
                 continue;
             }
@@ -3361,7 +3616,10 @@ int powerfs_writepages(struct address_space *mapping,
             clear_page_dirty_for_io(page);
 
             offset = page_offset(page);
+            pr_debug("powerfs: WPAGES page ino=%lu offset=%lld i_size=%lld\n",
+                    inode->i_ino, offset, i_size_read(inode));
             if (offset >= i_size_read(inode)) {
+                pr_debug("powerfs: WPAGES offset >= i_size, SKIP page\n");
                 unlock_page(page);
                 continue;
             }
@@ -3508,6 +3766,11 @@ int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
         return ret;
     }
 
+    pr_debug("powerfs: WB_BEGIN ok ino=%lu folio=%px order=%d locked=%d uptodate=%d index=%lu\n",
+            inode->i_ino, folio, folio_order(folio),
+            folio_test_locked(folio), folio_test_uptodate(folio),
+            folio->index);
+
     WARN_ON_ONCE(!folio_test_locked(folio));
     *foliop = folio;
     *fsdata = NULL;
@@ -3537,35 +3800,24 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
     struct inode *inode = mapping->host;
     loff_t end_pos = pos + copied;
 
-    pr_debug("powerfs: write_end ino=%lu pos=%lld copied=%u len=%u i_size=%lld (async)\n",
-            inode->i_ino, pos, copied, len, i_size_read(inode));
+    pr_debug("powerfs: WB_END ino=%lu pos=%lld copied=%u len=%u i_size=%lld uptodate=%d\n",
+            inode->i_ino, pos, copied, len, i_size_read(inode),
+            folio_test_uptodate(folio));
 
     if (copied > 0) {
-        /* folio 必须 uptodate 才能 mark_dirty (参考 ceph_write_end).
-         *
-         * netfs_write_begin 对新文件 (pos >= i_size) 会跳过 issue_read,
-         * folio 不是 uptodate (netfs_skip_folio_read 返回 true 但只清零
-         * 不标记 uptodate). 此时若 copied == len (整 folio 写入), 标记
-         * uptodate 继续; 若 copied < len (partial write), 返回 0 让 VFS
-         * 重试 (需要先读取现有数据). */
         if (!folio_test_uptodate(folio)) {
             if (copied < len) {
-                pr_debug("powerfs: write_end partial write, return 0 for retry\n");
+                pr_debug("powerfs: WB_END partial write, return 0 for retry\n");
                 copied = 0;
                 goto out;
             }
             folio_mark_uptodate(folio);
         }
-        /* 更新本地 i_size. Filer 端 i_size 由 write_inode 在 writeback
-         * 时通过 setattr 同步 (pi->content_size 跟踪上次同步值). */
         if (end_pos > i_size_read(inode)) {
             i_size_write(inode, end_pos);
             mark_inode_dirty(inode);
-            pr_debug("powerfs: write_end i_size updated to %lld\n", end_pos);
         }
-        /* 标记 folio 脏, 由 writeback 子系统触发 writepages 异步刷盘 */
         folio_mark_dirty(folio);
-        pr_debug("powerfs: write_end folio marked dirty, done\n");
     }
 
 out:

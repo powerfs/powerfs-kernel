@@ -22,16 +22,16 @@
 #define POWERFS_MAX_NAME_LEN    255
 #define POWERFS_VERSION         "2.0.0-ceph-style"
 
-/* Dentry lease 超时 (jiffies, 默认 5 秒) */
-#define POWERFS_DENTRY_LEASE_TTL    (5 * HZ)
+/* 目录 lease 超时 (jiffies, 默认 5 秒).
+ * 绑定在父目录 inode 上, 控制该目录下所有子 dentry (正/负) 的缓存有效期.
+ * - readdir / lookup 成功后设为 now + TTL
+ * - 本地 mutation (mkdir/rmdir/create/unlink/rename) 主动清零
+ * - d_revalidate 检查此字段, 永不返回 0 (避免 RCU stall)
+ * 平衡: 太短 → 频繁网络查询; 太长 → 跨客户端可见性延迟 */
+#define POWERFS_DIR_LEASE_TTL       (5 * HZ)
 
 /* Inode cache 超时 (jiffies, 默认 10 秒) */
 #define POWERFS_INODE_CACHE_TTL     (10 * HZ)
-
-/* 目录 lease 超时 (jiffies, 默认 30 秒).
- * readdir 成功后 30s 内重复 readdir 走本地缓存, 不发网络.
- * 本地 mutation (mkdir/rmdir/create/unlink/rename 等) 主动清零. */
-#define POWERFS_DIR_LEASE_TTL       (30 * HZ)
 
 /* Chunk 和 Stripe 大小 */
 #define POWERFS_CHUNK_SIZE      (2 * 1024 * 1024)    /* 2MB */
@@ -76,20 +76,17 @@ struct powerfs_dirent;
 struct powerfs_lookup_req;
 struct powerfs_create_req;
 
-/* ========== Dentry 私有数据 (参考 ceph_dentry_info) ========== */
+/* ========== Dentry 私有数据 (参考 ceph_dentry_info) ==========
+ *
+ * 目录级 lease 方案: dentry 不再维护独立 lease, 统一依赖父目录 inode 的
+ * dir_lease_expire. dentry_info 仅保留 RCU 延迟释放和 readdir 偏移. */
 
 struct powerfs_dentry_info {
     struct dentry *dentry;            /* 所属 dentry */
-    struct list_head lease_list;      /* 租约链表节点 */
-    unsigned long lease_expire;       /* 租约过期时间 (jiffies) */
-    unsigned long time;               /* 最近更新时间 */
+    unsigned long time;               /* 创建时间 (调试用) */
     u64 offset;                       /* readdir 偏移 */
-    unsigned long flags;              /* 标志位 */
     struct rcu_head rcu;              /* RCU 延迟释放 (d_fsdata 不能裸 kmem_cache_free) */
 };
-
-/* powerfs_dentry_info 标志位 */
-#define POWERFS_DENTRY_COMPLETE   0  /* 目录缓存完整 */
 
 /* 获取 dentry 私有数据 */
 static inline struct powerfs_dentry_info *POWERFS_D(struct dentry *dentry)
@@ -186,6 +183,10 @@ struct powerfs_inode_info {
      *   callback 比对 (callback 携带 epoch, 不匹配说明有过本地修改) */
     unsigned long dir_lease_expire;
     u64 dir_lease_epoch;
+
+    /* 异步 setattr (writeback offload, 防止 per-CPU writeback workqueue lockup) */
+    struct work_struct setattr_work;
+    bool setattr_pending;
 
     /* shutdown 标志 (参考 ceph_inode_is_shutdown) */
     bool shutdown;
@@ -330,8 +331,6 @@ void powerfs_set_sb_dentry_ops(struct super_block *sb);
 
 /* 辅助函数 */
 struct inode *powerfs_create_root(struct super_block *sb);
-void powerfs_set_dentry_lease(struct dentry *dentry, unsigned long ttl);
-bool powerfs_dentry_lease_valid(struct dentry *dentry);
 
 /* readdir (目录文件操作) */
 int powerfs_dir_open(struct inode *inode, struct file *file);

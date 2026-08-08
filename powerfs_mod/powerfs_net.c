@@ -937,7 +937,7 @@ void powerfs_shard_route_on_filer_reconnect(int filer_idx)
                 req->error = -EAGAIN;
                 pr_debug("powerfs: wake req seq=%u shard=%d -> -EAGAIN (non-leader filer %d up)\n",
                          req->seq, i, filer_idx);
-                complete(&req->done);
+                powerfs_req_complete(req);
             }
         }
     }
@@ -1118,7 +1118,7 @@ void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
             list_del_init(&req->list_node);
             pr_debug("powerfs: FAULT cancel req seq=%u msg_type=%u on filer %s:%u\n",
                      req->seq, req->msg_type, conn->addr, conn->port);
-            complete(&req->done);
+            powerfs_req_complete(req);
         }
 
         if (cancelled)
@@ -1690,7 +1690,19 @@ static int pfs_rx_thread_fn(void *arg)
 
     spin_lock_bh(&sched->rx_lock);
 
-    while (!atomic_read(&g_pool.stopping) && !kthread_should_stop()) {
+    while (!kthread_should_stop()) {
+        /* stopping 时不处理新工作, 但不退出 — 必须等 kthread_stop()
+         * 设置 KTHREAD_SHOULD_STOP 后才退出. 否则线程提前退出 →
+         * task_struct 被内核回收 → kthread_stop() 访问已释放内存
+         * → UAF → SLUB freelist 损坏 → dentry 哈希链环 → RCU stall. */
+        if (atomic_read(&g_pool.stopping)) {
+            spin_unlock_bh(&sched->rx_lock);
+            wait_event_interruptible(sched->rx_waitq,
+                                     kthread_should_stop());
+            spin_lock_bh(&sched->rx_lock);
+            continue;
+        }
+
         conn = list_first_entry_or_null(&sched->rx_conns,
                                         struct powerfs_net_server_conn,
                                         rx_list);
@@ -1721,7 +1733,6 @@ static int pfs_rx_thread_fn(void *arg)
              * 醒来检查 rx_conns, 避免遗漏的 conn 永远等不到处理. */
             wait_event_interruptible_timeout(sched->rx_waitq,
                 !list_empty(&sched->rx_conns) ||
-                atomic_read(&g_pool.stopping) ||
                 kthread_should_stop(),
                 msecs_to_jiffies(500));
             spin_lock_bh(&sched->rx_lock);
@@ -1747,7 +1758,16 @@ static int pfs_tx_thread_fn(void *arg)
 
     spin_lock_bh(&sched->tx_lock);
 
-    while (!atomic_read(&g_pool.stopping) && !kthread_should_stop()) {
+    while (!kthread_should_stop()) {
+        /* 同 pfs_rx_thread_fn: stopping 不退出, 等 kthread_stop(). */
+        if (atomic_read(&g_pool.stopping)) {
+            spin_unlock_bh(&sched->tx_lock);
+            wait_event_interruptible(sched->tx_waitq,
+                                     kthread_should_stop());
+            spin_lock_bh(&sched->tx_lock);
+            continue;
+        }
+
         conn = list_first_entry_or_null(&sched->tx_conns,
                                         struct powerfs_net_server_conn,
                                         tx_list);
@@ -1769,7 +1789,6 @@ static int pfs_tx_thread_fn(void *arg)
             spin_unlock_bh(&sched->tx_lock);
             wait_event_interruptible(sched->tx_waitq,
                 !list_empty(&sched->tx_conns) ||
-                atomic_read(&g_pool.stopping) ||
                 kthread_should_stop());
             spin_lock_bh(&sched->tx_lock);
         }
@@ -1882,12 +1901,34 @@ static int pfs_rx_step(struct powerfs_net_server_conn *conn)
                    conn->addr, conn->port);
             return -EINVAL;
         }
+        /* K1 (Layer 1): 帧头不变式严格校验.
+         *
+         * data_len 是 body + data 总长度, body_len 是 body 段长度,
+         * data 段 = data_len - body_len. 因此 data_len >= body_len 是
+         * 协议不变式. 违反说明帧头损坏或对端有 bug, 必须拒绝整帧.
+         *
+         * 旧代码静默钳制 body_sz = total, 掩盖了协议错误, 导致后续
+         * TLV 解析消费错误偏移的数据, 产生难以定位的级联故障.
+         */
+        if (conn->rx_cur_hdr.data_len < conn->rx_cur_hdr.body_len) {
+            pr_err("powerfs: RX_HDR_INVARIANT seq=%u msg=0x%04x data_len=%u < body_len=%u peer=%s:%u\n",
+                   conn->rx_cur_hdr.seq, conn->rx_cur_hdr.msg_type,
+                   conn->rx_cur_hdr.data_len, conn->rx_cur_hdr.body_len,
+                   conn->addr, conn->port);
+            return -EPROTO;
+        }
+        if (conn->rx_cur_hdr.data_len > POWERFS_NET_MAX_FRAME) {
+            pr_err("powerfs: RX_HDR_INVARIANT seq=%u msg=0x%04x data_len=%u > MAX_FRAME=%u peer=%s:%u\n",
+                   conn->rx_cur_hdr.seq, conn->rx_cur_hdr.msg_type,
+                   conn->rx_cur_hdr.data_len, POWERFS_NET_MAX_FRAME,
+                   conn->addr, conn->port);
+            return -EPROTO;
+        }
         /* 解析 body/data 长度 (data_len=总长, body_len=body 段长) */
         {
             size_t total = conn->rx_cur_hdr.data_len;
             size_t body_sz = conn->rx_cur_hdr.body_len;
-            if (body_sz > total)
-                body_sz = total;  /* 防御: body_len 异常时钳制 */
+            /* K1 已保证 data_len >= body_len, 无需再钳制 */
             conn->rx_body_total = body_sz;
             conn->rx_data_total = total - body_sz;
             if (conn->rx_body_total > POWERFS_NET_MAX_BODY ||
@@ -2040,17 +2081,39 @@ static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
         req->error = 0;
         req->resp_body_len = 0;
         if (req->resp_body && body_len > 0) {
-            size_t c = min(body_len, req->resp_body_cap);
-            memcpy(req->resp_body, body, c);
-            req->resp_body_len = c;
+            /* K2 (Layer 2): 截断检测 — 不静默 min() 截断.
+             *
+             * 旧代码用 min(body_len, cap) 静默截断响应, 导致调用方
+             * 收到不完整的 TLV 数据, 后续解析消费错误偏移 → 级联故障.
+             * 现在检测到截断时设置 req->error = -E2BIG, 调用方可感知
+             * 并传播错误到上层, 而不是继续处理残缺数据.
+             */
+            if (body_len > req->resp_body_cap) {
+                pr_err("powerfs: RX_TRUNCATE seq=%u msg=0x%04x body_len=%zu > cap=%zu peer=%s:%u\n",
+                       seq, msg_type, body_len, req->resp_body_cap,
+                       conn->addr, conn->port);
+                req->error = -E2BIG;
+                req->resp_body_len = 0;
+            } else {
+                memcpy(req->resp_body, body, body_len);
+                req->resp_body_len = body_len;
+            }
         }
         req->resp_data_len = 0;
         if (req->resp_data && data_len > 0) {
-            size_t c = min(data_len, req->resp_data_cap);
-            memcpy(req->resp_data, data, c);
-            req->resp_data_len = c;
+            /* K2: data 段截断检测, 同 body 段逻辑 */
+            if (data_len > req->resp_data_cap) {
+                pr_err("powerfs: RX_TRUNCATE seq=%u msg=0x%04x data_len=%zu > cap=%zu peer=%s:%u\n",
+                       seq, msg_type, data_len, req->resp_data_cap,
+                       conn->addr, conn->port);
+                req->error = -E2BIG;
+                req->resp_data_len = 0;
+            } else {
+                memcpy(req->resp_data, data, data_len);
+                req->resp_data_len = data_len;
+            }
         }
-        complete(&req->done);
+        powerfs_req_complete(req);
 
         /* Phase 2: 流控统计 — record_complete (latency + bytes) */
         {
@@ -2178,17 +2241,23 @@ static void pfs_process_transmit(struct powerfs_net_server_conn *conn)
         return;
     }
     if (ret < 0) {
-        /* 发送失败: 摘除请求, complete -ENOTCONN, 触发断连 */
+        /* 发送失败: 摘除请求, complete -ENOTCONN, 触发断连.
+         * 用 RB_EMPTY_NODE 检查 (而非 list_empty) 防止与 disconnect 竞态:
+         * disconnect 已将 req 从 req_tree 移除时, 此处跳过 complete,
+         * 由 disconnect 路径统一完成. */
+        bool won = false;
         pr_debug("powerfs: tx failed seq=%u msg_type=%u: %d\n",
                  req->seq, req->msg_type, ret);
         spin_lock(&conn->req_lock);
-        if (!list_empty(&req->list_node)) {
+        if (!RB_EMPTY_NODE(&req->rb_node)) {
             list_del_init(&req->list_node);
             powerfs_req_tree_remove(conn, req);
+            req->error = -ENOTCONN;
+            won = true;
         }
         spin_unlock(&conn->req_lock);
-        req->error = -ENOTCONN;
-        complete(&req->done);
+        if (won)
+            powerfs_req_complete(req);
         queue_work(g_pool.reconn_wq, &conn->disconnect_work);
         return;
     }
@@ -2406,7 +2475,7 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
             list_del_init(&req->list_node);
             pr_debug("powerfs: disconnect cancel req seq=%u msg_type=%u on filer %s:%u\n",
                      req->seq, req->msg_type, conn->addr, conn->port);
-            complete(&req->done);
+            powerfs_req_complete(req);
         }
     }
 
@@ -2773,6 +2842,93 @@ EXPORT_SYMBOL_GPL(powerfs_conn_pool_exit);
 
 /* ========== 请求对象生命周期 (Phase 1: 新架构) ========== */
 
+/* powerfs_req_timeout_fn - 异步请求超时回调 (delayed_work, process context)
+ *
+ * 仅用于 callback != NULL 的异步请求. deadline 到期时触发, 检查请求是否
+ * 仍在 pending 队列; 若是, 摘除并以 -ETIMEDOUT 完成.
+ *
+ * 与正常完成路径 (RX dispatch / disconnect) 通过 req_lock + list_empty
+ * 互斥: 先摘除者胜, 后者看到 list_empty 直接退出, 避免双重完成.
+ *
+ * process context (system_wq): 可安全调用 callback (含 iput/kvmfree 等
+ * 可能睡眠的操作), 与 RX 调度器线程解耦. */
+static void powerfs_req_timeout_fn(struct work_struct *work)
+{
+    struct delayed_work *dwork = to_delayed_work(work);
+    struct powerfs_request *req =
+        container_of(dwork, struct powerfs_request, timeout_work);
+    struct powerfs_net_server_conn *conn = req->filer;
+    bool won = false;
+
+    if (!conn)
+        return;
+
+    /* 与 RX/disconnect 路径互斥: 用 RB_EMPTY_NODE 检查 req 是否仍在 req_tree.
+     *
+     * 之前用 list_empty(&req->list_node) 检查, 但 disconnect 路径将 req
+     * splice 到 cancel_list 后 list_node 仍非空 (在 cancel_list 上),
+     * 导致 timeout 误判为 "仍在 pending" → list_del_init + complete,
+     * 与 disconnect 的 complete 形成双重完成 → ctx/req double-free →
+     * SLUB freelist 自循环 → dentry 哈希链损坏 → __d_lookup_rcu 死循环.
+     *
+     * RB_EMPTY_NODE 在 powerfs_req_tree_remove 调用 RB_CLEAR_NODE 后返回 true,
+     * 可靠反映 req 是否已被 disconnect/RX 从 req_tree 摘除. */
+    spin_lock(&conn->req_lock);
+    if (!RB_EMPTY_NODE(&req->rb_node)) {
+        list_del_init(&req->list_node);
+        powerfs_req_tree_remove(conn, req);
+        req->error = -ETIMEDOUT;
+        won = true;
+    }
+    spin_unlock(&conn->req_lock);
+
+    if (!won)
+        return;  /* 已被 RX/disconnect 完成, 无需重复 */
+
+    /* 从 tx_queue 摘除 (若仍在) */
+    spin_lock(&conn->tx_lock);
+    if (!list_empty(&req->tx_list))
+        list_del_init(&req->tx_list);
+    spin_unlock(&conn->tx_lock);
+
+    pr_warn("powerfs: async req seq=%u msg=0x%04x timed out on %s:%u\n",
+            req->seq, req->msg_type, conn->addr, conn->port);
+
+    /* timer_armed 由 powerfs_req_complete 清除; 此处调用 powerfs_req_complete
+     * 会 cancel_delayed_work_sync(self) — 内核允许从 work fn 自身调用,
+     * 返回 true 且不阻塞. 清除 timer_armed 避免冗余 cancel. */
+    req->timer_armed = false;
+    powerfs_req_complete(req);
+}
+
+/* powerfs_req_complete - 统一完成入口
+ *
+ * 取消异步超时定时器 (若已武装), 然后分发:
+ *   - callback != NULL (异步): 调用 callback(req), 由 callback 负责
+ *     powerfs_request_free
+ *   - callback == NULL (同步): complete(&req->done), 唤醒等待线程
+ *
+ * 调用方 (RX dispatch / disconnect / timeout / submit) 必须在调用前
+ * 将 req 从 pending_reqs + req_tree 摘除 (或确认已被摘除), 避免迟到
+ * 响应误匹配. */
+void powerfs_req_complete(struct powerfs_request *req)
+{
+    if (!req)
+        return;
+
+    if (req->timer_armed) {
+        cancel_delayed_work_sync(&req->timeout_work);
+        req->timer_armed = false;
+    }
+
+    if (req->callback)
+        req->callback(req);
+    else
+        complete(&req->done);
+}
+EXPORT_SYMBOL_GPL(powerfs_req_complete);
+EXPORT_SYMBOL_GPL(net_status_to_errno);
+
 struct powerfs_request *powerfs_request_alloc(__u16 msg_type, gfp_t gfp)
 {
     struct powerfs_request *req;
@@ -2794,6 +2950,8 @@ struct powerfs_request *powerfs_request_alloc(__u16 msg_type, gfp_t gfp)
     req->attempts = 0;
     req->needs_resend = false;
     req->callback = NULL;
+    req->priv = NULL;
+    req->timer_armed = false;
 
     return req;
 }
@@ -2817,6 +2975,14 @@ void powerfs_request_release(struct kref *kref)
     if (!RB_EMPTY_NODE(&req->rb_node)) {
         pr_warn("powerfs: freeing req seq=%u still in req_tree\n", req->seq);
         /* Note: 无法在此处 rb_erase, 因为不知道 root. 调用方应先移除. */
+    }
+    /* 防御: 异步请求若未正常完成就被释放, 取消超时定时器避免 UAF.
+     * 正常路径 powerfs_req_complete 已清除 timer_armed, 此处为兜底. */
+    if (req->timer_armed) {
+        pr_warn("powerfs: freeing req seq=%u with timer still armed\n",
+                req->seq);
+        req->timer_armed = false;
+        cancel_delayed_work_sync(&req->timeout_work);
     }
 
     kfree(req);
@@ -2940,7 +3106,7 @@ void powerfs_shard_route_dispatch_pending(u64 shard_id)
         req->error = -EAGAIN;
         pr_debug("powerfs: dispatch req seq=%u msg_type=%u -> -EAGAIN (retry)\n",
                  req->seq, req->msg_type);
-        complete(&req->done);
+        powerfs_req_complete(req);
     }
 }
 EXPORT_SYMBOL_GPL(powerfs_shard_route_dispatch_pending);
@@ -2965,7 +3131,7 @@ EXPORT_SYMBOL_GPL(powerfs_shard_route_dispatch_pending);
  *   - -ENOTCONN: 连接断开 (调度器 send 失败或 sk_state_change 触发 disconnect),
  *                submit 应重试其他 filer
  *   - -ETIMEDOUT: 等待响应超时
- *   注: 本函数不调用 complete(&req->done); 由调度器/disconnect_one/FAULT 完成.
+ *   注: 本函数不调用 powerfs_req_complete; 由调度器/disconnect_one/FAULT 完成.
  *       send 失败和超时路径不 complete, submit 会 reinit_completion 后重试或返回.
  */
 static int powerfs_request_do_send(struct powerfs_request *req,
@@ -3019,6 +3185,30 @@ static int powerfs_request_do_send(struct powerfs_request *req,
     spin_unlock(&conn->tx_lock);
 
     pfs_tx_schedule(conn);
+
+    /* === 异步模式: callback != NULL 时不等待, 立即返回 ===
+     *
+     * page writeback 路径用异步提交避免 workqueue 线程阻塞在网络等待上
+     * (旧同步路径 wait_for_completion 可阻塞 30s, 多个 needle 串行 →
+     * workqueue lockup 598s).
+     *
+     * 异步请求的完成由三条路径触发, 均经 powerfs_req_complete 分发到 callback:
+     *   a. 正常: 调度器 RX 收到响应 (pfs_rx_dispatch 摘除 req 后调用)
+     *   b. 断连: disconnect_one / FAULT 以 -ENOTCONN 取消
+     *   c. 超时: delayed_work (timeout_work) 到期以 -ETIMEDOUT 完成
+     *
+     * 超时定时器在 deadline 到期时触发 (process context, system_wq),
+     * 与正常完成路径通过 req_lock + list_empty 互斥, 先摘除者胜.
+     * 必须有超时兜底, 否则 page 永久滞留 PageWriteback → hung task. */
+    if (req->callback) {
+        if (req->deadline) {
+            INIT_DELAYED_WORK(&req->timeout_work, powerfs_req_timeout_fn);
+            req->timer_armed = true;
+            queue_delayed_work(system_wq, &req->timeout_work,
+                               req->deadline - jiffies);
+        }
+        return 0;
+    }
 
     /* Phase 2: 等待调度器 complete (异步收发, 流水线).
      *
@@ -3177,7 +3367,7 @@ int powerfs_request_submit(struct powerfs_request *req)
             pr_warn("powerfs: req msg_type=%u shard=%llu deadline exceeded\n",
                     req->msg_type, (unsigned long long)req->shard_id);
             req->error = -ETIMEDOUT;
-            complete(&req->done);
+            powerfs_req_complete(req);
             return -ETIMEDOUT;
         }
 
@@ -3239,7 +3429,7 @@ int powerfs_request_submit(struct powerfs_request *req)
 
             if (req->shard_id >= POWERFS_MAX_SHARDS) {
                 req->error = -ENOTCONN;
-                complete(&req->done);
+                powerfs_req_complete(req);
                 return -ENOTCONN;
             }
 
@@ -3425,7 +3615,7 @@ int powerfs_request_submit(struct powerfs_request *req)
                 }
             }
             req->error = -EAGAIN;
-            complete(&req->done);
+            powerfs_req_complete(req);
             return -EAGAIN;
         }
 
@@ -3435,7 +3625,7 @@ int powerfs_request_submit(struct powerfs_request *req)
 
     /* 不会到达 */
     req->error = -EAGAIN;
-    complete(&req->done);
+    powerfs_req_complete(req);
     return -EAGAIN;
 }
 EXPORT_SYMBOL_GPL(powerfs_request_submit);
@@ -3553,7 +3743,7 @@ int powerfs_net_send_request(__u16 msg_type, u64 route_inode,
 /**
  * net_status_to_errno - 将 powerfs-net 状态码转换为 Linux errno
  */
-static int net_status_to_errno(__u16 status)
+int net_status_to_errno(__u16 status)
 {
     switch (status) {
     case POWERFS_NET_STATUS_OK:              return 0;
@@ -4031,12 +4221,18 @@ int powerfs_net_read(__u64 ino, __u64 volume_id, __u64 file_key,
         ret = powerfs_net_read_needle(volume_id, needle_id,
                                        needle_buf, POWERFS_CHUNK_SIZE,
                                        &chunk_read_len);
-        if (ret < 0) {
+        if (ret < 0 && ret != -ENOENT) {
             pr_warn("powerfs: read_needle vid=%llu nid=%llu failed: %d\n",
                     (unsigned long long)volume_id,
                     (unsigned long long)needle_id, ret);
             kvfree(needle_buf);
             return ret;
+        }
+        if (ret == -ENOENT) {
+            /* needle 不存在 (稀疏文件 hole / 未写入的 chunk):
+             * 当作空 needle 处理, 后续零填充逻辑生效.
+             * 不 break, 因为 hole 后面可能还有已写入的 needle. */
+            chunk_read_len = 0;
         }
 
         /* 拷贝请求区间: [offset_in_needle, min(offset_in_needle+remaining, chunk_read_len)) */
@@ -4056,8 +4252,10 @@ int powerfs_net_read(__u64 ino, __u64 volume_id, __u64 file_key,
         cur_offset += to_copy;
         remaining -= to_copy;
 
-        /* needle 内容不足且未到 chunk 末尾, 说明文件已结束 */
-        if (chunk_read_len < POWERFS_CHUNK_SIZE &&
+        /* needle 存在但内容不足且未到 chunk 末尾, 说明文件已结束.
+         * 注意: needle 不存在 (ENOENT) 时不 break, 因为稀疏文件
+         * hole 后面可能还有已写入的 needle. */
+        if (ret == 0 && chunk_read_len < POWERFS_CHUNK_SIZE &&
             offset_in_needle + to_copy >= chunk_read_len)
             break;
     }
@@ -5349,6 +5547,165 @@ int powerfs_net_read_needle(__u64 volume_id, __u64 file_key,
 
     return 0;
 }
+
+/* ========== 异步 WriteNeedle / ReadNeedle (page writeback 异步提交) ==========
+ *
+ * 与同步版本共享 powerfs_request_do_send, 但设置 req->callback 使 do_send
+ * 入队后立即返回 (不 wait_for_completion). 响应到达时由调度器经
+ * powerfs_req_complete 调用 callback.
+ *
+ * 缓冲区生命周期: 调用方提供的 req_body/resp_body/resp_data/data 必须持久
+ * 存活到 callback 触发 (通常放在 callback 所属的 ctx 结构体中).
+ */
+
+/* powerfs_net_write_needle_async - 异步写 needle
+ *
+ * 返回 0: 提交成功, callback 将被调用 (调用方不得再访问 req)
+ * 返回 <0: 提交失败, callback 不会被调用, 调用方自行清理 */
+int powerfs_net_write_needle_async(__u64 volume_id, __u64 file_key, __u64 inode,
+                                   const __u8 *data, size_t data_len,
+                                   const char *lease_token, size_t token_len,
+                                   __u8 *req_body, size_t req_body_cap,
+                                   __u8 *resp_body, size_t resp_body_cap,
+                                   int timeout_ms,
+                                   int (*callback)(struct powerfs_request *),
+                                   void *priv)
+{
+    struct powerfs_tlv_enc enc;
+    struct powerfs_net_server_conn *conn;
+    struct powerfs_request *req;
+    int ret;
+
+    if (atomic_read(&g_pool.stopping))
+        return -ENOTCONN;
+
+    /* TLV 编码到调用方提供的持久缓冲区 (callback 触发前不可释放) */
+    powerfs_tlv_enc_init(&enc, req_body, req_body_cap);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, volume_id);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_FILE_KEY, file_key);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INODE_V2, inode);
+    if (lease_token && token_len > 0 && token_len < 64)
+        powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_LEASE_TOKEN,
+                               lease_token, token_len);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                           "kernel-client", strlen("kernel-client"));
+
+    conn = powerfs_net_find_volume_conn(volume_id, false /* data 通路 */);
+    if (!conn) {
+        pr_warn("powerfs: write_needle_async: no volume conn for volume_id=%llu\n",
+                (unsigned long long)volume_id);
+        return -ENOTCONN;
+    }
+
+    req = powerfs_request_alloc(POWERFS_NET_MSG_WRITE_NEEDLE, GFP_NOFS);
+    if (!req)
+        return -ENOMEM;
+
+    req->req_body = req_body;
+    req->req_body_len = powerfs_tlv_enc_len(&enc);
+    req->req_data = data;
+    req->req_data_len = data_len;
+    req->resp_body = resp_body;
+    req->resp_body_cap = resp_body_cap;
+    req->resp_data = NULL;
+    req->resp_data_cap = 0;
+    req->shard_id = 0;
+    req->filer = conn;  /* timeout_work 需要从 req->filer 获取 conn */
+    req->callback = callback;
+    req->priv = priv;
+    if (timeout_ms > 0)
+        req->deadline = jiffies + msecs_to_jiffies(timeout_ms);
+
+    /* 流控统计 (与 send_to_volume 一致) */
+    {
+        int flow_idx = pfs_conn_flow_idx(conn);
+        powerfs_flow_record_start(flow_idx,
+                                  req->req_body_len + req->req_data_len);
+    }
+
+    ret = powerfs_request_do_send(req, conn);
+    if (ret != 0) {
+        /* 提交失败: do_send 未入队 (或入队后立即被拒), callback 不会触发.
+         * 补 record_complete 防止 active_reqs 泄漏, 释放 req, 返回错误. */
+        powerfs_flow_record_complete(pfs_conn_flow_idx(conn), 0, 0, true);
+        powerfs_request_free(req);
+        return ret;
+    }
+
+    /* 提交成功: do_send 已武装 timeout_work 并返回 0.
+     * 响应/超时/断连将触发 powerfs_req_complete → callback.
+     * callback 内负责 powerfs_request_free(req). */
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_write_needle_async);
+
+/* powerfs_net_read_needle_async - 异步读 needle (writeback RMW 读)
+ *
+ * 响应 data 段写入 resp_data (调用方提供, 通常为 needle_buf).
+ * callback 内通过 req->resp_data_len 获取实际读取长度.
+ *
+ * 返回 0: 提交成功, callback 将被调用
+ * 返回 <0: 提交失败, callback 不会被调用 */
+int powerfs_net_read_needle_async(__u64 volume_id, __u64 file_key,
+                                  __u8 *resp_data, size_t resp_data_cap,
+                                  __u8 *req_body, size_t req_body_cap,
+                                  int timeout_ms,
+                                  int (*callback)(struct powerfs_request *),
+                                  void *priv)
+{
+    struct powerfs_tlv_enc enc;
+    struct powerfs_net_server_conn *conn;
+    struct powerfs_request *req;
+    int ret;
+
+    if (atomic_read(&g_pool.stopping))
+        return -ENOTCONN;
+
+    powerfs_tlv_enc_init(&enc, req_body, req_body_cap);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, volume_id);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_FILE_KEY, file_key);
+
+    conn = powerfs_net_find_volume_conn(volume_id, false /* data 通路 */);
+    if (!conn) {
+        pr_warn("powerfs: read_needle_async: no volume conn for volume_id=%llu\n",
+                (unsigned long long)volume_id);
+        return -ENOTCONN;
+    }
+
+    req = powerfs_request_alloc(POWERFS_NET_MSG_READ_NEEDLE, GFP_NOFS);
+    if (!req)
+        return -ENOMEM;
+
+    req->req_body = req_body;
+    req->req_body_len = powerfs_tlv_enc_len(&enc);
+    req->req_data = NULL;
+    req->req_data_len = 0;
+    req->resp_body = NULL;
+    req->resp_body_cap = 0;
+    req->resp_data = resp_data;
+    req->resp_data_cap = resp_data_cap;
+    req->shard_id = 0;
+    req->filer = conn;
+    req->callback = callback;
+    req->priv = priv;
+    if (timeout_ms > 0)
+        req->deadline = jiffies + msecs_to_jiffies(timeout_ms);
+
+    {
+        int flow_idx = pfs_conn_flow_idx(conn);
+        powerfs_flow_record_start(flow_idx, req->req_body_len);
+    }
+
+    ret = powerfs_request_do_send(req, conn);
+    if (ret != 0) {
+        powerfs_flow_record_complete(pfs_conn_flow_idx(conn), 0, 0, true);
+        powerfs_request_free(req);
+        return ret;
+    }
+
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_read_needle_async);
 
 /*
  * powerfs_net_renew_lease - RangeLease 续约 (Phase 3)

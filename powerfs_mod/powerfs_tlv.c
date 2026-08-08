@@ -398,7 +398,9 @@ int powerfs_tlv_dec_string(struct powerfs_tlv_dec *dec, __u8 field,
     if (!data || actual_field != field)
         return -ENOENT;
 
-    if (actual_len > max_len) {
+    /* max_len 是 buffer 容量 (含 null 终止符), 字符串最多 max_len-1 字节.
+     * 用 >= 防止 actual_len == max_len 时 str[actual_len] 写越界 1 字节. */
+    if (actual_len >= max_len) {
         /* 跳过数据并报错 */
         dec->pos += actual_len;
         return -E2BIG;
