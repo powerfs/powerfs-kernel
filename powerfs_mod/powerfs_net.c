@@ -4846,13 +4846,17 @@ int powerfs_net_read(struct powerfs_inode_info *pi, __u64 ino,
                                                        needle_buf,
                                                        POWERFS_CHUNK_SIZE,
                                                        &chunk_read_len);
+                        /* 无论成功失败都标记 failed_over, 避免循环外
+                         * if (!failed_over) spin_unlock 导致 double-unlock. */
+                        failed_over = true;
                         if (ret == 0) {
-                            failed_over = true;
                             /* K4-4: CRC32 校验 (failover 路径).
-                             * rep_crc==0 跳过校验 (对齐项目约束). */
+                             * rep_crc==0 跳过校验 (对齐项目约束).
+                             * 对齐 FUSE crc32fast::hash: init=0xFFFFFFFF,
+                             * final XOR 0xFFFFFFFF. */
                             if (rep_crc != 0 && chunk_read_len > 0) {
-                                __u32 actual = crc32_le(0, needle_buf,
-                                                        chunk_read_len);
+                                __u32 actual = crc32_le(~0, needle_buf,
+                                                        chunk_read_len) ^ ~0;
                                 if (actual != rep_crc) {
                                     pr_warn("powerfs: CRC mismatch (failover) "
                                             "ino=%llu chunk=%u expected=%#x "
@@ -4908,7 +4912,8 @@ int powerfs_net_read(struct powerfs_inode_info *pi, __u64 ino,
             spin_unlock(&pi->i_lock);
 
             if (found && expected_crc != 0) {
-                __u32 actual_crc = crc32_le(0, needle_buf, chunk_read_len);
+                /* K4-4: 对齐 FUSE crc32fast::hash: init=0xFFFFFFFF, final XOR. */
+                __u32 actual_crc = crc32_le(~0, needle_buf, chunk_read_len) ^ ~0;
                 if (actual_crc != expected_crc) {
                     pr_warn("powerfs: CRC mismatch (primary) ino=%llu chunk=%u "
                             "expected=%#x actual=%#x\n",
