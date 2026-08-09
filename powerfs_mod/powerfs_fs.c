@@ -4552,7 +4552,10 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
             {
                 u32 migrate_threshold = min(pi->inline_max_size * 3 / 2,
                                             (u32)POWERFS_INLINE_MAX_SIZE);
-                if (pi->inline_len > migrate_threshold) {
+                /* 注意: 用 >= 而非 >, 否则当 inline_max_size == POWERFS_INLINE_MAX_SIZE
+                 * (如 8192) 时, migrate_threshold=8192, inline_len 最大也是 8192,
+                 * 条件 inline_len > 8192 永远为 false, 迁移不会触发. */
+                if (pi->inline_len >= migrate_threshold) {
                     int mig_ret = powerfs_migrate_inline_to_flat(inode, pi);
                     if (mig_ret < 0) {
                         pr_warn("powerfs: WB_END INLINE ino=%lu migrate failed: %d\n",
