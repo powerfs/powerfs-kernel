@@ -42,6 +42,7 @@
 #include <linux/rbtree.h>
 #include <linux/kref.h>
 #include <linux/unaligned.h>
+#include <linux/crc32.h>
 
 #include <net/sock.h>
 #include <net/tcp.h>
@@ -3924,7 +3925,9 @@ static int parse_placement_field(const __u8 *val, size_t len,
 
 /* 解析 Reliability TLV (0xA1): u8 tag + count/shards.
  *   0x00=Single(1B) 0x01=Replicated(5B) 0x02=EC(9B)
- * 对齐 powerfs-layout/src/codec.rs encode_reliability (L323) */
+ * 对齐 powerfs-layout/src/codec.rs decode_reliability (L344).
+ *
+ * K4-8: EC 分支解析 data_shards/parity_shards. */
 static int parse_reliability_field(const __u8 *val, size_t len,
                                    struct powerfs_file_layout *layout)
 {
@@ -3933,6 +3936,78 @@ static int parse_reliability_field(const __u8 *val, size_t len,
 
     layout->reliability = val[0];
     layout->has_reliability = true;
+
+    /* K4-8: 解析 EC data_shards/parity_shards */
+    if (val[0] == POWERFS_RELIABILITY_EC && len >= 9) {
+        __u32 data, parity;
+        memcpy(&data, val + 1, sizeof(__u32));
+        memcpy(&parity, val + 5, sizeof(__u32));
+        layout->ec_data_shards = le32_to_cpu(data);
+        layout->ec_parity_shards = le32_to_cpu(parity);
+        pr_debug("powerfs: parse_reliability EC data=%u parity=%u\n",
+                 layout->ec_data_shards, layout->ec_parity_shards);
+    }
+
+    return 0;
+}
+
+/* K4-2: 解析 ReplicaChunks TLV (0xB5): [count u32 LE][ChunkRef × count].
+ * 每个 ChunkRef 44 字节: offset(u64) + size(u64) + needle_id(u64) +
+ * volume_id(u64) + crc32(u32) + mtime(u64), 全部小端.
+ * 对齐 powerfs-layout codec.rs decode_chunk_list (L584). */
+static int parse_replica_chunks_field(const __u8 *val, size_t len,
+                                      struct powerfs_file_layout *layout)
+{
+    __u32 count, i;
+    const __u8 *p;
+    struct powerfs_chunk_map *chunks;
+
+    if (len < 4)
+        return -EINVAL;
+
+    memcpy(&count, val, sizeof(__u32));
+    count = le32_to_cpu(count);
+
+    if (count == 0) {
+        layout->replica_chunks = NULL;
+        layout->replica_count = 0;
+        layout->has_replica_chunks = true;
+        return 0;
+    }
+
+    /* 每个 ChunkRef 44 字节 */
+    if (len < 4 + (size_t)count * 44)
+        return -EINVAL;
+
+    chunks = kmalloc_array(count, sizeof(struct powerfs_chunk_map),
+                           GFP_KERNEL);
+    if (!chunks)
+        return -ENOMEM;
+
+    p = val + 4;
+    for (i = 0; i < count; i++) {
+        __u64 offset, size, needle_id, volume_id, mtime;
+        __u32 crc32;
+
+        memcpy(&offset, p + 0, 8);
+        memcpy(&size, p + 8, 8);
+        memcpy(&needle_id, p + 16, 8);
+        memcpy(&volume_id, p + 24, 8);
+        memcpy(&crc32, p + 32, 4);
+        memcpy(&mtime, p + 36, 8);
+
+        chunks[i].chunk_idx = le64_to_cpu(offset) / POWERFS_CHUNK_SIZE;
+        chunks[i].needle_id = le64_to_cpu(needle_id);
+        chunks[i].volume_id = le64_to_cpu(volume_id);
+        chunks[i].crc32 = le32_to_cpu(crc32);
+
+        p += 44;
+    }
+
+    layout->replica_chunks = chunks;
+    layout->replica_count = count;
+    layout->has_replica_chunks = true;
+    pr_debug("powerfs: parse_replica_chunks count=%u\n", count);
     return 0;
 }
 
@@ -4107,14 +4182,22 @@ static void parse_file_layout(struct powerfs_tlv_dec *dec,
         }
     }
 
+    /* K4-2: ReplicaChunks (0xB5) — [count u32 LE][ChunkRef × count].
+     * 用于读路径 failover: 主 volume 失败时从副本重读.
+     * parse 阶段 kmalloc, apply 阶段所有权转移给 inode. */
+    if (powerfs_tlv_dec_find_raw(dec, POWERFS_NET_FLD_REPLICA_CHUNKS, &raw, &raw_len) == 0) {
+        parse_replica_chunks_field(raw, raw_len, layout);
+    }
+
     /* K3-DEBUG: log parsed layout for diagnostics */
     pr_info("powerfs: parse_file_layout RESULT placement=%u reliability=%u chunk_size=%u "
             "has_placement=%d has_reliability=%d stripe_size=%llu stripe_count=%u "
-            "volume_ids_count=%u inline_len=%u\n",
+            "volume_ids_count=%u inline_len=%u ec_data=%u ec_parity=%u replica_count=%u\n",
             layout->placement, layout->reliability, layout->chunk_size,
             layout->has_placement ? 1 : 0, layout->has_reliability ? 1 : 0,
             (unsigned long long)layout->stripe_size, layout->stripe_count,
-            layout->volume_ids_count, layout->inline_len);
+            layout->volume_ids_count, layout->inline_len,
+            layout->ec_data_shards, layout->ec_parity_shards, layout->replica_count);
 }
 
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
@@ -4732,6 +4815,63 @@ int powerfs_net_read(struct powerfs_inode_info *pi, __u64 ino,
                                        needle_buf, POWERFS_CHUNK_SIZE,
                                        &chunk_read_len);
         if (ret < 0 && ret != -ENOENT) {
+            /* K4-2: 读 failover — 主 volume 失败时从 replica_chunks 重读.
+             * 对齐 FUSE read failover (cache.rs): 遍历 replica_chunks
+             * 找到 chunk_idx 匹配的副本, 用其 (volume_id, needle_id) 重读.
+             * 对齐项目约束: "所有请求断连时入队列等待, 不降级到本地缓存" —
+             * 这里 failover 是切换到副本 volume, 不是降级到本地缓存. */
+            if (pi->replica_chunks && pi->replica_count > 0) {
+                __u32 chunk_idx = cur_offset / POWERFS_CHUNK_SIZE;
+                __u32 i;
+                bool failed_over = false;
+
+                spin_lock(&pi->i_lock);
+                for (i = 0; i < pi->replica_count; i++) {
+                    if (pi->replica_chunks[i].chunk_idx == chunk_idx) {
+                        __u64 rep_vid = pi->replica_chunks[i].volume_id;
+                        __u64 rep_nid = pi->replica_chunks[i].needle_id;
+                        __u32 rep_crc = pi->replica_chunks[i].crc32;
+                        spin_unlock(&pi->i_lock);
+
+                        pr_warn("powerfs: read failover ino=%llu chunk=%u "
+                                "primary vid=%llu nid=%llu failed=%d → "
+                                "replica vid=%llu nid=%llu\n",
+                                (unsigned long long)ino, chunk_idx,
+                                (unsigned long long)volume_id,
+                                (unsigned long long)needle_id, ret,
+                                (unsigned long long)rep_vid,
+                                (unsigned long long)rep_nid);
+
+                        ret = powerfs_net_read_needle(rep_vid, rep_nid,
+                                                       needle_buf,
+                                                       POWERFS_CHUNK_SIZE,
+                                                       &chunk_read_len);
+                        if (ret == 0) {
+                            failed_over = true;
+                            /* K4-4: CRC32 校验 (failover 路径).
+                             * rep_crc==0 跳过校验 (对齐项目约束). */
+                            if (rep_crc != 0 && chunk_read_len > 0) {
+                                __u32 actual = crc32_le(0, needle_buf,
+                                                        chunk_read_len);
+                                if (actual != rep_crc) {
+                                    pr_warn("powerfs: CRC mismatch (failover) "
+                                            "ino=%llu chunk=%u expected=%#x "
+                                            "actual=%#x\n",
+                                            (unsigned long long)ino, chunk_idx,
+                                            rep_crc, actual);
+                                    kvfree(needle_buf);
+                                    return -EIO;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                if (!failed_over)
+                    spin_unlock(&pi->i_lock);
+            }
+        }
+        if (ret < 0 && ret != -ENOENT) {
             pr_warn("powerfs: read_needle vid=%llu nid=%llu failed: %d\n",
                     (unsigned long long)volume_id,
                     (unsigned long long)needle_id, ret);
@@ -4744,6 +4884,40 @@ int powerfs_net_read(struct powerfs_inode_info *pi, __u64 ino,
              * 不 break, 因为 hole 后面可能还有已写入的 needle. */
             chunk_read_len = 0;
             ret = 0;  /* 后续 break 判断用 ret==0 */
+        }
+
+        /* K4-4: CRC32 校验 (主路径).
+         * 读成功后, 若 replica_chunks 中有匹配 chunk_idx 的 crc32, 校验数据完整性.
+         * crc32==0 跳过校验 (对齐项目约束).
+         * 注意: 仅校验 needle_buf 全量数据 (chunk_read_len), 不校验部分拷贝. */
+        if (ret == 0 && chunk_read_len > 0 &&
+            pi->replica_chunks && pi->replica_count > 0) {
+            __u32 chunk_idx = cur_offset / POWERFS_CHUNK_SIZE;
+            __u32 i;
+            __u32 expected_crc = 0;
+            bool found = false;
+
+            spin_lock(&pi->i_lock);
+            for (i = 0; i < pi->replica_count; i++) {
+                if (pi->replica_chunks[i].chunk_idx == chunk_idx) {
+                    expected_crc = pi->replica_chunks[i].crc32;
+                    found = true;
+                    break;
+                }
+            }
+            spin_unlock(&pi->i_lock);
+
+            if (found && expected_crc != 0) {
+                __u32 actual_crc = crc32_le(0, needle_buf, chunk_read_len);
+                if (actual_crc != expected_crc) {
+                    pr_warn("powerfs: CRC mismatch (primary) ino=%llu chunk=%u "
+                            "expected=%#x actual=%#x\n",
+                            (unsigned long long)ino, chunk_idx,
+                            expected_crc, actual_crc);
+                    kvfree(needle_buf);
+                    return -EIO;
+                }
+            }
         }
 
         /* 拷贝请求区间: [offset_in_needle, min(offset_in_needle+remaining, chunk_read_len)) */

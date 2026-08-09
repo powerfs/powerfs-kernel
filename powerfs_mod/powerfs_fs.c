@@ -677,6 +677,28 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
         pi->stripe_size = 0;
         pi->stripe_count = 0;
     }
+
+    /* K4-8: EC 元数据 — 从 Reliability EC 分支解析.
+     * 仅在 reliability==EC 时应用, 非 EC 清零. */
+    if (pi->reliability == POWERFS_RELIABILITY_EC) {
+        pi->ec_data_shards = layout->ec_data_shards;
+        pi->ec_parity_shards = layout->ec_parity_shards;
+    } else {
+        pi->ec_data_shards = 0;
+        pi->ec_parity_shards = 0;
+    }
+
+    /* K4-2: ReplicaChunks — 读 failover 使用.
+     * 所有权转移: 先释放旧数组, 再挂载新数组.
+     * 仅在 reliability==REPLICATED 时有意义, 但解析不区分 (apply 时决定). */
+    if (layout->has_replica_chunks) {
+        struct powerfs_chunk_map *old_rep = pi->replica_chunks;
+        pi->replica_chunks = layout->replica_chunks;
+        pi->replica_count = layout->replica_count;
+        layout->replica_chunks = NULL;     /* 所有权转移, 防止 double-free */
+        layout->replica_count = 0;
+        kfree(old_rep);
+    }
 }
 
 /*
@@ -728,14 +750,16 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
             spin_lock(&pi->i_lock);
             powerfs_apply_layout_to_inode(pi, &layout);
             spin_unlock(&pi->i_lock);
-            /* apply 后 layout.volume_ids/inline_data 已转移到 inode (或已释放).
+            /* apply 后 layout.volume_ids/inline_data/replica_chunks 已转移到 inode (或已释放).
              * 防御性: 若 apply 异常未消费, 这里释放. */
             kfree(layout.volume_ids);
             kfree(layout.inline_data);
+            kfree(layout.replica_chunks);
         } else {
-            /* getattr 失败: 释放 parse 可能分配的 volume_ids/inline_data */
+            /* getattr 失败: 释放 parse 可能分配的 volume_ids/inline_data/replica_chunks */
             kfree(layout.volume_ids);
             kfree(layout.inline_data);
+            kfree(layout.replica_chunks);
         }
     }
     if (ret) {
@@ -1805,9 +1829,10 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
             if (IS_ERR(inode)) {
                 pr_warn("powerfs: lookup '%pd' iget failed: %ld\n",
                         dentry, PTR_ERR(inode));
-                /* K3: iget 失败, 释放 parse 分配的 volume_ids/inline_data */
+                /* K3: iget 失败, 释放 parse 分配的 volume_ids/inline_data/replica_chunks */
                 kfree(lookup_layout.volume_ids);
                 kfree(lookup_layout.inline_data);
+                kfree(lookup_layout.replica_chunks);
                 d_add(dentry, NULL);
                 return NULL;
             }
@@ -1918,9 +1943,10 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
              * lookup 成功 (即使 ENOENT) 也续约父目录 lease. */
             pr_debug("powerfs: lookup '%pd' not found (powerfs_net)\n", dentry);
             /* K3: ENOENT 时 lookup_layout 已被 parse_file_layout 零初始化,
-             * volume_ids/inline_data 为 NULL (Filer 不对不存在的文件编码 layout), 安全. */
+             * volume_ids/inline_data/replica_chunks 为 NULL (Filer 不对不存在的文件编码 layout), 安全. */
             kfree(lookup_layout.volume_ids);
             kfree(lookup_layout.inline_data);
+            kfree(lookup_layout.replica_chunks);
             d_add(dentry, NULL);
             WRITE_ONCE(POWERFS_I(dir)->dir_lease_expire,
                        jiffies + POWERFS_DIR_LEASE_TTL);
@@ -1940,6 +1966,7 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
         /* K3: err 路径 lookup_layout 已零初始化, kfree(NULL) 安全 */
         kfree(lookup_layout.volume_ids);
         kfree(lookup_layout.inline_data);
+        kfree(lookup_layout.replica_chunks);
         return ERR_PTR(err);
     }
 
@@ -2045,12 +2072,14 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
                  dentry, inode->i_ino, pi->placement, pi->reliability,
                  pi->layout_chunk_size, pi->stripe_count, pi->volume_ids_count,
                  pi->inline_data ? 1 : 0);
-    } else if (mknod_has_layout && (mknod_layout.volume_ids || mknod_layout.inline_data)) {
-        /* 未应用到 inode (非 regular 文件), 释放 parse 分配的 volume_ids/inline_data */
+    } else if (mknod_has_layout && (mknod_layout.volume_ids || mknod_layout.inline_data || mknod_layout.replica_chunks)) {
+        /* 未应用到 inode (非 regular 文件), 释放 parse 分配的 volume_ids/inline_data/replica_chunks */
         kfree(mknod_layout.volume_ids);
         mknod_layout.volume_ids = NULL;
         kfree(mknod_layout.inline_data);
         mknod_layout.inline_data = NULL;
+        kfree(mknod_layout.replica_chunks);
+        mknod_layout.replica_chunks = NULL;
     }
 
     /* 关联 dentry 和 inode.

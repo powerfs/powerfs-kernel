@@ -207,9 +207,23 @@ struct powerfs_file_layout {
     u64 *volume_ids;            /* volume_ids 数组 (kmalloc), NULL=未解析 */
     u32 volume_ids_count;       /* volume_ids 数组长度 */
 
+    /* === K4: Reliability EC 元数据 (从 0xA1 Reliability 解析) ===
+     * EC tag=0x02 后续: data_shards u32 LE + parity_shards u32 LE.
+     * 对齐 powerfs-layout codec.rs decode_reliability (L359). */
+    u32 ec_data_shards;         /* EC 数据分片数, 0=非 EC */
+    u32 ec_parity_shards;       /* EC 校验分片数 */
+
+    /* === K4: 副本 chunk 列表 (从 0xB5 ReplicaChunks 解析) ===
+     * 每个 ChunkRef 44 字节: offset/size/needle_id/volume_id/crc32/mtime.
+     * 对齐 powerfs-layout codec.rs decode_chunk_list (L584).
+     * parse 阶段 kmalloc, apply 阶段所有权转移给 inode. */
+    struct powerfs_chunk_map *replica_chunks;  /* 副本 chunks (kmalloc), NULL=无 */
+    u32 replica_count;                          /* replica_chunks 数组长度 */
+
     bool has_placement;     /* 响应中是否包含 Placement 字段 */
     bool has_reliability;   /* 响应中是否包含 Reliability 字段 */
     bool has_inline_data;   /* 响应中是否包含 InlineData 字段 */
+    bool has_replica_chunks;/* 响应中是否包含 ReplicaChunks 字段 */
 };
 
 struct powerfs_inode_info {
@@ -279,6 +293,11 @@ struct powerfs_inode_info {
     struct powerfs_chunk_map *replica_chunks;
     u32 replica_count;
 
+    /* === K4: EC 元数据 (从 0xA1 Reliability 解析) ===
+     * ec_data_shards=0 表示非 EC 模式. */
+    u32 ec_data_shards;
+    u32 ec_parity_shards;
+
     /* 缓存有效性 */
     bool cache_valid;
     unsigned long cache_expire;
@@ -332,7 +351,8 @@ int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
  * volume_ids 所有权从 layout 转移到 inode (layout->volume_ids 置 NULL).
  * inline_data 所有权从 layout 转移到 inode (layout->inline_data 置 NULL).
  * 若 inode 已有 volume_ids/inline_data, 先 kfree 旧的再替换 (避免泄漏).
- * 调用方负责在 layout 解析失败时 kfree(layout.volume_ids) 和 kfree(layout.inline_data). */
+ * 调用方负责在 layout 解析失败时 kfree(layout.volume_ids)、kfree(layout.inline_data)
+ * 和 kfree(layout.replica_chunks). */
 void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
                                    struct powerfs_file_layout *layout);
 
