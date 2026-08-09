@@ -751,7 +751,26 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
     if (!inode)
         goto out_free;
 
+    /* 防御性检查: inode 是否已被 evict (I_FREEING/I_CLEAR).
+     * 虽然修复了 igrab 检查后不应出现此情况, 但 getattr 是长时间
+     * 阻塞网络调用, 返回后 inode 状态可能已变. 持有 igrab 引用
+     * 保证 inode 不会被释放, 但 evict_inode 可能已标记 shutdown.
+     * 此时不应再修改 inode 字段 (可能与 evict 并发). */
+    if (inode->i_state & (I_FREEING | I_CLEAR | I_WILL_FREE)) {
+        pr_debug("powerfs: refresh_work ino=%llu inode being evicted, skip\n",
+                 rw->ino);
+        goto out_iput;
+    }
+
     pi = POWERFS_I(inode);
+
+    /* evict_inode 已设置 shutdown: inode 私有数据正在被释放,
+     * 不应再修改 pi 字段. */
+    if (pi->shutdown) {
+        pr_debug("powerfs: refresh_work ino=%llu inode shutdown, skip\n",
+                 rw->ino);
+        goto out_iput;
+    }
 
     /* 1. 发 getattr 获取最新元数据 */
     {
@@ -781,11 +800,21 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
     if (ret) {
         pr_warn("powerfs: refresh_work ino=%llu getattr failed: %d\n",
                 rw->ino, ret);
-        /* getattr 失败: 清 cache_valid, 让下次访问触发 re-lookup */
-        spin_lock(&pi->i_lock);
-        pi->cache_valid = false;
-        pi->need_refresh = false;
-        spin_unlock(&pi->i_lock);
+        /* getattr 失败: 清 cache_valid, 让下次访问触发 re-lookup.
+         * 但若 inode 已 shutdown, 不修改 pi 字段 (evict 进行中). */
+        if (!pi->shutdown) {
+            spin_lock(&pi->i_lock);
+            pi->cache_valid = false;
+            pi->need_refresh = false;
+            spin_unlock(&pi->i_lock);
+        }
+        goto out_iput;
+    }
+
+    /* getattr 返回后再次检查: 长时间网络阻塞期间 inode 可能被 evict. */
+    if (pi->shutdown || (inode->i_state & (I_FREEING | I_CLEAR))) {
+        pr_debug("powerfs: refresh_work ino=%llu inode evicted during getattr, skip update\n",
+                 rw->ino);
         goto out_iput;
     }
 
@@ -811,8 +840,13 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
     spin_unlock(&inode->i_lock);
 
     spin_lock(&pi->i_lock);
-    pi->volume_id = volume_id;
-    pi->file_key = file_key;
+    /* 仅在 Filer 返回非零值时更新 volume_id/file_key.
+     * close 前的 getattr 可能返回 0 (Filer 端 chunks 在 close 时才同步),
+     * 若用 0 覆盖迁移后已设置的值, 会导致 writeback locate 失败 (-EINVAL). */
+    if (volume_id != 0)
+        pi->volume_id = volume_id;
+    if (file_key != 0)
+        pi->file_key = file_key;
     pi->cache_valid = true;
     pi->cache_expire = jiffies + POWERFS_INODE_CACHE_TTL;
     pi->need_refresh = false;
@@ -887,24 +921,43 @@ int powerfs_invalidate_one(u64 ino)
     }
 
     /* 失效 page cache (clean pages), 使下次读从 volume 重新拉取.
-     * 放到独立工作队列处理, 避免在调度器线程中阻塞. */
+     * 放到独立工作队列处理, 避免在调度器线程中阻塞.
+     *
+     * 修复 crash: igrab 可能失败 (inode 处于 I_FREEING 状态),
+     * 未检查返回值会导致 refresh_work 访问已释放的 inode (use-after-free).
+     * ilookup5 返回的 inode 虽有引用, 但在极端并发下 (如 dentry 释放
+     * 触发 evict), igrab 仍可能失败. 失败时降级为清 cache_valid. */
     {
         struct powerfs_refresh_work *rw;
-        rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
-        if (rw) {
-            INIT_WORK(&rw->work, powerfs_refresh_inode_work);
-            rw->ino = ino;
-            igrab(inode);
-            rw->inode = inode;
-            queue_work(powerfs_refresh_wq, &rw->work);
-        } else {
-            /* fallback: 清 cache_valid, 让下次访问触发 re-lookup */
+        struct inode *grabbed;
+
+        grabbed = igrab(inode);
+        if (!grabbed) {
+            /* inode 正在被 evict, 降级: 清 cache_valid */
             struct powerfs_inode_info *pi = POWERFS_I(inode);
             spin_lock(&pi->i_lock);
             pi->cache_valid = false;
             spin_unlock(&pi->i_lock);
+            pr_debug("powerfs: invalidate_one ino=%llu igrab failed, fallback\n", ino);
+            goto skip_refresh;
+        }
+
+        rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
+        if (rw) {
+            INIT_WORK(&rw->work, powerfs_refresh_inode_work);
+            rw->ino = ino;
+            rw->inode = grabbed;  /* igrab 成功的引用, refresh_work 中 iput */
+            queue_work(powerfs_refresh_wq, &rw->work);
+        } else {
+            /* kmalloc 失败: 释放 igrab 引用, 降级清 cache_valid */
+            struct powerfs_inode_info *pi = POWERFS_I(grabbed);
+            spin_lock(&pi->i_lock);
+            pi->cache_valid = false;
+            spin_unlock(&pi->i_lock);
+            iput(grabbed);
         }
     }
+skip_refresh:
 
     /* For directories, expire the readdir lease so next readdir
      * re-fetches entries from the Filer. */
@@ -1062,6 +1115,15 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->replica_chunks = NULL;
     pi->replica_count = 0;
 
+    /* K4-5: EC shards 列表 — 必须初始化为 NULL!
+     * 修复 crash: slab 重用旧 inode 内存时, ec_chunks 残留悬空指针,
+     * apply_layout_to_inode 的 kfree(old_ec) 对垃圾指针 kfree → GPF.
+     * 同理 ec_data_shards/ec_parity_shards 也需初始化. */
+    pi->ec_chunks = NULL;
+    pi->ec_chunk_count = 0;
+    pi->ec_data_shards = 0;
+    pi->ec_parity_shards = 0;
+
     /* K2: Inline 数据缓冲初始化 (默认无 inline_data, GETATTR 时按需分配) */
     pi->inline_data = NULL;
     pi->inline_len = 0;
@@ -1159,33 +1221,45 @@ void powerfs_evict_inode(struct inode *inode)
         kfree(rb_entry(n, struct powerfs_lease, node));
     }
 
-    /* 5. 释放 chunk 映射 */
-    kfree(pi->chunks);
+    /* 释放动态分配的布局数据. 持锁防止与 refresh_work/apply_layout 竞争.
+     * 修复 crash: 连接断开时 refresh_work getattr 失败 → iput → evict_inode,
+     * 若不持锁, apply_layout 可能并发释放/替换指针, 导致 kfree 无效地址. */
+    spin_lock(&pi->i_lock);
+
+    /* 释放 chunk 映射 */
+    if (pi->chunks && virt_addr_valid(pi->chunks))
+        kfree(pi->chunks);
     pi->chunks = NULL;
     pi->chunk_count = 0;
 
     /* K3-1: 释放 Stripe volume_ids 数组 (evict 时释放, 避免 slab 重分配后悬挂) */
-    kfree(pi->volume_ids);
+    if (pi->volume_ids && virt_addr_valid(pi->volume_ids))
+        kfree(pi->volume_ids);
     pi->volume_ids = NULL;
     pi->volume_ids_count = 0;
     pi->stripe_size = 0;
     pi->stripe_count = 0;
 
     /* K4: 释放副本 chunk 列表 */
-    kfree(pi->replica_chunks);
+    if (pi->replica_chunks && virt_addr_valid(pi->replica_chunks))
+        kfree(pi->replica_chunks);
     pi->replica_chunks = NULL;
     pi->replica_count = 0;
 
     /* K4-5: 释放 EC shards 列表 */
-    kfree(pi->ec_chunks);
+    if (pi->ec_chunks && virt_addr_valid(pi->ec_chunks))
+        kfree(pi->ec_chunks);
     pi->ec_chunks = NULL;
     pi->ec_chunk_count = 0;
 
-    /* 6. 清理目录缓存链表 */
-    powerfs_clear_dir_entries(inode);
+    /* K2: 释放 inline_data (之前遗漏, 导致内存泄漏) */
+    if (pi->inline_data && virt_addr_valid(pi->inline_data))
+        kfree(pi->inline_data);
+    pi->inline_data = NULL;
+    pi->inline_len = 0;
+    pi->inline_dirty = false;
 
-    /* 7. 清理状态 */
-    spin_lock(&pi->i_lock);
+    /* 7. 清理状态 (仍在 i_lock 下) */
     pi->cache_valid = false;
     pi->dir_complete = false;
     /* Phase 1: 清目录 lease, 防止 inode 复用 (slab 重分配) 后误命中旧 lease. */
@@ -1193,6 +1267,9 @@ void powerfs_evict_inode(struct inode *inode)
     pi->dir_lease_epoch = 0;
     pi->shutdown = true;
     spin_unlock(&pi->i_lock);
+
+    /* 6. 清理目录缓存链表 (使用 dir_mutex, 不在 i_lock 下) */
+    powerfs_clear_dir_entries(inode);
 }
 
 /*
@@ -1287,9 +1364,10 @@ static int powerfs_write_inode(struct inode *inode, struct writeback_control *wb
     if ((u64)i_size == last_synced)
         return 0;
 
-    if (wbc->sync_mode == WB_SYNC_ALL) {
-        /* fsync/sync: 调用方进程上下文, 可安全同步等待网络.
-         * (VFS 在调用者线程中执行, 非 writeback workqueue) */
+    if (wbc->sync_mode == WB_SYNC_ALL && !(current->flags & PF_WQ_WORKER)) {
+        /* fsync: 调用方进程上下文 (非 writeback workqueue), 可安全同步等待网络.
+         * 注意: sync(2) 会在 per-CPU writeback 线程中触发 WB_SYNC_ALL,
+         * 此时不能阻塞 (PF_WQ_WORKER), 走 offload 路径. */
         int ret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
                                        0, 0, 0, (__u64)i_size);
         if (ret < 0) {
@@ -1464,12 +1542,14 @@ static int ensure_lease(struct inode *inode, loff_t offset)
         powerfs_net_release_lease(pi->volume_id, inode->i_ino,
                                    lease->token, strlen(lease->token), NULL);
         kfree(lease);
+        lease = NULL;  /* 置 NULL, 避免悬空指针检查 */
     }
 
-    /* 调度续约工作 (首次获取 lease 时启动) */
+    /* 调度续约工作 (仅在新 lease 成功插入时启动).
+     * delay = LEASE_DURATION - RENEW_THRESHOLD (20s), 在过期前 10s 续约.
+     * queue_delayed_work 不会重复入队: 若 work 已 pending, 返回 false. */
     if (sbi && sbi->lease_wq && !sbi->shutting_down) {
-        unsigned long delay = lease ?
-            0 : (POWERFS_LEASE_DURATION - POWERFS_LEASE_RENEW_THRESHOLD);
+        unsigned long delay = POWERFS_LEASE_DURATION - POWERFS_LEASE_RENEW_THRESHOLD;
         queue_delayed_work(sbi->lease_wq, &pi->lease_renew_work, delay);
     }
 
@@ -1479,11 +1559,20 @@ static int ensure_lease(struct inode *inode, loff_t offset)
 /*
  * powerfs_get_lease_token - 获取指定 offset 所在 stripe 的 lease token
  *
- * writeback 路径辅助函数: 先调用 ensure_lease (含快速路径, 已持有则直接返回),
- * 再从 lease_lock 下读取 token. 用于 batch 内每个 needle 写入前获取对应
- * stripe 的 lease, 修复旧实现只为 batch 首页 stripe 获取 lease 的问题.
+ * writeback 路径辅助函数: 从 lease_lock 下读取已持有的 token.
  *
- * 返回 0 成功 (token/token_len 已填充), 负值错误.
+ * 重要修复: 不再调用 ensure_lease (同步网络调用 powerfs_net_acquire_lease).
+ * writeback 工作队列 (powerfs_wb) 禁止阻塞在网络 I/O 上, 否则会导致:
+ *   - workqueue lockup (实测 679s+)
+ *   - wb_workfn 在 powerfs_write_inode spin_lock 上死等
+ *   - sync(2) 进入 D 状态永久卡死
+ *   - RCU stall
+ *
+ * lease 获取由 open/write 路径预先完成, writeback 时 lease 应已持有.
+ * 若 lease 未持有或已过期, 返回 -ENOENT, writeback 继续无 lease 写入
+ * (Volume Server 容许无 lease 写入, lease_token 为可选字段).
+ *
+ * 返回 0 成功 (token/token_len 已填充), 负值错误 (-ENOENT=无 lease).
  */
 static int powerfs_get_lease_token(struct inode *inode, loff_t offset,
                                     char *token, size_t *token_len)
@@ -1491,11 +1580,6 @@ static int powerfs_get_lease_token(struct inode *inode, loff_t offset,
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     u64 stripe_start = (offset / POWERFS_STRIPE_SIZE) * POWERFS_STRIPE_SIZE;
     struct powerfs_lease *l;
-    int ret;
-
-    ret = ensure_lease(inode, offset);
-    if (ret)
-        return ret;
 
     spin_lock(&pi->lease_lock);
     l = powerfs_lease_find(pi, stripe_start);
@@ -1503,13 +1587,12 @@ static int powerfs_get_lease_token(struct inode *inode, loff_t offset,
         strncpy(token, l->token, 63);
         token[63] = '\0';
         *token_len = strlen(token);
-        ret = 0;
-    } else {
-        *token_len = 0;
-        ret = -ENOENT;
+        spin_unlock(&pi->lease_lock);
+        return 0;
     }
     spin_unlock(&pi->lease_lock);
-    return ret;
+    *token_len = 0;
+    return -ENOENT;
 }
 
 /*
@@ -1568,10 +1651,6 @@ static void powerfs_lease_renew_work_func(struct work_struct *work)
     /* 卸载中或 workqueue 已销毁: 停止续约, 不重调度 */
     if (!sbi || !sbi->lease_wq || sbi->shutting_down || pi->shutdown)
         return;
-
-    /* DEBUG: 禁用 lease renew 以排除法定位 RCU stall.
-     * 直接返回, 不执行续约, 不重调度. */
-    return;
 
     /* Phase 1: 锁内扫描, 收集需要续约的 lease 信息 + 跟踪最早过期时间.
      * 不在锁内执行网络 I/O: spinlock 不可睡眠, 网络 RPC 可阻塞 5s. */
@@ -1920,9 +1999,13 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
                     spin_lock(&pi->i_lock);
                     pi->cache_valid = true;
                     pi->cache_expire = jiffies + POWERFS_INODE_CACHE_TTL;
-                    /* 更新 volume_id/file_key (可能因 FUSE 端写入而变化) */
-                    pi->volume_id = volume_id;
-                    pi->file_key = file_key;
+                    /* 仅在 Filer 返回非零值时更新 volume_id/file_key.
+                     * close 前的 lookup 可能返回 0 (Filer 端 chunks 在 close 时才同步),
+                     * 若用 0 覆盖已有值, 会导致 writeback/read locate 失败. */
+                    if (volume_id != 0)
+                        pi->volume_id = volume_id;
+                    if (file_key != 0)
+                        pi->file_key = file_key;
                     /* K3: 更新 FileLayout (placement 可能从 Flat 切换到 Stripe) */
                     powerfs_apply_layout_to_inode(pi, &lookup_layout);
                     spin_unlock(&pi->i_lock);
@@ -2345,6 +2428,7 @@ static int powerfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 {
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(dir->i_sb);
     struct inode *inode;
+    struct powerfs_inode_info *pi;
     u64 new_ino;
     int err;
 
@@ -2380,11 +2464,32 @@ static int powerfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
     if (!inode)
         return -ENOSPC;
 
+    pi = POWERFS_I(inode);
+
     /* 使用 page cache 存储符号链接目标 */
     err = page_symlink(inode, symname, strlen(symname) + 1);
     if (err) {
         iput(inode);
         return err;
+    }
+
+    /* Filer 会将 symlink target 存储为 InlineData (placement=Inline).
+     * 本地也存储一份到 inline_data, 以便 page cache 被 evict 后
+     * netfs_issue_read 能从 inline_data 恢复 (而非回退到 volume_read
+     * 导致 -EINVAL, 因为 Inline 文件无 needle). */
+    {
+        size_t target_len = strlen(symname) + 1;
+        u8 *buf = kvmalloc(target_len, GFP_KERNEL);
+        if (buf) {
+            memcpy(buf, symname, target_len);
+            spin_lock(&pi->i_lock);
+            kfree(pi->inline_data);
+            pi->inline_data = buf;
+            pi->inline_len = target_len;
+            pi->placement = POWERFS_PLACEMENT_INLINE;
+            pi->inline_dirty = false;  /* Filer 已知 target */
+            spin_unlock(&pi->i_lock);
+        }
     }
 
     /* 关联 dentry 和 inode (用 d_instantiate, 不能用 d_add — 见 powerfs_mknod 注释) */
@@ -4160,14 +4265,25 @@ int powerfs_writepages(struct address_space *mapping,
 
             /* 分配 batch (如果当前没有 pending) */
             if (!batch) {
+                struct inode *grabbed;
                 batch = powerfs_alloc_write_batch(batch_pages, GFP_NOFS);
                 if (!batch) {
                     redirty_page_for_writepage(wbc, page);
                     unlock_page(page);
                     continue;
                 }
+                grabbed = igrab(inode);
+                if (!grabbed) {
+                    /* inode 正在被 evict (I_FREEING), 无法提交 writeback.
+                     * 释放 batch, redirty 页面. */
+                    kvfree(batch);
+                    batch = NULL;
+                    redirty_page_for_writepage(wbc, page);
+                    unlock_page(page);
+                    continue;
+                }
                 INIT_WORK(&batch->work, powerfs_writepage_work_fn);
-                batch->inode = igrab(inode);
+                batch->inode = grabbed;
             }
 
             /* 添加页面到 batch */
@@ -4250,6 +4366,14 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
 
     INIT_WORK(&wpw->work, powerfs_writepage_work_fn);
     wpw->inode = igrab(inode);
+    if (!wpw->inode) {
+        /* inode 正在被 evict (I_FREEING), 无法提交 writeback.
+         * 释放 wpw, redirty 页面. */
+        kvfree(wpw);
+        redirty_page_for_writepage(wbc, page);
+        unlock_page(page);
+        return 0;
+    }
     get_page(page);
     wpw->pages[0] = page;
     wpw->offsets[0] = offset;
@@ -4291,6 +4415,20 @@ int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
     pr_debug("powerfs: write_begin ino=%lu pos=%lld len=%u i_size=%lld\n",
             inode->i_ino, pos, len, i_size_read(inode));
 
+    /* page_symlink() 调用时 iocb==NULL (无 file 描述符),
+     * 不能走 netfs_write_begin (需要 file 参数).
+     * 改用 __filemap_get_folio 直接获取 page cache folio. */
+    if (!iocb) {
+        folio = __filemap_get_folio(mapping, pos / PAGE_SIZE,
+                                    FGP_WRITEBEGIN | FGP_LOCK | FGP_CREAT,
+                                    mapping_gfp_mask(mapping));
+        if (!folio)
+            return -ENOMEM;
+        *foliop = folio;
+        *fsdata = NULL;
+        return 0;
+    }
+
     ret = netfs_write_begin(&pi->netfs, iocb->ki_filp, inode->i_mapping,
                             pos, len, &folio, NULL);
     if (ret < 0) {
@@ -4329,7 +4467,7 @@ int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
  *       folio lock 被持有, 但 inline 路径已在 write_end 中做 kvmalloc
  *       (可睡眠), 故阻塞操作可接受. 迁移数据最大 8KB, 网络往返 <100ms.
  *
- * 返回 0 成功, 负数错误码 (-EFBIG 表示迁移失败, inline_data 保持原状).
+ * 返回 0 成功, 负数错误码 (网络错误透传, inline_data 保持原状).
  */
 static int powerfs_migrate_inline_to_flat(struct inode *inode,
                                           struct powerfs_inode_info *pi)
@@ -4374,10 +4512,10 @@ static int powerfs_migrate_inline_to_flat(struct inode *inode,
     shard_id = pi->parent_ino ? pi->parent_ino : ino;
     ret = powerfs_net_migrate_inline_alloc(shard_id, ino, &volume_id, &file_key);
     if (ret < 0) {
-        pr_warn("powerfs: MIGRATE ino=%lu alloc failed: %d — EFBIG, inline buffer unmodified\n",
+        pr_warn("powerfs: MIGRATE ino=%lu alloc failed: %d, inline buffer unmodified\n",
                 ino, ret);
         kfree(snap_data);
-        return -EFBIG;
+        return ret;  /* 透传网络错误 (-ENOTCONN/-ETIMEDOUT 等), 非 EFBIG */
     }
 
     /* 3. 同步写 snap_data 到 Volume Server (WriteNeedle).
@@ -4387,10 +4525,10 @@ static int powerfs_migrate_inline_to_flat(struct inode *inode,
                                     snap_data, snap_len,
                                     NULL, 0);
     if (ret < 0) {
-        pr_warn("powerfs: MIGRATE ino=%lu write_needle failed: %d — EFBIG, needle_id=%#llx leaked\n",
+        pr_warn("powerfs: MIGRATE ino=%lu write_needle failed: %d, needle_id=%#llx leaked\n",
                 ino, ret, (unsigned long long)file_key);
         kfree(snap_data);
-        return -EFBIG;
+        return ret;  /* 透传网络错误, 非 EFBIG */
     }
 
     pr_info("powerfs: MIGRATE ino=%lu write_needle OK volume_id=%llu needle_id=%#llx size=%u\n",
@@ -4551,7 +4689,7 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
              * 迁移阈值 = min(inline_max_size × 1.5, POWERFS_INLINE_MAX_SIZE).
              * 对齐 FUSE fuse.rs L3444: 滞后窗口避免边界抖动.
              * 迁移成功: inode 切换到 Flat, 后续 write 走 Flat writeback.
-             * 迁移失败: 返回 -EFBIG, inline_data 保持原状 (close 时同步到 Filer). */
+             * 迁移失败: 透传网络错误码, inline_data 保持原状 (close 时同步到 Filer). */
             {
                 u32 migrate_threshold = min(pi->inline_max_size * 3 / 2,
                                             (u32)POWERFS_INLINE_MAX_SIZE);
@@ -4744,7 +4882,30 @@ static ssize_t powerfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
+    struct inode *inode = iocb->ki_filp->f_inode;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    loff_t offset = iocb->ki_pos;
+    size_t count = iov_iter_count(from);
+
     powerfs_flow_admit_wait(POWERFS_FLOW_OP_WRITE, 2000);
+
+    /* 预先获取 lease (同步网络调用, 用户进程上下文可阻塞).
+     * writeback 工作队列不允许阻塞在网络 I/O 上, 故 lease 必须在
+     * write 路径预先获取, writeback 时只检查已持有的 lease (非阻塞).
+     *
+     * 跳过条件:
+     *   - Inline 模式 (数据不走 Volume Server)
+     *   - count == 0 (无数据写入)
+     *   - 目录 (不应走到这里, 防御性检查) */
+    if (pi->placement != POWERFS_PLACEMENT_INLINE &&
+        S_ISREG(inode->i_mode) && count > 0) {
+        int lease_ret = ensure_lease(inode, offset);
+        if (lease_ret && lease_ret != -ENOMEM)
+            pr_debug("powerfs: write_iter ensure_lease ino=%lu off=%lld ret=%d, continuing without lease\n",
+                     inode->i_ino, offset, lease_ret);
+        /* lease 获取失败不阻止写入, Volume Server 容许无 lease 写入 */
+    }
+
     return generic_file_write_iter(iocb, from);
 }
 
@@ -4780,13 +4941,10 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
     int ret = 0;
     bool synced = false;
 
-    /* 仅 Inline 模式 + dirty 需要同步.
-     * Flat/Stripe 走 writeback + fsync 路径, release 无额外操作. */
-    if (pi->placement != POWERFS_PLACEMENT_INLINE || !pi->inline_dirty) {
-        pr_info("powerfs: RELEASE skip ino=%lu placement=%u dirty=%d\n",
-                ino, pi->placement, pi->inline_dirty ? 1 : 0);
-        return 0;
-    }
+    /* Inline 模式 + dirty: 同步 inline_data 到 Filer (K2-5).
+     * Flat 模式: 同步 size+chunks 到 Filer (对齐 FUSE sync_size_chunks_on_close).
+     *   不同步的话 Filer 端 chunks 为空, remount/lookup 后 read locate 失败 (-EINVAL). */
+    if (pi->placement == POWERFS_PLACEMENT_INLINE && pi->inline_dirty) {
     pr_info("powerfs: RELEASE INLINE ino=%lu dirty=%d inline_len=%u\n",
             ino, pi->inline_dirty ? 1 : 0, pi->inline_len);
 
@@ -4866,6 +5024,107 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
     }
 
     kfree(snap_data);
+    return 0;
+    } /* end Inline release */
+
+    /* Flat 模式: close 时同步 size+chunks 到 Filer.
+     * 对齐 FUSE sync_size_chunks_on_close (fuse.rs L990).
+     * writeback 只刷数据到 Volume Server, 不同步 chunks 到 Filer.
+     * 若不同步, Filer 端 chunks 为空, remount/lookup 后 read locate 失败.
+     *
+     * 性能修复: close 时先 flush 脏页到 Volume Server (filemap_write_and_wait_range),
+     * 确保数据在 lease 有效期内写入. 否则 lease 过期后 writeback 无 lease 写入,
+     * 每个 writepage 需 5s (实测 780MB → 65min), 严重影响 sync 性能.
+     * file_release 在用户进程上下文调用, 可安全阻塞. */
+    if (pi->placement == POWERFS_PLACEMENT_FLAT && pi->volume_id && pi->file_key) {
+        loff_t i_size = i_size_read(inode);
+        u64 shard_id;
+        u32 chunk_size = pi->layout_chunk_size ? pi->layout_chunk_size : POWERFS_CHUNK_SIZE;
+        u32 chunk_count;
+        struct powerfs_chunk_map *chunks = NULL;
+        u32 i;
+        int flush_ret;
+
+        if (i_size == 0) {
+            pr_debug("powerfs: RELEASE FLAT ino=%lu size=0, skip\n", ino);
+            return 0;
+        }
+
+        /* Flush 脏页到 Volume Server (在 lease 过期前完成数据写入).
+         * ensure_lease 刷新 stripe 0 的 lease (快速路径: 已持有则立即返回).
+         * filemap_write_and_wait_range 触发 writeback, 此时 lease 仍有效,
+         * powerfs_get_lease_token 能找到 lease token, 写入快速完成. */
+        ensure_lease(inode, 0);
+        flush_ret = filemap_write_and_wait_range(inode->i_mapping, 0, LLONG_MAX);
+        if (flush_ret)
+            pr_warn("powerfs: RELEASE FLAT ino=%lu filemap_write_and_wait_range: %d\n",
+                    ino, flush_ret);
+
+        /* 仅在 i_size 变化时同步 (用 content_size 跟踪上次同步值) */
+        spin_lock(&pi->i_lock);
+        if ((u64)i_size == pi->content_size) {
+            spin_unlock(&pi->i_lock);
+            pr_debug("powerfs: RELEASE FLAT ino=%lu size=%llu unchanged, skip\n",
+                     ino, (u64)i_size);
+            return 0;
+        }
+        spin_unlock(&pi->i_lock);
+
+        chunk_count = (u32)div_u64(i_size + chunk_size - 1, chunk_size);
+        /* 限制最大 chunk_count 避免过大分配 (4096 chunks = 4GB @ 1MB chunk) */
+        if (chunk_count > 4096) {
+            pr_warn("powerfs: RELEASE FLAT ino=%lu chunk_count=%u > 4096, truncating\n",
+                    ino, chunk_count);
+            chunk_count = 4096;
+        }
+
+        chunks = kmalloc_array(chunk_count, sizeof(*chunks), GFP_KERNEL);
+        if (!chunks) {
+            pr_warn("powerfs: RELEASE FLAT ino=%lu kmalloc %u chunks failed, metadata not synced\n",
+                    ino, chunk_count);
+            return 0;
+        }
+
+        for (i = 0; i < chunk_count; i++) {
+            chunks[i].chunk_idx = i;
+            chunks[i].needle_id = pi->file_key + i;
+            chunks[i].volume_id = pi->volume_id;
+            chunks[i].crc32 = 0;
+        }
+
+        shard_id = pi->parent_ino ? pi->parent_ino : ino;
+
+        pr_info("powerfs: RELEASE FLAT ino=%lu size=%llu chunks=%u vid=%llu fkey=%llu\n",
+                ino, (u64)i_size, chunk_count,
+                (unsigned long long)pi->volume_id,
+                (unsigned long long)pi->file_key);
+
+        for (attempt = 1; attempt <= 5; attempt++) {
+            ret = powerfs_net_update_inode_size_chunks(shard_id, ino,
+                                                        (__u64)i_size,
+                                                        "kernel",
+                                                        chunks, chunk_count,
+                                                        NULL, 0);
+            if (ret == 0) {
+                spin_lock(&pi->i_lock);
+                pi->content_size = (u64)i_size;
+                spin_unlock(&pi->i_lock);
+                pr_info("powerfs: RELEASE FLAT ino=%lu synced size=%llu chunks=%u (attempt %d)\n",
+                        ino, (u64)i_size, chunk_count, attempt);
+                break;
+            }
+            pr_warn("powerfs: RELEASE FLAT ino=%lu attempt %d failed: %d\n",
+                    ino, attempt, ret);
+            if (attempt < 5)
+                msleep(500 * attempt);
+        }
+
+        kfree(chunks);
+        return 0;
+    }
+
+    pr_debug("powerfs: RELEASE skip ino=%lu placement=%u dirty=%d\n",
+             ino, pi->placement, pi->inline_dirty ? 1 : 0);
     return 0;
 }
 
@@ -5128,13 +5387,14 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     }
 
     /* Phase 3: lease 续约 workqueue.
-     * WQ_HIGHPRI: lease 过期即丢锁导致写失败, 续约延迟敏感,
-     *   参考 GFS2 glock_workqueue (fs/gfs2/glock.c:2462).
-     * WQ_MEM_RECLAIM | WQ_UNBOUND: 参考 nfsiod/GFS2.
-     * max_active=0: 内核默认, 不同 inode 的 lease 续约可并发,
-     *   无全局顺序依赖 (不同于 Ceph cap_wq max_active=1 串行). */
+     * WQ_UNBOUND: 不绑定 CPU, 允许调度器自由调度.
+     * WQ_MEM_RECLAIM: 参考 nfsiod/GFS2, 内存回收路径可用.
+     * 不使用 WQ_HIGHPRI: 大量 lease 续约 (50+ 文件) 会饥饿其他工作队列
+     *   (writeback/refresh), 导致 workqueue lockup + RCU stall.
+     *   lease 续约不是延迟敏感的 — 过期前 10s 续约即可, 延迟 1-2s 可接受.
+     * max_active=4: 限制并发续约数, 防止网络 I/O 阻塞淹没 workqueue. */
     sbi->lease_wq = alloc_workqueue("powerfs_lease",
-                                     WQ_UNBOUND | WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
+                                     WQ_UNBOUND | WQ_MEM_RECLAIM, 4);
     if (!sbi->lease_wq) {
         pr_err("powerfs: failed to create lease workqueue\n");
         return -ENOMEM;

@@ -3790,7 +3790,7 @@ int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
                                struct powerfs_file_layout *layout,
                                int timeout_ms)
 {
-    __u8 body[256];
+    __u8 body[512];
     struct powerfs_tlv_enc enc;
     __u8 *resp_body;
     size_t resp_body_len = 0;
@@ -4329,7 +4329,7 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
                         __u64 *volume_id_ret, __u64 *file_key_ret,
                         struct powerfs_file_layout *layout)
 {
-    __u8 body[256];
+    __u8 body[512];
     struct powerfs_tlv_enc enc;
     __u8 *resp_body;
     size_t resp_body_len = 0;
@@ -4409,10 +4409,12 @@ out:
 int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,
                        bool is_dir)
 {
-    __u8 body[256];
+    __u8 body[512];
     struct powerfs_tlv_enc enc;
     __u16 msg_type;
     int ret;
+    __u8 resp_body[256];
+    size_t resp_body_len = 0;
 
     msg_type = is_dir ? POWERFS_NET_MSG_RMDIR : POWERFS_NET_MSG_UNLINK;
 
@@ -4423,13 +4425,28 @@ int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,
     ret = powerfs_net_send_request(msg_type, dir_ino,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    NULL, 0,
+                                    resp_body, sizeof(resp_body),
                                     NULL, 0, POWERFS_META_TIMEOUT_MS,
-                                    NULL, NULL);
+                                    &resp_body_len, NULL);
     if (ret < 0)
         return ret;
-    if (ret > 0)
+    if (ret > 0) {
+        /* Filer rmdir 非空目录时返回 STATUS_ERR_SERVER_ERROR + FieldId::Name
+         * 携带错误描述 "directory not empty".
+         * 对齐 FUSE 客户端 (fuse.rs L1680): "not empty" -> ENOTEMPTY. */
+        if (ret == POWERFS_NET_STATUS_ERR_SERVER && resp_body_len > 0) {
+            struct powerfs_tlv_dec dec;
+            char err_str[128];
+
+            powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+            if (powerfs_tlv_dec_string(&dec, POWERFS_NET_FLD_NAME,
+                                        err_str, sizeof(err_str)) == 0) {
+                if (strstr(err_str, "not empty"))
+                    return -ENOTEMPTY;
+            }
+        }
         return net_status_to_errno((__u16)ret);
+    }
 
     return 0;
 }
@@ -4684,11 +4701,16 @@ int powerfs_net_readdir_timeout(__u64 dir_ino, const char *last_name, __u64 limi
     size_t flen;
     int ret;
 
+    /* readdir 响应缓冲: 256KB.
+     * 每个 Entry 最坏 ~288B (255B name + 10 字段 * ~5B TLV overhead),
+     * 256 entries ≈ 72KB. 256KB 留充足余量, 用 kvmalloc 允许 vmalloc 回退. */
+    const size_t resp_cap = 256 * 1024;
+
     *actual_count = 0;
     *has_more = false;
 
     /* 动态分配响应缓冲 (避免栈溢出) */
-    resp_body = kmalloc(16384, GFP_KERNEL);
+    resp_body = kvmalloc(resp_cap, GFP_KERNEL);
     if (!resp_body)
         return -ENOMEM;
 
@@ -4703,20 +4725,20 @@ int powerfs_net_readdir_timeout(__u64 dir_ino, const char *last_name, __u64 limi
     ret = powerfs_net_send_request(POWERFS_NET_MSG_READDIR, dir_ino,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    resp_body, 16384,
+                                    resp_body, resp_cap,
                                     NULL, 0, timeout_ms,
                                     &resp_body_len, NULL);
     if (ret < 0) {
-        kfree(resp_body);
+        kvfree(resp_body);
         return ret;
     }
     if (ret > 0) {
-        kfree(resp_body);
+        kvfree(resp_body);
         return net_status_to_errno((__u16)ret);
     }
 
     if (resp_body_len == 0) {
-        kfree(resp_body);
+        kvfree(resp_body);
         return 0;
     }
 
@@ -4774,7 +4796,7 @@ int powerfs_net_readdir_timeout(__u64 dir_ino, const char *last_name, __u64 limi
         powerfs_tlv_dec_skip(&dec, flen);
     }
 
-    kfree(resp_body);
+    kvfree(resp_body);
     return 0;
 }
 
@@ -5412,7 +5434,7 @@ int powerfs_net_readlink(__u64 ino, char *target, size_t target_cap)
  */
 int powerfs_net_link(__u64 ino, __u64 dir_ino, const char *name, size_t name_len)
 {
-    __u8 body[256];
+    __u8 body[512];
     struct powerfs_tlv_enc enc;
     int ret;
 
@@ -6387,7 +6409,7 @@ int powerfs_net_write_needle(__u64 volume_id, __u64 file_key, __u64 inode,
                              const __u8 *data, size_t data_len,
                              const char *lease_token, size_t token_len)
 {
-    __u8 body[256];
+    __u8 body[512];
     struct powerfs_tlv_enc enc;
     __u8 resp_body[64];
     size_t resp_body_len = 0;
@@ -6639,7 +6661,7 @@ int powerfs_net_renew_lease(__u64 volume_id, __u64 ino,
                             const char *token, size_t token_len,
                             unsigned long *new_expire_jiffies)
 {
-    __u8 body[256];
+    __u8 body[512];
     struct powerfs_tlv_enc enc;
     __u8 resp_body[128];
     size_t resp_body_len = 0;
@@ -6714,7 +6736,7 @@ int powerfs_net_acquire_lease(__u64 volume_id, __u64 ino,
                               __u64 *epoch_out, __u64 *content_size_out,
                               unsigned long *expire_jiffies_out)
 {
-    __u8 body[256];
+    __u8 body[512];
     struct powerfs_tlv_enc enc;
     __u8 resp_body[256];
     size_t resp_body_len = 0;
@@ -6820,7 +6842,7 @@ int powerfs_net_release_lease(__u64 volume_id, __u64 ino,
                               const char *token, size_t token_len,
                               const char *client_id)
 {
-    __u8 body[256];
+    __u8 body[512];
     struct powerfs_tlv_enc enc;
     size_t resp_body_len = 0;
     int ret;

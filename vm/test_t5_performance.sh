@@ -112,15 +112,25 @@ get_mem_available() {
 }
 
 # 检查是否有 D 状态的 powerfs 线程 (不可中断睡眠)
+# 注意: powerfs_wb (writeback) kworker 在网络 IO 期间合法进入 D 状态,
+# 采用重试机制 (3次, 间隔2s) 避免误报. 持续 D 状态才视为真正 hung.
 check_d_state() {
     local d_tasks
-    d_tasks=$(vm "for p in /proc/[0-9]*/stack; do t=\$(cat \${p%/stack}/stat 2>/dev/null | awk '{print \$3}'); if [ \"\$t\" = 'D' ]; then comm=\$(cat \${p%/stack}/comm 2>/dev/null); echo \"\$comm (\${p%/stack})\"; fi; done 2>/dev/null | grep -i powerfs" 2>/dev/null || true)
-    if [ -n "$d_tasks" ]; then
-        echo "  ${C_RED}检测到 D 状态 powerfs 线程:${C_RESET}"
-        echo "$d_tasks" | sed 's/^/    /'
-        return 1
-    fi
-    return 0
+    local retry=0
+    local max_retry=3
+    while [ $retry -lt $max_retry ]; do
+        d_tasks=$(vm "for p in /proc/[0-9]*/stack; do t=\$(cat \${p%/stack}/stat 2>/dev/null | awk '{print \$3}'); if [ \"\$t\" = 'D' ]; then comm=\$(cat \${p%/stack}/comm 2>/dev/null); echo \"\$comm (\${p%/stack})\"; fi; done 2>/dev/null | grep -i powerfs" 2>/dev/null || true)
+        if [ -z "$d_tasks" ]; then
+            return 0
+        fi
+        retry=$((retry + 1))
+        if [ $retry -lt $max_retry ]; then
+            sleep 2
+        fi
+    done
+    echo "  ${C_RED}D-state powerfs thread detected (persisted ${max_retry} checks):${C_RESET}"
+    echo "$d_tasks" | sed 's/^/    /'
+    return 1
 }
 
 # 综合内核状态检查

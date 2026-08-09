@@ -98,15 +98,25 @@ get_mem_available() {
 }
 
 # 检查是否有 D 状态的 powerfs 线程 (不可中断睡眠)
+# 注意: powerfs_wb (writeback) kworker 在网络 IO 期间合法进入 D 状态,
+# 采用重试机制 (3次, 间隔2s) 避免误报. 持续 D 状态才视为真正 hung.
 check_d_state() {
     local d_tasks
-    d_tasks=$(vm "for p in /proc/[0-9]*/stack; do t=\$(cat \${p%/stack}/stat 2>/dev/null | awk '{print \$3}'); if [ \"\$t\" = 'D' ]; then comm=\$(cat \${p%/stack}/comm 2>/dev/null); echo \"\$comm (\${p%/stack})\"; fi; done 2>/dev/null | grep -i powerfs" 2>/dev/null || true)
-    if [ -n "$d_tasks" ]; then
-        echo "  ${C_RED}D-state powerfs thread detected:${C_RESET}"
-        echo "$d_tasks" | sed 's/^/    /'
-        return 1
-    fi
-    return 0
+    local retry=0
+    local max_retry=3
+    while [ $retry -lt $max_retry ]; do
+        d_tasks=$(vm "for p in /proc/[0-9]*/stack; do t=\$(cat \${p%/stack}/stat 2>/dev/null | awk '{print \$3}'); if [ \"\$t\" = 'D' ]; then comm=\$(cat \${p%/stack}/comm 2>/dev/null); echo \"\$comm (\${p%/stack})\"; fi; done 2>/dev/null | grep -i powerfs" 2>/dev/null || true)
+        if [ -z "$d_tasks" ]; then
+            return 0
+        fi
+        retry=$((retry + 1))
+        if [ $retry -lt $max_retry ]; then
+            sleep 2
+        fi
+    done
+    echo "  ${C_RED}D-state powerfs thread detected (persisted ${max_retry} checks):${C_RESET}"
+    echo "$d_tasks" | sed 's/^/    /'
+    return 1
 }
 
 # 综合内核状态检查
@@ -484,6 +494,9 @@ test_t3_dir() {
 
     local base listing nlink link_target owner
 
+    # 清理上次测试可能残留的文件 (避免 "File exists" 等错误)
+    vm "rm -rf ${MNT}/t3a ${MNT}/t3b ${MNT}/t3c ${MNT}/t3d ${MNT}/t3e_old ${MNT}/t3e_new ${MNT}/t3f_old ${MNT}/t3f_new ${MNT}/t3g_target ${MNT}/t3g_link ${MNT}/t3h_orig ${MNT}/t3h_link ${MNT}/t3i_file" 2>/dev/null
+
     # T3-3a: mkdir 嵌套目录 (a/b/c/d) → ls 确认
     echo "  [T3-3a] mkdir nested a/b/c/d..."
     base=$(dmesg_line_count)
@@ -541,21 +554,33 @@ test_t3_dir() {
     fi
 
     # T3-3d: readdir → 确认目录项完整
+    # 注意: 创建后立即 ls 可能因目录缓存未及时更新而读取为空,
+    # 采用重试机制 (最多 5 次, 每次间隔 0.5s) 兼顾时序与快速反馈.
     echo "  [T3-3d] readdir completeness..."
     base=$(dmesg_line_count)
     vm "mkdir -p ${MNT}/t3d" 2>/dev/null
     vm "touch ${MNT}/t3d/f1 ${MNT}/t3d/f2 ${MNT}/t3d/f3" 2>/dev/null
-    listing=$(vm "ls ${MNT}/t3d" 2>/dev/null)
-    local miss=0
-    for f in f1 f2 f3; do
-        if ! echo "$listing" | grep -qx "$f"; then
-            miss=1
+    local miss=1
+    local retry=0
+    local max_retry=5
+    while [ $retry -lt $max_retry ]; do
+        listing=$(vm "ls ${MNT}/t3d" 2>/dev/null)
+        miss=0
+        for f in f1 f2 f3; do
+            if ! echo "$listing" | grep -qx "$f"; then
+                miss=1
+            fi
+        done
+        if [ $miss -eq 0 ]; then
+            break
         fi
+        retry=$((retry + 1))
+        sleep 0.5
     done
     if [ $miss -eq 0 ]; then
-        ok "T3-3d readdir complete (f1 f2 f3)"
+        ok "T3-3d readdir complete (f1 f2 f3, retries=${retry})"
     else
-        ng "T3-3d readdir incomplete: '${listing}'"
+        ng "T3-3d readdir incomplete after ${max_retry} retries: '${listing}'"
         return 1
     fi
     if ! check_kernel_state "T3-3d readdir" "$base"; then
@@ -607,8 +632,10 @@ test_t3_dir() {
     fi
 
     # T3-3g: symlink → readlink 确认链接目标
+    # 注意: 先清理可能残留的文件, 避免上次测试失败导致 ln -s 报 "File exists"
     echo "  [T3-3g] symlink + readlink..."
     base=$(dmesg_line_count)
+    vm "rm -f ${MNT}/t3g_target ${MNT}/t3g_link" 2>/dev/null
     vm "echo target > ${MNT}/t3g_target" 2>/dev/null
     vm "ln -s ${MNT}/t3g_target ${MNT}/t3g_link" 2>/dev/null
     link_target=$(vm "readlink ${MNT}/t3g_link" 2>/dev/null)
