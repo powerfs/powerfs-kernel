@@ -81,6 +81,27 @@
 
 ---
 
+### 阶段 T8: 数据持久化测试
+
+**目标**：验证所有修改操作在 umount → remount（或 rmmod → insmod）后数据一致。
+
+| 测试 ID | 测试内容 | 通过标准 |
+|---------|---------|---------|
+| T8.1 | 写入持久化：小(100B)/中(1MB)/大(10MB)/覆盖写/append | remount 后 MD5 一致 |
+| T8.2 | 创建/删除持久化：文件/目录/目录树 | remount 后存在性正确 |
+| T8.3 | 硬链接持久化：nlink/内容/原文件删除后存活 | nlink 和 MD5 一致 |
+| T8.4 | 软链接持久化：绝对路径/相对路径 | readlink 和 cat 正确 |
+| T8.5 | truncate 持久化：扩展/缩小/清零 | size 和内容一致 |
+| T8.6 | 元数据持久化：chmod/chown/utimes/目录权限 | mode/uid/gid/mtime 一致 |
+| T8.7 | fsync 持久化：fsync+drop_caches/fsync+remount/close flush | MD5 一致 |
+| T8.8 | rename 持久化：文件 rename/目录 rename | 旧路径不存在，新路径可读 |
+| T8.9 | 综合场景：多操作混合 + 部分删除 | manifest 一致，hardlink 存活 |
+| T8.10 | 完整模块重载：umount+rmmod+insmod+mount | 数据完整 |
+
+**脚本**：`vm/test_t8_persistence.sh`
+
+---
+
 ### 阶段 T5: 性能测试
 
 **目标**：评估内核文件系统的 IO 性能。
@@ -135,9 +156,9 @@
 ## 4. 实施顺序
 
 ```
-T1 (VFS 基础) → T2 (正确性) → T3 (布局功能) → T4 (集成)
-                                                      ↓
-                 T7 (可靠性) ← T6 (稳定性) ← T5 (性能)
+T1 (VFS 基础) → T2 (正确性) → T3 (布局功能) → T4 (集成) → T8 (持久化)
+                                                                    ↓
+                          T7 (可靠性) ← T6 (稳定性) ← T5 (性能)
 ```
 
 **每阶段验证门**：前一阶段全部 PASS 才进入下一阶段。
