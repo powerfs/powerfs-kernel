@@ -130,6 +130,15 @@ enum powerfs_net_msg_type {
      * K2 (Inline close) / K3 (Stripe close) 切换到此消息. */
     POWERFS_NET_MSG_UPDATE_INODE_SIZE_CHUNKS = 0x0034,
 
+    /* K2-6: Inline → Flat 迁移分配. 客户端 write 累计超 max_size×1.5 时调用.
+     * 对齐 powerfs-net MsgType::MigrateInlineAlloc (0x0037).
+     * Filer 仅分配 (volume_id, needle_id), 不修改 inode (保留 inline_data
+     * 用于 crash safety). 客户端拿到分配后同步写 Volume Server, close 时
+     * UPDATE_INODE_SIZE_CHUNKS 原子完成 Inline→Flat 切换.
+     * Request: ShardId + Ino
+     * Response: VolumeId + FileKey(needle_id) */
+    POWERFS_NET_MSG_MIGRATE_INLINE_ALLOC = 0x0037,
+
     /* 状态 */
     POWERFS_NET_MSG_STATFS = 0x0040,
 
@@ -1023,6 +1032,29 @@ int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
                                          __u32 chunk_count,
                                          const __u8 *inline_data,
                                          __u32 inline_len);
+
+/* K2-6: MIGRATE_INLINE_ALLOC — Inline → Flat 迁移分配.
+ *
+ * 对齐 FUSE migrate_inline_alloc (powerfs-fuse/src/fuse.rs L3469) 和
+ * Filer handle_migrate_inline_alloc (net_handler.rs L1832).
+ *
+ * 客户端 write 累计超 max_size×1.5 时调用. Filer 仅分配 (volume_id,
+ * needle_id), 不修改 inode 元数据 (保留 inline_data 用于 crash safety).
+ * 客户端拿到分配后同步写 Volume Server, close 时 UPDATE_INODE_SIZE_CHUNKS
+ * 原子完成 Inline→Flat 切换.
+ *
+ * Request TLV:  ShardId(0x70) + Ino(0x07)
+ * Response TLV: VolumeId(0x10) + FileKey(0x11) / Name=error
+ *
+ * 参数:
+ *   shard_id: 父目录 ino (Filer 路由)
+ *   ino: 文件 inode
+ *   volume_id: 输出, 分配的 volume_id
+ *   file_key: 输出, 分配的 needle_id
+ *
+ * 返回 0 成功, 负数错误码. */
+int powerfs_net_migrate_inline_alloc(__u64 shard_id, __u64 ino,
+                                     __u64 *volume_id, __u64 *file_key);
 
 /* READDIR (匹配 Filer 协议: ParentIno + Limit + LastName 分页).
  * powerfs_net_readdir 用默认 5s 超时 (兼容旧调用方).

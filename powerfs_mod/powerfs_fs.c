@@ -4250,6 +4250,113 @@ int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 }
 
 /*
+ * powerfs_migrate_inline_to_flat - K2-7 Inline → Flat 自动迁移
+ *
+ * 对齐 FUSE write inline migrate (powerfs-fuse/src/fuse.rs L3446):
+ *   1. 快照 inline_data (持 i_lock)
+ *   2. 调 Filer MIGRATE_INLINE_ALLOC 分配 (volume_id, needle_id)
+ *   3. 同步写 merged_data 到 Volume Server (WriteNeedle, lease_token=NULL)
+ *   4. 持锁切换 inode: placement=Flat + volume_id + file_key + 清 inline_data
+ *
+ * crash safety (对齐 FUSE):
+ *   - Filer 分配后不修改 inode, 保留 inline_data
+ *   - 客户端崩溃后 Filer 仍有 inline_data, 文件仍可作 Inline 读
+ *   - 分配的 needle_id 泄漏 (可接受, 同 CREATE 失败)
+ *   - 客户端写 Volume Server 成功后, close 时 UPDATE_INODE_SIZE_CHUNKS
+ *     原子完成切换 (清除 inline_data + 设 Flat chunks)
+ *
+ * 注意: 本函数在 write_end 中调用, 持有 folio lock. 网络 I/O 期间
+ *       folio lock 被持有, 但 inline 路径已在 write_end 中做 kvmalloc
+ *       (可睡眠), 故阻塞操作可接受. 迁移数据最大 8KB, 网络往返 <100ms.
+ *
+ * 返回 0 成功, 负数错误码 (-EFBIG 表示迁移失败, inline_data 保持原状).
+ */
+static int powerfs_migrate_inline_to_flat(struct inode *inode,
+                                          struct powerfs_inode_info *pi)
+{
+    u8 *snap_data = NULL;
+    u32 snap_len = 0;
+    u64 shard_id, ino = inode->i_ino;
+    u64 volume_id = 0, file_key = 0;
+    int ret;
+
+    /* 1. 持锁快照 inline_data (网络 I/O 不能持 spinlock) */
+    spin_lock(&pi->i_lock);
+    if (!pi->inline_data || pi->inline_len == 0) {
+        spin_unlock(&pi->i_lock);
+        pr_warn("powerfs: MIGRATE ino=%lu no inline_data to migrate\n", ino);
+        return -EINVAL;
+    }
+    snap_len = pi->inline_len;
+    spin_unlock(&pi->i_lock);
+
+    snap_data = kmalloc(snap_len, GFP_KERNEL);
+    if (!snap_data) {
+        pr_warn("powerfs: MIGRATE ino=%lu kmalloc %u failed\n", ino, snap_len);
+        return -ENOMEM;
+    }
+    spin_lock(&pi->i_lock);
+    if (pi->inline_data && pi->inline_len == snap_len) {
+        memcpy(snap_data, pi->inline_data, snap_len);
+    } else {
+        spin_unlock(&pi->i_lock);
+        pr_warn("powerfs: MIGRATE ino=%lu inline_data changed during snapshot\n", ino);
+        kfree(snap_data);
+        return -EAGAIN;
+    }
+    spin_unlock(&pi->i_lock);
+
+    pr_info("powerfs: MIGRATE ino=%lu inline_len=%u → triggering Flat migration\n",
+            ino, snap_len);
+
+    /* 2. 调 Filer MIGRATE_INLINE_ALLOC 分配 (volume_id, needle_id).
+     * shard_id = parent_ino (Filer 路由, 对齐 FUSE). */
+    shard_id = pi->parent_ino ? pi->parent_ino : ino;
+    ret = powerfs_net_migrate_inline_alloc(shard_id, ino, &volume_id, &file_key);
+    if (ret < 0) {
+        pr_warn("powerfs: MIGRATE ino=%lu alloc failed: %d — EFBIG, inline buffer unmodified\n",
+                ino, ret);
+        kfree(snap_data);
+        return -EFBIG;
+    }
+
+    /* 3. 同步写 snap_data 到 Volume Server (WriteNeedle).
+     * lease_token=NULL: Volume Server 不校验 lease (net_handler.rs L92).
+     * ClientId="kernel-client" 必须发送 (write_needle L5934 注释). */
+    ret = powerfs_net_write_needle(volume_id, file_key, ino,
+                                    snap_data, snap_len,
+                                    NULL, 0);
+    if (ret < 0) {
+        pr_warn("powerfs: MIGRATE ino=%lu write_needle failed: %d — EFBIG, needle_id=%#llx leaked\n",
+                ino, ret, (unsigned long long)file_key);
+        kfree(snap_data);
+        return -EFBIG;
+    }
+
+    pr_info("powerfs: MIGRATE ino=%lu write_needle OK volume_id=%llu needle_id=%#llx size=%u\n",
+            ino, (unsigned long long)volume_id,
+            (unsigned long long)file_key, snap_len);
+
+    /* 4. 持锁切换 inode 到 Flat: 释放 inline_data, 更新布局元数据.
+     * 后续 write 走 Flat writeback 路径, close 时 UPDATE_INODE_SIZE_CHUNKS
+     * 同步 size+chunks 到 Filer (原子清除 inline_data + 设 Flat chunks). */
+    spin_lock(&pi->i_lock);
+    pi->placement = POWERFS_PLACEMENT_FLAT;
+    pi->volume_id = volume_id;
+    pi->file_key = file_key;
+    pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+    kfree(pi->inline_data);
+    pi->inline_data = NULL;
+    pi->inline_len = 0;
+    pi->inline_dirty = false;
+    spin_unlock(&pi->i_lock);
+
+    kfree(snap_data);
+    pr_info("powerfs: MIGRATE ino=%lu → Flat done, subsequent writes → Volume Server\n", ino);
+    return 0;
+}
+
+/*
  * powerfs_write_end - 写结束 (Stage C: 纯 page cache 更新, 无网络 IO)
  *
  * 参照 ceph_write_end (fs/ceph/addr.c):
@@ -4312,18 +4419,24 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                 pr_info("powerfs: WB_END INLINE first write ino=%lu copied=%u end=%zu\n",
                         inode->i_ino, copied, end_pos);
 
-            /* 检查是否超出 inline 硬上限 (迁移由 K2-7 处理, 这里先截断) */
+            /* K2-7: 检查是否超出 inline 硬上限 (8KB).
+             * 超出时截断到 INLINE_MAX_SIZE, 写入后触发迁移到 Flat.
+             * 迁移阈值 = min(inline_max_size × 1.5, INLINE_MAX_SIZE),
+             * 对齐 FUSE fuse.rs L3444. */
             if (need_len > POWERFS_INLINE_MAX_SIZE) {
                 pr_warn("powerfs: WB_END INLINE ino=%lu write end=%zu > INLINE_MAX=%d, "
-                        "migration needed (K2-7)\n",
+                        "will migrate after write\n",
                         inode->i_ino, need_len, POWERFS_INLINE_MAX_SIZE);
-                /* 暂不阻止写入, 但 inline_data 只保留前 INLINE_MAX_SIZE 字节.
-                 * K2-7 迁移逻辑会将文件切换到 Flat. */
                 need_len = POWERFS_INLINE_MAX_SIZE;
                 copied = min_t(unsigned int, copied,
                                POWERFS_INLINE_MAX_SIZE - pos);
-                if (copied == 0)
-                    goto out;
+                if (copied == 0) {
+                    /* pos 已超 8KB, 无法写入 inline_data.
+                     * 返回 -EFBIG 触发上层重试 (此时若已迁移则走 Flat). */
+                    folio_unlock(folio);
+                    folio_put(folio);
+                    return -EFBIG;
+                }
                 end_pos = pos + copied;
             }
 
@@ -4373,6 +4486,29 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
 
             /* 分配了但未使用 (被并发覆盖) 的 buffer 释放 */
             kfree(new_buf);
+
+            /* K2-7: 检查是否需要迁移到 Flat.
+             * 迁移阈值 = min(inline_max_size × 1.5, POWERFS_INLINE_MAX_SIZE).
+             * 对齐 FUSE fuse.rs L3444: 滞后窗口避免边界抖动.
+             * 迁移成功: inode 切换到 Flat, 后续 write 走 Flat writeback.
+             * 迁移失败: 返回 -EFBIG, inline_data 保持原状 (close 时同步到 Filer). */
+            {
+                u32 migrate_threshold = min(pi->inline_max_size * 3 / 2,
+                                            (u32)POWERFS_INLINE_MAX_SIZE);
+                if (pi->inline_len > migrate_threshold) {
+                    int mig_ret = powerfs_migrate_inline_to_flat(inode, pi);
+                    if (mig_ret < 0) {
+                        pr_warn("powerfs: WB_END INLINE ino=%lu migrate failed: %d\n",
+                                inode->i_ino, mig_ret);
+                        folio_unlock(folio);
+                        folio_put(folio);
+                        return mig_ret;
+                    }
+                    /* 迁移成功: inode 已切换到 Flat.
+                     * folio 仍标记 dirty, writeback 会走 Flat 路径写 Volume Server.
+                     * close 时 UPDATE_INODE_SIZE_CHUNKS 同步 size+chunks 到 Filer. */
+                }
+            }
         }
     }
 

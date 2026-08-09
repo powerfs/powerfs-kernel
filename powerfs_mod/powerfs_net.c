@@ -3879,8 +3879,8 @@ int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
  */
 
 /* 解析 Placement TLV (0xA0): u8 tag + 后续字段.
- *   0x00=Flat(1B) 0x01=Inline(5B) 0x02=Stripe(17B) 0x03=WideStripe(17B)
- * 对齐 powerfs-layout/src/codec.rs encode_placement (L233)
+ *   0x00=Inline(5B) 0x01=Flat(1B) 0x02=Stripe(17B) 0x03=WideStripe(17B)
+ * 对齐 powerfs-layout/src/codec.rs placement_tag (L52) + encode_placement (L233)
  *
  * 注意: Placement 字段本身只携带 tag + (Inline:max_size | Stripe:三字段).
  * volume_ids 列表通过独立 FieldId::VolumeIds(0xAB) / VolumeIdsRange(0xB6)
@@ -4106,6 +4106,15 @@ static void parse_file_layout(struct powerfs_tlv_dec *dec,
             pr_warn("powerfs: VolumeIdsRange len %zu != 12\n", raw_len);
         }
     }
+
+    /* K3-DEBUG: log parsed layout for diagnostics */
+    pr_info("powerfs: parse_file_layout RESULT placement=%u reliability=%u chunk_size=%u "
+            "has_placement=%d has_reliability=%d stripe_size=%llu stripe_count=%u "
+            "volume_ids_count=%u inline_len=%u\n",
+            layout->placement, layout->reliability, layout->chunk_size,
+            layout->has_placement ? 1 : 0, layout->has_reliability ? 1 : 0,
+            (unsigned long long)layout->stripe_size, layout->stripe_count,
+            layout->volume_ids_count, layout->inline_len);
 }
 
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
@@ -4453,6 +4462,76 @@ int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_net_update_inode_size_chunks);
+
+/**
+ * powerfs_net_migrate_inline_alloc - K2-6 Inline → Flat 迁移分配
+ *
+ * 对齐 FUSE migrate_inline_alloc (powerfs-fuse/src/fuse.rs L3469) 和
+ * Filer handle_migrate_inline_alloc (net_handler.rs L1832).
+ *
+ * 客户端 write 累计超 max_size×1.5 时调用. Filer 仅分配 (volume_id,
+ * needle_id), 不修改 inode 元数据 (保留 inline_data 用于 crash safety).
+ *
+ * Request TLV:  ShardId(0x70) + Ino(0x07)
+ * Response TLV: VolumeId(0x92) + FileKey(0x94) / Name(0x02)=error
+ *
+ * crash safety: 若客户端在分配后崩溃, Filer 仍有 inline_data, 文件仍可
+ * 作为 Inline 读; 分配的 needle_id 泄漏 (可接受, 同 CREATE 失败).
+ */
+int powerfs_net_migrate_inline_alloc(__u64 shard_id, __u64 ino,
+                                     __u64 *volume_id, __u64 *file_key)
+{
+    __u8 body[64];
+    struct powerfs_tlv_enc enc;
+    __u8 resp_body[128];
+    size_t resp_body_len = 0;
+    struct powerfs_tlv_dec dec;
+    __u64 v_id = 0, f_key = 0;
+    int ret;
+
+    if (!volume_id || !file_key)
+        return -EINVAL;
+
+    *volume_id = 0;
+    *file_key = 0;
+
+    powerfs_tlv_enc_init(&enc, body, sizeof(body));
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SHARD_ID, shard_id);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_MIGRATE_INLINE_ALLOC, ino,
+                                    body, powerfs_tlv_enc_len(&enc),
+                                    NULL, 0,
+                                    resp_body, sizeof(resp_body),
+                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
+                                    &resp_body_len, NULL);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return net_status_to_errno((__u16)ret);
+
+    /* 解析响应: VolumeId + FileKey */
+    powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+    if (powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, &v_id) != 0) {
+        pr_warn("powerfs: MIGRATE_INLINE_ALLOC ino=%llu missing VolumeId in response\n",
+                (unsigned long long)ino);
+        return -EPROTO;
+    }
+    if (powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_FILE_KEY, &f_key) != 0) {
+        pr_warn("powerfs: MIGRATE_INLINE_ALLOC ino=%llu missing FileKey in response\n",
+                (unsigned long long)ino);
+        return -EPROTO;
+    }
+
+    *volume_id = v_id;
+    *file_key = f_key;
+
+    pr_info("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → volume_id=%llu file_key=%#llx\n",
+            (unsigned long long)ino, (unsigned long long)v_id,
+            (unsigned long long)f_key);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_migrate_inline_alloc);
 
 /**
  * powerfs_net_readdir - 读取目录项 (匹配 Filer 协议)
