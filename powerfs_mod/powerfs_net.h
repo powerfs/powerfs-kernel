@@ -950,26 +950,30 @@ struct powerfs_net_dir_entry {
     __u32 nlink;
 };
 
+/* GETATTR (返回完整属性含时间戳 + volume_id/file_key 用于数据直连) */
+struct powerfs_file_layout;  /* 定义在 powerfs.h */
+struct powerfs_chunk_map;   /* 定义在 powerfs.h */
+struct powerfs_inode_info;  /* 定义在 powerfs.h */
+
 /* LOOKUP (返回完整属性含时间戳 + volume_id/file_key 用于数据直连).
  * powerfs_net_lookup 用默认 10s 超时 (兼容旧调用方).
  * powerfs_net_lookup_timeout 由调用方指定超时 (Phase 1: lookup 在断连窗口内
  * 用 2s 短超时, 见 powerfs_net_pick_timeout).
- * volume_id/file_key: 输出, 用于直连 Volume Server 读写数据 (目录为 0). */
+ * volume_id/file_key: 输出, 用于直连 Volume Server 读写数据 (目录为 0).
+ * layout: 输出, K3 解析 FileLayout (placement/volume_ids 等), 可为 NULL. */
 int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
                        __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
                        __u64 *size, __u32 *nlink,
                        __u64 *mtime, __u64 *atime, __u64 *ctime,
-                       __u64 *volume_id, __u64 *file_key);
+                       __u64 *volume_id, __u64 *file_key,
+                       struct powerfs_file_layout *layout);
 int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
                                __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
                                __u64 *size, __u32 *nlink,
                                __u64 *mtime, __u64 *atime, __u64 *ctime,
                                __u64 *volume_id, __u64 *file_key,
+                               struct powerfs_file_layout *layout,
                                int timeout_ms);
-
-/* GETATTR (返回完整属性含时间戳 + volume_id/file_key 用于数据直连) */
-struct powerfs_file_layout;  /* 定义在 powerfs.h */
-struct powerfs_chunk_map;   /* 定义在 powerfs.h */
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
                          __u64 *size, __u32 *nlink,
                          __u64 *mtime, __u64 *atime, __u64 *ctime,
@@ -1029,9 +1033,11 @@ int powerfs_net_readdir_timeout(__u64 dir_ino, const char *last_name, __u64 limi
                                 bool *has_more, int timeout_ms);
 
 /* READ (直连 Volume Server, 不经过 Filer).
- * volume_id/file_key: 从 lookup/getattr 获取的数据直连标识.
+ * K3: 改为接受 powerfs_inode_info, 内部用 powerfs_locate_chunk 按 offset 定位
+ * (volume_id, needle_id), 统一支持 Flat/Stripe/WideStripe 多卷布局.
+ * 调用方无需预先获取 volume_id/file_key.
  * needle 模型: 整存整取, 内部按 offset/length 截取. */
-int powerfs_net_read(__u64 ino, __u64 volume_id, __u64 file_key,
+int powerfs_net_read(struct powerfs_inode_info *pi, __u64 ino,
                      __u64 offset, __u32 length,
                      __u8 *buf, size_t buf_cap, __u32 *read_len);
 

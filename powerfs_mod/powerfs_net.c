@@ -3775,11 +3775,17 @@ int net_status_to_errno(__u16 status)
  * volume_id/file_key 用于数据直连 Volume Server (WriteNeedle/ReadNeedle).
  * 目录的 volume_id/file_key 为 0 (目录无数据).
  */
+
+/* K3: 前向声明 — parse_file_layout 定义在 getattr 之后, 但 lookup 需先调用 */
+static void parse_file_layout(struct powerfs_tlv_dec *dec,
+                              struct powerfs_file_layout *layout);
+
 int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
                                __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
                                __u64 *size, __u32 *nlink,
                                __u64 *mtime, __u64 *atime, __u64 *ctime,
                                __u64 *volume_id, __u64 *file_key,
+                               struct powerfs_file_layout *layout,
                                int timeout_ms)
 {
     __u8 body[256];
@@ -3824,6 +3830,12 @@ int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
             powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, volume_id);
         if (file_key)
             powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_FILE_KEY, file_key);
+
+        /* K3: 解析 FileLayout (placement/volume_ids 等).
+         * Filer encode_chunks_fields 对 Stripe 文件编码 Placement::Stripe +
+         * VolumeIds, 内核需在 lookup 时解析以正确路由 read/write. */
+        if (layout)
+            parse_file_layout(&dec, layout);
     }
 
     return 0;
@@ -3834,13 +3846,14 @@ int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
                        __u64 *ino, __u32 *mode, __u32 *uid, __u32 *gid,
                        __u64 *size, __u32 *nlink,
                        __u64 *mtime, __u64 *atime, __u64 *ctime,
-                       __u64 *volume_id, __u64 *file_key)
+                       __u64 *volume_id, __u64 *file_key,
+                       struct powerfs_file_layout *layout)
 {
     return powerfs_net_lookup_timeout(dir_ino, name, name_len,
                                       ino, mode, uid, gid,
                                       size, nlink,
                                       mtime, atime, ctime,
-                                      volume_id, file_key,
+                                      volume_id, file_key, layout,
                                       POWERFS_NET_RECV_TIMEOUT);
 }
 
@@ -3856,7 +3869,11 @@ int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
 
 /* 解析 Placement TLV (0xA0): u8 tag + 后续字段.
  *   0x00=Flat(1B) 0x01=Inline(5B) 0x02=Stripe(17B) 0x03=WideStripe(17B)
- * 对齐 powerfs-layout/src/codec.rs encode_placement (L233) */
+ * 对齐 powerfs-layout/src/codec.rs encode_placement (L233)
+ *
+ * 注意: Placement 字段本身只携带 tag + (Inline:max_size | Stripe:三字段).
+ * volume_ids 列表通过独立 FieldId::VolumeIds(0xAB) / VolumeIdsRange(0xB6)
+ * 传输, 由 parse_file_layout() 单独解析. */
 static int parse_placement_field(const __u8 *val, size_t len,
                                  struct powerfs_file_layout *layout)
 {
@@ -3870,12 +3887,21 @@ static int parse_placement_field(const __u8 *val, size_t len,
     case POWERFS_PLACEMENT_FLAT:
         break;
     case POWERFS_PLACEMENT_INLINE:
+        /* max_size: u32 LE, 紧跟 tag */
         if (len >= 5)
             layout->inline_max_size = le32_to_cpup((__le32 *)&val[1]);
         break;
     case POWERFS_PLACEMENT_STRIPE:
     case POWERFS_PLACEMENT_WIDESTRIPE:
-        /* stripe_size(8B) + stripe_count(4B) + start_volume_idx(4B) = 16B after tag */
+        /* stripe_size(8B) + stripe_count(4B) + start_volume_idx(4B) = 16B after tag.
+         * 对齐 codec.rs encode_placement Stripe 分支. */
+        if (len >= 17) {
+            layout->stripe_size = le64_to_cpup((__le64 *)&val[1]);
+            layout->stripe_count = le32_to_cpup((__le32 *)&val[9]);
+            layout->start_volume_idx = le32_to_cpup((__le32 *)&val[13]);
+        } else {
+            pr_warn("powerfs: Stripe placement truncated len=%zu\n", len);
+        }
         break;
     default:
         pr_warn("powerfs: unknown placement tag %u\n", val[0]);
@@ -3900,7 +3926,18 @@ static int parse_reliability_field(const __u8 *val, size_t len,
 }
 
 /* 从 TLV 响应解析 FileLayout 字段 (Placement/Reliability/ReliabilityState/ChunkSize).
- * 在 GETATTR/CREATE 响应解析后调用, 使用 find_* 非顺序查找. */
+ * 在 GETATTR/CREATE 响应解析后调用, 使用 find_* 非顺序查找.
+ *
+ * K3: 额外解析 Stripe 字段:
+ *   - StripeSize (0xA8) / StripeCount (0xA9) / StartVolumeIdx (0xAA)
+ *     (Placement 字段已携带, 独立字段作为兜底)
+ *   - VolumeIds (0xAB): u64 LE 数组
+ *   - VolumeIdsRange (0xB6): start_u64 + count_u32 = 12B 范围压缩
+ *   - StartNeedleId (0xAC): StripeDescriptor 首 needle (K3-5 预留)
+ *
+ * volume_ids 解析后通过 layout->volume_ids 返回 (kmalloc), 调用方负责:
+ *   - apply 到 inode: powerfs_apply_layout_to_inode (所有权转移)
+ *   - 或失败时 kfree(layout.volume_ids) 防止泄漏 */
 static void parse_file_layout(struct powerfs_tlv_dec *dec,
                               struct powerfs_file_layout *layout)
 {
@@ -3908,6 +3945,7 @@ static void parse_file_layout(struct powerfs_tlv_dec *dec,
     size_t raw_len;
     __u8 u8val;
     __u32 u32val;
+    __u64 u64val;
 
     if (!layout)
         return;
@@ -3915,7 +3953,7 @@ static void parse_file_layout(struct powerfs_tlv_dec *dec,
     memset(layout, 0, sizeof(*layout));
     layout->chunk_size = POWERFS_CHUNK_SIZE;  /* 默认值 */
 
-    /* Placement (0xA0) — 二进制 tag + 后续 */
+    /* Placement (0xA0) — 二进制 tag + 后续 (Stripe 携带三字段) */
     if (powerfs_tlv_dec_find_raw(dec, POWERFS_NET_FLD_PLACEMENT, &raw, &raw_len) == 0)
         parse_placement_field(raw, raw_len, layout);
 
@@ -3935,6 +3973,76 @@ static void parse_file_layout(struct powerfs_tlv_dec *dec,
     if (layout->inline_max_size == 0 &&
         powerfs_tlv_dec_find_u32(dec, POWERFS_NET_FLD_INLINE_MAX_SIZE, &u32val) == 0)
         layout->inline_max_size = u32val;
+
+    /* === K3: Stripe 字段 (独立 FieldId 兜底, Placement 字段优先) === */
+
+    /* StripeSize (0xA8) — u64, Placement 字段已携带时跳过 */
+    if (layout->stripe_size == 0 &&
+        powerfs_tlv_dec_find_u64(dec, POWERFS_NET_FLD_STRIPE_SIZE, &u64val) == 0)
+        layout->stripe_size = u64val;
+
+    /* StripeCount (0xA9) — u32, Placement 字段已携带时跳过 */
+    if (layout->stripe_count == 0 &&
+        powerfs_tlv_dec_find_u32(dec, POWERFS_NET_FLD_STRIPE_COUNT, &u32val) == 0)
+        layout->stripe_count = u32val;
+
+    /* StartVolumeIdx (0xAA) — u32, Placement 字段已携带时跳过 */
+    if (layout->start_volume_idx == 0 &&
+        powerfs_tlv_dec_find_u32(dec, POWERFS_NET_FLD_START_VOLUME_IDX, &u32val) == 0)
+        layout->start_volume_idx = u32val;
+
+    /* StartNeedleId (0xAC) — u64, StripeDescriptor 首 needle (K3-5 预留) */
+    if (powerfs_tlv_dec_find_u64(dec, POWERFS_NET_FLD_START_NEEDLE_ID, &u64val) == 0)
+        layout->start_needle_id = u64val;
+
+    /* VolumeIds (0xAB) — u64 LE 数组. 对齐 codec.rs decode_volume_ids.
+     * 仅 Stripe/WideStripe 模式下有意义, 但解析不区分 placement
+     * (调用方 apply 时根据 placement 决定是否使用). */
+    if (powerfs_tlv_dec_find_raw(dec, POWERFS_NET_FLD_VOLUME_IDS, &raw, &raw_len) == 0) {
+        if (raw_len > 0 && (raw_len % 8) == 0) {
+            u32 cnt = raw_len / 8;
+            /* 限制 count 防止异常大值导致 OOM (256 卷 WideStripe 上限) */
+            if (cnt <= 256) {
+                u64 *vids = kmalloc_array(cnt, sizeof(u64), GFP_KERNEL);
+                if (vids) {
+                    u32 i;
+                    for (i = 0; i < cnt; i++)
+                        vids[i] = le64_to_cpup((__le64 *)&raw[i * 8]);
+                    /* 释放可能已存在的 (VolumeIdsRange 先解析的情况) */
+                    kfree(layout->volume_ids);
+                    layout->volume_ids = vids;
+                    layout->volume_ids_count = cnt;
+                }
+            } else {
+                pr_warn("powerfs: VolumeIds count %u > 256, ignored\n", cnt);
+            }
+        }
+    }
+
+    /* VolumeIdsRange (0xB6) — start_u64 + count_u32 = 12B 范围压缩.
+     * 对齐 codec.rs decode_file_layout VolumeIdsRange 分支.
+     * 仅在 VolumeIds (0xAB) 未解析时使用 (0xAB 优先, 更精确). */
+    if (!layout->volume_ids &&
+        powerfs_tlv_dec_find_raw(dec, POWERFS_NET_FLD_VOLUME_IDS_RANGE, &raw, &raw_len) == 0) {
+        if (raw_len == 12) {
+            u64 start = le64_to_cpup((__le64 *)&raw[0]);
+            u32 cnt = le32_to_cpup((__le32 *)&raw[8]);
+            if (cnt > 0 && cnt <= 256) {
+                u64 *vids = kmalloc_array(cnt, sizeof(u64), GFP_KERNEL);
+                if (vids) {
+                    u32 i;
+                    for (i = 0; i < cnt; i++)
+                        vids[i] = start + i;
+                    layout->volume_ids = vids;
+                    layout->volume_ids_count = cnt;
+                }
+            } else if (cnt > 256) {
+                pr_warn("powerfs: VolumeIdsRange count %u > 256, ignored\n", cnt);
+            }
+        } else {
+            pr_warn("powerfs: VolumeIdsRange len %zu != 12\n", raw_len);
+        }
+    }
 }
 
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
@@ -4373,23 +4481,27 @@ int powerfs_net_readdir(__u64 dir_ino, const char *last_name, __u64 limit,
 /**
  * powerfs_net_read - 读数据 (直连 Volume Server, 不经过 Filer)
  *
- * 数据读写绕过 Filer: 从 inode 的 (volume_id, file_key) 直连 Volume Server
- * 读取 needle 内容, 再按 offset/length 截取返回.
+ * 数据读写绕过 Filer: 通过 powerfs_locate_chunk 按 offset 定位 (volume_id,
+ * needle_id), 直连 Volume Server 读取 needle 内容, 再按 offset/length 截取.
+ *
+ * K3: 统一 Flat/Stripe/WideStripe 多卷布局.
+ *   - Flat:   volume_id 固定, needle_id = file_key + offset / CHUNK_SIZE
+ *   - Stripe: volume_id = volume_ids[stripe_unit_idx],
+ *             needle_id = file_key + chunk_idx_in_unit
  *
  * needle 模型: 每个 needle = 1 chunk (POWERFS_CHUNK_SIZE=1MB), 整存整取.
- *   needle_id = file_key + offset / CHUNK_SIZE
  *   offset_in_needle = offset % CHUNK_SIZE
  *
  * 跨 needle 读取: 逐个 needle 读取, 拷贝对应区间到 buf.
  *
  * 参数:
+ *   pi: powerfs_inode_info (用于 locate_chunk, 持 i_lock 快照定位信息)
  *   ino: inode 号 (用于 lease 校验, 传给 volume server)
- *   volume_id/file_key: 从 lookup/getattr 获取的数据直连标识
  *   offset/length: 文件内偏移和读取长度
  *   buf/buf_cap: 输出缓冲区
  *   read_len: 输出, 实际读取字节数
  */
-int powerfs_net_read(__u64 ino, __u64 volume_id, __u64 file_key,
+int powerfs_net_read(struct powerfs_inode_info *pi, __u64 ino,
                      __u64 offset, __u32 length,
                      __u8 *buf, size_t buf_cap, __u32 *read_len)
 {
@@ -4399,31 +4511,39 @@ int powerfs_net_read(__u64 ino, __u64 volume_id, __u64 file_key,
     __u32 remaining = length;
     int ret;
 
-    if (!volume_id || !file_key) {
-        pr_warn("powerfs: read ino=%llu no volume mapping (volume_id=%llu file_key=%llu)\n",
-                (unsigned long long)ino,
-                (unsigned long long)volume_id,
-                (unsigned long long)file_key);
-        return -ENOLINK;
-    }
+    if (!pi)
+        return -EINVAL;
 
     if (buf_cap < length)
         return -EINVAL;
 
-    /* needle_buf 用于接收整个 needle (2MB) 内容.
-     * kvmalloc 在大尺寸时自动回退 vmalloc, 适合 2MB. */
+    /* needle_buf 用于接收整个 needle (1MB) 内容.
+     * kvmalloc 在大尺寸时自动回退 vmalloc, 适合 1MB. */
     needle_buf = kvmalloc(POWERFS_CHUNK_SIZE, GFP_KERNEL);
     if (!needle_buf)
         return -ENOMEM;
 
-    /* 逐 needle 读取, 拷贝请求区间到 buf */
+    /* 逐 needle 读取, 拷贝请求区间到 buf.
+     * K3: 每个 needle 按 cur_offset 调用 powerfs_locate_chunk 定位,
+     *     持 i_lock 快照 (volume_id, needle_id) 后释放锁做网络 I/O. */
     while (remaining > 0) {
-        __u64 needle_id = file_key + cur_offset / POWERFS_CHUNK_SIZE;
+        __u64 volume_id, needle_id;
         size_t offset_in_needle = cur_offset % POWERFS_CHUNK_SIZE;
         __u32 chunk_read_len = 0;
         __u32 to_copy;
 
-        /* 读取整个 needle */
+        spin_lock(&pi->i_lock);
+        ret = powerfs_locate_chunk(pi, cur_offset, &volume_id, &needle_id);
+        spin_unlock(&pi->i_lock);
+        if (ret) {
+            pr_warn("powerfs: read locate ino=%llu offset=%llu failed: %d\n",
+                    (unsigned long long)ino,
+                    (unsigned long long)cur_offset, ret);
+            kvfree(needle_buf);
+            return ret;
+        }
+
+        /* 读取整个 needle (网络 I/O, 无锁) */
         ret = powerfs_net_read_needle(volume_id, needle_id,
                                        needle_buf, POWERFS_CHUNK_SIZE,
                                        &chunk_read_len);
@@ -4439,6 +4559,7 @@ int powerfs_net_read(__u64 ino, __u64 volume_id, __u64 file_key,
              * 当作空 needle 处理, 后续零填充逻辑生效.
              * 不 break, 因为 hole 后面可能还有已写入的 needle. */
             chunk_read_len = 0;
+            ret = 0;  /* 后续 break 判断用 ret==0 */
         }
 
         /* 拷贝请求区间: [offset_in_needle, min(offset_in_needle+remaining, chunk_read_len)) */

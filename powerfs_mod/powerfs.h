@@ -148,10 +148,13 @@ struct powerfs_lease {
 
 /* ========== FileLayout 枚举 (对齐 powerfs-layout crate) ========== */
 
-/* Placement 类型 (FieldId 0xA0, u8 tag) */
+/* Placement 类型 (FieldId 0xA0, u8 tag).
+ * 值必须与 powerfs-layout/src/codec.rs placement_tag 一致 (wire 格式):
+ *   INLINE=0, FLAT=1, STRIPE=2, WIDE_STRIPE=3
+ * 注意: 默认值 0 = INLINE, 新 inode 必须显式设置 FLAT. */
 enum powerfs_placement {
-    POWERFS_PLACEMENT_FLAT      = 0,
-    POWERFS_PLACEMENT_INLINE    = 1,
+    POWERFS_PLACEMENT_INLINE    = 0,
+    POWERFS_PLACEMENT_FLAT      = 1,
     POWERFS_PLACEMENT_STRIPE    = 2,
     POWERFS_PLACEMENT_WIDESTRIPE = 3,
 };
@@ -178,6 +181,18 @@ struct powerfs_file_layout {
     u8 reliability_state;   /* enum powerfs_reliability_state */
     u32 chunk_size;         /* layout chunk_size, 默认 POWERFS_CHUNK_SIZE */
     u32 inline_max_size;    /* Inline 阈值 (K2) */
+
+    /* === K3: Stripe/WideStripe 元数据 ===
+     * 从 Placement(0xA0) 后续字段 + 独立 FieldId 解析.
+     * volume_ids 由调用方 apply 后转入 inode (kmalloc), layout 本身
+     * 仅持有指针, parse 阶段分配, apply 阶段所有权转移给 inode. */
+    u64 stripe_size;            /* stripe unit 大小 (字节) */
+    u32 stripe_count;           /* 条带卷数 */
+    u32 start_volume_idx;       /* 起始卷索引 */
+    u64 start_needle_id;        /* StripeDescriptor 首 needle_id (K3-5 预留) */
+    u64 *volume_ids;            /* volume_ids 数组 (kmalloc), NULL=未解析 */
+    u32 volume_ids_count;       /* volume_ids 数组长度 */
+
     bool has_placement;     /* 响应中是否包含 Placement 字段 */
     bool has_reliability;   /* 响应中是否包含 Reliability 字段 */
 };
@@ -207,6 +222,27 @@ struct powerfs_inode_info {
     u8 reliability;         /* enum powerfs_reliability, 默认 SINGLE */
     u8 reliability_state;   /* enum powerfs_reliability_state */
     u32 layout_chunk_size;  /* 从 GETATTR 解析的 chunk_size, 默认 POWERFS_CHUNK_SIZE */
+
+    /* === K3: Stripe/WideStripe 多卷元数据 ===
+     * 从 GETATTR/CREATE 响应解析, 由 powerfs_apply_layout_to_inode() 填充.
+     * volume_ids 在 evict_inode/free_inode 中释放 (kmalloc).
+     *
+     * locate 算法 (对齐 FUSE resolve_stripe_chunk, fuse.rs L462):
+     *   stripe_unit_idx = offset / stripe_size
+     *   chunk_idx_in_unit = (offset % stripe_size) / chunk_size
+     *   volume_id = volume_ids[stripe_unit_idx]
+     *   needle_id = file_key + chunk_idx_in_unit
+     *
+     * 注意: 当前实现假设所有 stripe unit 共享同一 base needle_id (file_key).
+     * FUSE 端 chunks[stripe_unit_idx].needle_id 作为 base, 这里用 file_key
+     * 是因为 Filer CREATE Stripe 响应中各 chunk 的 needle_id 各不相同,
+     * 但 file_key 字段未单独携带. 后续若需要 per-unit needle, 切换到
+     * chunks[] 数组方式 (K3-5 LIST_CHUNKS). */
+    u64 stripe_size;            /* stripe unit 大小 (字节), 默认=layout_chunk_size */
+    u32 stripe_count;           /* 条带卷数 */
+    u32 start_volume_idx;       /* 起始卷索引 (预留) */
+    u64 *volume_ids;            /* volume_ids 数组 (kmalloc), NULL=Flat/Inline */
+    u32 volume_ids_count;       /* volume_ids 数组长度 */
 
     /* === K4: 副本 chunk 列表 (读 failover 使用, 从 GETATTR 0xB5 解析) === */
     struct powerfs_chunk_map *replica_chunks;
@@ -258,6 +294,15 @@ static inline struct powerfs_inode_info *POWERFS_I(struct inode *inode)
  */
 int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
                          u64 *volume_id_out, u64 *needle_id_out);
+
+/* K3-1: powerfs_apply_layout_to_inode - 将 FileLayout 解析结果应用到 inode
+ *
+ * 在持 pi->i_lock 的情况下调用 (或确保 inode 未被并发访问).
+ * volume_ids 所有权从 layout 转移到 inode (layout->volume_ids 置 NULL).
+ * 若 inode 已有 volume_ids, 先 kfree 旧的再替换 (避免泄漏).
+ * 调用方负责在 layout 解析失败时 kfree(layout.volume_ids). */
+void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
+                                   struct powerfs_file_layout *layout);
 
 /* ========== 客户端结构 (参考 ceph_fs_client) ========== */
 
