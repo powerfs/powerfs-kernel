@@ -127,21 +127,24 @@ static void powerfs_netfs_issue_read(struct netfs_io_subrequest *subreq)
                             start, copy_len);
             copy_to_iter(src + start, copy_len, &iter);
         }
-        spin_unlock(&pi->i_lock);
 
-        subreq->transferred = copy_len;
-        /* K2: 调试 — 输出 inline_data 的前 8 字节和简单 checksum (sum of bytes) */
+        /* K2: 调试 — 在锁内计算 checksum 和前 8 字节, 避免锁外
+         * src 指针被 GETATTR 并发释放导致 use-after-free. */
         {
             __u32 i, csum = 0;
+            __u8 b[8] = {0};
             __u8 *p = src + start;
-            for (i = 0; i < copy_len && i < src_len - start; i++)
+            for (i = 0; i < copy_len && i < src_len - start; i++) {
                 csum += p[i];
+                if (i < 8)
+                    b[i] = p[i];
+            }
+            spin_unlock(&pi->i_lock);
+
+            subreq->transferred = copy_len;
             pr_info("powerfs: issue_read INLINE ino=%lu start=%llu copy=%zu len=%u csum=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
                     inode->i_ino, (unsigned long long)start, copy_len, src_len, csum,
-                    copy_len > 0 ? p[0] : 0, copy_len > 1 ? p[1] : 0,
-                    copy_len > 2 ? p[2] : 0, copy_len > 3 ? p[3] : 0,
-                    copy_len > 4 ? p[4] : 0, copy_len > 5 ? p[5] : 0,
-                    copy_len > 6 ? p[6] : 0, copy_len > 7 ? p[7] : 0);
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
         }
         netfs_read_subreq_terminated(subreq);
         return;
