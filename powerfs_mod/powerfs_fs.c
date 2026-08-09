@@ -699,6 +699,17 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
         layout->replica_count = 0;
         kfree(old_rep);
     }
+
+    /* K4-5: EC shards — EC 读取路径使用.
+     * 从 ChunkLayout PER_CHUNK 解析, 所有权转移到 inode. */
+    if (layout->has_ec_chunks) {
+        struct powerfs_chunk_map *old_ec = pi->ec_chunks;
+        pi->ec_chunks = layout->ec_chunks;
+        pi->ec_chunk_count = layout->ec_chunk_count;
+        layout->ec_chunks = NULL;
+        layout->ec_chunk_count = 0;
+        kfree(old_ec);
+    }
 }
 
 /*
@@ -755,11 +766,13 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
             kfree(layout.volume_ids);
             kfree(layout.inline_data);
             kfree(layout.replica_chunks);
+            kfree(layout.ec_chunks);
         } else {
-            /* getattr 失败: 释放 parse 可能分配的 volume_ids/inline_data/replica_chunks */
+            /* getattr 失败: 释放 parse 可能分配的 volume_ids/inline_data/replica_chunks/ec_chunks */
             kfree(layout.volume_ids);
             kfree(layout.inline_data);
             kfree(layout.replica_chunks);
+            kfree(layout.ec_chunks);
         }
     }
     if (ret) {
@@ -1097,6 +1110,11 @@ void powerfs_free_inode(struct inode *inode)
     pi->replica_chunks = NULL;
     pi->replica_count = 0;
 
+    /* K4-5: 释放 EC shards 列表 */
+    kfree(pi->ec_chunks);
+    pi->ec_chunks = NULL;
+    pi->ec_chunk_count = 0;
+
     kmem_cache_free(powerfs_inode_cachep, pi);
 }
 
@@ -1154,6 +1172,11 @@ void powerfs_evict_inode(struct inode *inode)
     kfree(pi->replica_chunks);
     pi->replica_chunks = NULL;
     pi->replica_count = 0;
+
+    /* K4-5: 释放 EC shards 列表 */
+    kfree(pi->ec_chunks);
+    pi->ec_chunks = NULL;
+    pi->ec_chunk_count = 0;
 
     /* 6. 清理目录缓存链表 */
     powerfs_clear_dir_entries(inode);
@@ -1833,6 +1856,7 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
                 kfree(lookup_layout.volume_ids);
                 kfree(lookup_layout.inline_data);
                 kfree(lookup_layout.replica_chunks);
+                kfree(lookup_layout.ec_chunks);
                 d_add(dentry, NULL);
                 return NULL;
             }
@@ -1947,6 +1971,7 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
             kfree(lookup_layout.volume_ids);
             kfree(lookup_layout.inline_data);
             kfree(lookup_layout.replica_chunks);
+            kfree(lookup_layout.ec_chunks);
             d_add(dentry, NULL);
             WRITE_ONCE(POWERFS_I(dir)->dir_lease_expire,
                        jiffies + POWERFS_DIR_LEASE_TTL);
@@ -1967,6 +1992,7 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
         kfree(lookup_layout.volume_ids);
         kfree(lookup_layout.inline_data);
         kfree(lookup_layout.replica_chunks);
+        kfree(lookup_layout.ec_chunks);
         return ERR_PTR(err);
     }
 
@@ -2080,6 +2106,8 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
         mknod_layout.inline_data = NULL;
         kfree(mknod_layout.replica_chunks);
         mknod_layout.replica_chunks = NULL;
+        kfree(mknod_layout.ec_chunks);
+        mknod_layout.ec_chunks = NULL;
     }
 
     /* 关联 dentry 和 inode.

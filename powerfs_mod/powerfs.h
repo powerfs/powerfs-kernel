@@ -220,10 +220,19 @@ struct powerfs_file_layout {
     struct powerfs_chunk_map *replica_chunks;  /* 副本 chunks (kmalloc), NULL=无 */
     u32 replica_count;                          /* replica_chunks 数组长度 */
 
+    /* === K4-5: EC shards 列表 (从 ChunkLayout PER_CHUNK tag=0x01 解析) ===
+     * EC 文件的所有 shards (data + parity), 按 group 连续排列:
+     *   group 0: shards[0..total-1], group 1: shards[total..2*total-1], ...
+     * 每个 ChunkRef 44 字节, 与 replica_chunks 格式相同.
+     * 对齐 FUSE fuse.rs L2465-2473 ec_chunks 读取. */
+    struct powerfs_chunk_map *ec_chunks;  /* EC shards (kmalloc), NULL=非EC */
+    u32 ec_chunk_count;                    /* ec_chunks 数组长度 */
+
     bool has_placement;     /* 响应中是否包含 Placement 字段 */
     bool has_reliability;   /* 响应中是否包含 Reliability 字段 */
     bool has_inline_data;   /* 响应中是否包含 InlineData 字段 */
     bool has_replica_chunks;/* 响应中是否包含 ReplicaChunks 字段 */
+    bool has_ec_chunks;     /* 响应中是否包含 EC chunks (PER_CHUNK) */
 };
 
 struct powerfs_inode_info {
@@ -297,6 +306,12 @@ struct powerfs_inode_info {
      * ec_data_shards=0 表示非 EC 模式. */
     u32 ec_data_shards;
     u32 ec_parity_shards;
+
+    /* === K4-5: EC shards 列表 (从 ChunkLayout PER_CHUNK 解析) ===
+     * EC 文件所有 shards (data+parity), 按 group 连续排列.
+     * evict_inode/free_inode 中释放. */
+    struct powerfs_chunk_map *ec_chunks;
+    u32 ec_chunk_count;
 
     /* 缓存有效性 */
     bool cache_valid;

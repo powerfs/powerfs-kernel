@@ -43,6 +43,7 @@
 #include <linux/kref.h>
 #include <linux/unaligned.h>
 #include <linux/crc32.h>
+#include "powerfs_ec.h"
 
 #include <net/sock.h>
 #include <net/tcp.h>
@@ -4109,6 +4110,49 @@ static void parse_file_layout(struct powerfs_tlv_dec *dec,
                             data_len);
                 }
             }
+        } else if (raw_len >= 5 && raw[0] == 0x01) {
+            /* K4-5: PER_CHUNK tag=0x01 — EC shards 列表.
+             * [0x01] [count u32 LE] [ChunkRef × count]
+             * 每个 ChunkRef 44 字节, 与 ReplicaChunks 格式相同.
+             * 对齐 FUSE fuse.rs L2465-2473 ec_chunks 读取. */
+            __u32 count = le32_to_cpup((__le32 *)&raw[1]);
+            if (count > 0 && raw_len >= 5 + (size_t)count * 44) {
+                struct powerfs_chunk_map *chunks;
+                const __u8 *p = raw + 5;
+                __u32 i;
+
+                chunks = kmalloc_array(count,
+                                       sizeof(struct powerfs_chunk_map),
+                                       GFP_KERNEL);
+                if (chunks) {
+                    for (i = 0; i < count; i++) {
+                        __u64 offset, size, needle_id, volume_id, mtime;
+                        __u32 crc32;
+
+                        memcpy(&offset, p + 0, 8);
+                        memcpy(&size, p + 8, 8);
+                        memcpy(&needle_id, p + 16, 8);
+                        memcpy(&volume_id, p + 24, 8);
+                        memcpy(&crc32, p + 32, 4);
+                        memcpy(&mtime, p + 36, 8);
+
+                        chunks[i].chunk_idx = le64_to_cpu(offset) / POWERFS_CHUNK_SIZE;
+                        chunks[i].needle_id = le64_to_cpu(needle_id);
+                        chunks[i].volume_id = le64_to_cpu(volume_id);
+                        chunks[i].crc32 = le32_to_cpu(crc32);
+                        p += 44;
+                    }
+                    kfree(layout->ec_chunks);
+                    layout->ec_chunks = chunks;
+                    layout->ec_chunk_count = count;
+                    layout->has_ec_chunks = true;
+                    pr_info("powerfs: parse_file_layout ChunkLayout PER_CHUNK count=%u\n",
+                            count);
+                } else {
+                    pr_warn("powerfs: ChunkLayout PER_CHUNK kmalloc %u failed\n",
+                            count);
+                }
+            }
         }
     }
 
@@ -4745,6 +4789,167 @@ int powerfs_net_readdir(__u64 dir_ino, const char *last_name, __u64 limit,
                                        POWERFS_READDIR_TIMEOUT_MS);
 }
 
+/*
+ * powerfs_net_read_ec - K4-5/K4-6 EC 模式读取 (降级重建)
+ *
+ * 对齐 FUSE fuse.rs L2440-2538 EC 读取逻辑:
+ *   1. 计算 group_idx = offset / (data_shards × chunk_size)
+ *   2. 读取 group 的所有 shards (data + parity)
+ *   3. CRC32 校验每个 shard, 不匹配视为缺失
+ *   4. Fast path: 所有 data shards 可用 → 直接拼接
+ *   5. Slow path: 有缺失 → powerfs_ec_decode 降级重建
+ *   6. 从拼接的 group_data 提取请求范围
+ */
+static int powerfs_net_read_ec(struct powerfs_inode_info *pi, __u64 ino,
+                                __u64 offset, __u32 length,
+                                __u8 *buf, size_t buf_cap, __u32 *read_len)
+{
+    u32 data_shards = pi->ec_data_shards;
+    u32 parity_shards = pi->ec_parity_shards;
+    u32 total_shards = data_shards + parity_shards;
+    u64 group_data_size = (u64)data_shards * POWERFS_CHUNK_SIZE;
+    u64 group_idx = div64_u64(offset, group_data_size);
+    u64 group_offset = offset - group_idx * group_data_size;
+    u64 group_base = group_idx * total_shards;
+    u8 **shards = NULL;
+    bool *available = NULL;
+    u8 *group_data = NULL;
+    size_t copy_len;
+    u32 i;
+    int ret;
+
+    *read_len = 0;
+
+    if (data_shards == 0 || !pi->ec_chunks ||
+        group_base + total_shards > pi->ec_chunk_count)
+        return -EINVAL;
+
+    shards = kcalloc(total_shards, sizeof(u8 *), GFP_KERNEL);
+    available = kcalloc(total_shards, sizeof(bool), GFP_KERNEL);
+    if (!shards || !available) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    /* 1. 读取所有 shards (data + parity), 失败/CRC不匹配视为缺失 */
+    for (i = 0; i < total_shards; i++) {
+        struct powerfs_chunk_map *chunk = &pi->ec_chunks[group_base + i];
+        u32 crc_expected = chunk->crc32;
+        __u32 shard_len = 0;
+
+        shards[i] = kmalloc(POWERFS_CHUNK_SIZE, GFP_KERNEL);
+        if (!shards[i])
+            continue;
+
+        ret = powerfs_net_read_needle(chunk->volume_id, chunk->needle_id,
+                                       shards[i], POWERFS_CHUNK_SIZE,
+                                       &shard_len);
+        if (ret < 0) {
+            pr_warn("powerfs: EC read ino=%llu group=%llu shard=%u failed: %d\n",
+                    (unsigned long long)ino, (unsigned long long)group_idx,
+                    i, ret);
+            kfree(shards[i]);
+            shards[i] = NULL;
+            continue;
+        }
+
+        /* K4-4: CRC32 校验, 不匹配视为缺失 (由 parity 重建). */
+        if (crc_expected != 0 && shard_len > 0) {
+            u32 crc_actual = crc32_le(~0, shards[i], shard_len) ^ ~0;
+            if (crc_actual != crc_expected) {
+                pr_warn("powerfs: EC CRC mismatch ino=%llu shard=%u "
+                        "expected=%#x actual=%#x — will reconstruct\n",
+                        (unsigned long long)ino, i, crc_expected, crc_actual);
+                kfree(shards[i]);
+                shards[i] = NULL;
+                continue;
+            }
+        }
+        available[i] = true;
+    }
+
+    /* 2. 统计可用 data shards, 选择 fast/slow path */
+    {
+        u32 data_available = 0;
+        for (i = 0; i < data_shards; i++) {
+            if (available[i])
+                data_available++;
+        }
+
+        if (data_available == data_shards) {
+            /* Fast path: 所有 data shards 可用 → 直接拼接 */
+            group_data = kmalloc(group_data_size, GFP_KERNEL);
+            if (!group_data) {
+                ret = -ENOMEM;
+                goto out;
+            }
+            for (i = 0; i < data_shards; i++) {
+                memcpy(group_data + (u64)i * POWERFS_CHUNK_SIZE,
+                       shards[i], POWERFS_CHUNK_SIZE);
+            }
+        } else {
+            /* K4-6: Slow path — 降级重建 */
+            struct powerfs_ec_codec *codec;
+
+            pr_info("powerfs: EC read ino=%llu group=%llu degraded "
+                    "data=%u/%u — reconstructing\n",
+                    (unsigned long long)ino, (unsigned long long)group_idx,
+                    data_available, data_shards);
+
+            codec = powerfs_ec_init(data_shards, parity_shards);
+            if (IS_ERR(codec)) {
+                ret = PTR_ERR(codec);
+                goto out;
+            }
+
+            if (!powerfs_ec_can_recover(codec, available)) {
+                pr_warn("powerfs: EC read ino=%llu cannot recover\n",
+                        (unsigned long long)ino);
+                powerfs_ec_free(codec);
+                ret = -EIO;
+                goto out;
+            }
+
+            ret = powerfs_ec_decode(codec, shards, available,
+                                    POWERFS_CHUNK_SIZE);
+            powerfs_ec_free(codec);
+            if (ret) {
+                pr_warn("powerfs: EC decode ino=%llu failed: %d\n",
+                        (unsigned long long)ino, ret);
+                goto out;
+            }
+
+            group_data = kmalloc(group_data_size, GFP_KERNEL);
+            if (!group_data) {
+                ret = -ENOMEM;
+                goto out;
+            }
+            for (i = 0; i < data_shards; i++) {
+                if (shards[i])
+                    memcpy(group_data + (u64)i * POWERFS_CHUNK_SIZE,
+                           shards[i], POWERFS_CHUNK_SIZE);
+            }
+        }
+    }
+
+    /* 3. 从 group_data 提取请求范围 */
+    copy_len = min_t(size_t, length, group_data_size - group_offset);
+    copy_len = min_t(size_t, copy_len, buf_cap);
+    memcpy(buf, group_data + group_offset, copy_len);
+    *read_len = (__u32)copy_len;
+    ret = 0;
+
+out:
+    kfree(group_data);
+    if (shards) {
+        for (i = 0; i < total_shards; i++)
+            kfree(shards[i]);
+        kfree(shards);
+    }
+    kfree(available);
+    return ret;
+}
+
 /**
  * powerfs_net_read - 读数据 (直连 Volume Server, 不经过 Filer)
  *
@@ -4783,6 +4988,11 @@ int powerfs_net_read(struct powerfs_inode_info *pi, __u64 ino,
 
     if (buf_cap < length)
         return -EINVAL;
+
+    /* K4-5: EC 模式走专用读取路径 (降级重建). */
+    if (pi->reliability == POWERFS_RELIABILITY_EC && pi->ec_chunks)
+        return powerfs_net_read_ec(pi, ino, offset, length,
+                                    buf, buf_cap, read_len);
 
     /* needle_buf 用于接收整个 needle (1MB) 内容.
      * kvmalloc 在大尺寸时自动回退 vmalloc, 适合 1MB. */
