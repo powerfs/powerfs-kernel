@@ -41,6 +41,7 @@
 #include <linux/statfs.h>
 #include <linux/rbtree.h>
 #include <linux/kref.h>
+#include <linux/unaligned.h>
 
 #include <net/sock.h>
 #include <net/tcp.h>
@@ -3847,14 +3848,100 @@ int powerfs_net_lookup(__u64 dir_ino, const char *name, size_t name_len,
  * powerfs_net_getattr - 获取文件属性 (返回完整属性含时间戳 + volume_id/file_key)
  *
  * Filer 响应 TLV 字段: Ino, Mode, Uid, Gid, Size, Nlink, Mtime, Atime, Ctime,
- *                      VolumeId, FileKey (via encode_chunks_fields)
+ *                      VolumeId, FileKey, Placement, Reliability, ReliabilityState, ChunkSize
  *
  * volume_id/file_key 用于数据直连 Volume Server (WriteNeedle/ReadNeedle).
+ * layout 携带 FileLayout 元数据 (placement/reliability/chunk_size), 可为 NULL.
  */
+
+/* 解析 Placement TLV (0xA0): u8 tag + 后续字段.
+ *   0x00=Flat(1B) 0x01=Inline(5B) 0x02=Stripe(17B) 0x03=WideStripe(17B)
+ * 对齐 powerfs-layout/src/codec.rs encode_placement (L233) */
+static int parse_placement_field(const __u8 *val, size_t len,
+                                 struct powerfs_file_layout *layout)
+{
+    if (len < 1)
+        return -EINVAL;
+
+    layout->placement = val[0];
+    layout->has_placement = true;
+
+    switch (val[0]) {
+    case POWERFS_PLACEMENT_FLAT:
+        break;
+    case POWERFS_PLACEMENT_INLINE:
+        if (len >= 5)
+            layout->inline_max_size = le32_to_cpup((__le32 *)&val[1]);
+        break;
+    case POWERFS_PLACEMENT_STRIPE:
+    case POWERFS_PLACEMENT_WIDESTRIPE:
+        /* stripe_size(8B) + stripe_count(4B) + start_volume_idx(4B) = 16B after tag */
+        break;
+    default:
+        pr_warn("powerfs: unknown placement tag %u\n", val[0]);
+        layout->placement = POWERFS_PLACEMENT_FLAT;
+        break;
+    }
+    return 0;
+}
+
+/* 解析 Reliability TLV (0xA1): u8 tag + count/shards.
+ *   0x00=Single(1B) 0x01=Replicated(5B) 0x02=EC(9B)
+ * 对齐 powerfs-layout/src/codec.rs encode_reliability (L323) */
+static int parse_reliability_field(const __u8 *val, size_t len,
+                                   struct powerfs_file_layout *layout)
+{
+    if (len < 1)
+        return -EINVAL;
+
+    layout->reliability = val[0];
+    layout->has_reliability = true;
+    return 0;
+}
+
+/* 从 TLV 响应解析 FileLayout 字段 (Placement/Reliability/ReliabilityState/ChunkSize).
+ * 在 GETATTR/CREATE 响应解析后调用, 使用 find_* 非顺序查找. */
+static void parse_file_layout(struct powerfs_tlv_dec *dec,
+                              struct powerfs_file_layout *layout)
+{
+    const __u8 *raw;
+    size_t raw_len;
+    __u8 u8val;
+    __u32 u32val;
+
+    if (!layout)
+        return;
+
+    memset(layout, 0, sizeof(*layout));
+    layout->chunk_size = POWERFS_CHUNK_SIZE;  /* 默认值 */
+
+    /* Placement (0xA0) — 二进制 tag + 后续 */
+    if (powerfs_tlv_dec_find_raw(dec, POWERFS_NET_FLD_PLACEMENT, &raw, &raw_len) == 0)
+        parse_placement_field(raw, raw_len, layout);
+
+    /* Reliability (0xA1) — 二进制 tag + count */
+    if (powerfs_tlv_dec_find_raw(dec, POWERFS_NET_FLD_RELIABILITY, &raw, &raw_len) == 0)
+        parse_reliability_field(raw, raw_len, layout);
+
+    /* ReliabilityState (0xA2) — u8 */
+    if (powerfs_tlv_dec_find_u8(dec, POWERFS_NET_FLD_RELIABILITY_STATE, &u8val) == 0)
+        layout->reliability_state = u8val;
+
+    /* ChunkSize (0xAD) — u32, 覆盖默认值 */
+    if (powerfs_tlv_dec_find_u32(dec, POWERFS_NET_FLD_CHUNK_SIZE, &u32val) == 0 && u32val > 0)
+        layout->chunk_size = u32val;
+
+    /* InlineMaxSize (0xAF) — u32, 可能从 Placement tag 已解析 */
+    if (layout->inline_max_size == 0 &&
+        powerfs_tlv_dec_find_u32(dec, POWERFS_NET_FLD_INLINE_MAX_SIZE, &u32val) == 0)
+        layout->inline_max_size = u32val;
+}
+
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
                          __u64 *size, __u32 *nlink,
                          __u64 *mtime, __u64 *atime, __u64 *ctime,
-                         __u64 *volume_id, __u64 *file_key)
+                         __u64 *volume_id, __u64 *file_key,
+                         struct powerfs_file_layout *layout)
 {
     __u8 body[64];
     struct powerfs_tlv_enc enc;
@@ -3881,7 +3968,8 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
         __u64 tmp_ino = 0;
         powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
         /* Filer getattr 响应: Ino, Mode, Uid, Gid, Size, Nlink, Mtime, Atime, Ctime,
-         * Name, [Chunks(JSON), Fid, VolumeId, Cookie, FileKey...]
+         * Name, [Chunks(JSON), Fid, VolumeId, Cookie, FileKey,
+         *        Placement, Reliability, ReliabilityState, ChunkSize...]
          * 跳过 Ino (客户端已知), 然后按顺序解析属性字段 */
         powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_INO, &tmp_ino);
         powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_MODE, mode);
@@ -3898,6 +3986,9 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
             powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, volume_id);
         if (file_key)
             powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_FILE_KEY, file_key);
+
+        /* K1: 解析 FileLayout (placement/reliability/chunk_size) */
+        parse_file_layout(&dec, layout);
     }
 
     return 0;
@@ -3909,15 +4000,21 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
  * 响应中包含 Filer 自分配的 volume_id + needle_id (file_key),
  * 内核需将其存入 inode 私有数据, 供后续直连 volume 读写使用.
  * 目录无数据, volume_id/file_key 为 0.
+ *
+ * K1-4: Inline/Stripe 模式下 Filer 通过 encode_file_layout 返回
+ *       placement/reliability/chunk_size, 本函数解析后通过 layout 输出.
+ *       Flat 模式 Filer 不 encode layout, layout->has_placement 保持 false,
+ *       调用方按默认 Flat 处理.
  */
 int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
                         __u32 mode, __u32 uid, __u32 gid, bool is_dir,
                         __u64 *ino_ret,
-                        __u64 *volume_id_ret, __u64 *file_key_ret)
+                        __u64 *volume_id_ret, __u64 *file_key_ret,
+                        struct powerfs_file_layout *layout)
 {
     __u8 body[256];
     struct powerfs_tlv_enc enc;
-    __u8 resp_body[128];
+    __u8 resp_body[256];
     size_t resp_body_len = 0;
     struct powerfs_tlv_dec dec;
     __u16 msg_type;
@@ -3962,13 +4059,18 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
     if (resp_body_len > 0) {
         powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
         /* 使用 find 方式解析, 不依赖字段顺序
-         * (Filer create 响应: Ino, Mode, Name, VolumeId, FileKey) */
+         * (Filer create 响应: Ino, Mode, Name, [FileLayout], VolumeId, FileKey) */
         if (ino_ret)
             powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_INO, ino_ret);
         if (volume_id_ret)
             powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, volume_id_ret);
         if (file_key_ret)
             powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_FILE_KEY, file_key_ret);
+
+        /* K1-4: 解析 FileLayout (Inline/Stripe 模式由 Filer encode_file_layout 返回).
+         * Flat 模式 Filer 不 encode layout, parse_file_layout 内部保持默认值. */
+        if (layout)
+            parse_file_layout(&dec, layout);
     }
 
     return 0;
@@ -4034,6 +4136,110 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
 
     return 0;
 }
+
+/**
+ * powerfs_net_update_inode_size_chunks - K1-6 close/fsync 强一致同步 size+chunks
+ *
+ * 对齐 FUSE sync_size_chunks_on_close (powerfs-fuse/src/fuse.rs L990) 和
+ * Filer handle_update_inode_size_chunks (net_handler.rs L1573).
+ *
+ * 请求 TLV 字段 (对齐 Filer decode 顺序):
+ *   ShardId(0x70) + Ino(0x07) + Size(0x06) + ClientId(0x30)
+ *   + [FileLayout: Placement(0xA0) + Reliability(0xA1) + ReliabilityState(0xA2)
+ *               + ChunkLayout(0xA4)]
+ *
+ * FileLayout 编码 (对齐 powerfs-layout codec.rs encode_file_layout):
+ *   Placement: u8 tag (Flat=0, Inline=1, Stripe=2)
+ *   Reliability: bytes [tag] (SingleReplica=0)
+ *   ReliabilityState: u8 (PendingReplicated=0)
+ *   ChunkLayout: bytes [tag=1(PerChunk), count u32 LE, ChunkRef * count]
+ *     ChunkRef (44B): offset u64 LE, size u64 LE, needle_id u64 LE,
+ *                     volume_id u64 LE, crc32 u32 LE, mtime u64 LE
+ *
+ * 注意: Filer 端会用传入 chunks 覆盖现有 chunks. 调用方必须传入完整 chunks 列表
+ *       (或 NULL 表示空列表, 会清空 Filer 端 chunks — 慎用).
+ */
+int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
+                                         const char *client_id,
+                                         const struct powerfs_chunk_map *chunks,
+                                         __u32 chunk_count)
+{
+    /* body 大小估算: 固定头(~80B) + ChunkLayout(5 + 44*chunk_count).
+     * chunk_count=0 时 256B 足够; 多 chunk 动态分配. */
+    size_t body_cap = 256 + (size_t)chunk_count * 44 + 64;
+    __u8 *body;
+    struct powerfs_tlv_enc enc;
+    __u8 resp_body[128];
+    size_t resp_body_len = 0;
+    int ret;
+
+    /* ChunkLayout 动态编码缓冲: 1(tag) + 4(count) + 44*count */
+    __u8 *layout_buf;
+    size_t layout_len = 1 + 4 + (size_t)chunk_count * 44;
+    const char *cid = client_id ? client_id : "kernel";
+    __u32 i;
+
+    body = kmalloc(body_cap, GFP_KERNEL);
+    if (!body)
+        return -ENOMEM;
+
+    layout_buf = kmalloc(layout_len, GFP_KERNEL);
+    if (!layout_buf) {
+        kfree(body);
+        return -ENOMEM;
+    }
+
+    /* 构建 ChunkLayout: [tag=1(PerChunk)][count u32 LE][ChunkRef * count] */
+    layout_buf[0] = 1; /* PER_CHUNK tag */
+    put_unaligned_le32(chunk_count, &layout_buf[1]);
+    if (chunks && chunk_count > 0) {
+        __u8 *p = &layout_buf[5];
+        for (i = 0; i < chunk_count; i++) {
+            const struct powerfs_chunk_map *cm = &chunks[i];
+            put_unaligned_le64((__u64)i * POWERFS_CHUNK_SIZE, p);   /* offset */
+            put_unaligned_le64(0, p + 8);                            /* size */
+            put_unaligned_le64(cm->needle_id, p + 16);               /* needle_id */
+            put_unaligned_le64(cm->volume_id, p + 24);               /* volume_id */
+            put_unaligned_le32(cm->crc32, p + 32);                   /* crc32 */
+            put_unaligned_le64(0, p + 36);                           /* mtime */
+            p += 44;
+        }
+    }
+
+    powerfs_tlv_enc_init(&enc, body, body_cap);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SHARD_ID, shard_id);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SIZE, size);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID, cid, strlen(cid));
+
+    /* FileLayout: Placement=Flat, Reliability=SingleReplica,
+     * ReliabilityState=PendingReplicated, ChunkLayout=PerChunk */
+    powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_PLACEMENT, POWERFS_PLACEMENT_FLAT);
+    {
+        __u8 rel_buf[1] = { 0 }; /* SingleReplica tag = 0 */
+        powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_RELIABILITY, rel_buf, 1);
+    }
+    powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_RELIABILITY_STATE,
+                       POWERFS_RSTATE_PENDING);
+    powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_CHUNK_LAYOUT, layout_buf, layout_len);
+
+    kfree(layout_buf);
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_UPDATE_INODE_SIZE_CHUNKS, ino,
+                                    body, powerfs_tlv_enc_len(&enc),
+                                    NULL, 0,
+                                    resp_body, sizeof(resp_body),
+                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
+                                    &resp_body_len, NULL);
+    kfree(body);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return net_status_to_errno((__u16)ret);
+
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_update_inode_size_chunks);
 
 /**
  * powerfs_net_readdir - 读取目录项 (匹配 Filer 协议)
@@ -4170,7 +4376,7 @@ int powerfs_net_readdir(__u64 dir_ino, const char *last_name, __u64 limit,
  * 数据读写绕过 Filer: 从 inode 的 (volume_id, file_key) 直连 Volume Server
  * 读取 needle 内容, 再按 offset/length 截取返回.
  *
- * needle 模型: 每个 needle = 1 chunk (POWERFS_CHUNK_SIZE=2MB), 整存整取.
+ * needle 模型: 每个 needle = 1 chunk (POWERFS_CHUNK_SIZE=1MB), 整存整取.
  *   needle_id = file_key + offset / CHUNK_SIZE
  *   offset_in_needle = offset % CHUNK_SIZE
  *

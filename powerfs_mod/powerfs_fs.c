@@ -446,6 +446,62 @@ struct inode *powerfs_find_inode(struct super_block *sb, u64 ino)
 }
 
 /*
+ * powerfs_locate_chunk - K1-5 统一 chunk 定位 (Flat/Stripe 多卷入口)
+ *
+ * 对齐 FUSE powerfs-fuse/src/fuse.rs locate() 逻辑:
+ *   - Flat 模型: needle_id = file_key + offset / chunk_size,
+ *     volume_id = inode->volume_id (单卷)
+ *   - Stripe 模型 (K3): 按 chunk_idx 查 chunks 数组获取 (volume_id, needle_id)
+ *   - Inline 模型 (K2): 返回 -EINVAL, inline 不走 volume 路径
+ *
+ * K1 阶段: chunks 数组尚未由 GETATTR 填充 (K3 才解析 VolumeIds/Chunks TLV),
+ *          所以始终走 Flat 分支, 行为与原有 file_key+N 计算一致.
+ * K3 阶段: GETATTR 解析 chunks 后, 自动走多卷查表分支.
+ *
+ * 注意: 调用方应持 pi->i_lock 或确保 chunks 不被并发释放 (evict_inode).
+ *       当前 read/write 路径在持锁快照后调用, 满足约束.
+ */
+int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
+                         u64 *volume_id_out, u64 *needle_id_out)
+{
+    u32 chunk_size;
+    u64 chunk_idx;
+
+    if (!pi || !volume_id_out || !needle_id_out)
+        return -EINVAL;
+
+    /* Inline 文件不走 volume 路径 (K2) */
+    if (pi->placement == POWERFS_PLACEMENT_INLINE)
+        return -EINVAL;
+
+    /* chunk_size: 优先用 layout 解析值, 兜底 POWERFS_CHUNK_SIZE */
+    chunk_size = pi->layout_chunk_size ? pi->layout_chunk_size : POWERFS_CHUNK_SIZE;
+    if (chunk_size == 0)
+        return -EINVAL;
+
+    chunk_idx = (u64)(offset / chunk_size);
+
+    /* K3 多卷路径: chunks 数组存在且 chunk_idx 命中.
+     * K1 阶段 chunk_count==0, 走 Flat 分支. */
+    if (pi->chunks && chunk_idx < pi->chunk_count) {
+        struct powerfs_chunk_map *cm = &pi->chunks[chunk_idx];
+        if (cm->volume_id != 0 && cm->needle_id != 0) {
+            *volume_id_out = cm->volume_id;
+            *needle_id_out = cm->needle_id;
+            return 0;
+        }
+    }
+
+    /* Flat 模型: file_key + chunk_idx, 单卷 */
+    if (!pi->volume_id || !pi->file_key)
+        return -EINVAL;
+
+    *volume_id_out = pi->volume_id;
+    *needle_id_out = pi->file_key + chunk_idx;
+    return 0;
+}
+
+/*
  * powerfs_refresh_inode_work - 异步刷新 inode 元数据 (workqueue 回调)
  *
  * 在独立工作队列中执行, 避免 self-deadlock:
@@ -476,10 +532,21 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
     pi = POWERFS_I(inode);
 
     /* 1. 发 getattr 获取最新元数据 */
-    ret = powerfs_net_getattr(inode->i_ino, &mode, &uid, &gid,
-                              &size, &nlink,
-                              &mtime, &atime, &ctime,
-                              &volume_id, &file_key);
+    {
+        struct powerfs_file_layout layout;
+        ret = powerfs_net_getattr(inode->i_ino, &mode, &uid, &gid,
+                                  &size, &nlink,
+                                  &mtime, &atime, &ctime,
+                                  &volume_id, &file_key, &layout);
+        if (ret == 0) {
+            spin_lock(&pi->i_lock);
+            pi->placement = layout.placement;
+            pi->reliability = layout.reliability;
+            pi->reliability_state = layout.reliability_state;
+            pi->layout_chunk_size = layout.chunk_size;
+            spin_unlock(&pi->i_lock);
+        }
+    }
     if (ret) {
         pr_warn("powerfs: refresh_work ino=%llu getattr failed: %d\n",
                 rw->ino, ret);
@@ -1635,6 +1702,10 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
     struct inode *inode;
     u64 new_ino;
     u64 mknod_volume_id = 0, mknod_file_key = 0;  /* P3.4: Filer 自分配, 存入 inode */
+    /* K1-4: CREATE 响应携带的 FileLayout (Inline/Stripe 模式有值, Flat 无).
+     * mknod_has_layout=false 时按默认 Flat 处理. */
+    struct powerfs_file_layout mknod_layout;
+    bool mknod_has_layout = false;
     int type;
 
     (void)idmap;
@@ -1651,12 +1722,13 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
     if (S_ISREG(mode) || S_ISDIR(mode)) {
         u64 remote_ino = 0;
         u64 volume_id = 0, file_key = 0;
+        struct powerfs_file_layout layout;
         int rerr = powerfs_net_create(dir->i_ino, dentry->d_name.name,
                                        dentry->d_name.len, mode,
                                        from_kuid(&init_user_ns, current_fsuid()),
                                        from_kgid(&init_user_ns, current_fsgid()),
                                        S_ISDIR(mode), &remote_ino,
-                                       &volume_id, &file_key);
+                                       &volume_id, &file_key, &layout);
         if (rerr) {
             pr_warn("powerfs: net_create '%pd' failed: %d\n", dentry, rerr);
             return rerr;
@@ -1667,9 +1739,15 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
          * P3.4: 保存 Filer 自分配的 volume_id + needle_id 到 mknod 局部变量,
          * inode 创建后写入 powerfs_inode_info, 供后续直连 volume 读写.
          * 目录无数据, volume_id/file_key 为 0 (Filer handle_mkdir 不分配).
+         *
+         * K1-4: 保存 layout 到 mknod 局部变量, inode 创建后应用.
+         *       Inline/Stripe 模式 Filer encode layout; Flat 模式 has_placement=false,
+         *       应用时按默认 Flat 处理 (不覆盖 inode 默认值).
          */
         mknod_volume_id = volume_id;
         mknod_file_key = file_key;
+        mknod_layout = layout;
+        mknod_has_layout = true;
     } else {
         new_ino = atomic_inc_return(&sbi->next_ino) + POWERFS_INO_START;
     }
@@ -1689,6 +1767,26 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
         spin_unlock(&pi->i_lock);
         pr_debug("powerfs: create '%pd' ino=%lu volume_id=%llu file_key=%llu\n",
                  dentry, inode->i_ino, mknod_volume_id, mknod_file_key);
+    }
+
+    /* K1-4: 应用 CREATE 响应中的 FileLayout 到 inode.
+     * Inline 模式: placement=Inline, 后续 write/read 走 inline_data 路径 (K2).
+     * Stripe 模式: placement=Stripe, 后续 write/read 走多卷 locate (K3).
+     * Flat 模式: has_placement=false, 保持 inode 默认值 (FLAT/SINGLE). */
+    if (S_ISREG(mode) && mknod_has_layout) {
+        struct powerfs_inode_info *pi = POWERFS_I(inode);
+        spin_lock(&pi->i_lock);
+        if (mknod_layout.has_placement)
+            pi->placement = mknod_layout.placement;
+        if (mknod_layout.has_reliability)
+            pi->reliability = mknod_layout.reliability;
+        pi->reliability_state = mknod_layout.reliability_state;
+        if (mknod_layout.chunk_size > 0)
+            pi->layout_chunk_size = mknod_layout.chunk_size;
+        spin_unlock(&pi->i_lock);
+        pr_debug("powerfs: create '%pd' ino=%lu placement=%u reliability=%u chunk_size=%u\n",
+                 dentry, inode->i_ino, pi->placement, pi->reliability,
+                 pi->layout_chunk_size);
     }
 
     /* 关联 dentry 和 inode.
@@ -3605,6 +3703,7 @@ int powerfs_writepages(struct address_space *mapping,
             struct page *page = folio_page(fbatch.folios[i], 0);
             loff_t offset;
             size_t count = PAGE_SIZE;
+            u64 cur_needle_idx;
 
             lock_page(page);
             if (!PageDirty(page)) {
@@ -3616,6 +3715,22 @@ int powerfs_writepages(struct address_space *mapping,
             clear_page_dirty_for_io(page);
 
             offset = page_offset(page);
+            /* 按 needle (chunk) 边界分组: 当页面的 chunk_idx 变化时,
+             * 提交当前 batch, 确保同一 needle 的所有页面在同一个 batch
+             * 中完成 read-modify-write. 避免多个 batch 并发对同一 needle
+             * 做 RMW 导致数据覆盖 (1MB 文件 16 个 batch 并发覆盖问题). */
+            cur_needle_idx = offset / POWERFS_CHUNK_SIZE;
+            if (batch && batch->num_pages > 0) {
+                u64 prev_needle_idx = batch->offsets[batch->num_pages - 1]
+                                      / POWERFS_CHUNK_SIZE;
+                if (cur_needle_idx != prev_needle_idx) {
+                    /* needle 边界变化: 提交当前 batch */
+                    atomic_inc(&sbi->wb_in_flight);
+                    queue_work(sbi->writeback_wq, &batch->work);
+                    batch = NULL;
+                }
+            }
+
             pr_debug("powerfs: WPAGES page ino=%lu offset=%lld i_size=%lld\n",
                     inode->i_ino, offset, i_size_read(inode));
             if (offset >= i_size_read(inode)) {
@@ -3986,10 +4101,6 @@ static int powerfs_show_options(struct seq_file *m, struct dentry *root)
 
     seq_printf(m, ",master_addr=%s", sbi->master_addr);
     seq_printf(m, ",master_port=%u", sbi->master_port);
-    seq_printf(m, ",volume_addr=%s", sbi->volume_addr);
-    seq_printf(m, ",volume_port=%u", sbi->volume_port);
-    seq_printf(m, ",filer_addr=%s", sbi->filer_addr);
-    seq_printf(m, ",filer_port=%u", sbi->filer_port);
 
     return 0;
 }
@@ -4067,10 +4178,6 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     struct powerfs_ctx_simple {
         char master_addr[64];
         u16  master_port;
-        char volume_addr[64];
-        u16  volume_port;
-        char filer_addr[64];
-        u16  filer_port;
         u32  write_batch_kb;
     };
     /* 注意: sget_fc() 会将 fc->s_fs_info 转移到 sb->s_fs_info, 然后将
@@ -4097,10 +4204,6 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     if (ctx) {
         strncpy(sbi->master_addr, ctx->master_addr, sizeof(sbi->master_addr) - 1);
         sbi->master_port = ctx->master_port;
-        strncpy(sbi->volume_addr, ctx->volume_addr, sizeof(sbi->volume_addr) - 1);
-        sbi->volume_port = ctx->volume_port;
-        strncpy(sbi->filer_addr, ctx->filer_addr, sizeof(sbi->filer_addr) - 1);
-        sbi->filer_port = ctx->filer_port;
         batch_kb = ctx->write_batch_kb;
         /* 释放 init_fs_context 分配的 ctx, 释放后 sb->s_fs_info 仍指向已释放内存,
          * 必须在下方设置 sb->s_fs_info = sbi 之前完成 */
@@ -4122,6 +4225,13 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     }
     /* 转换为页数: kb * 1024 / PAGE_SIZE = kb / (PAGE_SIZE/1024) = kb / 4 */
     sbi->write_batch_pages = (int)(batch_kb * 1024 / PAGE_SIZE);
+    /* K1-5 fix: 确保 batch 至少能容纳一个 chunk 的所有页面,
+     * 避免 same-needle 的 RMW 并发覆盖. chunk_size=1MB → 256 页. */
+    {
+        int min_pages = (int)(POWERFS_CHUNK_SIZE / PAGE_SIZE);
+        if (sbi->write_batch_pages < min_pages)
+            sbi->write_batch_pages = min_pages;
+    }
     pr_debug("powerfs: write_batch_kb=%u → write_batch_pages=%d\n",
             batch_kb, sbi->write_batch_pages);
 
@@ -4216,21 +4326,21 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     /* === 初始化 powerfs_net 连接池 (多节点 Delta Sync) === */
     powerfs_net_pool_init();
 
-    /* 配置 Filer 节点 (Delta Sync 的主节点).
-     * Filer 列表获取策略 (优先级递减):
-     *   1. 若配置了 master_addr, 调用 powerfs_net_discover_filers 从
-     *      Master 动态发现 filer 列表 (支持几百个 filer 的扩展场景).
-     *   2. 发现失败时, 回退到 sbi->filer_addr / g_server_addr 手动解析
-     *      (逗号分隔多地址), 保证向后兼容.
+    /* 配置 Filer 节点 — 全部通过 Master 动态发现.
      *
-     * 注意: ctx 已在上方 kfree, 这里使用 sbi 中保存的挂载参数.
-     * Master 节点也加入连接池 (供后续 Master 交互使用, 如 GetTopology). */
+     * 架构: 只需配置 master_addr (3 个 Raft 节点), Filer 和 Volume 地址
+     * 全部通过 Master 的 GetTopology / ListFilers 动态发现.
+     * 不再支持手动配置 filer_addr / volume_addr.
+     *
+     * 流程:
+     *   1. 添加 Master 到连接池 (discover_filers/volumes 需要)
+     *   2. powerfs_net_discover_filers 从 Master 获取 filer 列表
+     *   3. powerfs_net_discover_volumes 从 Master 获取 volume 路由表 */
     {
         const char *maddr = (sbi->master_addr[0]) ? sbi->master_addr : NULL;
         __u16 mport = sbi->master_port ? sbi->master_port : 9334;
-        int discovered = 0;
 
-        /* 先添加 Master 到连接池 (discover_filers 需要) */
+        /* 添加 Master 到连接池 */
         if (maddr) {
             char mbuf[256];
             char *mp, *mtok;
@@ -4244,81 +4354,29 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
                                       POWERFS_NET_SERVER_MASTER);
                 pr_debug("powerfs: added master %s:%u\n", mtok, mport);
             }
+        } else {
+            pr_err("powerfs: master_addr not configured, cannot mount\n");
+            return -EINVAL;
         }
 
-        /* 尝试从 Master 发现 filer 列表 */
-        if (maddr) {
-            discovered = powerfs_net_discover_filers(maddr, mport);
+        /* 从 Master 发现 filer 列表 */
+        {
+            int discovered = powerfs_net_discover_filers(maddr, mport);
             if (discovered > 0) {
-                pr_debug("powerfs: discovered %d filers via Master\n",
+                pr_info("powerfs: discovered %d filers via Master\n",
                         discovered);
             } else {
-                pr_warn("powerfs: Master filer discovery failed (%d), "
-                        "falling back to manual filer_addr\n", discovered);
+                pr_err("powerfs: Master filer discovery failed (%d), "
+                       "cannot mount without filers\n", discovered);
+                return -ENOLINK;
             }
-        }
-
-        /* 回退: 手动解析 filer_addr (模块参数 filer_addr=...) */
-        if (discovered <= 0) {
-            const char *faddr = sbi->filer_addr;
-            __u16 fport = sbi->filer_port;
-            if (faddr && faddr[0]) {
-                char addr_buf[256];
-                char *p, *tok;
-                bool first = true;
-
-                strncpy(addr_buf, faddr, sizeof(addr_buf) - 1);
-                addr_buf[sizeof(addr_buf) - 1] = '\0';
-
-                p = addr_buf;
-                while ((tok = strsep(&p, ",")) != NULL) {
-                    if (tok[0] == '\0')
-                        continue;
-                    while (*tok == ' ')
-                        tok++;
-                    if (tok[0] == '\0')
-                        continue;
-                    powerfs_net_add_server(tok, fport,
-                                          POWERFS_NET_SERVER_FILER);
-                    if (first) {
-                        powerfs_net_set_primary(tok, fport);
-                        first = false;
-                    }
-                    pr_debug("powerfs: added filer %s:%u (manual)\n",
-                            tok, fport);
-                }
-            }
-        }
-    }
-
-    /* P3.3a: 配置 Volume 节点作为 fallback (支持逗号分隔多地址).
-     * 主路径: discover_volumes 从 Master GetTopology 自动发现并建立连接.
-     * fallback: 当 Master 不可达时, 使用 volume_addr 模块参数建立的连接.
-     * volume_addr 未配置时, 完全依赖 Master 动态发现 (设计目标). */
-    if (sbi->volume_addr[0]) {
-        char vbuf[256];
-        char *vp, *vtok;
-        strncpy(vbuf, sbi->volume_addr, sizeof(vbuf) - 1);
-        vbuf[sizeof(vbuf) - 1] = '\0';
-        vp = vbuf;
-        while ((vtok = strsep(&vp, ",")) != NULL) {
-            while (*vtok == ' ') vtok++;
-            if (vtok[0] == '\0') continue;
-            powerfs_net_add_server(vtok, sbi->volume_port,
-                                  POWERFS_NET_SERVER_VOLUME);
-            pr_debug("powerfs: added volume %s:%u\n", vtok,
-                    sbi->volume_port);
         }
     }
 
     /* 初始化新连接池.
      *
      * 新架构 (per-conn 状态机 + shard 路由 + 事件驱动) 为唯一路径.
-     * 旧 g_conn 单连接 fallback 已移除, pool_init 失败直接返回错误.
-     * 断连检测由 sk_state_change 回调 + TCP keepalive 取代, 无需健康监控线程.
-     *
-     * P3.2: 传入 master_addr, 让 g_pool.master_addr 被设置, 供后续
-     * discover_volumes 及其他需要 Master 交互的场景使用. */
+     * 断连检测由 sk_state_change 回调 + TCP keepalive 取代, 无需健康监控线程. */
     {
         const char *maddr = sbi->master_addr[0] ? sbi->master_addr : NULL;
         __u16 mport = sbi->master_port ? sbi->master_port : 9334;
@@ -4329,11 +4387,7 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         }
         pr_debug("powerfs: new connection pool initialized (sk callback + keepalive)\n");
 
-        /* P3.3a: 从 Master GetTopology 发现 volume 路由表 (volume_id → conn_idx).
-         * 主路径: discover_volumes 从 Master 获取拓扑, 精确匹配已有连接,
-         *         未匹配的自动建立新连接 (不依赖 volume_addr 模块参数).
-         * fallback: volume_addr 模块参数建立的连接 (上面已 add_server)
-         *           在 Master 不可达时作为备用连接.
+        /* 从 Master GetTopology 发现 volume 路由表 (volume_id → conn_idx).
          * 失败不挂载失败: filer 元数据仍可用, 数据读写等 volume 上线后恢复. */
         if (maddr) {
             int vol_ret = powerfs_net_discover_volumes(maddr, mport);
@@ -4341,10 +4395,6 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
                 pr_warn("powerfs: discover_volumes failed: %d "
                         "(volume data IO will fail until routes established)\n",
                         vol_ret);
-                if (sbi->volume_addr[0]) {
-                    pr_info("powerfs: volume_addr fallback connections active "
-                            "(no route mapping until Master reachable)\n");
-                }
             } else {
                 pr_debug("powerfs: volume routes discovered via Master\n");
             }

@@ -476,6 +476,86 @@ int powerfs_tlv_dec_find_u64(struct powerfs_tlv_dec *dec, __u8 field, __u64 *val
     return -ENOENT;
 }
 
+int powerfs_tlv_dec_find_u32(struct powerfs_tlv_dec *dec, __u8 field, __u32 *val)
+{
+    size_t saved_pos = dec->pos;
+    __u8 cur_field;
+    size_t cur_len;
+    int ret;
+
+    dec->pos = 0;
+    while (dec->pos < dec->len) {
+        ret = powerfs_tlv_dec_next(dec, &cur_field, &cur_len);
+        if (ret)
+            break;
+
+        if (cur_field == field && cur_len == 4) {
+            *val = (__u32)dec->buf[dec->pos] |
+                   ((__u32)dec->buf[dec->pos + 1] << 8) |
+                   ((__u32)dec->buf[dec->pos + 2] << 16) |
+                   ((__u32)dec->buf[dec->pos + 3] << 24);
+            dec->pos += 4;
+            return 0;
+        }
+        dec->pos += cur_len;
+    }
+
+    dec->pos = saved_pos;
+    return -ENOENT;
+}
+
+int powerfs_tlv_dec_find_u8(struct powerfs_tlv_dec *dec, __u8 field, __u8 *val)
+{
+    size_t saved_pos = dec->pos;
+    __u8 cur_field;
+    size_t cur_len;
+    int ret;
+
+    dec->pos = 0;
+    while (dec->pos < dec->len) {
+        ret = powerfs_tlv_dec_next(dec, &cur_field, &cur_len);
+        if (ret)
+            break;
+
+        if (cur_field == field && cur_len == 1) {
+            *val = dec->buf[dec->pos];
+            dec->pos += 1;
+            return 0;
+        }
+        dec->pos += cur_len;
+    }
+
+    dec->pos = saved_pos;
+    return -ENOENT;
+}
+
+int powerfs_tlv_dec_find_raw(struct powerfs_tlv_dec *dec, __u8 field,
+                             const __u8 **val, size_t *len)
+{
+    size_t saved_pos = dec->pos;
+    __u8 cur_field;
+    size_t cur_len;
+    int ret;
+
+    dec->pos = 0;
+    while (dec->pos < dec->len) {
+        ret = powerfs_tlv_dec_next(dec, &cur_field, &cur_len);
+        if (ret)
+            break;
+
+        if (cur_field == field) {
+            *val = &dec->buf[dec->pos];
+            *len = cur_len;
+            dec->pos += cur_len;
+            return 0;
+        }
+        dec->pos += cur_len;
+    }
+
+    dec->pos = saved_pos;
+    return -ENOENT;
+}
+
 /* ========== 导出符号 ========== */
 
 EXPORT_SYMBOL_GPL(powerfs_tlv_enc_init);
@@ -497,3 +577,6 @@ EXPORT_SYMBOL_GPL(powerfs_tlv_dec_string);
 EXPORT_SYMBOL_GPL(powerfs_tlv_dec_skip);
 EXPORT_SYMBOL_GPL(powerfs_tlv_dec_is_empty);
 EXPORT_SYMBOL_GPL(powerfs_tlv_dec_find_u64);
+EXPORT_SYMBOL_GPL(powerfs_tlv_dec_find_u32);
+EXPORT_SYMBOL_GPL(powerfs_tlv_dec_find_u8);
+EXPORT_SYMBOL_GPL(powerfs_tlv_dec_find_raw);

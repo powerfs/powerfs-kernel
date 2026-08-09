@@ -33,8 +33,10 @@
 /* Inode cache 超时 (jiffies, 默认 10 秒) */
 #define POWERFS_INODE_CACHE_TTL     (10 * HZ)
 
-/* Chunk 和 Stripe 大小 */
-#define POWERFS_CHUNK_SIZE      (2 * 1024 * 1024)    /* 2MB */
+/* Chunk 和 Stripe 大小
+ * chunk_size 与用户态 (powerfs-layout) 统一为 1MB, 见 file-layout-design.md §9.
+ * stripe_size (64MB) 是写批处理 lease 单元, 非布局 Placement::Stripe 的 stripe_size. */
+#define POWERFS_CHUNK_SIZE      (1 * 1024 * 1024)    /* 1MB — 与用户态 P4 统一 */
 #define POWERFS_STRIPE_SIZE     (64 * 1024 * 1024)   /* 64MB */
 #define POWERFS_LEASE_DURATION  (30 * HZ)
 /* Phase 3: lease 续约阈值. 当 lease 剩余有效期 < 阈值时触发续约.
@@ -144,6 +146,42 @@ struct powerfs_lease {
     u64 content_size;
 };
 
+/* ========== FileLayout 枚举 (对齐 powerfs-layout crate) ========== */
+
+/* Placement 类型 (FieldId 0xA0, u8 tag) */
+enum powerfs_placement {
+    POWERFS_PLACEMENT_FLAT      = 0,
+    POWERFS_PLACEMENT_INLINE    = 1,
+    POWERFS_PLACEMENT_STRIPE    = 2,
+    POWERFS_PLACEMENT_WIDESTRIPE = 3,
+};
+
+/* Reliability 类型 (FieldId 0xA1, u8 tag) */
+enum powerfs_reliability {
+    POWERFS_RELIABILITY_SINGLE     = 0,
+    POWERFS_RELIABILITY_REPLICATED = 1,
+    POWERFS_RELIABILITY_EC         = 2,
+};
+
+/* ReliabilityState (FieldId 0xA2, u8) */
+enum powerfs_reliability_state {
+    POWERFS_RSTATE_PENDING     = 0,
+    POWERFS_RSTATE_REPLICATED  = 1,
+    POWERFS_RSTATE_EC          = 2,
+    POWERFS_RSTATE_DEGRADED    = 3,
+};
+
+/* FileLayout 解析结果 (从 GETATTR/CREATE TLV 响应提取) */
+struct powerfs_file_layout {
+    u8 placement;           /* enum powerfs_placement */
+    u8 reliability;         /* enum powerfs_reliability */
+    u8 reliability_state;   /* enum powerfs_reliability_state */
+    u32 chunk_size;         /* layout chunk_size, 默认 POWERFS_CHUNK_SIZE */
+    u32 inline_max_size;    /* Inline 阈值 (K2) */
+    bool has_placement;     /* 响应中是否包含 Placement 字段 */
+    bool has_reliability;   /* 响应中是否包含 Reliability 字段 */
+};
+
 struct powerfs_inode_info {
     struct netfs_inode netfs;          /* 内含 struct inode，必须第一个字段 */
 
@@ -163,6 +201,16 @@ struct powerfs_inode_info {
     u64 content_size;
     u64 volume_id;
     u64 file_key;   /* needle_id (base, chunk N = file_key + N), from Filer Create or GetAttr */
+
+    /* === K1: FileLayout 元数据 (从 GETATTR/CREATE TLV 解析) === */
+    u8 placement;           /* enum powerfs_placement, 默认 FLAT */
+    u8 reliability;         /* enum powerfs_reliability, 默认 SINGLE */
+    u8 reliability_state;   /* enum powerfs_reliability_state */
+    u32 layout_chunk_size;  /* 从 GETATTR 解析的 chunk_size, 默认 POWERFS_CHUNK_SIZE */
+
+    /* === K4: 副本 chunk 列表 (读 failover 使用, 从 GETATTR 0xB5 解析) === */
+    struct powerfs_chunk_map *replica_chunks;
+    u32 replica_count;
 
     /* 缓存有效性 */
     bool cache_valid;
@@ -198,23 +246,28 @@ static inline struct powerfs_inode_info *POWERFS_I(struct inode *inode)
     return container_of(inode, struct powerfs_inode_info, netfs.inode);
 }
 
+/* K1-5: powerfs_locate_chunk - 统一 chunk 定位 (Flat/Stripe 多卷入口)
+ *
+ * 按 offset 查找对应的 (volume_id, needle_id):
+ *   - chunks 数组存在且 chunk_idx 命中: 多卷查表 (Stripe/K3 路径)
+ *   - 否则: Flat 模型, needle_id = file_key + offset / chunk_size,
+ *     volume_id = inode->volume_id
+ *
+ * 调用方持 pi->i_lock 或确保 chunks 数组不被并发释放.
+ * 返回 0 成功, -EINVAL inline 文件 (不走 volume 路径) 或 chunk_idx 越界.
+ */
+int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
+                         u64 *volume_id_out, u64 *needle_id_out);
+
 /* ========== 客户端结构 (参考 ceph_fs_client) ========== */
 
 struct powerfs_client {
     struct super_block *sb;
-    
-    /* Master 服务地址 */
+
+    /* Master 服务地址 (唯一配置项, Filer/Volume 通过 Master 动态发现) */
     char master_addr[64];
     u16 master_port;
-    
-    /* Volume 服务地址 */
-    char volume_addr[64];
-    u16 volume_port;
-    
-    /* Filer 服务地址 */
-    char filer_addr[64];
-    u16 filer_port;
-    
+
     /* 通信层 */
     struct powerfs_comm *comm;
     
@@ -235,17 +288,9 @@ struct powerfs_sb_info {
     struct super_block *sb;
     struct powerfs_client *client;
 
-    /* Master 服务地址 */
+    /* Master 服务地址 (唯一配置项, Filer/Volume 通过 Master 动态发现) */
     char master_addr[64];
     u16  master_port;
-
-    /* Volume 服务地址 */
-    char volume_addr[64];
-    u16  volume_port;
-
-    /* Filer 服务地址 */
-    char filer_addr[64];
-    u16  filer_port;
 
     /* inode slab cache */
     struct kmem_cache *inode_cache;

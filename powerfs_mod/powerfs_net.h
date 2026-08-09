@@ -124,6 +124,11 @@ enum powerfs_net_msg_type {
 
     /* 一致性操作 */
     POWERFS_NET_MSG_INVALIDATE = 0x0032,
+    /* K1-6: close/fsync 时强一致同步 size+chunks 到 Filer (Raft).
+     * 对齐 powerfs-net MsgType::UpdateInodeSizeChunks (0x0034).
+     * K1 阶段内核不维护 chunks 列表, fsync 仍用 SETATTR;
+     * K2 (Inline close) / K3 (Stripe close) 切换到此消息. */
+    POWERFS_NET_MSG_UPDATE_INODE_SIZE_CHUNKS = 0x0034,
 
     /* 状态 */
     POWERFS_NET_MSG_STATFS = 0x0040,
@@ -219,6 +224,10 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_VCLOCK_ENTRIES = 0x32,
     POWERFS_NET_FLD_DELTA_OPS = 0x33,
 
+    /* K1-6: ShardId (u64), 对齐 powerfs-net FieldId::ShardId (0x70).
+     * 用于 UpdateInodeSizeChunks 等需 shard 路由的消息. */
+    POWERFS_NET_FLD_SHARD_ID = 0x70,
+
     /* Lease 字段 */
     POWERFS_NET_FLD_LEASE_ID = 0x40,
     POWERFS_NET_FLD_LEASE_DURATION = 0x41,
@@ -238,6 +247,39 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_INODE_V2 = 0x97,    /* inode (u64), needle 操作中与 FileKey 并存 */
     POWERFS_NET_FLD_USED_SPACE = 0x98,  /* used space (u64), matches Rust FieldId::UsedSpace */
     POWERFS_NET_FLD_FILE_COUNT = 0x99,  /* file count (u64), matches Rust FieldId::FileCount */
+
+    /* ===== FileLayout fields (0xA0-0xAF) — powerfs-layout crate ===== */
+    POWERFS_NET_FLD_PLACEMENT = 0xA0,       /* Placement 编码 (u8 tag + 后续) */
+    POWERFS_NET_FLD_RELIABILITY = 0xA1,     /* Reliability 编码 (u8 tag + count) */
+    POWERFS_NET_FLD_RELIABILITY_STATE = 0xA2, /* ReliabilityState (u8) */
+    POWERFS_NET_FLD_COMPRESSION = 0xA3,     /* CompressionState (u8), 预留 */
+    POWERFS_NET_FLD_CHUNK_LAYOUT = 0xA4,    /* 二进制 ChunkEncoding (替代 JSON Chunks) */
+    POWERFS_NET_FLD_HAS_MORE_CHUNKS = 0xA5, /* Paginated 标志 (u8) */
+    POWERFS_NET_FLD_NEXT_OFFSET = 0xA6,     /* LIST_CHUNKS 起始 (u64) */
+    POWERFS_NET_FLD_TOTAL_COUNT = 0xA7,     /* 总 chunk 数 (u32) */
+    POWERFS_NET_FLD_STRIPE_SIZE = 0xA8,     /* Stripe/WideStripe stripe_size (u64) */
+    POWERFS_NET_FLD_STRIPE_COUNT = 0xA9,    /* Stripe/WideStripe stripe_count (u32) */
+    POWERFS_NET_FLD_START_VOLUME_IDX = 0xAA, /* 起始 volume 索引 (u32) */
+    POWERFS_NET_FLD_VOLUME_IDS = 0xAB,      /* volume_ids 列表 (u64 LE 数组) */
+    POWERFS_NET_FLD_START_NEEDLE_ID = 0xAC, /* 首 needle_id (u64) */
+    POWERFS_NET_FLD_CHUNK_SIZE = 0xAD,      /* 单 chunk 大小 (u32), 统一 1MB */
+    POWERFS_NET_FLD_INLINE_DATA = 0xAE,     /* Inline 数据 (bytes, <=8KB) */
+    POWERFS_NET_FLD_INLINE_MAX_SIZE = 0xAF, /* Inline 阈值 (u32) */
+
+    /* ===== Coherence protocol fields (0xB0-0xB2), 预留 ===== */
+    POWERFS_NET_FLD_START_INODE = 0xB0,     /* AllocInodeBatch 起始 (u64), 预留 */
+    POWERFS_NET_FLD_END_INODE = 0xB1,       /* AllocInodeBatch 结束 (u64), 预留 */
+    POWERFS_NET_FLD_OPEN_COUNT = 0xB2,      /* open_count (u32), 预留 */
+
+    /* ===== Xattr fields (0xB3-0xB4), 预留 ===== */
+    POWERFS_NET_FLD_XATTR_KEY = 0xB3,       /* xattr 键 (string), 预留 */
+    POWERFS_NET_FLD_XATTR_VALUE = 0xB4,     /* xattr 值 (bytes), 预留 */
+
+    /* ===== Replica fields (0xB5) ===== */
+    POWERFS_NET_FLD_REPLICA_CHUNKS = 0xB5,  /* 副本 chunk 列表 (ChunkRef 二进制数组) */
+
+    /* ===== WideStripe range compression (0xB6) ===== */
+    POWERFS_NET_FLD_VOLUME_IDS_RANGE = 0xB6, /* 范围压缩: start_u64 + count_u32 = 12B */
 };
 
 /* ========== 帧头结构 (28 字节, packed) ========== */
@@ -331,6 +373,10 @@ int  powerfs_tlv_dec_string(struct powerfs_tlv_dec *dec, __u8 field,
 int  powerfs_tlv_dec_skip(struct powerfs_tlv_dec *dec, size_t length);
 bool powerfs_tlv_dec_is_empty(const struct powerfs_tlv_dec *dec);
 int  powerfs_tlv_dec_find_u64(struct powerfs_tlv_dec *dec, __u8 field, __u64 *val);
+int  powerfs_tlv_dec_find_u32(struct powerfs_tlv_dec *dec, __u8 field, __u32 *val);
+int  powerfs_tlv_dec_find_u8(struct powerfs_tlv_dec *dec, __u8 field, __u8 *val);
+int  powerfs_tlv_dec_find_raw(struct powerfs_tlv_dec *dec, __u8 field,
+                              const __u8 **val, size_t *len);
 
 /* ========== powerfs-net 连接管理 (v2: sk 回调 + per-CPU 调度器) ========== */
 
@@ -922,20 +968,27 @@ int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
                                int timeout_ms);
 
 /* GETATTR (返回完整属性含时间戳 + volume_id/file_key 用于数据直连) */
+struct powerfs_file_layout;  /* 定义在 powerfs.h */
+struct powerfs_chunk_map;   /* 定义在 powerfs.h */
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
                          __u64 *size, __u32 *nlink,
                          __u64 *mtime, __u64 *atime, __u64 *ctime,
-                         __u64 *volume_id, __u64 *file_key);
+                         __u64 *volume_id, __u64 *file_key,
+                         struct powerfs_file_layout *layout);
 
 /* SETATTR */
 int powerfs_net_setattr(__u64 ino, __u32 mode_valid, __u32 mode,
                          __u32 uid, __u32 gid, __u64 size);
 
-/* CREATE / MKDIR */
+/* CREATE / MKDIR
+ * layout: 输出参数, 解析 CREATE 响应中的 FileLayout (placement/reliability/
+ *         chunk_size). Flat 模式 Filer 不 encode layout, 此时 layout->has_placement
+ *         为 false, 调用方按默认 Flat 处理. 可为 NULL. */
 int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
                         __u32 mode, __u32 uid, __u32 gid, bool is_dir,
                         __u64 *ino_ret,
-                        __u64 *volume_id_ret, __u64 *file_key_ret);
+                        __u64 *volume_id_ret, __u64 *file_key_ret,
+                        struct powerfs_file_layout *layout);
 
 /* UNLINK / RMDIR */
 int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,
@@ -944,6 +997,25 @@ int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,
 /* RENAME */
 int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_len,
                        __u64 new_dir_ino, const char *new_name, size_t new_name_len);
+
+/* K1-6: UPDATE_INODE_SIZE_CHUNKS — close/fsync 时强一致同步 size+chunks 到 Filer.
+ *
+ * 对齐 FUSE sync_size_chunks_on_close (powerfs-fuse/src/fuse.rs L990):
+ *   - shard_id: 父目录 ino (Filer 用 calculate_shard 路由)
+ *   - ino: 文件 inode
+ *   - size: content_size
+ *   - client_id: 客户端标识 (用于去重/调试)
+ *   - chunks/chunk_count: chunk 映射数组, 可为 NULL (K1 阶段不传 chunks)
+ *
+ * 注意: Filer 端会用传入的 chunks 覆盖现有 chunks (update_inode_size_chunks_atomic).
+ *       K1 阶段内核不维护 chunks 列表, 不应调用此函数 (用 setattr 替代).
+ *       K2/K3 阶段内核维护 chunks 后, close/fsync 切换到此函数.
+ *
+ * 返回 0 成功, 负数错误码. */
+int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
+                                         const char *client_id,
+                                         const struct powerfs_chunk_map *chunks,
+                                         __u32 chunk_count);
 
 /* READDIR (匹配 Filer 协议: ParentIno + Limit + LastName 分页).
  * powerfs_net_readdir 用默认 5s 超时 (兼容旧调用方).

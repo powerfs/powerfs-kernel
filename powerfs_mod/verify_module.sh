@@ -161,7 +161,10 @@ DELTA_SYMBOLS=(
     "powerfs_net_add_server"
     "powerfs_net_is_connected"
     "powerfs_net_lookup"
-    "powerfs_net_disconnect"
+    "powerfs_net_getattr"
+    "powerfs_net_create"
+    "powerfs_net_read"
+    "powerfs_net_write"
 )
 
 for sym in "${DELTA_SYMBOLS[@]}"; do

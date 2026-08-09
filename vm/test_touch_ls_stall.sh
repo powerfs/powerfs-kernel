@@ -8,15 +8,28 @@
 #
 # 用法: ./test_touch_ls_stall.sh [持续时间秒数]
 # 默认: 120 秒
+#
+# 前置条件:
+#   - VM 已启动: ./qemuctl.sh debug   (调试模式, 实时 serial 日志)
+#   - powerfs 已挂载: ./qemuctl.sh mount
+#   - SSH 可达: ssh -p 2223 root@localhost (密码 powerfs)
 
 DURATION="${1:-120}"
-SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p 2223 root@localhost"
+SSH="sshpass -p powerfs ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -p 2223 root@localhost"
 
 echo "=== PowerFS touch+ls stall 隔离测试 ==="
 echo "持续时间: ${DURATION}s"
 echo "操作: touch (无写数据) + ls + 负 dentry 查找"
 echo "启动时间: $(date)"
 echo ""
+
+# VM 可达检查
+if ! $SSH "echo VM_OK" >/dev/null 2>&1; then
+    echo "[FATAL] VM 不可达 (ssh -p 2223 root@localhost)"
+    echo "        请先启动: ./qemuctl.sh debug"
+    exit 1
+fi
+echo "[OK] VM SSH 可达 (port 2223)"
 
 # 确保已挂载
 $SSH 'mountpoint /mnt/pfs 2>/dev/null || { mkdir -p /mnt/pfs && mount -t powerfs none /mnt/pfs; }' 2>/dev/null

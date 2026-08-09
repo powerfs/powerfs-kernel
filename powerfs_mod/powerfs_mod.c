@@ -22,39 +22,21 @@
 
 /* ========== 模块参数 ==========
  *
- * 默认值对齐 docker-compose 部署 (network: 172.30.0.0/24):
- *   master: 172.30.0.11/12/13, net_port=9334 (powerfs-net 端口)
- *   filer:  172.30.0.35/36/37, net_port=9334
- *   volume: 172.30.0.21/22/23, net_port=8901
+ * 架构: 只需配置 Master 地址 (3 个), Filer/Volume 地址全部通过
+ * Master 动态发现 (GetTopology / ListFilers).
+ * 不再需要手动配置 filer_addr / volume_addr.
  *
  * 注意: master_port 必须是 net_port (9334), 不是 grpc_port (9333),
  * 因为内核通过 powerfs-net (TLV) 协议与 Master 通信.
- * filer_port 同理, 使用 net_port 而非 grpc_port.
  */
 
 static char *master_addr = "172.30.0.11,172.30.0.12,172.30.0.13";
 module_param(master_addr, charp, 0644);
-MODULE_PARM_DESC(master_addr, "Master server addresses (comma-separated), powerfs-net port");
+MODULE_PARM_DESC(master_addr, "Master server addresses (comma-separated, 3 nodes for Raft)");
 
 static ushort master_port = 9334;
 module_param(master_port, ushort, 0644);
 MODULE_PARM_DESC(master_port, "Master powerfs-net port (default 9334, not gRPC 9333)");
-
-static char *volume_addr = "172.30.0.21,172.30.0.22,172.30.0.23";
-module_param(volume_addr, charp, 0644);
-MODULE_PARM_DESC(volume_addr, "Volume server addresses (comma-separated)");
-
-static ushort volume_port = 8901;
-module_param(volume_port, ushort, 0644);
-MODULE_PARM_DESC(volume_port, "Volume powerfs-net port (default 8901)");
-
-static char *filer_addr = "172.30.0.35,172.30.0.36,172.30.0.37";
-module_param(filer_addr, charp, 0644);
-MODULE_PARM_DESC(filer_addr, "Filer server addresses (comma-separated, fallback when Master discovery fails)");
-
-static ushort filer_port = 9334;
-module_param(filer_port, ushort, 0644);
-MODULE_PARM_DESC(filer_port, "Filer powerfs-net port (default 9334)");
 
 ushort shard_count = 2;  /* 默认 2, 对齐 Filer 配置 */
 module_param(shard_count, ushort, 0644);
@@ -65,20 +47,12 @@ MODULE_PARM_DESC(shard_count, "Filer shard count for metadata routing (default 2
 enum powerfs_param {
     Opt_master_addr,
     Opt_master_port,
-    Opt_volume_addr,
-    Opt_volume_port,
-    Opt_filer_addr,
-    Opt_filer_port,
     Opt_write_batch_kb,
 };
 
 static const struct fs_parameter_spec powerfs_fs_parameters[] = {
     fsparam_string("master_addr",  Opt_master_addr),
     fsparam_u32("master_port",     Opt_master_port),
-    fsparam_string("volume_addr",  Opt_volume_addr),
-    fsparam_u32("volume_port",     Opt_volume_port),
-    fsparam_string("filer_addr",   Opt_filer_addr),
-    fsparam_u32("filer_port",      Opt_filer_port),
     fsparam_u32("write_batch_kb",  Opt_write_batch_kb),
     {}
 };
@@ -86,10 +60,6 @@ static const struct fs_parameter_spec powerfs_fs_parameters[] = {
 struct powerfs_ctx {
     char master_addr[64];
     u16  master_port;
-    char volume_addr[64];
-    u16  volume_port;
-    char filer_addr[64];
-    u16  filer_port;
     u32  write_batch_kb;
 };
 
@@ -132,18 +102,6 @@ static int powerfs_parse_param(struct fs_context *fc, struct fs_parameter *param
     case Opt_master_port:
         ctx->master_port = (u16)result.uint_32;
         pr_info("powerfs: master_port = %u\n", ctx->master_port);
-        break;
-    case Opt_volume_addr:
-        strncpy(ctx->volume_addr, param->string, sizeof(ctx->volume_addr) - 1);
-        break;
-    case Opt_volume_port:
-        ctx->volume_port = (u16)result.uint_32;
-        break;
-    case Opt_filer_addr:
-        strncpy(ctx->filer_addr, param->string, sizeof(ctx->filer_addr) - 1);
-        break;
-    case Opt_filer_port:
-        ctx->filer_port = (u16)result.uint_32;
         break;
     case Opt_write_batch_kb:
         ctx->write_batch_kb = result.uint_32;
@@ -192,10 +150,6 @@ static int powerfs_init_fs_context(struct fs_context *fc)
     /* 默认值 */
     strncpy(ctx->master_addr, master_addr, sizeof(ctx->master_addr) - 1);
     ctx->master_port = master_port;
-    strncpy(ctx->volume_addr, volume_addr, sizeof(ctx->volume_addr) - 1);
-    ctx->volume_port = volume_port;
-    strncpy(ctx->filer_addr, filer_addr, sizeof(ctx->filer_addr) - 1);
-    ctx->filer_port = filer_port;
 
     /* writepages 批量大小默认 64KB (16 pages).
      * ROCE 网络可挂载时设为 1024 (1MB) ~ 65536 (64MB stripe). */
