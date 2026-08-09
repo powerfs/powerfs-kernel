@@ -211,6 +211,8 @@ OBJ_FILES=(
     "powerfs_tlv.o"
     "powerfs_transport.o"
     "powerfs_serializer.o"
+    "powerfs_flow.o"
+    "powerfs_ec.o"
     "powerfs_mod.o"
 )
 
