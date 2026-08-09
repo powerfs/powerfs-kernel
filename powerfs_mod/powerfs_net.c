@@ -3790,10 +3790,16 @@ int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
 {
     __u8 body[256];
     struct powerfs_tlv_enc enc;
-    __u8 resp_body[512];
+    __u8 *resp_body;
     size_t resp_body_len = 0;
     struct powerfs_tlv_dec dec;
     int ret;
+
+    /* K2: Inline 文件的 LOOKUP 响应携带 inline_data (最大 8KB),
+     * 栈上 512B 缓冲区会被截断 (RX_TRUNCATE → -E2BIG). 用 kvmalloc 动态分配. */
+    resp_body = kvmalloc(POWERFS_NET_RESP_INLINE_CAP, GFP_NOFS);
+    if (!resp_body)
+        return -ENOMEM;
 
     /* 编码请求: ParentIno + Name */
     powerfs_tlv_enc_init(&enc, body, sizeof(body));
@@ -3803,13 +3809,15 @@ int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
     ret = powerfs_net_send_request(POWERFS_NET_MSG_LOOKUP, dir_ino,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    resp_body, sizeof(resp_body),
+                                    resp_body, POWERFS_NET_RESP_INLINE_CAP,
                                     NULL, 0, timeout_ms,
                                     &resp_body_len, NULL);
     if (ret < 0)
-        return ret;
-    if (ret > 0)
-        return net_status_to_errno((__u16)ret);
+        goto out;
+    if (ret > 0) {
+        ret = net_status_to_errno((__u16)ret);
+        goto out;
+    }
 
     /* 解码响应 */
     if (resp_body_len > 0) {
@@ -3838,7 +3846,10 @@ int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
             parse_file_layout(&dec, layout);
     }
 
-    return 0;
+    ret = 0;
+out:
+    kvfree(resp_body);
+    return ret;
 }
 
 /* 兼容 wrapper: 用默认 10s 超时 (POWERFS_NET_RECV_TIMEOUT). */
@@ -3974,6 +3985,58 @@ static void parse_file_layout(struct powerfs_tlv_dec *dec,
         powerfs_tlv_dec_find_u32(dec, POWERFS_NET_FLD_INLINE_MAX_SIZE, &u32val) == 0)
         layout->inline_max_size = u32val;
 
+    /* === K2: InlineData (0xAE) — raw bytes, <=8KB ===
+     * Filer 在 Inline 模式下将文件数据编码在此字段, 客户端无需走 Volume RPC.
+     * 对齐 codec.rs decode_file_layout InlineData 分支.
+     * 安全检查: raw_len <= POWERFS_INLINE_MAX_SIZE (8KB), 防止异常大值 OOM. */
+    if (powerfs_tlv_dec_find_raw(dec, POWERFS_NET_FLD_INLINE_DATA, &raw, &raw_len) == 0) {
+        if (raw_len > 0 && raw_len <= POWERFS_INLINE_MAX_SIZE) {
+            /* 释放可能已存在的 (重复解析或 Placement tag 已携带) */
+            kfree(layout->inline_data);
+            layout->inline_data = kmalloc(raw_len, GFP_KERNEL);
+            if (layout->inline_data) {
+                memcpy(layout->inline_data, raw, raw_len);
+                layout->inline_len = raw_len;
+                layout->has_inline_data = true;
+            } else {
+                pr_warn("powerfs: InlineData kmalloc %zu failed\n", raw_len);
+            }
+        } else if (raw_len > POWERFS_INLINE_MAX_SIZE) {
+            pr_warn("powerfs: InlineData len %zu > %d, ignored\n",
+                    raw_len, POWERFS_INLINE_MAX_SIZE);
+        }
+    }
+
+    /* === K2: ChunkLayout (0xA4) — Filer 通过 encode_encoding 编码 InlineData ===
+     * Filer 的 encode_file_layout 将 InlineData 编码在 ChunkLayout 字段中:
+     *   [encoding_tag::INLINE_DATA(0x00)] [data_len u32 LE] [data...]
+     * 内核需从此字段提取 inline_data (对齐 codec.rs decode_file_layout ChunkLayout 分支).
+     * 仅当 InlineData (0xAE) 字段不存在时, 才从 ChunkLayout 提取 (0xAE 优先). */
+    if (!layout->has_inline_data &&
+        powerfs_tlv_dec_find_raw(dec, POWERFS_NET_FLD_CHUNK_LAYOUT, &raw, &raw_len) == 0) {
+        /* ChunkLayout 格式: [tag u8] [变体数据...]
+         * tag=0x00 (INLINE_DATA): [0x00] [len u32 LE] [data]
+         * tag=0x01 (PER_CHUNK):   [0x01] [count u32 LE] [ChunkRef...] */
+        if (raw_len >= 5 && raw[0] == 0x00) {
+            __u32 data_len = le32_to_cpup((__le32 *)&raw[1]);
+            if (data_len > 0 && data_len <= POWERFS_INLINE_MAX_SIZE &&
+                raw_len >= 5 + data_len) {
+                kfree(layout->inline_data);
+                layout->inline_data = kmalloc(data_len, GFP_KERNEL);
+                if (layout->inline_data) {
+                    memcpy(layout->inline_data, raw + 5, data_len);
+                    layout->inline_len = data_len;
+                    layout->has_inline_data = true;
+                    pr_info("powerfs: parse_file_layout ChunkLayout InlineData len=%u\n",
+                            data_len);
+                } else {
+                    pr_warn("powerfs: ChunkLayout InlineData kmalloc %u failed\n",
+                            data_len);
+                }
+            }
+        }
+    }
+
     /* === K3: Stripe 字段 (独立 FieldId 兜底, Placement 字段优先) === */
 
     /* StripeSize (0xA8) — u64, Placement 字段已携带时跳过 */
@@ -4053,10 +4116,15 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
 {
     __u8 body[64];
     struct powerfs_tlv_enc enc;
-    __u8 resp_body[512];
+    __u8 *resp_body;
     size_t resp_body_len = 0;
     struct powerfs_tlv_dec dec;
     int ret;
+
+    /* K2: Inline 文件的 GETATTR 响应携带 inline_data (最大 8KB). */
+    resp_body = kvmalloc(POWERFS_NET_RESP_INLINE_CAP, GFP_NOFS);
+    if (!resp_body)
+        return -ENOMEM;
 
     powerfs_tlv_enc_init(&enc, body, sizeof(body));
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
@@ -4064,13 +4132,15 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
     ret = powerfs_net_send_request(POWERFS_NET_MSG_GETATTR, ino,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    resp_body, sizeof(resp_body),
+                                    resp_body, POWERFS_NET_RESP_INLINE_CAP,
                                     NULL, 0, 10000,
                                     &resp_body_len, NULL);
     if (ret < 0)
-        return ret;
-    if (ret > 0)
-        return net_status_to_errno((__u16)ret);
+        goto out;
+    if (ret > 0) {
+        ret = net_status_to_errno((__u16)ret);
+        goto out;
+    }
 
     if (resp_body_len > 0) {
         __u64 tmp_ino = 0;
@@ -4099,7 +4169,10 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
         parse_file_layout(&dec, layout);
     }
 
-    return 0;
+    ret = 0;
+out:
+    kvfree(resp_body);
+    return ret;
 }
 
 /**
@@ -4122,11 +4195,16 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
 {
     __u8 body[256];
     struct powerfs_tlv_enc enc;
-    __u8 resp_body[256];
+    __u8 *resp_body;
     size_t resp_body_len = 0;
     struct powerfs_tlv_dec dec;
     __u16 msg_type;
     int ret;
+
+    /* K2: CREATE 响应可能携带 inline_data (Inline 模式新建文件时 Filer 返回 layout). */
+    resp_body = kvmalloc(POWERFS_NET_RESP_INLINE_CAP, GFP_NOFS);
+    if (!resp_body)
+        return -ENOMEM;
 
     msg_type = is_dir ? POWERFS_NET_MSG_MKDIR : POWERFS_NET_MSG_CREATE;
 
@@ -4156,13 +4234,15 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
     ret = powerfs_net_send_request(msg_type, dir_ino,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    resp_body, sizeof(resp_body),
+                                    resp_body, POWERFS_NET_RESP_INLINE_CAP,
                                     NULL, 0, POWERFS_META_TIMEOUT_MS,
                                     &resp_body_len, NULL);
     if (ret < 0)
-        return ret;
-    if (ret > 0)
-        return net_status_to_errno((__u16)ret);
+        goto out;
+    if (ret > 0) {
+        ret = net_status_to_errno((__u16)ret);
+        goto out;
+    }
 
     if (resp_body_len > 0) {
         powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
@@ -4181,7 +4261,10 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
             parse_file_layout(&dec, layout);
     }
 
-    return 0;
+    ret = 0;
+out:
+    kvfree(resp_body);
+    return ret;
 }
 
 /**
@@ -4270,18 +4353,22 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
 int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
                                          const char *client_id,
                                          const struct powerfs_chunk_map *chunks,
-                                         __u32 chunk_count)
+                                         __u32 chunk_count,
+                                         const __u8 *inline_data,
+                                         __u32 inline_len)
 {
-    /* body 大小估算: 固定头(~80B) + ChunkLayout(5 + 44*chunk_count).
-     * chunk_count=0 时 256B 足够; 多 chunk 动态分配. */
-    size_t body_cap = 256 + (size_t)chunk_count * 44 + 64;
+    /* body 大小估算: 固定头(~80B) + ChunkLayout(5 + 44*chunk_count) + inline_data.
+     * chunk_count=0 且无 inline_data 时 256B 足够; 多 chunk/大 inline 动态分配. */
+    bool is_inline = (inline_data != NULL && inline_len > 0);
+    size_t body_cap = 256 + (size_t)chunk_count * 44 + 64 + inline_len;
     __u8 *body;
     struct powerfs_tlv_enc enc;
     __u8 resp_body[128];
     size_t resp_body_len = 0;
     int ret;
 
-    /* ChunkLayout 动态编码缓冲: 1(tag) + 4(count) + 44*count */
+    /* ChunkLayout 动态编码缓冲: 1(tag) + 4(count) + 44*count.
+     * Inline 模式不传 ChunkLayout, 但仍分配 (跳过编码). */
     __u8 *layout_buf;
     size_t layout_len = 1 + 4 + (size_t)chunk_count * 44;
     const char *cid = client_id ? client_id : "kernel";
@@ -4320,16 +4407,34 @@ int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SIZE, size);
     powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID, cid, strlen(cid));
 
-    /* FileLayout: Placement=Flat, Reliability=SingleReplica,
-     * ReliabilityState=PendingReplicated, ChunkLayout=PerChunk */
-    powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_PLACEMENT, POWERFS_PLACEMENT_FLAT);
-    {
-        __u8 rel_buf[1] = { 0 }; /* SingleReplica tag = 0 */
-        powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_RELIABILITY, rel_buf, 1);
+    /* K2: Inline 模式 — Placement=INLINE + InlineData, 无 ChunkLayout.
+     * Flat 模式 — Placement=FLAT + ChunkLayout, 无 InlineData. */
+    if (is_inline) {
+        powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_PLACEMENT, POWERFS_PLACEMENT_INLINE);
+        {
+            __u8 rel_buf[1] = { 0 }; /* SingleReplica tag = 0 */
+            powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_RELIABILITY, rel_buf, 1);
+        }
+        powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_RELIABILITY_STATE,
+                           POWERFS_RSTATE_PENDING);
+        /* InlineData (0xAE) — 文件数据直接编码在 inode 元数据中 */
+        powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_INLINE_DATA,
+                              inline_data, inline_len);
+        /* InlineMaxSize (0xAF) — 通知 Filer 当前 inline 阈值 */
+        powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_INLINE_MAX_SIZE,
+                            POWERFS_INLINE_MAX_SIZE);
+    } else {
+        /* FileLayout: Placement=Flat, Reliability=SingleReplica,
+         * ReliabilityState=PendingReplicated, ChunkLayout=PerChunk */
+        powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_PLACEMENT, POWERFS_PLACEMENT_FLAT);
+        {
+            __u8 rel_buf[1] = { 0 }; /* SingleReplica tag = 0 */
+            powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_RELIABILITY, rel_buf, 1);
+        }
+        powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_RELIABILITY_STATE,
+                           POWERFS_RSTATE_PENDING);
+        powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_CHUNK_LAYOUT, layout_buf, layout_len);
     }
-    powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_RELIABILITY_STATE,
-                       POWERFS_RSTATE_PENDING);
-    powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_CHUNK_LAYOUT, layout_buf, layout_len);
 
     kfree(layout_buf);
 

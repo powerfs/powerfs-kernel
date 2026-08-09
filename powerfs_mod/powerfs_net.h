@@ -1010,6 +1010,7 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
  *   - size: content_size
  *   - client_id: 客户端标识 (用于去重/调试)
  *   - chunks/chunk_count: chunk 映射数组, 可为 NULL (K1 阶段不传 chunks)
+ *   - inline_data/inline_len: K2 Inline 文件数据, 非 NULL 时 Placement=INLINE
  *
  * 注意: Filer 端会用传入的 chunks 覆盖现有 chunks (update_inode_size_chunks_atomic).
  *       K1 阶段内核不维护 chunks 列表, 不应调用此函数 (用 setattr 替代).
@@ -1019,7 +1020,9 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
 int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
                                          const char *client_id,
                                          const struct powerfs_chunk_map *chunks,
-                                         __u32 chunk_count);
+                                         __u32 chunk_count,
+                                         const __u8 *inline_data,
+                                         __u32 inline_len);
 
 /* READDIR (匹配 Filer 协议: ParentIno + Limit + LastName 分页).
  * powerfs_net_readdir 用默认 5s 超时 (兼容旧调用方).

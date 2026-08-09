@@ -38,6 +38,14 @@
  * stripe_size (64MB) 是写批处理 lease 单元, 非布局 Placement::Stripe 的 stripe_size. */
 #define POWERFS_CHUNK_SIZE      (1 * 1024 * 1024)    /* 1MB — 与用户态 P4 统一 */
 #define POWERFS_STRIPE_SIZE     (64 * 1024 * 1024)   /* 64MB */
+
+/* K2: Inline 小文件硬上限 (与 FUSE INLINE_HARD_LIMIT / Filer INLINE_HARD_LIMIT 一致).
+ * 超过此大小的文件不走 Inline 模式, 直接走 Flat.
+ * inline_data 在 inode 中用指针 (kmalloc), 仅 Inline 文件分配, 避免浪费 slab. */
+#define POWERFS_INLINE_MAX_SIZE (8 * 1024)           /* 8KB */
+/* K2: 网络响应缓冲区容量 — LOOKUP/GETATTR/CREATE 响应可能携带 inline_data,
+ * 需容纳 8KB inline + ~512B 元数据开销. 栈上分配不安全, 用 kvmalloc. */
+#define POWERFS_NET_RESP_INLINE_CAP  (POWERFS_INLINE_MAX_SIZE + 512)
 #define POWERFS_LEASE_DURATION  (30 * HZ)
 /* Phase 3: lease 续约阈值. 当 lease 剩余有效期 < 阈值时触发续约.
  * 设为 DURATION/3 (10s): 在过期前 10s 续约, 留足网络往返 + 重试时间.
@@ -182,6 +190,12 @@ struct powerfs_file_layout {
     u32 chunk_size;         /* layout chunk_size, 默认 POWERFS_CHUNK_SIZE */
     u32 inline_max_size;    /* Inline 阈值 (K2) */
 
+    /* === K2: Inline 数据 (从 0xAE InlineData 字段解析) ===
+     * inline_data 在 parse 阶段 kmalloc, apply 阶段所有权转移给 inode
+     * (layout->inline_data 置 NULL). 调用方负责 parse 失败时 kfree. */
+    u8 *inline_data;            /* Inline 数据 (kmalloc), NULL=无 InlineData 字段 */
+    u32 inline_len;             /* inline_data 实际长度 */
+
     /* === K3: Stripe/WideStripe 元数据 ===
      * 从 Placement(0xA0) 后续字段 + 独立 FieldId 解析.
      * volume_ids 由调用方 apply 后转入 inode (kmalloc), layout 本身
@@ -195,6 +209,7 @@ struct powerfs_file_layout {
 
     bool has_placement;     /* 响应中是否包含 Placement 字段 */
     bool has_reliability;   /* 响应中是否包含 Reliability 字段 */
+    bool has_inline_data;   /* 响应中是否包含 InlineData 字段 */
 };
 
 struct powerfs_inode_info {
@@ -222,6 +237,22 @@ struct powerfs_inode_info {
     u8 reliability;         /* enum powerfs_reliability, 默认 SINGLE */
     u8 reliability_state;   /* enum powerfs_reliability_state */
     u32 layout_chunk_size;  /* 从 GETATTR 解析的 chunk_size, 默认 POWERFS_CHUNK_SIZE */
+
+    /* === K2: Inline 小文件数据缓冲 ===
+     * placement==INLINE 时, 文件数据存储在 inline_data (kmalloc), 不走 Volume RPC.
+     * - GETATTR/LOOKUP 响应含 InlineData (0xAE) 字段时, 分配并填充 inline_data
+     * - write 路径: 小文件写入 inline_data, 标记 inline_dirty
+     * - close/release: inline_dirty 时通过 UPDATE_INODE 提交到 Filer
+     * - 累计写入 > inline_max_size×1.5 时触发迁移到 Flat (K2-7)
+     * - 迁移到 Flat 后 inline_data 释放 (kfree + 置 NULL)
+     * - evict_inode/free_inode 中确保 kfree(inline_data)
+     *
+     * 并发保护: inline_data 由 i_lock (spinlock) 保护, 写路径持有 i_lock 修改.
+     * read 路径 (netfs_read_folio 回调) 持有 i_lock 读 inline_data. */
+    u8 *inline_data;            /* Inline 文件数据 (kmalloc), NULL=非 Inline */
+    u32 inline_len;             /* inline_data 实际长度 (字节) */
+    u32 inline_max_size;        /* Inline 阈值 (从 Filer 获取, 默认 POWERFS_INLINE_MAX_SIZE) */
+    bool inline_dirty;          /* inline_data 已修改, close 时需提交到 Filer */
 
     /* === K3: Stripe/WideStripe 多卷元数据 ===
      * 从 GETATTR/CREATE 响应解析, 由 powerfs_apply_layout_to_inode() 填充.
@@ -299,8 +330,9 @@ int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
  *
  * 在持 pi->i_lock 的情况下调用 (或确保 inode 未被并发访问).
  * volume_ids 所有权从 layout 转移到 inode (layout->volume_ids 置 NULL).
- * 若 inode 已有 volume_ids, 先 kfree 旧的再替换 (避免泄漏).
- * 调用方负责在 layout 解析失败时 kfree(layout.volume_ids). */
+ * inline_data 所有权从 layout 转移到 inode (layout->inline_data 置 NULL).
+ * 若 inode 已有 volume_ids/inline_data, 先 kfree 旧的再替换 (避免泄漏).
+ * 调用方负责在 layout 解析失败时 kfree(layout.volume_ids) 和 kfree(layout.inline_data). */
 void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
                                    struct powerfs_file_layout *layout);
 
