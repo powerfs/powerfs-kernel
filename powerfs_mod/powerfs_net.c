@@ -4831,35 +4831,51 @@ static int powerfs_net_read_ec(struct powerfs_inode_info *pi, __u64 ino,
         goto out;
     }
 
-    /* 1. 读取所有 shards (data + parity), 失败/CRC不匹配视为缺失 */
+    /* 1. 读取所有 shards (data + parity), 失败/CRC不匹配视为缺失.
+     * 持锁快照每个 shard 的 (volume_id, needle_id, crc32), 然后释放锁
+     * 做网络 I/O — 避免 ec_chunks 被 GETATTR 并发释放导致 UAF. */
     for (i = 0; i < total_shards; i++) {
-        struct powerfs_chunk_map *chunk = &pi->ec_chunks[group_base + i];
-        u32 crc_expected = chunk->crc32;
+        u64 shard_vid, shard_nid;
+        u32 shard_crc;
         __u32 shard_len = 0;
+
+        spin_lock(&pi->i_lock);
+        if (!pi->ec_chunks || group_base + i >= pi->ec_chunk_count) {
+            spin_unlock(&pi->i_lock);
+            pr_warn("powerfs: EC read ino=%llu shard=%u ec_chunks changed\n",
+                    (unsigned long long)ino, i);
+            continue;
+        }
+        shard_vid = pi->ec_chunks[group_base + i].volume_id;
+        shard_nid = pi->ec_chunks[group_base + i].needle_id;
+        shard_crc = pi->ec_chunks[group_base + i].crc32;
+        spin_unlock(&pi->i_lock);
 
         shards[i] = kmalloc(POWERFS_CHUNK_SIZE, GFP_KERNEL);
         if (!shards[i])
             continue;
 
-        ret = powerfs_net_read_needle(chunk->volume_id, chunk->needle_id,
+        ret = powerfs_net_read_needle(shard_vid, shard_nid,
                                        shards[i], POWERFS_CHUNK_SIZE,
                                        &shard_len);
         if (ret < 0) {
-            pr_warn("powerfs: EC read ino=%llu group=%llu shard=%u failed: %d\n",
+            pr_warn("powerfs: EC read ino=%llu group=%llu shard=%u "
+                    "vid=%llu nid=%llu failed: %d\n",
                     (unsigned long long)ino, (unsigned long long)group_idx,
-                    i, ret);
+                    i, (unsigned long long)shard_vid,
+                    (unsigned long long)shard_nid, ret);
             kfree(shards[i]);
             shards[i] = NULL;
             continue;
         }
 
         /* K4-4: CRC32 校验, 不匹配视为缺失 (由 parity 重建). */
-        if (crc_expected != 0 && shard_len > 0) {
+        if (shard_crc != 0 && shard_len > 0) {
             u32 crc_actual = crc32_le(~0, shards[i], shard_len) ^ ~0;
-            if (crc_actual != crc_expected) {
+            if (crc_actual != shard_crc) {
                 pr_warn("powerfs: EC CRC mismatch ino=%llu shard=%u "
                         "expected=%#x actual=%#x — will reconstruct\n",
-                        (unsigned long long)ino, i, crc_expected, crc_actual);
+                        (unsigned long long)ino, i, shard_crc, crc_actual);
                 kfree(shards[i]);
                 shards[i] = NULL;
                 continue;
@@ -4878,7 +4894,7 @@ static int powerfs_net_read_ec(struct powerfs_inode_info *pi, __u64 ino,
 
         if (data_available == data_shards) {
             /* Fast path: 所有 data shards 可用 → 直接拼接 */
-            group_data = kmalloc(group_data_size, GFP_KERNEL);
+            group_data = kvmalloc(group_data_size, GFP_KERNEL);
             if (!group_data) {
                 ret = -ENOMEM;
                 goto out;
@@ -4919,7 +4935,7 @@ static int powerfs_net_read_ec(struct powerfs_inode_info *pi, __u64 ino,
                 goto out;
             }
 
-            group_data = kmalloc(group_data_size, GFP_KERNEL);
+            group_data = kvmalloc(group_data_size, GFP_KERNEL);
             if (!group_data) {
                 ret = -ENOMEM;
                 goto out;
@@ -4940,7 +4956,7 @@ static int powerfs_net_read_ec(struct powerfs_inode_info *pi, __u64 ino,
     ret = 0;
 
 out:
-    kfree(group_data);
+    kvfree(group_data);
     if (shards) {
         for (i = 0; i < total_shards; i++)
             kfree(shards[i]);
