@@ -626,6 +626,14 @@ struct powerfs_net_server_conn {
     unsigned long reconnect_delay;  /* 当前退避间隔 (jiffies) */
 #define POWERFS_NET_BASE_DELAY    1000    /* 初始 1s */
 #define POWERFS_NET_MAX_DELAY     30000   /* 最大 30s */
+
+    /* === 半开连接检测 (half-open detection) ===
+     * 问题: TCP 连接半开时 (filer 侧已关闭但 FIN 未到达内核, 或网络静默丢包),
+     * sk_state_change 不触发, 请求持续超时但连接不会被重置.
+     * 方案: 连续超时计数, 达阈值 (3 次) 触发 disconnect_one 强制重连.
+     * 成功完成请求时重置为 0. */
+    atomic_t consecutive_timeouts;
+#define POWERFS_NET_TIMEOUT_RECONNECT_THRESHOLD  3
 };
 
 /* Shard 路由表: shard_id → filer_idx */

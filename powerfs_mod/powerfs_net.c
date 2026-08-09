@@ -2394,6 +2394,7 @@ int powerfs_conn_connect_one(struct powerfs_net_server_conn *conn)
     powerfs_conn_set_state(conn, CONN_CONNECTED);
     conn->reconnect_count = 0;
     conn->reconnect_delay = 0;  /* 成功连接: 重置指数退避 */
+    atomic_set(&conn->consecutive_timeouts, 0);  /* 重置半开检测计数器 */
 
     /* v2: 安装 sk 回调 (替换 v1 的 kthread_run(rx_thread)).
      * 必须在状态转为 CONNECTED 后安装, 回调依赖 conn->sock 稳定.
@@ -2654,6 +2655,7 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         atomic_set(&conn->seq_counter, 1);
         conn->reconnect_count = 0;
         conn->reconnect_delay = 0;
+        atomic_set(&conn->consecutive_timeouts, 0);
 
         spin_lock_init(&conn->state_lock);
         init_waitqueue_head(&conn->sock_user_wq);
@@ -2716,6 +2718,7 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         atomic_set(&conn->seq_counter, 1);
         conn->reconnect_count = 0;
         conn->reconnect_delay = 0;
+        atomic_set(&conn->consecutive_timeouts, 0);
 
         spin_lock_init(&conn->state_lock);
         init_waitqueue_head(&conn->sock_user_wq);
@@ -3286,6 +3289,22 @@ static int powerfs_request_do_send(struct powerfs_request *req,
             if (!list_empty(&req->tx_list))
                 list_del_init(&req->tx_list);
             spin_unlock(&conn->tx_lock);
+
+            /* 半开连接检测: 连续超时达阈值 → 强制断连重连.
+             * 问题: TCP 半开时 (filer 侧关闭但 FIN 未达内核, 或网络静默丢包),
+             * sk_state_change 不触发, 连接不会被重置, 请求持续超时.
+             * 方案: 连续 N 次超时后调用 disconnect_one, 触发 reconnect_work.
+             * disconnect_one 会以 -ENOTCONN complete 所有 pending 请求,
+             * 上层 submit 重试时连接已重建. */
+            if (atomic_inc_return(&conn->consecutive_timeouts) >=
+                    POWERFS_NET_TIMEOUT_RECONNECT_THRESHOLD) {
+                pr_warn("powerfs: conn %s:%u half-open detected (%d consecutive timeouts), forcing reconnect\n",
+                        conn->addr, conn->port,
+                        atomic_read(&conn->consecutive_timeouts));
+                /* 避免重复触发: disconnect_one 内部会检查 state==CONN_CONNECTED */
+                if (conn->state == CONN_CONNECTED)
+                    queue_work(g_pool.reconn_wq, &conn->disconnect_work);
+            }
             return req->error;
         }
     }
@@ -3305,6 +3324,10 @@ static int powerfs_request_do_send(struct powerfs_request *req,
     if (!list_empty(&req->tx_list))
         list_del_init(&req->tx_list);
     spin_unlock(&conn->tx_lock);
+
+    /* 请求成功完成 → 重置半开连接检测计数器 */
+    if (!req->error)
+        atomic_set(&conn->consecutive_timeouts, 0);
 
     pr_debug("powerfs: request completed seq=%u msg_type=%u status=%u body=%zu data=%zu\n",
              seq, req->msg_type, req->resp_status,
@@ -6234,6 +6257,7 @@ static int pfs_ensure_volume_conn(const char *ip, __u16 port,
     atomic_set(&conn->seq_counter, 1);
     conn->reconnect_count = 0;
     conn->reconnect_delay = 0;
+    atomic_set(&conn->consecutive_timeouts, 0);
 
     spin_lock_init(&conn->state_lock);
     init_waitqueue_head(&conn->sock_user_wq);
