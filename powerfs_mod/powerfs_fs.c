@@ -1020,11 +1020,13 @@ int powerfs_init_inode(struct inode *inode, umode_t mode,
     strncpy(pi->name, name ? name : "", POWERFS_MAX_NAME_LEN - 1);
     pi->cache_valid = true;
     pi->cache_expire = jiffies + POWERFS_INODE_CACHE_TTL;
-    pi->dir_complete = true;  /* 本地缓存模式: 目录始终完整 */
-    /* Phase 1: 目录 lease 初始化.
-     * 新建目录: 设 lease 未过期 (空目录, 无需拉取).
-     * 新建普通文件: dir_lease_* 字段无意义, 但统一初始化. */
-    pi->dir_lease_expire = jiffies + POWERFS_DIR_LEASE_TTL;
+    /* dir_complete = false: looked-up directories must fetch entries from
+     * Filer on first readdir. Only mkdir (new empty directory) sets this
+     * to true after calling powerfs_init_inode. Setting true here causes
+     * readdir to take the fast-path with an empty dir_entries list,
+     * making directories appear empty after remount. */
+    pi->dir_complete = false;
+    pi->dir_lease_expire = 0;
     pi->dir_lease_epoch = 0;
 
     /* 初始化目录项链表 */
@@ -1044,7 +1046,8 @@ int powerfs_init_inode(struct inode *inode, umode_t mode,
         inode->i_op = &powerfs_dir_inode_operations;
         inode->i_fop = &powerfs_dir_operations;
         set_nlink(inode, 2);  /* "." + ".." */
-        pi->dir_complete = true;  /* 新建目录为空，认为 complete */
+        /* dir_complete stays false (set above). mkdir path sets it to
+         * true after powerfs_init_inode returns (new empty directory). */
         pr_debug("powerfs: init_inode DIR, i_fop=%p\n", inode->i_fop);
         break;
 
@@ -2181,6 +2184,15 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
                                dir->i_ino, dentry->d_name.name);
     if (!inode)
         return -ENOSPC;
+
+    /* For newly created directories, mark dir_complete=true (empty directory,
+     * no need to fetch from Filer). powerfs_init_inode sets it to false for
+     * the general case (LOOKUP path), so we override it here for mkdir. */
+    if (S_ISDIR(mode)) {
+        struct powerfs_inode_info *pi = POWERFS_I(inode);
+        WRITE_ONCE(pi->dir_complete, true);
+        WRITE_ONCE(pi->dir_lease_expire, jiffies + POWERFS_DIR_LEASE_TTL);
+    }
 
     /* P3.4: 将 Filer 分配的 volume_id + needle_id 存入 inode 私有数据 */
     if (S_ISREG(mode) && mknod_volume_id != 0) {
@@ -5649,9 +5661,12 @@ struct inode *powerfs_create_root(struct super_block *sb)
 
     pi = POWERFS_I(root);
 
-    /* 根目录的父目录是自己 */
+    /* 根目录的父目录是自己.
+     * dir_complete=false: first readdir fetches from Filer to get any
+     * pre-existing entries. The root may have files from previous mounts. */
     pi->parent_ino = POWERFS_ROOT_INO;
-    pi->dir_complete = true;  /* 根目录初始为空，认为 complete */
+    WRITE_ONCE(pi->dir_complete, false);
+    WRITE_ONCE(pi->dir_lease_expire, 0);
 
     /* 根目录设置 uid/gid 为 0 */
     root->i_uid = GLOBAL_ROOT_UID;
