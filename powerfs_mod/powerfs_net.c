@@ -5323,9 +5323,17 @@ int powerfs_net_write(__u64 ino, __u64 volume_id, __u64 file_key,
 
 /**
  * powerfs_net_setattr - 设置文件属性
+ *
+ * TLV body: Ino + optional {Mode, Uid, Gid, Size, Mtime, Atime}.
+ * Each optional field is encoded only when its bit is set in mode_valid,
+ * allowing the Filer to distinguish "not set" (None) from "set to 0".
+ *
+ * mtime/atime are unix seconds. Callers that only sync SIZE (writeback,
+ * fsync) pass mode_valid without MTIME/ATIME bits and mtime=atime=0.
  */
 int powerfs_net_setattr(__u64 ino, __u32 mode_valid, __u32 mode,
-                        __u32 uid, __u32 gid, __u64 size)
+                        __u32 uid, __u32 gid, __u64 size,
+                        __u64 mtime, __u64 atime)
 {
     __u8 body[128];
     struct powerfs_tlv_enc enc;
@@ -5344,6 +5352,10 @@ int powerfs_net_setattr(__u64 ino, __u32 mode_valid, __u32 mode,
         powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_GID, gid);
     if (mode_valid & POWERFS_ATTR_SIZE)
         powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SIZE, size);
+    if (mode_valid & POWERFS_ATTR_MTIME)
+        powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_MTIME, mtime);
+    if (mode_valid & POWERFS_ATTR_ATIME)
+        powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_ATIME, atime);
 
     ret = powerfs_net_send_request(POWERFS_NET_MSG_SETATTR, ino,
                                     body, powerfs_tlv_enc_len(&enc),

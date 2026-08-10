@@ -1309,7 +1309,7 @@ static void powerfs_setattr_work_fn(struct work_struct *work)
         goto out;
 
     ret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
-                               0, 0, 0, i_size);
+                               0, 0, 0, i_size, 0, 0);
     if (ret < 0) {
         pr_warn("powerfs: async setattr ino=%lu size=%llu failed: %d\n",
                 inode->i_ino, i_size, ret);
@@ -1382,7 +1382,7 @@ static int powerfs_write_inode(struct inode *inode, struct writeback_control *wb
          * 注意: sync(2) 会在 per-CPU writeback 线程中触发 WB_SYNC_ALL,
          * 此时不能阻塞 (PF_WQ_WORKER), 走 offload 路径. */
         int ret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
-                                       0, 0, 0, (__u64)i_size);
+                                       0, 0, 0, (__u64)i_size, 0, 0);
         if (ret < 0) {
             pr_warn("powerfs: write_inode sync setattr ino=%lu size=%llu failed: %d\n",
                     inode->i_ino, (u64)i_size, ret);
@@ -2541,7 +2541,10 @@ static int powerfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 int powerfs_readlink(struct dentry *dentry, char *buffer, int buflen)
 {
     struct inode *inode = d_inode(dentry);
-    int ret;
+    struct powerfs_inode_info *pi;
+    struct page *page;
+    void *page_addr;
+    u32 len;
 
     pr_debug("powerfs: readlink '%pd'\n", dentry);
 
@@ -2551,46 +2554,87 @@ int powerfs_readlink(struct dentry *dentry, char *buffer, int buflen)
     if (!S_ISLNK(inode->i_mode))
         return -EINVAL;
 
-    /*
-     * 本地缓存模式: 直接从 page cache 读取
-     *
-     * 不再从代理读取 (避免同步通信导致的 RCU stall)
-     * 符号链接目标存储在 page cache 中 (由 page_symlink 写入)
-     */
-
-    /*
-     * 从 page cache 读取 (本地缓存/纯内存模式)
-     */
-    {
-        struct page *page;
-        void *page_addr;
-        u32 len;
-
-        if (inode->i_size == 0) {
-            pr_warn("powerfs: readlink '%pd' empty target\n", dentry);
-            buffer[0] = '\0';
-            return 0;
-        }
-
-        len = min_t(u32, (u64)inode->i_size, buflen - 1);
-
-        page = find_get_page(inode->i_mapping, 0);
-        if (!page) {
-            pr_warn("powerfs: readlink '%pd' no page cache\n", dentry);
-            buffer[0] = '\0';
-            return 0;
-        }
-
-        page_addr = kmap(page);
-        memcpy(buffer, page_addr, len);
-        buffer[len] = '\0';
-        kunmap(page);
-        put_page(page);
-
-        pr_debug("powerfs: readlink '%pd' from cache: '%s'\n",
-                 dentry, buffer);
+    if (inode->i_size == 0) {
+        pr_warn("powerfs: readlink '%pd' empty target\n", dentry);
+        buffer[0] = '\0';
         return 0;
     }
+
+    len = min_t(u32, (u64)inode->i_size, buflen - 1);
+
+    /* 1. Try page cache first (fast path, works before remount). */
+    page = find_get_page(inode->i_mapping, 0);
+    if (!page) {
+        pi = POWERFS_I(inode);
+
+        /* 2. Check inline_data (set by powerfs_symlink or GETATTR response). */
+        spin_lock(&pi->i_lock);
+        if (pi->inline_data && pi->inline_len > 0) {
+            u32 copy_len = min_t(u32, pi->inline_len, len);
+            memcpy(buffer, pi->inline_data, copy_len);
+            buffer[copy_len] = '\0';
+            spin_unlock(&pi->i_lock);
+            pr_debug("powerfs: readlink '%pd' from inline_data: '%s'\n",
+                     dentry, buffer);
+            return 0;
+        }
+        spin_unlock(&pi->i_lock);
+
+        /* 3. No inline_data: fetch via GETATTR (symlink target is stored as
+         * inline_data on the Filer, but LOOKUP response may not include it).
+         * After GETATTR, inline_data is populated and we can read from it. */
+        {
+            struct powerfs_file_layout layout = {0};
+            __u32 mode = 0, uid = 0, gid = 0, nlink = 0;
+            __u64 size = 0, mtime = 0, atime = 0, ctime = 0;
+            __u64 volume_id = 0, file_key = 0;
+            int ret;
+
+            ret = powerfs_net_getattr(inode->i_ino, &mode, &uid, &gid,
+                                      &size, &nlink, &mtime, &atime, &ctime,
+                                      &volume_id, &file_key, &layout);
+            if (ret == 0) {
+                spin_lock(&pi->i_lock);
+                powerfs_apply_layout_to_inode(pi, &layout);
+                if (pi->inline_data && pi->inline_len > 0) {
+                    u32 copy_len = min_t(u32, pi->inline_len, len);
+                    memcpy(buffer, pi->inline_data, copy_len);
+                    buffer[copy_len] = '\0';
+                    spin_unlock(&pi->i_lock);
+                    pr_debug("powerfs: readlink '%pd' from GETATTR inline: '%s'\n",
+                             dentry, buffer);
+                    kfree(layout.volume_ids);
+                    kfree(layout.replica_chunks);
+                    kfree(layout.ec_chunks);
+                    return 0;
+                }
+                spin_unlock(&pi->i_lock);
+            }
+            kfree(layout.volume_ids);
+            kfree(layout.inline_data);
+            kfree(layout.replica_chunks);
+            kfree(layout.ec_chunks);
+        }
+
+        /* 4. GETATTR didn't return inline_data: try read_cache_page as
+         * last resort (triggers netfs_read_folio for Flat files). */
+        page = read_cache_page(inode->i_mapping, 0, NULL, NULL);
+        if (IS_ERR(page)) {
+            pr_warn("powerfs: readlink '%pd' read_cache_page failed: %ld\n",
+                    dentry, PTR_ERR(page));
+            buffer[0] = '\0';
+            return 0;
+        }
+    }
+
+    page_addr = kmap(page);
+    memcpy(buffer, page_addr, len);
+    buffer[len] = '\0';
+    kunmap(page);
+    put_page(page);
+
+    pr_debug("powerfs: readlink '%pd' from cache: '%s'\n", dentry, buffer);
+    return 0;
 }
 
 /* ========== 目录操作: link (硬链接) ========== */
@@ -2807,7 +2851,7 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
     if (powerfs_net_is_connected()) {
         __u32 valid = 0;
         __u32 m = 0, u = 0, g = 0;
-        __u64 sz = 0;
+        __u64 sz = 0, mt = 0, at = 0;
 
         if (ia_valid & ATTR_MODE) {
             valid |= POWERFS_ATTR_MODE;
@@ -2825,12 +2869,25 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
             valid |= POWERFS_ATTR_SIZE;
             sz = i_size_read(inode);
         }
+        /* ATTR_MTIME/ATTR_ATIME: persist timestamps so utimes(2)/touch
+         * survive remount. Read inode mtime/atime (already updated by
+         * setattr_copy above) via 6.17 accessors, convert to unix seconds.
+         * ATTR_CTIME is not forwarded (Filer sets ctime implicitly on
+         * size change). */
+        if (ia_valid & ATTR_MTIME) {
+            valid |= POWERFS_ATTR_MTIME;
+            mt = inode_get_mtime(inode).tv_sec;
+        }
+        if (ia_valid & ATTR_ATIME) {
+            valid |= POWERFS_ATTR_ATIME;
+            at = inode_get_atime(inode).tv_sec;
+        }
 
         if (valid) {
             int sret = powerfs_net_setattr(inode->i_ino, valid,
-                                            m, u, g, sz);
-            pr_debug("powerfs: SETATTR net ino=%lu valid=0x%x sz=%llu sret=%d\n",
-                    inode->i_ino, valid, sz, sret);
+                                            m, u, g, sz, mt, at);
+            pr_debug("powerfs: SETATTR net ino=%lu valid=0x%x sz=%llu mt=%llu at=%llu sret=%d\n",
+                    inode->i_ino, valid, sz, mt, at, sret);
             if (sret < 0)
                 pr_warn("powerfs: setattr net sync ino=%lu failed: %d\n",
                         inode->i_ino, sret);
@@ -4865,7 +4922,7 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
     pr_debug("powerfs: fsync after writeback i_size=%lld\n", i_size);
     if (i_size > 0) {
         int sret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
-                                        0, 0, 0, (__u64)i_size);
+                                        0, 0, 0, (__u64)i_size, 0, 0);
         if (sret < 0) {
             pr_warn("powerfs: fsync setattr size=%llu ino=%lu failed: %d\n",
                     (u64)i_size, inode->i_ino, sret);

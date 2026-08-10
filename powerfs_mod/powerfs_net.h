@@ -997,9 +997,13 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
                          __u64 *volume_id, __u64 *file_key,
                          struct powerfs_file_layout *layout);
 
-/* SETATTR */
+/* SETATTR
+ * mtime/atime: unix seconds (seconds since epoch), only sent when
+ *              mode_valid includes POWERFS_ATTR_MTIME/POWERFS_ATTR_ATIME.
+ *              Pass 0 when not applicable (e.g. writeback size-only sync). */
 int powerfs_net_setattr(__u64 ino, __u32 mode_valid, __u32 mode,
-                         __u32 uid, __u32 gid, __u64 size);
+                         __u32 uid, __u32 gid, __u64 size,
+                         __u64 mtime, __u64 atime);
 
 /* CREATE / MKDIR
  * layout: 输出参数, 解析 CREATE 响应中的 FileLayout (placement/reliability/

@@ -51,13 +51,11 @@ section() { echo -e "\n${CYAN}==== $* ====${NC}"; }
 check_dmesg_clean() {
     local since="$1"
     local label="$2"
-    local new_lines
-    new_lines=$(dmesg_since "$since" 2>/dev/null || echo 0)
-    if [ "$new_lines" -gt 0 ]; then
-        local dmesg_out
-        dmesg_out=$(vm "dmesg | tail -${new_lines}" 2>/dev/null | head -30)
+    local dmesg_out
+    dmesg_out=$(dmesg_since "$since" 2>/dev/null)
+    if [ -n "$dmesg_out" ]; then
         if echo "$dmesg_out" | grep -qiE 'BUG|panic|oops|WARNING|hung_task|lockup|slab-out|use-after-free|null.pointer|general.protection'; then
-            warn "${label}: dmesg has ${new_lines} new lines, potential issues:"
+            warn "${label}: dmesg has potential issues:"
             echo "$dmesg_out" | head -10 | sed 's/^/    /'
             return 1
         fi
@@ -115,7 +113,7 @@ RUN_TESTS=("$@")
 do_umount() {
     vm "umount ${MNT}" 2>/dev/null
     sleep 1
-    if vm "mountpoint -q ${MNT}" 2>/dev/null; then
+    if vm "mount | grep -q 'on ${MNT} type powerfs'" 2>/dev/null; then
         vm "umount -l ${MNT}" 2>/dev/null
         sleep 1
     fi
@@ -133,10 +131,10 @@ do_rmmmod() {
 
 do_remount() {
     vm "mkdir -p ${MNT}" 2>/dev/null
-    vm "mount -t powerfs none ${MNT} -o server=${FILER_ADDR:-10.0.2.2:9101}" 2>/dev/null
+    vm "mount -t powerfs none ${MNT}" 2>/dev/null
     sleep 2
-    if ! vm "mountpoint -q ${MNT}" 2>/dev/null; then
-        ng "remount failed: ${MNT} not mounted"
+    if ! vm "mount | grep -q 'on ${MNT} type powerfs'" 2>/dev/null; then
+        ng "remount" "remount failed: ${MNT} not mounted"
         return 1
     fi
     # 等待 dentry 加载
@@ -154,8 +152,14 @@ cycle_mount() {
         return 1
     fi
 
-    # 重新加载模块
-    vm "insmod /root/powerfs.ko" 2>/dev/null
+    # 重新加载模块 (需要 master_addr/master_port 参数, 从 /proc/cmdline 读取)
+    local cmdline master_addr master_port
+    cmdline=$(vm "cat /proc/cmdline" 2>/dev/null)
+    master_addr=$(echo "$cmdline" | grep -o 'powerfs_master_addr=[^ ]*' | head -1 | cut -d= -f2)
+    master_port=$(echo "$cmdline" | grep -o 'powerfs_master_port=[^ ]*' | head -1 | cut -d= -f2)
+    master_addr=${master_addr:-172.30.0.11,172.30.0.12,172.30.0.13}
+    master_port=${master_port:-9334}
+    vm "insmod /powerfs.ko master_addr=${master_addr} master_port=${master_port} shard_count=2" 2>/dev/null
     sleep 1
     if ! vm "lsmod | grep -q powerfs" 2>/dev/null; then
         ng "module reload failed"
@@ -212,7 +216,7 @@ test_t1() {
     "${QEMUCTL}" mount 2>/dev/null
     sleep 3
 
-    if ! vm "mountpoint -q ${MNT}" 2>/dev/null; then
+    if ! vm "mount | grep -q 'on ${MNT} type powerfs'" 2>/dev/null; then
         ng "T1" "mount failed"
         return 1
     fi
@@ -1094,8 +1098,14 @@ test_t11() {
         ok "T11: slab clean (final=${slab_final})"
     fi
 
-    # 重新挂载便于后续测试
-    vm "insmod /root/powerfs.ko" 2>/dev/null
+    # 重新挂载便于后续测试 (使用 cycle_mount 的参数读取逻辑)
+    local cmdline master_addr master_port
+    cmdline=$(vm "cat /proc/cmdline" 2>/dev/null)
+    master_addr=$(echo "$cmdline" | grep -o 'powerfs_master_addr=[^ ]*' | head -1 | cut -d= -f2)
+    master_port=$(echo "$cmdline" | grep -o 'powerfs_master_port=[^ ]*' | head -1 | cut -d= -f2)
+    master_addr=${master_addr:-172.30.0.11,172.30.0.12,172.30.0.13}
+    master_port=${master_port:-9334}
+    vm "insmod /powerfs.ko master_addr=${master_addr} master_port=${master_port} shard_count=2" 2>/dev/null
     sleep 1
     do_remount
     ok "T11: re-mounted for subsequent tests"
