@@ -1147,9 +1147,19 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     INIT_WORK(&pi->setattr_work, powerfs_setattr_work_fn);
     pi->setattr_pending = false;
 
-    /* 初始化目录缓存字段 */
+    /* 初始化目录缓存字段.
+     * MUST reset dir_complete/dir_lease_expire/dir_lease_epoch on every
+     * alloc_inode: the slab constructor (powerfs_inode_init_once) runs only
+     * on first slab page creation, NOT on object reuse. Without this reset,
+     * a reused inode inherits stale dir_complete=true + future
+     * dir_lease_expire from the previous inode, causing readdir to skip the
+     * Filer fetch and emit an empty dir_entries list (T3b/T3c/T9a/T9b
+     * "Directory not empty" failures after remount). */
     INIT_LIST_HEAD(&pi->dir_entries);
     mutex_init(&pi->dir_mutex);
+    WRITE_ONCE(pi->dir_complete, false);
+    WRITE_ONCE(pi->dir_lease_expire, 0);
+    pi->dir_lease_epoch = 0;
 
     pr_debug("powerfs: alloc_inode (pi=%p, inode=%p)\n", pi, &pi->netfs.inode);
 
@@ -2328,6 +2338,14 @@ static int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
 
     /* 清空子目录的目录项链表 */
     powerfs_clear_dir_entries(inode);
+
+    /* Invalidate the removed directory's own lease. Without this, the inode
+     * may stay in the inode cache (dentry references) with stale
+     * dir_complete=true + future dir_lease_expire. When the Filer reuses
+     * this inode number for a new directory, iget5_locked returns the cached
+     * inode, and readdir takes the fast-path with an empty dir_entries list,
+     * skipping the Filer fetch (T3b/T3c/T9a/T9b "Directory not empty"). */
+    powerfs_invalidate_dir_lease(inode);
 
     /* 从父目录的本地目录项链表中移除 */
     powerfs_remove_dir_entry(dir, dentry->d_name.name);
