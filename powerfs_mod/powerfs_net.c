@@ -2042,8 +2042,9 @@ static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
         if (ino != 0) {
             pr_debug("powerfs: invalidate ino=%llu version=%llu\n",
                     ino, version);
-            /* powerfs_invalidate_one() may sleep (invalidate_inode_pages2),
-             * safe here in process context (调度器线程). */
+            /* powerfs_invalidate_one() now defers all work (inode lookup +
+             * getattr + page cache invalidation) to powerfs_refresh_wq.
+             * This is non-blocking and safe to call from the RX dispatcher. */
             powerfs_invalidate_one(ino);
         } else {
             pr_warn("powerfs: notify frame missing Ino field\n");

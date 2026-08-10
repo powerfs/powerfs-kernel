@@ -99,12 +99,18 @@ static void powerfs_netfs_issue_read(struct netfs_io_subrequest *subreq)
         src = pi->inline_data;
         src_len = pi->inline_len;
         if (!src || src_len == 0) {
-            /* inline_data 未加载 (可能 GETATTR 未携带 InlineData).
-             * 回退到 Volume 路径 (虽然 Inline 文件不应有 needle, 但安全兜底). */
+            /* Inline 文件无 inline_data: 新建文件尚未写入, 或 GETATTR 未携带.
+             * 不回退到 Volume 路径 (Inline 文件无 needle, locate_chunk 返回 -EINVAL).
+             * 返回 0 字节 + HIT_EOF: netfs 将 folio 填零并标记 uptodate,
+             * write_begin 正常进行. 对齐 FUSE: read-before-write 对空文件返回 0.
+             * HIT_EOF 必须设置, 否则 netfs_read_collect 将 short read 转为 -ENODATA. */
             spin_unlock(&pi->i_lock);
-            pr_warn("powerfs: issue_read INLINE ino=%lu but no inline_data, fallback to volume\n",
+            pr_debug("powerfs: issue_read INLINE ino=%lu no inline_data, return 0 (HIT_EOF)\n",
                     inode->i_ino);
-            goto volume_read;
+            subreq->transferred = 0;
+            __set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
+            netfs_read_subreq_terminated(subreq);
+            return;
         }
 
         /* 计算可拷贝长度: 从 start 开始, 不超过 inline_len, 不超过请求 len */
@@ -114,6 +120,7 @@ static void powerfs_netfs_issue_read(struct netfs_io_subrequest *subreq)
             pr_debug("powerfs: issue_read INLINE ino=%lu start=%llu >= inline_len=%u, EOF\n",
                     inode->i_ino, (unsigned long long)start, src_len);
             subreq->transferred = 0;
+            __set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
             netfs_read_subreq_terminated(subreq);
             return;
         }
@@ -142,6 +149,10 @@ static void powerfs_netfs_issue_read(struct netfs_io_subrequest *subreq)
             spin_unlock(&pi->i_lock);
 
             subreq->transferred = copy_len;
+            /* 部分读取 (copy_len < len): inline 数据不足请求长度, 即 EOF.
+             * 必须设置 HIT_EOF, 否则 netfs_read_collect 将 short read 转为 -ENODATA. */
+            if (copy_len < len)
+                __set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
             pr_info("powerfs: issue_read INLINE ino=%lu start=%llu copy=%zu len=%u csum=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
                     inode->i_ino, (unsigned long long)start, copy_len, src_len, csum,
                     b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
@@ -153,6 +164,21 @@ static void powerfs_netfs_issue_read(struct netfs_io_subrequest *subreq)
 volume_read:
     /* K3: powerfs_net_read 内部按 offset 调用 powerfs_locate_chunk 定位
      * (volume_id, needle_id), 统一支持 Flat/Stripe/WideStripe. */
+
+    /* 新建 Flat 文件尚无 chunks (无 volume_id, file_key, chunks 数组):
+     * GETATTR 可能在 create 后返回 placement=Flat 但尚未分配 chunks.
+     * 此时不走 powerfs_net_read (locate_chunk 会返回 -EINVAL),
+     * 返回 0 字节 + HIT_EOF, 让 write_begin 正常进行 (read-before-write 无数据可读). */
+    if (pi->placement != POWERFS_PLACEMENT_INLINE &&
+        !pi->volume_id && !pi->file_key &&
+        !pi->chunks && !pi->volume_ids) {
+        pr_debug("powerfs: issue_read FLAT ino=%lu no chunks yet, return 0 (HIT_EOF)\n",
+                inode->i_ino);
+        subreq->transferred = 0;
+        __set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
+        netfs_read_subreq_terminated(subreq);
+        return;
+    }
 
     /* 基本功能阶段: 同步读取到临时 buffer, 再拷贝到 xarray 中的 folio.
      * 后续优化: 直接从 xarray 映射 folio, 避免额外拷贝 (参照 ceph).
@@ -190,6 +216,10 @@ volume_read:
 
     kvfree(buf);
     subreq->transferred = read_len;
+    /* 部分读取 (read_len < len): volume 数据不足请求长度, 即 EOF.
+     * 必须设置 HIT_EOF, 否则 netfs_read_collect 将 short read 转为 -ENODATA. */
+    if (read_len < len)
+        __set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
     netfs_read_subreq_terminated(subreq);
 }
 
@@ -748,8 +778,19 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
     __u64 volume_id = 0, file_key = 0;
     int ret;
 
-    if (!inode)
-        goto out_free;
+    /* If inode is NULL, do the lookup here (in workqueue context, not RX thread).
+     * This avoids blocking the RX dispatcher in ilookup5 → __wait_on_freeing_inode
+     * when the inode is being freed. The lookup may block, but only this workqueue
+     * thread is affected, not the RX thread that handles all network responses. */
+    if (!inode) {
+        struct super_block *sb = powerfs_get_sb();
+        if (!sb)
+            goto out_free;
+        inode = powerfs_find_inode(sb, rw->ino);
+        if (!inode)
+            goto out_free;
+        /* ilookup5 returned a referenced inode; iput at out_iput. */
+    }
 
     /* 防御性检查: inode 是否已被 evict (I_FREEING/I_CLEAR).
      * 虽然修复了 igrab 检查后不应出现此情况, 但 getattr 是长时间
@@ -771,6 +812,13 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
                  rw->ino);
         goto out_iput;
     }
+
+    /* Mark need_refresh: signals concurrent readers that a refresh is in flight.
+     * (Previously set in powerfs_invalidate_one before scheduling, but now
+     * the inode lookup is deferred to this work function.) */
+    spin_lock(&pi->i_lock);
+    pi->need_refresh = true;
+    spin_unlock(&pi->i_lock);
 
     /* 1. 发 getattr 获取最新元数据 */
     {
@@ -857,8 +905,24 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
             (unsigned long long)volume_id,
             (unsigned long long)file_key);
 
-    /* 3. 失效 page cache (clean pages), 使下次读从 volume 重新拉取 */
-    invalidate_inode_pages2(inode->i_mapping);
+    /* 3. 失效 page cache (clean unlocked pages), 使下次读从 volume 重新拉取.
+     * 使用非阻塞版本 invalidate_mapping_pages: 跳过已锁定/脏页, 不阻塞等待.
+     *
+     * 之前用 invalidate_inode_pages2 会在 __folio_lock 阻塞:
+     *   - 写路径持页锁期间 refresh worker 进入 D 状态
+     *   - 读路径持页锁期间同样阻塞 (页虽干净但被锁)
+     * 导致 hung_task 检测 (60s) 或测试脚本 D-state 检查失败.
+     *
+     * invalidate_mapping_pages 使用 trylock, 遇到锁定的页直接跳过:
+     *   - 被跳过的页会在下次 lookup 时自然失效 (cache_valid=false)
+     *   - 无 mmap 支持, 不需要 unmap 处理 */
+    invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
+
+    /* 4. For directories, expire the readdir lease so next readdir
+     * re-fetches entries from the Filer. (Moved from powerfs_invalidate_one
+     * since the inode lookup is now deferred to this work function.) */
+    if (S_ISDIR(inode->i_mode))
+        powerfs_invalidate_dir_lease(inode);
 
 out_iput:
     iput(inode);
@@ -875,97 +939,46 @@ out_free:
  * Called from the powerfs-net RX path when a NOTIFY frame arrives
  * from the Filer (triggered by another client's metadata mutation).
  *
- * Actions:
- *   1. Look up the inode in the VFS inode hash (ilookup5). If not
- *      cached locally, nothing to invalidate — return 0.
- *   2. invalidate_inode_pages2() to drop clean pages and force
- *      re-read from the Filer/Volume on next access.
- *   3. For directories, call powerfs_invalidate_dir_lease() so the
- *      next readdir re-fetches entries.
+ * This function is NON-BLOCKING and safe to call from the RX dispatcher.
+ * It defers ALL work (inode lookup, getattr, page cache invalidation,
+ * dir lease expiry) to powerfs_refresh_wq via powerfs_refresh_inode_work.
+ *
+ * Why deferral is required:
+ *   ilookup5 → find_inode → __wait_on_freeing_inode blocks if the inode
+ *   is being freed. In the RX thread, this blocks ALL response processing
+ *   (writeback completions, read responses, etc.), causing hung_task panic
+ *   after 60s. By deferring to a workqueue, only the workqueue thread
+ *   blocks, not the RX thread.
  *
  * We intentionally do NOT d_drop() here: the Fuser-side Invalidate
  * only carries (inode, version), so we don't know if the inode was
  * deleted or merely modified.  The next lookup/getattr will fetch
  * fresh metadata; if the inode no longer exists on the Filer, the
  * lookup returns negative and VFS evicts the dentry naturally.
- *
- * Must be called in process context (workqueue / tasklet work),
- * not in softirq — invalidate_inode_pages2 may sleep.
  */
 int powerfs_invalidate_one(u64 ino)
 {
-    struct super_block *sb = powerfs_get_sb();
-    struct inode *inode;
+    struct powerfs_refresh_work *rw;
 
-    if (!sb)
-        return -ENODEV;
-
-    inode = powerfs_find_inode(sb, ino);
-    if (!inode)
-        return 0;  /* not cached, nothing to invalidate */
-
-    /* 异步刷新 inode 元数据: 使用独立工作队列, 避免在调度器线程中
-     * 同步等待 getattr 响应 (self-deadlock: 调度器等待自己处理的响应).
+    /* Schedule async refresh work with inode=NULL: the work function will
+     * do the ilookup5 in workqueue context, NOT in the RX dispatcher thread.
      *
-     * 不再清除 cache_valid + 触发 d_invalidate + lookup_slow, 因为
-     * 该路径在并发场景下会触发 d_lock 死锁 (__d_lookup 自旋等待
-     * 被 d_invalidate 持有的 d_lock).
-     *
-     * 新方案: 保持 cache_valid=true, 通过异步 getattr 刷新 size/
-     * volume_id/file_key, 同时失效 page cache 使下次读重新拉取数据. */
-    {
-        struct powerfs_inode_info *pi = POWERFS_I(inode);
-        spin_lock(&pi->i_lock);
-        pi->need_refresh = true;
-        spin_unlock(&pi->i_lock);
+     * Why: ilookup5 → find_inode → __wait_on_freeing_inode blocks if the
+     * inode is being freed. In the RX thread, this blocks ALL response
+     * processing (including writeback completions), causing hung_task panic
+     * after 60s. Moving the lookup to a workqueue isolates the blocking. */
+    rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
+    if (!rw) {
+        pr_warn("powerfs: invalidate_one ino=%llu kmalloc failed, skipped\n", ino);
+        return -ENOMEM;
     }
 
-    /* 失效 page cache (clean pages), 使下次读从 volume 重新拉取.
-     * 放到独立工作队列处理, 避免在调度器线程中阻塞.
-     *
-     * 修复 crash: igrab 可能失败 (inode 处于 I_FREEING 状态),
-     * 未检查返回值会导致 refresh_work 访问已释放的 inode (use-after-free).
-     * ilookup5 返回的 inode 虽有引用, 但在极端并发下 (如 dentry 释放
-     * 触发 evict), igrab 仍可能失败. 失败时降级为清 cache_valid. */
-    {
-        struct powerfs_refresh_work *rw;
-        struct inode *grabbed;
+    INIT_WORK(&rw->work, powerfs_refresh_inode_work);
+    rw->ino = ino;
+    rw->inode = NULL;  /* NULL → work function will do ilookup5 */
+    queue_work(powerfs_refresh_wq, &rw->work);
 
-        grabbed = igrab(inode);
-        if (!grabbed) {
-            /* inode 正在被 evict, 降级: 清 cache_valid */
-            struct powerfs_inode_info *pi = POWERFS_I(inode);
-            spin_lock(&pi->i_lock);
-            pi->cache_valid = false;
-            spin_unlock(&pi->i_lock);
-            pr_debug("powerfs: invalidate_one ino=%llu igrab failed, fallback\n", ino);
-            goto skip_refresh;
-        }
-
-        rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
-        if (rw) {
-            INIT_WORK(&rw->work, powerfs_refresh_inode_work);
-            rw->ino = ino;
-            rw->inode = grabbed;  /* igrab 成功的引用, refresh_work 中 iput */
-            queue_work(powerfs_refresh_wq, &rw->work);
-        } else {
-            /* kmalloc 失败: 释放 igrab 引用, 降级清 cache_valid */
-            struct powerfs_inode_info *pi = POWERFS_I(grabbed);
-            spin_lock(&pi->i_lock);
-            pi->cache_valid = false;
-            spin_unlock(&pi->i_lock);
-            iput(grabbed);
-        }
-    }
-skip_refresh:
-
-    /* For directories, expire the readdir lease so next readdir
-     * re-fetches entries from the Filer. */
-    if (S_ISDIR(inode->i_mode))
-        powerfs_invalidate_dir_lease(inode);
-
-    pr_debug("powerfs: invalidate_one ino=%llu queued refresh\n", ino);
-    iput(inode);
+    pr_debug("powerfs: invalidate_one ino=%llu queued (lookup deferred to workqueue)\n", ino);
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_invalidate_one);
@@ -5378,9 +5391,12 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     }
     atomic_set(&sbi->wb_in_flight, 0);
 
-    /* 创建异步 inode 刷新工作队列 (NOTIFY → getattr 刷新元数据) */
+    /* 创建异步 inode 刷新工作队列 (NOTIFY → getattr 刷新元数据).
+     * max_active=4: 允许多个 refresh work 并发执行, 避免单个 ilookup5 阻塞
+     * (等待 I_FREEING inode) 导致所有 NOTIFY 处理积压.
+     * WQ_MEM_RECLAIM: 确保 memory reclaim 路径可以提交 work. */
     powerfs_refresh_wq = alloc_workqueue("powerfs_refresh",
-                                          WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+                                          WQ_UNBOUND | WQ_MEM_RECLAIM, 4);
     if (!powerfs_refresh_wq) {
         pr_err("powerfs: failed to create refresh workqueue\n");
         return -ENOMEM;
