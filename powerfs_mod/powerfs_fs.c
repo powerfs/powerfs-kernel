@@ -2585,12 +2585,15 @@ int powerfs_readlink(struct dentry *dentry, char *buffer, int buflen)
         return -EINVAL;
 
     if (inode->i_size == 0) {
-        pr_warn("powerfs: readlink '%pd' empty target\n", dentry);
-        buffer[0] = '\0';
-        return 0;
+        /* Symlink size may be 0 if created by an older Filer that didn't
+         * set size=target.len(). Fall through to inline_data / GETATTR
+         * instead of returning empty string. */
+        pr_debug("powerfs: readlink '%pd' size=0, trying inline/getattr\n", dentry);
     }
 
     len = min_t(u32, (u64)inode->i_size, buflen - 1);
+    if (len == 0)
+        len = buflen - 1;  /* fallback: allow GETATTR to fill the target */
 
     /* 1. Try page cache first (fast path, works before remount). */
     page = find_get_page(inode->i_mapping, 0);
@@ -3467,10 +3470,11 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
                 struct powerfs_dir_entry *de;
                 struct powerfs_net_dir_entry *ne = &net_entries[i];
 
-                /* 检查是否已存在 (避免重复) */
+                /* 检查是否已存在 (按名称去重, 不能用 ino — hardlink
+                 * 的多个目录项共享同一 inode 但名称不同) */
                 bool found = false;
                 list_for_each_entry(de, &dpi->dir_entries, list) {
-                    if (de->ino == ne->ino) {
+                    if (strcmp(de->name, ne->name) == 0) {
                         found = true;
                         break;
                     }
