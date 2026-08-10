@@ -4842,18 +4842,7 @@ static const struct address_space_operations powerfs_aops = {
 int powerfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
     pr_debug("powerfs: statfs\n");
-
-    buf->f_type = POWERFS_SUPER_MAGIC;
-    buf->f_bsize = 4096;
-    buf->f_frsize = 4096;
-    buf->f_blocks = 100000000;   /* 100TB */
-    buf->f_bfree = 50000000;     /* 50TB free */
-    buf->f_bavail = 50000000;
-    buf->f_files = 10000000;
-    buf->f_ffree = 5000000;
-    buf->f_namelen = POWERFS_MAX_NAME_LEN;
-
-    return 0;
+    return powerfs_net_statfs(buf);
 }
 
 /* ========== 文件操作 ========== */

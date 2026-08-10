@@ -217,6 +217,8 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_HARD_LINK_ID = 0x16,
     POWERFS_NET_FLD_OWNER = 0x17,
     POWERFS_NET_FLD_BACKEND = 0x18,
+    POWERFS_NET_FLD_FREE = 0x1A,
+    POWERFS_NET_FLD_FREE_INODES = 0x1B,
 
     /* 列表字段 */
     POWERFS_NET_FLD_LIMIT = 0x20,

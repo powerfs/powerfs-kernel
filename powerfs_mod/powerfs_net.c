@@ -5372,23 +5372,200 @@ int powerfs_net_setattr(__u64 ino, __u32 mode_valid, __u32 mode,
 }
 
 /**
- * powerfs_net_statfs - 获取文件系统统计信息
+ * powerfs_net_statfs - 获取文件系统统计信息 (查询 Master)
+ *
+ * 向 Master 发送 StatFs 请求, 聚合所有 volume 的 size/used/file_count.
+ * 结果缓存 30s (POWERFS_STATFS_CACHE_TTL), 避免频繁查询 Master.
+ * 缓存过期后同步查询 Master; 查询失败时回退到上次缓存值 (若有).
+ *
+ * 填充 kstatfs:
+ *   f_type     = POWERFS_SUPER_MAGIC
+ *   f_bsize    = block_size (4096)
+ *   f_blocks   = total_size / block_size
+ *   f_bfree    = free_size / block_size
+ *   f_bavail   = free_size / block_size
+ *   f_files    = total_files
+ *   f_ffree    = free_inodes
+ *   f_namelen  = POWERFS_MAX_NAME_LEN
  */
+#define POWERFS_STATFS_CACHE_TTL    (30 * HZ)  /* 30 seconds */
+
+static struct {
+    __u64 total_size;
+    __u64 free_size;
+    __u64 total_files;
+    __u64 free_inodes;
+    __u32 block_size;
+    unsigned long cached_jiffies;
+    bool valid;
+} g_statfs_cache;
+
+static DEFINE_SPINLOCK(g_statfs_cache_lock);
+
 int powerfs_net_statfs(struct kstatfs *stats)
 {
-    size_t resp_body_len = 0;
-    int ret;
+    unsigned long now = jiffies;
+    bool need_refresh = false;
+    __u64 total_size = 0, free_size = 0, total_files = 0, free_inodes = 0;
+    __u32 block_size = 4096;
 
-    ret = powerfs_net_send_request(POWERFS_NET_MSG_STATFS, 0,
-                                    NULL, 0,
-                                    NULL, 0,
-                                    (__u8 *)stats, sizeof(*stats),
-                                    NULL, 0, 2000,
-                                    &resp_body_len, NULL);
-    if (ret < 0)
-        return ret;
-    if (ret > 0)
-        return net_status_to_errno((__u16)ret);
+    /* 1. Check cache under spinlock */
+    spin_lock(&g_statfs_cache_lock);
+    if (g_statfs_cache.valid &&
+        time_before(now, g_statfs_cache.cached_jiffies + POWERFS_STATFS_CACHE_TTL)) {
+        /* Cache is fresh — use it */
+        total_size = g_statfs_cache.total_size;
+        free_size = g_statfs_cache.free_size;
+        total_files = g_statfs_cache.total_files;
+        free_inodes = g_statfs_cache.free_inodes;
+        block_size = g_statfs_cache.block_size;
+        spin_unlock(&g_statfs_cache_lock);
+
+        /* Fill kstatfs from cached data */
+        stats->f_type = POWERFS_SUPER_MAGIC;
+        stats->f_bsize = block_size;
+        stats->f_frsize = block_size;
+        stats->f_blocks = block_size ? total_size / block_size : 0;
+        stats->f_bfree = block_size ? free_size / block_size : 0;
+        stats->f_bavail = stats->f_bfree;
+        stats->f_files = total_files;
+        stats->f_ffree = free_inodes;
+        stats->f_namelen = POWERFS_MAX_NAME_LEN;
+        return 0;
+    }
+
+    /* Cache expired or invalid — need to query Master */
+    need_refresh = true;
+
+    /* If we have stale cached data, use it as fallback */
+    if (g_statfs_cache.valid) {
+        total_size = g_statfs_cache.total_size;
+        free_size = g_statfs_cache.free_size;
+        total_files = g_statfs_cache.total_files;
+        free_inodes = g_statfs_cache.free_inodes;
+        block_size = g_statfs_cache.block_size;
+    }
+    spin_unlock(&g_statfs_cache_lock);
+
+    if (!need_refresh)
+        goto fill_stats;
+
+    /* 2. Query Master for fresh data */
+    if (g_pool.master_set) {
+        char addr_buf[64];
+        char *p, *tok;
+        struct socket *sock = NULL;
+        __u8 resp_body[128];
+        __u8 resp_data[64];
+        size_t body_len = 0, data_len = 0;
+        struct powerfs_net_frame_hdr hdr;
+        __u32 seq;
+        int ret, i;
+
+        strncpy(addr_buf, g_pool.master_addr, sizeof(addr_buf) - 1);
+        addr_buf[sizeof(addr_buf) - 1] = '\0';
+
+        p = addr_buf;
+        while ((tok = strsep(&p, ",")) != NULL) {
+            struct powerfs_tlv_dec dec;
+
+            while (*tok == ' ')
+                tok++;
+            if (tok[0] == '\0')
+                continue;
+
+            /* Connect to Master */
+            sock = powerfs_net_create_tcp_socket();
+            if (!sock)
+                continue;
+
+            ret = powerfs_net_tcp_connect(sock, tok, g_pool.master_port);
+            if (ret < 0) {
+                powerfs_net_close_socket(sock);
+                continue;
+            }
+
+            /* Handshake */
+            ret = powerfs_net_do_handshake(sock);
+            if (ret < 0) {
+                powerfs_net_close_socket(sock);
+                continue;
+            }
+
+            /* Send StatFs request (empty body) */
+            seq = atomic_inc_return(&g_discover_seq);
+            powerfs_net_frame_hdr_encode(&hdr,
+                                          POWERFS_NET_MSG_STATFS,
+                                          POWERFS_NET_FLAG_REQUEST,
+                                          seq, 0, 0, 0, 0);
+
+            ret = powerfs_net_frame_send(sock, &hdr, NULL, 0, NULL, 0);
+            if (ret < 0) {
+                powerfs_net_close_socket(sock);
+                continue;
+            }
+
+            /* Receive response (skip NOTIFY frames) */
+            for (i = 0; i < 5; i++) {
+                ret = powerfs_net_frame_recv(sock, &hdr,
+                                              resp_body, sizeof(resp_body), &body_len,
+                                              resp_data, sizeof(resp_data), &data_len,
+                                              POWERFS_NET_RECV_TIMEOUT);
+                if (ret < 0)
+                    break;
+                if (hdr.flags & POWERFS_NET_FLAG_NOTIFY)
+                    continue;
+                break;
+            }
+
+            powerfs_net_close_socket(sock);
+
+            if (ret < 0) {
+                pr_debug("powerfs: statfs recv failed: %d\n", ret);
+                continue;
+            }
+
+            if (hdr.status != POWERFS_NET_STATUS_OK) {
+                pr_debug("powerfs: statfs status=%u\n", hdr.status);
+                continue;
+            }
+
+            /* Decode TLV response */
+            powerfs_tlv_dec_init(&dec, resp_body, body_len);
+            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_SIZE, &total_size);
+            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_FREE, &free_size);
+            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_NLINK, &total_files);
+            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_FREE_INODES, &free_inodes);
+            powerfs_tlv_dec_u32(&dec, POWERFS_NET_FLD_BLKSIZE, &block_size);
+
+            /* Update cache */
+            spin_lock(&g_statfs_cache_lock);
+            g_statfs_cache.total_size = total_size;
+            g_statfs_cache.free_size = free_size;
+            g_statfs_cache.total_files = total_files;
+            g_statfs_cache.free_inodes = free_inodes;
+            g_statfs_cache.block_size = block_size;
+            g_statfs_cache.cached_jiffies = now;
+            g_statfs_cache.valid = true;
+            spin_unlock(&g_statfs_cache_lock);
+
+            pr_debug("powerfs: statfs from master %s: total=%llu free=%llu files=%llu\n",
+                     tok, total_size, free_size, total_files);
+            break; /* Success — stop trying other masters */
+        }
+    }
+
+fill_stats:
+    /* 3. Fill kstatfs (from fresh data or stale fallback) */
+    stats->f_type = POWERFS_SUPER_MAGIC;
+    stats->f_bsize = block_size;
+    stats->f_frsize = block_size;
+    stats->f_blocks = block_size ? total_size / block_size : 0;
+    stats->f_bfree = block_size ? free_size / block_size : 0;
+    stats->f_bavail = stats->f_bfree;
+    stats->f_files = total_files;
+    stats->f_ffree = free_inodes;
+    stats->f_namelen = POWERFS_MAX_NAME_LEN;
 
     return 0;
 }
