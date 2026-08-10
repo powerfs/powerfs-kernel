@@ -337,6 +337,15 @@ struct powerfs_inode_info {
     struct work_struct setattr_work;
     bool setattr_pending;
 
+    /* === writeback 互斥 (防止并发 RMW 数据覆盖) ===
+     * powerfs_writepages 是异步的 (queue_work), 返回后异步 work 可能仍在执行.
+     * 若 writeback 线程再次调用 powerfs_writepages 处理同一 needle 的不同页面,
+     * 两个 RMW 并发会导致后写入的覆盖先写入的数据 (data corruption).
+     * wb_mutex 确保同一 inode 的 writeback 串行: writepages 获取, 最后一个
+     * batch 的 final_cleanup 释放. wb_batch_count 跟踪待完成 batch 数. */
+    struct mutex wb_mutex;
+    atomic_t wb_batch_count;
+
     /* shutdown 标志 (参考 ceph_inode_is_shutdown) */
     bool shutdown;
 };

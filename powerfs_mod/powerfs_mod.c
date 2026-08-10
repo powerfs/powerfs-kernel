@@ -38,9 +38,9 @@ static ushort master_port = 9334;
 module_param(master_port, ushort, 0644);
 MODULE_PARM_DESC(master_port, "Master powerfs-net port (default 9334, not gRPC 9333)");
 
-ushort shard_count = 2;  /* 默认 2, 对齐 Filer 配置 */
+ushort shard_count = 3;  /* 默认 3, 对齐 Filer 配置 (3 Filer × 3 shard) */
 module_param(shard_count, ushort, 0644);
-MODULE_PARM_DESC(shard_count, "Filer shard count for metadata routing (default 2)");
+MODULE_PARM_DESC(shard_count, "Filer shard count for metadata routing (default 3)");
 
 /* ========== fs_context 参数解析 ========== */
 

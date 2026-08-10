@@ -1150,6 +1150,10 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     INIT_WORK(&pi->setattr_work, powerfs_setattr_work_fn);
     pi->setattr_pending = false;
 
+    /* writeback 互斥: 防止并发 RMW 数据覆盖 */
+    mutex_init(&pi->wb_mutex);
+    atomic_set(&pi->wb_batch_count, 0);
+
     /* 初始化目录缓存字段.
      * MUST reset dir_complete/dir_lease_expire/dir_lease_epoch on every
      * alloc_inode: the slab constructor (powerfs_inode_init_once) runs only
@@ -3766,10 +3770,17 @@ static void powerfs_wb_final_cleanup(struct powerfs_writepage_work *wpw)
     struct inode *inode = wpw->inode;
     struct super_block *sb = inode->i_sb;
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
 
     pr_debug("powerfs: WB_FINAL_CLEANUP ino=%lu wb_in_flight=%d\n",
             inode->i_ino, atomic_read(&sbi->wb_in_flight));
     atomic_dec(&sbi->wb_in_flight);
+
+    /* writeback 互斥: 最后一个 batch 完成时释放 wb_mutex,
+     * 允许下一次 powerfs_writepages 执行. */
+    if (atomic_dec_and_test(&pi->wb_batch_count))
+        mutex_unlock(&pi->wb_mutex);
+
     iput(inode);
     /* 延迟释放 wpw: work_struct 在 wpw 中, workqueue 在 work_fn 返回后
      * 仍访问 work->data. call_rcu 等待 RCU 宽限期后释放. */
@@ -4017,6 +4028,9 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     /* 若无有效页面 (全为 count==0 或 locate 失败), 直接清理 */
     if (num_groups == 0) {
         atomic_dec(&sbi->wb_in_flight);
+        /* writeback 互斥: 最后一个 batch 完成时释放 wb_mutex */
+        if (atomic_dec_and_test(&pi->wb_batch_count))
+            mutex_unlock(&pi->wb_mutex);
         iput(inode);
         /* 延迟释放: 同 final_cleanup, work_fn 上下文不能直接 kvfree wpw. */
         call_rcu(&wpw->rcu, powerfs_wb_free_rcu);
@@ -4226,6 +4240,9 @@ fail_all:
         put_page(wpw->pages[i]);
     }
     atomic_dec(&sbi->wb_in_flight);
+    /* writeback 互斥: 最后一个 batch 完成时释放 wb_mutex */
+    if (atomic_dec_and_test(&pi->wb_batch_count))
+        mutex_unlock(&pi->wb_mutex);
     iput(inode);
     /* 延迟释放: 同 final_cleanup, work_fn 上下文不能直接 kvfree wpw
      * (work_struct 生命周期约束). */
@@ -4249,12 +4266,14 @@ int powerfs_writepages(struct address_space *mapping,
     struct inode *inode = mapping->host;
     struct super_block *sb = inode->i_sb;
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
     struct folio_batch fbatch;
     pgoff_t index = wbc->range_start >> PAGE_SHIFT;
     pgoff_t end = wbc->range_end >> PAGE_SHIFT;
     struct powerfs_writepage_work *batch = NULL;
     int batch_pages = sbi->write_batch_pages;
     int ret = 0;
+    bool wb_submitted = false;
 
     pr_debug("powerfs: WPAGES ino=%lu range=%llu-%llu nr_to_write=%ld sync_mode=%d\n",
             inode->i_ino, wbc->range_start, wbc->range_end, wbc->nr_to_write,
@@ -4310,6 +4329,13 @@ int powerfs_writepages(struct address_space *mapping,
         return 0;
     }
 
+    /* writeback 互斥: 确保同一 inode 的 writeback 串行执行.
+     * powerfs_writepages 是异步的 (queue_work), 返回后异步 work 可能仍在执行.
+     * 若 writeback 线程再次调用 powerfs_writepages 处理同一 needle 的不同
+     * 页面, 两个 RMW 并发会导致后写入的覆盖先写入的数据 (data corruption).
+     * mutex_lock 等待上一次 writeback 的所有 batch 完成. */
+    mutex_lock(&pi->wb_mutex);
+
     folio_batch_init(&fbatch);
 
     while (index <= end) {
@@ -4351,6 +4377,8 @@ int powerfs_writepages(struct address_space *mapping,
                                       / POWERFS_CHUNK_SIZE;
                 if (cur_needle_idx != prev_needle_idx) {
                     /* needle 边界变化: 提交当前 batch */
+                    atomic_inc(&pi->wb_batch_count);
+                    wb_submitted = true;
                     atomic_inc(&sbi->wb_in_flight);
                     queue_work(sbi->writeback_wq, &batch->work);
                     batch = NULL;
@@ -4402,6 +4430,8 @@ int powerfs_writepages(struct address_space *mapping,
 
             /* batch 满了，提交到 workqueue */
             if (batch->num_pages >= batch_pages) {
+                atomic_inc(&pi->wb_batch_count);
+                wb_submitted = true;
                 atomic_inc(&sbi->wb_in_flight);
                 queue_work(sbi->writeback_wq, &batch->work);
                 batch = NULL;
@@ -4421,6 +4451,8 @@ done:
     /* 提交剩余的 batch */
     if (batch) {
         if (batch->num_pages > 0) {
+            atomic_inc(&pi->wb_batch_count);
+            wb_submitted = true;
             atomic_inc(&sbi->wb_in_flight);
             queue_work(sbi->writeback_wq, &batch->work);
         } else {
@@ -4428,6 +4460,10 @@ done:
             kvfree(batch);
         }
     }
+
+    /* writeback 互斥: 如果没有提交任何 batch, 直接释放 wb_mutex */
+    if (!wb_submitted)
+        mutex_unlock(&pi->wb_mutex);
 
     return ret;
 }
