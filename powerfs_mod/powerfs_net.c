@@ -62,6 +62,119 @@ static bool g_initialized = false;
 /* 前向声明: g_pool 定义在后面 (多连接池实现段) */
 static struct powerfs_net_pool g_pool;
 
+/* Global ShardMap for range-based inode → shard_id routing.
+ * Equivalent to powerfs-allocator::ShardMap in the FUSE client.
+ * Initialized in discover_filers() from Master topology (0xBD entries
+ * or fallback to from_shard_count). */
+struct shard_map g_shard_map = {
+    .entry_count = 0,
+    .lock = __SPIN_LOCK_UNLOCKED(g_shard_map.lock),
+};
+
+/* ========== ShardMap implementation ========== */
+
+/* Route an inode to its shard_id via binary search.
+ * Returns 0 if the map is empty (should not happen in production). */
+__u64 shard_map_route(__u64 inode)
+{
+    int lo, hi, mid, idx;
+    __u64 sid;
+
+    spin_lock(&g_shard_map.lock);
+    if (g_shard_map.entry_count == 0) {
+        spin_unlock(&g_shard_map.lock);
+        return 0;
+    }
+    /* Binary search: find the last entry whose range_start <= inode */
+    lo = 0;
+    hi = g_shard_map.entry_count - 1;
+    idx = 0;
+    while (lo <= hi) {
+        mid = lo + (hi - lo) / 2;
+        if (g_shard_map.entries[mid].range_start <= inode) {
+            idx = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    sid = g_shard_map.entries[idx].shard_id;
+    spin_unlock(&g_shard_map.lock);
+    return sid;
+}
+EXPORT_SYMBOL_GPL(shard_map_route);
+
+/* Initialize from shard_count: equal 1M ranges per shard.
+ * Equivalent to Rust's ShardMap::from_shard_count. */
+void shard_map_from_shard_count(__u64 count)
+{
+    int i;
+    __u64 inode_per_shard = 1000000;  /* 1M per shard */
+    __u64 start = 0;
+
+    if (count == 0 || count > POWERFS_MAX_SHARDS)
+        count = 1;
+
+    spin_lock(&g_shard_map.lock);
+    g_shard_map.entry_count = (int)count;
+    for (i = 0; i < (int)count; i++) {
+        g_shard_map.entries[i].range_start = start;
+        g_shard_map.entries[i].range_end = start + inode_per_shard;
+        g_shard_map.entries[i].shard_id = (__u64)i;
+        start += inode_per_shard;
+    }
+    spin_unlock(&g_shard_map.lock);
+
+    pr_info("powerfs: ShardMap initialized from shard_count=%llu (%d ranges)\n",
+            (u64)count, (int)count);
+}
+EXPORT_SYMBOL_GPL(shard_map_from_shard_count);
+
+/* Reconstruct from Master-provided entries blob (0xBD).
+ * Each entry = 25 bytes: range_start:u64 LE + range_end:u64 LE +
+ * shard_id:u64 LE + state:u8. */
+int shard_map_from_entries(const __u8 *blob, size_t len)
+{
+    int entry_count, i;
+
+    if (!blob || len == 0)
+        return -EINVAL;
+
+    entry_count = len / 25;
+    if (entry_count == 0 || entry_count > POWERFS_MAX_SHARDS) {
+        pr_warn("powerfs: ShardMap entries count %d out of range\n", entry_count);
+        return -EINVAL;
+    }
+
+    spin_lock(&g_shard_map.lock);
+    g_shard_map.entry_count = entry_count;
+    for (i = 0; i < entry_count; i++) {
+        const __u8 *p = blob + i * 25;
+        g_shard_map.entries[i].range_start = get_unaligned_le64(p);
+        g_shard_map.entries[i].range_end = get_unaligned_le64(p + 8);
+        g_shard_map.entries[i].shard_id = get_unaligned_le64(p + 16);
+        /* p[24] = state (0=Active, 1=Draining) — both still routable */
+    }
+    /* Entries from Master are already sorted by range_start, but sort
+     * defensively in case of corruption. */
+    /* Simple insertion sort (entry_count is small, <= 64) */
+    for (i = 1; i < entry_count; i++) {
+        struct shard_map_entry tmp = g_shard_map.entries[i];
+        int j = i - 1;
+        while (j >= 0 && g_shard_map.entries[j].range_start > tmp.range_start) {
+            g_shard_map.entries[j + 1] = g_shard_map.entries[j];
+            j--;
+        }
+        g_shard_map.entries[j + 1] = tmp;
+    }
+    spin_unlock(&g_shard_map.lock);
+
+    pr_info("powerfs: ShardMap initialized from Master entries (%d ranges)\n",
+            entry_count);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(shard_map_from_entries);
+
 /* 从模块参数获取 (定义在 powerfs_mod.c) */
 extern ushort shard_count;
 
@@ -2632,6 +2745,12 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         spin_lock_init(&g_pool.shard_route.entries[i].req_lock);
     }
     g_pool.shard_route.shard_count = shard_count;  /* 从模块参数获取 */
+
+    /* Initialize global ShardMap from module param as fallback.
+     * Overridden by Master topology (0xBD) in discover_volumes when
+     * the Master advertises ShardMapEntries. Equivalent to Rust's
+     * ShardMap::from_shard_count — equal 1M ranges per shard. */
+    shard_map_from_shard_count(shard_count);
 
     /* 3. 从现有 servers[] 列表初始化 filer 连接
      *    (servers[] 由 powerfs_net_discover_filers 或 powerfs_net_set_filers 填充)
@@ -7355,6 +7474,42 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
                         (unsigned long long)vid, data_idx, meta_idx, vaddr);
             }
             spin_unlock(&g_pool.vol_route_lock);
+        }
+
+        /* Parse ShardMap from topology response.
+         * Prefer Master-provided entries (0xBD, 25B per entry) to stay
+         * in sync with the Filer after shard splits. Fall back to
+         * TotalShards (0xB8) → from_shard_count, or the module param
+         * (already applied in pool_init) if neither is present. */
+        {
+            const __u8 *entries_blob = NULL;
+            size_t entries_len = 0;
+            __u64 total_shards = 0;
+            int sm_ret;
+
+            /* powerfs_tlv_dec_find_raw resets dec->pos to 0 and scans
+             * from the start, so order of these lookups doesn't matter. */
+            sm_ret = powerfs_tlv_dec_find_raw(&dec,
+                                               POWERFS_NET_FLD_SHARD_MAP_ENTRIES,
+                                               &entries_blob, &entries_len);
+            if (sm_ret == 0 && entries_len > 0) {
+                if (shard_map_from_entries(entries_blob, entries_len) == 0) {
+                    pr_info("powerfs: ShardMap updated from Master entries (0xBD, %zu bytes)\n",
+                            entries_len);
+                } else {
+                    pr_warn("powerfs: ShardMap entries (0xBD) parse failed, keeping fallback map\n");
+                }
+            } else if (powerfs_tlv_dec_find_u64(&dec,
+                                                 POWERFS_NET_FLD_TOTAL_SHARDS,
+                                                 &total_shards) == 0
+                       && total_shards > 0) {
+                shard_map_from_shard_count(total_shards);
+                pr_info("powerfs: ShardMap updated from TotalShards (0xB8=%llu)\n",
+                        (u64)total_shards);
+            } else {
+                pr_info("powerfs: Master topology has no ShardMap fields, keeping module-param fallback (shard_count=%u)\n",
+                        shard_count);
+            }
         }
 
         pr_info("powerfs: discover_volumes complete, %d routes added (vol_route_count=%d)\n",

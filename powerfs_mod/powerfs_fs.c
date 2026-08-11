@@ -4659,8 +4659,8 @@ static int powerfs_migrate_inline_to_flat(struct inode *inode,
             ino, snap_len);
 
     /* 2. 调 Filer MIGRATE_INLINE_ALLOC 分配 (volume_id, needle_id).
-     * shard_id = parent_ino (Filer 路由, 对齐 FUSE). */
-    shard_id = pi->parent_ino ? pi->parent_ino : ino;
+     * shard_id = shard_map_route(parent_ino) — 区间路由, 对齐 FUSE ShardMap. */
+    shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
     ret = powerfs_net_migrate_inline_alloc(shard_id, ino, &volume_id, &file_key);
     if (ret < 0) {
         pr_warn("powerfs: MIGRATE ino=%lu alloc failed: %d, inline buffer unmodified\n",
@@ -4968,7 +4968,7 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
         }
         spin_unlock(&pi->i_lock);
 
-        shard_id = pi->parent_ino ? pi->parent_ino : inode->i_ino;
+        shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : inode->i_ino);
         ret = powerfs_net_update_inode_size_chunks(shard_id, inode->i_ino,
                                                     (__u64)snap_len,
                                                     "kernel",
@@ -5056,7 +5056,7 @@ static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
  * inline_data 提交到 Filer (单次 Raft 提交 = 数据 + 元数据).
  *
  * 对齐 FUSE release inline 路径 (fuse.rs L3988):
- *   - shard_id = parent_ino (Filer 路由)
+ *   - shard_id = shard_map_route(parent_ino) (Filer 路由, 对齐 FUSE ShardMap)
  *   - chunks 为空 (Inline 不走 Volume Server)
  *   - size = inline_len
  *   - 5 次重试, 500ms×attempt 退避 (覆盖 Raft 选举窗口)
@@ -5132,7 +5132,7 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
                 snap_len > 6 ? snap_data[6] : 0, snap_len > 7 ? snap_data[7] : 0);
     }
 
-    shard_id = pi->parent_ino ? pi->parent_ino : ino;
+    shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
 
     /* 5 次重试, 500ms×attempt 退避 (对齐 FUSE, 覆盖 Raft 选举窗口 ~3s) */
     for (attempt = 1; attempt <= 5; attempt++) {
@@ -5232,7 +5232,7 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
             chunks[i].crc32 = 0;
         }
 
-        shard_id = pi->parent_ino ? pi->parent_ino : ino;
+        shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
 
         pr_info("powerfs: RELEASE FLAT ino=%lu size=%llu chunks=%u vid=%llu fkey=%llu\n",
                 ino, (u64)i_size, chunk_count,

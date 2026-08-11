@@ -291,6 +291,10 @@ enum powerfs_net_field_id {
 
     /* ===== WideStripe range compression (0xB6) ===== */
     POWERFS_NET_FLD_VOLUME_IDS_RANGE = 0xB6, /* 范围压缩: start_u64 + count_u32 = 12B */
+
+    /* ===== Topology extensions (0xB8-0xBD) ===== */
+    POWERFS_NET_FLD_TOTAL_SHARDS = 0xB8,      /* 全局 shard_count (u64), matches Rust FieldId::TotalShards */
+    POWERFS_NET_FLD_SHARD_MAP_ENTRIES = 0xBD,  /* ShardMap entries blob (bytes), matches Rust FieldId::ShardMapEntries */
 };
 
 /* ========== 帧头结构 (28 字节, packed) ========== */
@@ -684,6 +688,46 @@ struct powerfs_shard_route {
     spinlock_t lock;
     __u64 shard_count;          /* 从 Filer 获取 */
 };
+
+/* ========== ShardMap: range-based inode → shard_id routing ========== */
+/*
+ * Equivalent to powerfs-allocator::ShardMap (Rust). The map is a sorted
+ * array of (range_start, range_end, shard_id) entries. Binary search finds
+ * the shard for a given inode.
+ *
+ * On startup, `shard_map_from_shard_count(n)` generates equal 1M ranges
+ * (equivalent to ShardMap::from_shard_count). When the Master provides
+ * ShardMapEntries (0xBD), `shard_map_from_entries()` reconstructs the
+ * exact same map the Filer uses (including post-split ranges).
+ */
+
+struct shard_map_entry {
+    __u64 range_start;   /* inclusive */
+    __u64 range_end;     /* exclusive */
+    __u64 shard_id;
+};
+
+struct shard_map {
+    struct shard_map_entry entries[POWERFS_MAX_SHARDS];
+    int entry_count;
+    spinlock_t lock;
+};
+
+/* Global ShardMap — initialized in discover_filers() from Master topology. */
+extern struct shard_map g_shard_map;
+
+/* Route an inode to its shard_id via binary search on the range table. */
+__u64 shard_map_route(__u64 inode);
+
+/* Initialize the map from shard_count (equal 1M ranges per shard).
+ * Equivalent to Rust's ShardMap::from_shard_count. */
+void shard_map_from_shard_count(__u64 shard_count);
+
+/* Reconstruct the map from a Master-provided entries blob (0xBD).
+ * Each entry = 25 bytes: range_start:u64 LE + range_end:u64 LE +
+ * shard_id:u64 LE + state:u8 (0=Active, 1=Draining).
+ * Returns 0 on success, negative errno on error. */
+int shard_map_from_entries(const __u8 *blob, size_t len);
 
 /* 连接状态查询辅助函数 */
 static inline const char *powerfs_conn_state_str(enum powerfs_conn_state s)
