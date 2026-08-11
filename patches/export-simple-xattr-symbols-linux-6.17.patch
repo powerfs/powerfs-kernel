@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PowerFS Team
+Date: Mon, 11 Aug 2026 08:50:00 +0800
+Subject: [PATCH] fs/xattr: export simple_xattr_* symbols for loadable modules
+
+The simple_xattr API (simple_xattr_get, simple_xattr_set, simple_xattr_list,
+simple_xattr_free, simple_xattr_alloc, simple_xattr_add, simple_xattr_space,
+simple_xattrs_init, simple_xattrs_free) is used by in-tree filesystems like
+tmpfs/shmem, but none of these functions are exported with EXPORT_SYMBOL.
+
+This prevents out-of-tree filesystem modules (such as powerfs.ko) from using
+the simple_xattr API for in-memory extended attribute storage.
+
+Export all simple_xattr_* functions with EXPORT_SYMBOL_GPL so that loadable
+modules can use them.
+
+This patch is required for the PowerFS kernel module's xattr support
+(powerfs_fs.c uses xattr_handler + simple_xattr for user/trusted/security
+xattr namespaces).
+
+Apply with:
+  cd linux-6.17
+  patch -p1 < ../kernel/patches/export-simple-xattr-symbols-linux-6.17.patch
+
+Signed-off-by: PowerFS Team
+---
+ fs/xattr.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/fs/xattr.c b/fs/xattr.c
+index abcdef123456..abcdef123457 100644
+--- a/fs/xattr.c
++++ b/fs/xattr.c
+@@ -1578,6 +1578,15 @@ void simple_xattrs_free(struct simple_xattrs *xattrs, size_t *freed_space)
+ 		rbp = rbp_next;
+ 	}
+ }
++
++EXPORT_SYMBOL_GPL(simple_xattr_space);
++EXPORT_SYMBOL_GPL(simple_xattr_free);
++EXPORT_SYMBOL_GPL(simple_xattr_alloc);
++EXPORT_SYMBOL_GPL(simple_xattr_get);
++EXPORT_SYMBOL_GPL(simple_xattr_set);
++EXPORT_SYMBOL_GPL(simple_xattr_list);
++EXPORT_SYMBOL_GPL(simple_xattr_add);
++EXPORT_SYMBOL_GPL(simple_xattrs_init);
++EXPORT_SYMBOL_GPL(simple_xattrs_free);
+-- 
+2.43.0
+

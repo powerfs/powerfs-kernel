@@ -13,6 +13,7 @@
 #include <linux/seq_file.h>
 #include <linux/fs_context.h>
 #include <linux/netfs.h>
+#include <linux/xattr.h>
 
 /* ========== 常量定义 ========== */
 
@@ -348,6 +349,12 @@ struct powerfs_inode_info {
 
     /* shutdown 标志 (参考 ceph_inode_is_shutdown) */
     bool shutdown;
+
+    /* === xattr 存储 (simple_xattr in-memory) ===
+     * 使用内核 simple_xattr API, xattrs 存储在内存中 (不持久化到 Filer).
+     * 支持 user.* / trusted.* / security.* 前缀.
+     * 由 i_lock 间接保护 (simple_xattr 内部有自旋锁). */
+    struct simple_xattrs xattrs;
 };
 
 /* 获取 inode 扩展结构 */

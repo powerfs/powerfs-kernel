@@ -217,7 +217,7 @@ export MOUNT_OPTIONS=""
 - quota 组：PowerFS 无 quota 支持
 - reflink/cow 组：无 reflink
 - fiemap 组：无 fiemap 接口
-- generic/083, 084（fallocate）：暂未实现 fallocate，待确认后放开
+- generic/083, 084（fallocate）：已实现 powerfs_fallocate 回调（支持默认/KEEP_SIZE/PUNCH_HOLE 模式），可放开测试
 
 #### 9.4 运行方式
 
@@ -265,7 +265,7 @@ cat results/generic/001.full
 - **分类处理**：
   - POSIX 兼容性问题（如 xattr/utimes 行为不符）：记录并修复
   - 不适用特性（quota/reflink）：在 config 中 `EXCLUDE` 排除
-  - 已知限制（fallocate 未实现）：记录为 TODO，不视为 bug
+  - 已实现特性（fallocate/xattr 已实现）：powerfs_fallocate 支持 KEEP_SIZE/PUNCH_HOLE，xattr 使用 simple_xattr 内存存储
 - **回归用例**：修复后的失败用例纳入回归清单，后续每次重大改动后重跑
 
 #### 9.6 注意事项

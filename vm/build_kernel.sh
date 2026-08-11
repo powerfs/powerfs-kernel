@@ -171,6 +171,8 @@ echo "=== 优化内核配置 (QEMU + 调试) ==="
 # 启用共享内存 (用于 mmap)
 ./scripts/config --enable CONFIG_SHMEM
 ./scripts/config --enable CONFIG_TMPFS
+./scripts/config --enable CONFIG_TMPFS_XATTR
+./scripts/config --enable CONFIG_TMPFS_POSIX_ACL
 
 # 启用调试符号 (用于 GDB)
 ./scripts/config --enable CONFIG_DEBUG_INFO

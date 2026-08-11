@@ -34,6 +34,8 @@
 #include <linux/mnt_idmapping.h> /* mnt_idmap, nop_mnt_idmap (6.5+) */
 #include <linux/pagevec.h>       /* pagevec_lookup_range_tag (writepages 批量遍历) */
 #include <linux/delay.h>        /* msleep (release 重试退避) */
+#include <linux/xattr.h>        /* simple_xattr API for xattr support */
+#include <linux/falloc.h>       /* FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE */
 
 #include "powerfs.h"
 #include "powerfs_comm.h"
@@ -1168,6 +1170,9 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     WRITE_ONCE(pi->dir_lease_expire, 0);
     pi->dir_lease_epoch = 0;
 
+    /* xattr 存储 (simple_xattr in-memory) */
+    simple_xattrs_init(&pi->xattrs);
+
     pr_debug("powerfs: alloc_inode (pi=%p, inode=%p)\n", pi, &pi->netfs.inode);
 
     return &pi->netfs.inode;
@@ -1209,6 +1214,9 @@ void powerfs_free_inode(struct inode *inode)
     kfree(pi->ec_chunks);
     pi->ec_chunks = NULL;
     pi->ec_chunk_count = 0;
+
+    /* xattr 存储: 释放所有 xattr 条目 */
+    simple_xattrs_free(&pi->xattrs, NULL);
 
     kmem_cache_free(powerfs_inode_cachep, pi);
 }
@@ -2148,9 +2156,12 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
      * 向 filer 发 CREATE/MKDIR 请求获取权威 ino, 使文件元数据持久化到
      * filer (Raft 强一致); remount 后 lookup 能找回.
      * 断连时 powerfs_net_create 返回 -ENOTCONN, 操作失败 (不再本地分配).
-     * symlink/特殊文件暂走本地 (有独立 powerfs_net_symlink 接口).
+     * Symlinks 有独立 powerfs_net_symlink 接口, 不走此路径.
+     * 特殊文件 (fifo/block/char/socket) 也需持久化到 Filer, 否则 remount
+     * 后丢失. Filer handle_create 对特殊文件跳过 volume/needle 分配.
      */
-    if (S_ISREG(mode) || S_ISDIR(mode)) {
+    if (S_ISREG(mode) || S_ISDIR(mode) || S_ISFIFO(mode) ||
+        S_ISBLK(mode) || S_ISCHR(mode) || S_ISSOCK(mode)) {
         u64 remote_ino = 0;
         u64 volume_id = 0, file_key = 0;
         struct powerfs_file_layout layout = {0};
@@ -5257,6 +5268,10 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+/* Forward declaration — defined below */
+static long powerfs_fallocate(struct file *file, int mode,
+                              loff_t offset, loff_t len);
+
 /*
  * 文件操作表 - 尽可能复用 VFS 通用实现
  *
@@ -5268,9 +5283,134 @@ static const struct file_operations powerfs_file_operations = {
     .mmap         = generic_file_mmap,
     .release      = powerfs_file_release,
     .fsync        = powerfs_fsync,
+    .fallocate    = powerfs_fallocate,
     .splice_read  = filemap_splice_read,
     .splice_write = iter_file_splice_write,
     .llseek       = generic_file_llseek,
+};
+
+/* ========== fallocate 回调 (空间预分配) ==========
+ *
+ * PowerFS 不预分配物理块 (空间按需分配), fallocate 仅更新 i_size:
+ * - mode 0 (默认): 扩展 i_size 到 offset+len, 页面全零
+ * - FALLOC_FL_KEEP_SIZE: 不改变 i_size (no-op)
+ * - FALLOC_FL_PUNCH_HOLE: 释放页面缓存 (truncate_pagecache_range)
+ *
+ * 参考: brd_fallocate (ramfs), shmem_fallocate (tmpfs)
+ */
+static long powerfs_fallocate(struct file *file, int mode,
+                              loff_t offset, loff_t len)
+{
+    struct inode *inode = file_inode(file);
+    loff_t new_size = offset + len;
+    int ret;
+
+    /* Only support default, KEEP_SIZE, and PUNCH_HOLE modes */
+    if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
+        return -EOPNOTSUPP;
+
+    /* PUNCH_HOLE requires KEEP_SIZE */
+    if ((mode & FALLOC_FL_PUNCH_HOLE) && !(mode & FALLOC_FL_KEEP_SIZE))
+        return -EOPNOTSUPP;
+
+    if (offset < 0 || len <= 0)
+        return -EINVAL;
+
+    inode_lock(inode);
+
+    if (mode & FALLOC_FL_PUNCH_HOLE) {
+        /* Punch hole: release page cache in the given range */
+        truncate_pagecache_range(inode, offset, new_size - 1);
+        ret = 0;
+    } else if (!(mode & FALLOC_FL_KEEP_SIZE)) {
+        /* Default mode: extend file size */
+        if (new_size > i_size_read(inode)) {
+            i_size_write(inode, new_size);
+            mark_inode_dirty(inode);
+        }
+        ret = 0;
+    } else {
+        /* KEEP_SIZE: no-op (no physical pre-allocation) */
+        ret = 0;
+    }
+
+    inode_unlock(inode);
+    return ret;
+}
+
+/* ========== xattr 回调 (simple_xattr in-memory) ==========
+ *
+ * xattr 存储在 inode 内存中 (powerfs_inode_info.xattrs), 不持久化到 Filer.
+ * 使用内核 simple_xattr API + xattr_handler 机制 (kernel 6.17 移除了
+ * inode_operations 中的 setxattr/getxattr/removexattr 回调, 改用
+ * xattr_handler 注册到 super_block.s_xattr).
+ * 支持 user.* / trusted.* / security.* 前缀.
+ */
+
+static int powerfs_xattr_handler_get(const struct xattr_handler *handler,
+                                     struct dentry *unused, struct inode *inode,
+                                     const char *name, void *buffer, size_t size)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+
+    name = xattr_full_name(handler, name);
+    return simple_xattr_get(&pi->xattrs, name, buffer, size);
+}
+
+static int powerfs_xattr_handler_set(const struct xattr_handler *handler,
+                                     struct mnt_idmap *idmap,
+                                     struct dentry *unused, struct inode *inode,
+                                     const char *name, const void *value,
+                                     size_t size, int flags)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct simple_xattr *old_xattr;
+
+    (void)idmap;
+
+    if (size > XATTR_SIZE_MAX)
+        return -E2BIG;
+
+    name = xattr_full_name(handler, name);
+    old_xattr = simple_xattr_set(&pi->xattrs, name, value, size, flags);
+    if (IS_ERR(old_xattr))
+        return PTR_ERR(old_xattr);
+    simple_xattr_free(old_xattr);
+    return 0;
+}
+
+static ssize_t powerfs_listxattr(struct dentry *dentry, char *buffer,
+                                 size_t size)
+{
+    struct inode *inode = d_inode(dentry);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+
+    return simple_xattr_list(inode, &pi->xattrs, buffer, size);
+}
+
+static const struct xattr_handler powerfs_security_xattr_handler = {
+    .prefix = XATTR_SECURITY_PREFIX,
+    .get = powerfs_xattr_handler_get,
+    .set = powerfs_xattr_handler_set,
+};
+
+static const struct xattr_handler powerfs_trusted_xattr_handler = {
+    .prefix = XATTR_TRUSTED_PREFIX,
+    .get = powerfs_xattr_handler_get,
+    .set = powerfs_xattr_handler_set,
+};
+
+static const struct xattr_handler powerfs_user_xattr_handler = {
+    .prefix = XATTR_USER_PREFIX,
+    .get = powerfs_xattr_handler_get,
+    .set = powerfs_xattr_handler_set,
+};
+
+static const struct xattr_handler * const powerfs_xattr_handlers[] = {
+    &powerfs_security_xattr_handler,
+    &powerfs_trusted_xattr_handler,
+    &powerfs_user_xattr_handler,
+    NULL
 };
 
 /* ========== Inode operations 表 ========== */
@@ -5289,12 +5429,14 @@ static const struct inode_operations powerfs_dir_inode_operations = {
     .rename     = powerfs_rename,
     .getattr    = powerfs_getattr,
     .setattr    = powerfs_setattr,
+    .listxattr  = powerfs_listxattr,
 };
 
 /* 普通文件 inode 操作 */
 static const struct inode_operations powerfs_file_inode_operations = {
     .getattr    = powerfs_getattr,
     .setattr    = powerfs_setattr,
+    .listxattr  = powerfs_listxattr,
 };
 
 /*
@@ -5446,6 +5588,7 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     /* 设置超级块 (覆盖 sb->s_fs_info, 之前指向已释放的 ctx) */
     sb->s_fs_info = sbi;
     sb->s_op = &powerfs_super_ops;
+    sb->s_xattr = powerfs_xattr_handlers;
     sb->s_magic = POWERFS_SUPER_MAGIC;
     sb->s_blocksize = 4096;
     sb->s_blocksize_bits = 12;
