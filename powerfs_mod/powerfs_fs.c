@@ -576,12 +576,17 @@ int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
     chunk_idx = (u64)(offset / chunk_size);
 
     /* K3 多卷路径: chunks 数组存在且 chunk_idx 命中.
-     * 用于 Flat 模式下 GETATTR 返回的显式 chunks 列表. */
+     * 用于 Flat 模式下 GETATTR 返回的显式 chunks 列表.
+     * 对齐 FUSE chunk_map: 使用显式 per-chunk needle_id, 而非 file_key + chunk_idx. */
     if (pi->chunks && chunk_idx < pi->chunk_count) {
         struct powerfs_chunk_map *cm = &pi->chunks[chunk_idx];
         if (cm->volume_id != 0 && cm->needle_id != 0) {
             *volume_id_out = cm->volume_id;
             *needle_id_out = cm->needle_id;
+            pr_debug("powerfs: locate CHUNKS ino=%lu offset=%lld chunk_idx=%llu -> vid=%llu nid=%llu\n",
+                    pi->netfs.inode.i_ino, offset, chunk_idx,
+                    (unsigned long long)cm->volume_id,
+                    (unsigned long long)cm->needle_id);
             return 0;
         }
     }
@@ -608,12 +613,19 @@ int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
         return 0;
     }
 
-    /* Flat 模型: file_key + chunk_idx, 单卷 */
+    /* Flat 模型: file_key + chunk_idx, 单卷.
+     * 仅当 pi->chunks 未填充 (无 PER_CHUNK 数据) 时使用此回退路径. */
     if (!pi->volume_id || !pi->file_key)
         return -EINVAL;
 
     *volume_id_out = pi->volume_id;
     *needle_id_out = pi->file_key + chunk_idx;
+    pr_debug("powerfs: locate FALLBACK ino=%lu offset=%lld chunk_idx=%llu -> vid=%llu nid=%llu (fkey=%llu+%llu)\n",
+            pi->netfs.inode.i_ino, offset, chunk_idx,
+            (unsigned long long)pi->volume_id,
+            (unsigned long long)*needle_id_out,
+            (unsigned long long)pi->file_key,
+            chunk_idx);
     return 0;
 }
 
@@ -735,15 +747,45 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
         kfree(old_rep);
     }
 
-    /* K4-5: EC shards — EC 读取路径使用.
-     * 从 ChunkLayout PER_CHUNK 解析, 所有权转移到 inode. */
+    /* ChunkLayout PER_CHUNK: Filer 对 Flat/EC 文件均使用 tag=0x01 编码 chunks 列表.
+     * - EC 文件: shards 列表, 存入 pi->ec_chunks (EC 降级读取路径使用)
+     * - Flat 文件: 主 chunks 列表, 存入 pi->chunks (locate_chunk 使用显式 needle_id)
+     * - Stripe 文件: 释放 (locate_chunk 使用 volume_ids 路径)
+     *
+     * 修复 remount 读路径 bug: 之前 Flat 文件的 PER_CHUNK 数据被误存入 pi->ec_chunks
+     * (仅 EC 读取路径使用), 而 pi->chunks 始终为 NULL, 导致 locate_chunk 回退到
+     * file_key + chunk_idx 计算. FUSE 客户端使用显式 per-chunk needle_id (chunk_map),
+     * 两者在 needle_id 非连续时不一致. 现在对 Flat 文件将 PER_CHUNK 数据存入
+     * pi->chunks, 使 locate_chunk 使用与 FUSE 客户端相同的显式查找. */
     if (layout->has_ec_chunks) {
-        struct powerfs_chunk_map *old_ec = pi->ec_chunks;
-        pi->ec_chunks = layout->ec_chunks;
-        pi->ec_chunk_count = layout->ec_chunk_count;
-        layout->ec_chunks = NULL;
-        layout->ec_chunk_count = 0;
-        kfree(old_ec);
+        if (pi->reliability == POWERFS_RELIABILITY_EC) {
+            /* EC: shards 列表存入 ec_chunks */
+            struct powerfs_chunk_map *old_ec = pi->ec_chunks;
+            pi->ec_chunks = layout->ec_chunks;
+            pi->ec_chunk_count = layout->ec_chunk_count;
+            layout->ec_chunks = NULL;
+            layout->ec_chunk_count = 0;
+            kfree(old_ec);
+        } else if (pi->placement == POWERFS_PLACEMENT_FLAT) {
+            /* Flat: PER_CHUNK 是主 chunks 列表, 存入 pi->chunks.
+             * locate_chunk 优先使用 pi->chunks[chunk_idx] 的显式 needle_id,
+             * 而非 file_key + chunk_idx 计算 (对齐 FUSE chunk_map). */
+            struct powerfs_chunk_map *old = pi->chunks;
+            pi->chunks = layout->ec_chunks;
+            pi->chunk_count = layout->ec_chunk_count;
+            layout->ec_chunks = NULL;
+            layout->ec_chunk_count = 0;
+            kfree(old);
+            pr_info("powerfs: apply_layout FLAT chunks count=%u (vid=%llu fkey=%llu)\n",
+                    pi->chunk_count,
+                    (unsigned long long)pi->volume_id,
+                    (unsigned long long)pi->file_key);
+        } else {
+            /* Stripe: 释放, locate_chunk 使用 volume_ids 路径 */
+            kfree(layout->ec_chunks);
+            layout->ec_chunks = NULL;
+            layout->ec_chunk_count = 0;
+        }
     }
 }
 

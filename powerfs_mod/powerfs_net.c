@@ -4376,15 +4376,19 @@ static void parse_file_layout(struct powerfs_tlv_dec *dec,
         parse_replica_chunks_field(raw, raw_len, layout);
     }
 
-    /* K3-DEBUG: log parsed layout for diagnostics */
+    /* K3-DEBUG: log parsed layout for diagnostics.
+     * has_ec_chunks/ec_chunk_count 用于验证 remount 读路径修复:
+     * Flat 文件的 PER_CHUNK 数据应被正确解析 (has_ec_chunks=1, ec_chunk_count>0). */
     pr_info("powerfs: parse_file_layout RESULT placement=%u reliability=%u chunk_size=%u "
             "has_placement=%d has_reliability=%d stripe_size=%llu stripe_count=%u "
-            "volume_ids_count=%u inline_len=%u ec_data=%u ec_parity=%u replica_count=%u\n",
+            "volume_ids_count=%u inline_len=%u ec_data=%u ec_parity=%u replica_count=%u "
+            "has_ec_chunks=%d ec_chunk_count=%u\n",
             layout->placement, layout->reliability, layout->chunk_size,
             layout->has_placement ? 1 : 0, layout->has_reliability ? 1 : 0,
             (unsigned long long)layout->stripe_size, layout->stripe_count,
             layout->volume_ids_count, layout->inline_len,
-            layout->ec_data_shards, layout->ec_parity_shards, layout->replica_count);
+            layout->ec_data_shards, layout->ec_parity_shards, layout->replica_count,
+            layout->has_ec_chunks ? 1 : 0, layout->ec_chunk_count);
 }
 
 int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
