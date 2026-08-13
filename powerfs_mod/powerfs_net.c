@@ -4607,6 +4607,12 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
     __u8 body[512];
     struct powerfs_tlv_enc enc;
     int ret;
+    /* resp_body captures REDIRECT responses (Filer returns leader address in
+     * the body via FieldId::Owner). Without this buffer, RX path sees
+     * resp_body=NULL and drops the body, leaving resp_body_len=0 — then
+     * powerfs_net_parse_redirect fails and rename returns -EAGAIN forever. */
+    __u8 resp_body[256];
+    size_t resp_body_len = 0;
 
     powerfs_tlv_enc_init(&enc, body, sizeof(body));
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_PARENT_INO, old_dir_ino);
@@ -4617,9 +4623,9 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
     ret = powerfs_net_send_request(POWERFS_NET_MSG_RENAME, old_dir_ino,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    NULL, 0,
+                                    resp_body, sizeof(resp_body),
                                     NULL, 0, POWERFS_META_TIMEOUT_MS,
-                                    NULL, NULL);
+                                    &resp_body_len, NULL);
     if (ret < 0)
         return ret;
     if (ret > 0)
@@ -5773,6 +5779,9 @@ int powerfs_net_link(__u64 ino, __u64 dir_ino, const char *name, size_t name_len
     __u8 body[512];
     struct powerfs_tlv_enc enc;
     int ret;
+    /* resp_body captures REDIRECT responses (same rationale as rename). */
+    __u8 resp_body[256];
+    size_t resp_body_len = 0;
 
     powerfs_tlv_enc_init(&enc, body, sizeof(body));
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
@@ -5782,9 +5791,9 @@ int powerfs_net_link(__u64 ino, __u64 dir_ino, const char *name, size_t name_len
     ret = powerfs_net_send_request(POWERFS_NET_MSG_LINK, dir_ino,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    NULL, 0,
+                                    resp_body, sizeof(resp_body),
                                     NULL, 0, POWERFS_META_TIMEOUT_MS,
-                                    NULL, NULL);
+                                    &resp_body_len, NULL);
     if (ret < 0)
         return ret;
     if (ret > 0)

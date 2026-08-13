@@ -3856,10 +3856,10 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
     struct inode *inode = wpw->inode;
     int ret;
 
-    pr_debug("powerfs: WB_READ_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d)\n",
+    pr_info("powerfs: WB_READ_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d) needle_len=%u\n",
             inode->i_ino, (unsigned long long)ctx->needle_id,
             req->error, req->resp_status,
-            ctx->needle_start_idx, ctx->needle_end_idx);
+            ctx->needle_start_idx, ctx->needle_end_idx, ctx->needle_len);
 
     /* 解析读取结果 */
     if (req->error < 0) {
@@ -3923,7 +3923,7 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
     }
 
     /* 提交 write_needle_async (第二阶段) */
-    pr_debug("powerfs: WB_WRITE_SUBMIT ino=%lu nid=%llu len=%u\n",
+    pr_info("powerfs: WB_WRITE_SUBMIT ino=%lu nid=%llu len=%u\n",
             inode->i_ino, (unsigned long long)ctx->needle_id,
             ctx->needle_len);
     ret = powerfs_net_write_needle_async(
@@ -3960,7 +3960,7 @@ static int powerfs_wb_write_cb(struct powerfs_request *req)
     struct inode *inode = wpw->inode;
     int err = 0;
 
-    pr_debug("powerfs: WB_WRITE_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d)\n",
+    pr_info("powerfs: WB_WRITE_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d)\n",
             inode->i_ino, (unsigned long long)ctx->needle_id,
             req->error, req->resp_status,
             ctx->needle_start_idx, ctx->needle_end_idx);
@@ -4024,7 +4024,7 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     __u64 group_needle_id = 0;
     __u64 group_volume_id = 0;
 
-    pr_debug("powerfs: WP_START ino=%lu npages=%d\n",
+    pr_info("powerfs: WP_START ino=%lu npages=%d\n",
             inode->i_ino, wpw->num_pages);
 
     if (powerfs_net_is_stopping())
@@ -4326,11 +4326,10 @@ int powerfs_writepages(struct address_space *mapping,
     struct powerfs_writepage_work *batch = NULL;
     int batch_pages = sbi->write_batch_pages;
     int ret = 0;
-    bool wb_submitted = false;
 
-    pr_debug("powerfs: WPAGES ino=%lu range=%llu-%llu nr_to_write=%ld sync_mode=%d\n",
+    pr_info("powerfs: WPAGES ino=%lu range=%llu-%llu nr_to_write=%ld sync_mode=%d placement=%u\n",
             inode->i_ino, wbc->range_start, wbc->range_end, wbc->nr_to_write,
-            wbc->sync_mode);
+            wbc->sync_mode, pi->placement);
 
     /* 目录无数据页: 跳过 writeback 避免无意义的网络 I/O.
      * 根目录 (ino=1) 的元数据修改 (nlink/mtime) 由 write_inode 同步,
@@ -4386,8 +4385,13 @@ int powerfs_writepages(struct address_space *mapping,
      * powerfs_writepages 是异步的 (queue_work), 返回后异步 work 可能仍在执行.
      * 若 writeback 线程再次调用 powerfs_writepages 处理同一 needle 的不同
      * 页面, 两个 RMW 并发会导致后写入的覆盖先写入的数据 (data corruption).
-     * mutex_lock 等待上一次 writeback 的所有 batch 完成. */
+     * mutex_lock 等待上一次 writeback 的所有 batch 完成.
+     *
+     * 自引用 (+1): writepages 在提交 batch 期间持有一份 wb_batch_count 引用,
+     * 防止已提交的 batch 快速完成后将 count 归零并释放 wb_mutex, 导致后续
+     * batch 提交期间另一次 writepages 并发执行. writepages 结束时释放此引用. */
     mutex_lock(&pi->wb_mutex);
+    atomic_inc(&pi->wb_batch_count);
 
     folio_batch_init(&fbatch);
 
@@ -4430,8 +4434,11 @@ int powerfs_writepages(struct address_space *mapping,
                                       / POWERFS_CHUNK_SIZE;
                 if (cur_needle_idx != prev_needle_idx) {
                     /* needle 边界变化: 提交当前 batch */
+                    pr_info("powerfs: WPAGES SUBMIT ino=%lu batch npages=%d needle_idx=%llu offset=%lld-%lld\n",
+                            inode->i_ino, batch->num_pages, prev_needle_idx,
+                            batch->offsets[0],
+                            batch->offsets[batch->num_pages - 1] + batch->counts[batch->num_pages - 1]);
                     atomic_inc(&pi->wb_batch_count);
-                    wb_submitted = true;
                     atomic_inc(&sbi->wb_in_flight);
                     queue_work(sbi->writeback_wq, &batch->work);
                     batch = NULL;
@@ -4483,8 +4490,11 @@ int powerfs_writepages(struct address_space *mapping,
 
             /* batch 满了，提交到 workqueue */
             if (batch->num_pages >= batch_pages) {
+                pr_info("powerfs: WPAGES FULL ino=%lu batch npages=%d offset=%lld-%lld\n",
+                        inode->i_ino, batch->num_pages,
+                        batch->offsets[0],
+                        batch->offsets[batch->num_pages - 1] + batch->counts[batch->num_pages - 1]);
                 atomic_inc(&pi->wb_batch_count);
-                wb_submitted = true;
                 atomic_inc(&sbi->wb_in_flight);
                 queue_work(sbi->writeback_wq, &batch->work);
                 batch = NULL;
@@ -4505,7 +4515,6 @@ done:
     if (batch) {
         if (batch->num_pages > 0) {
             atomic_inc(&pi->wb_batch_count);
-            wb_submitted = true;
             atomic_inc(&sbi->wb_in_flight);
             queue_work(sbi->writeback_wq, &batch->work);
         } else {
@@ -4514,8 +4523,11 @@ done:
         }
     }
 
-    /* writeback 互斥: 如果没有提交任何 batch, 直接释放 wb_mutex */
-    if (!wb_submitted)
+    /* writeback 互斥: 释放 writepages 自身引用.
+     * 若所有 batch 已完成 (或无 batch 提交), 此处归零并释放 wb_mutex.
+     * 这防止了 batch 完成后提前释放 wb_mutex, 导致后续 batch 提交期间
+     * 另一次 writepages 并发执行造成同一 needle 的 RMW 数据覆盖. */
+    if (atomic_dec_and_test(&pi->wb_batch_count))
         mutex_unlock(&pi->wb_mutex);
 
     return ret;
@@ -4533,6 +4545,7 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
     struct inode *inode = page->mapping->host;
     struct super_block *sb = inode->i_sb;
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
     struct powerfs_writepage_work *wpw;
     loff_t offset = page_offset(page);
     size_t count = PAGE_SIZE;
@@ -4550,10 +4563,19 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
     if (offset + count > i_size_read(inode))
         count = i_size_read(inode) - offset;
 
+    /* writeback 互斥: 与 powerfs_writepages 共用 wb_mutex, 防止
+     * 单页 fallback 与批量 writeback 并发对同一 needle 做 RMW. */
+    mutex_lock(&pi->wb_mutex);
+    /* 自引用 + batch 引用: work_fn 完成时 dec batch 引用,
+     * writepage 结束时 dec 自引用, 归零者释放 wb_mutex. */
+    atomic_inc(&pi->wb_batch_count);
+
     wpw = powerfs_alloc_write_batch(1, GFP_NOFS);
     if (!wpw) {
         redirty_page_for_writepage(wbc, page);
         unlock_page(page);
+        if (atomic_dec_and_test(&pi->wb_batch_count))
+            mutex_unlock(&pi->wb_mutex);
         return 0;
     }
 
@@ -4565,6 +4587,8 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
         kvfree(wpw);
         redirty_page_for_writepage(wbc, page);
         unlock_page(page);
+        if (atomic_dec_and_test(&pi->wb_batch_count))
+            mutex_unlock(&pi->wb_mutex);
         return 0;
     }
     get_page(page);
@@ -4575,8 +4599,13 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
 
     set_page_writeback(page);
     unlock_page(page);
+    atomic_inc(&pi->wb_batch_count);   /* batch 引用 */
     atomic_inc(&sbi->wb_in_flight);
     queue_work(sbi->writeback_wq, &wpw->work);
+
+    /* 释放自引用; 若 batch 已完成, 此处归零并释放 wb_mutex */
+    if (atomic_dec_and_test(&pi->wb_batch_count))
+        mutex_unlock(&pi->wb_mutex);
 
     return 0;
 }
@@ -5237,6 +5266,7 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
          * filemap_write_and_wait_range 触发 writeback, 此时 lease 仍有效,
          * powerfs_get_lease_token 能找到 lease token, 写入快速完成. */
         ensure_lease(inode, 0);
+        pr_info("powerfs: RELEASE FLAT ino=%lu pre-flush i_size=%llu\n", ino, (u64)i_size);
         flush_ret = filemap_write_and_wait_range(inode->i_mapping, 0, LLONG_MAX);
         if (flush_ret)
             pr_warn("powerfs: RELEASE FLAT ino=%lu filemap_write_and_wait_range: %d\n",
