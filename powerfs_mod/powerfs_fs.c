@@ -3527,6 +3527,13 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
                 struct powerfs_dir_entry *de;
                 struct powerfs_net_dir_entry *ne = &net_entries[i];
 
+                /* 更新 last_name 用于分页 — 必须在每个条目上更新,
+                 * 不能只在非重复条目上更新. 否则当所有条目都是缓存中
+                 * 已有的重复条目时 (如本地 create 已添加), last_name
+                 * 不变, 导致分页循环重复请求同一页 (infinite loop). */
+                strncpy(last_name, ne->name, sizeof(last_name) - 1);
+                last_name[sizeof(last_name) - 1] = '\0';
+
                 /* 检查是否已存在 (按名称去重, 不能用 ino — hardlink
                  * 的多个目录项共享同一 inode 但名称不同) */
                 bool found = false;
@@ -3551,10 +3558,6 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
                 strncpy(de->name, ne->name, POWERFS_MAX_NAME_LEN - 1);
                 de->name[POWERFS_MAX_NAME_LEN - 1] = '\0';
                 list_add_tail(&de->list, &dpi->dir_entries);
-
-                /* 更新 last_name 用于分页 */
-                strncpy(last_name, ne->name, sizeof(last_name) - 1);
-                last_name[sizeof(last_name) - 1] = '\0';
             }
             mutex_unlock(&dpi->dir_mutex);
         } while (has_more && net_count > 0);
