@@ -3314,23 +3314,53 @@ static int powerfs_fill_readdir_cache(struct powerfs_dir_file_info *dfi,
 /**
  * powerfs_add_dir_entry - 添加目录项到链表
  *
- * 使用 dir_mutex 保护
+ * 使用 dir_mutex 保护.
+ * 如果同名条目已存在且标记为 deleted, 复用该条目 (un-delete + 更新元数据),
+ * 避免同名重复条目堆积.
  */
 static int powerfs_add_dir_entry(struct inode *dir, u64 ino,
                                   unsigned int type, const char *name)
 {
     struct powerfs_inode_info *dpi = POWERFS_I(dir);
-    struct powerfs_dir_entry *entry;
+    struct powerfs_dir_entry *entry, *existing = NULL;
 
     if (!S_ISDIR(dir->i_mode))
         return 0;
 
+    mutex_lock(&dpi->dir_mutex);
+
+    /* 检查是否已有同名条目 (可能是 deleted 状态) */
+    list_for_each_entry(entry, &dpi->dir_entries, list) {
+        if (strcmp(entry->name, name) == 0) {
+            existing = entry;
+            break;
+        }
+    }
+
+    if (existing) {
+        /* 复用已有条目: un-delete + 更新元数据 */
+        if (existing->deleted) {
+            pr_info("powerfs: add_dir_entry UN_DELETE dir_ino=%lu name='%s' "
+                    "old_ino=%llu new_ino=%llu (was deleted, now reactivated)\n",
+                    dir->i_ino, name, existing->ino, ino);
+        }
+        existing->deleted = false;
+        existing->ino = ino;
+        existing->type = type;
+        mutex_unlock(&dpi->dir_mutex);
+        return 0;
+    }
+
+    mutex_unlock(&dpi->dir_mutex);
+
+    /* 没有同名条目, 分配新条目 */
     entry = kmalloc(sizeof(*entry), GFP_KERNEL);
     if (!entry)
         return -ENOMEM;
 
     entry->ino = ino;
     entry->type = type;
+    entry->deleted = false;
     strncpy(entry->name, name, POWERFS_MAX_NAME_LEN - 1);
     entry->name[POWERFS_MAX_NAME_LEN - 1] = '\0';
 
@@ -3342,28 +3372,49 @@ static int powerfs_add_dir_entry(struct inode *dir, u64 ino,
 }
 
 /**
- * powerfs_remove_dir_entry - 从链表中移除目录项
+ * powerfs_remove_dir_entry - 标记目录项为已删除
  *
- * 使用 dir_mutex 保护
+ * 使用 dir_mutex 保护.
+ *
+ * 重要: 不物理删除链表节点, 只标记 deleted=true.
+ * 原因: powerfs_readdir 使用 ctx->pos 作为链表索引, 物理删除会导致
+ *       后续 getdents 调用的索引偏移, 漏掉未发射的条目 (C9f bug 根因).
+ *       标记删除保持链表结构稳定, readdir 跳过 deleted 条目即可.
+ *       deleted 条目在以下场景被清理:
+ *       - powerfs_clear_dir_entries (rmdir/evict)
+ *       - powerfs_add_dir_entry 同名复用
+ *       - powerfs_readdir Filer 重新拉取时 un-delete (文件被重建)
  */
 static int powerfs_remove_dir_entry(struct inode *dir, const char *name)
 {
     struct powerfs_inode_info *dpi = POWERFS_I(dir);
-    struct powerfs_dir_entry *entry, *tmp;
+    struct powerfs_dir_entry *entry;
+    int total = 0, deleted_count = 0;
 
     if (!S_ISDIR(dir->i_mode))
         return 0;
 
     mutex_lock(&dpi->dir_mutex);
-    list_for_each_entry_safe(entry, tmp, &dpi->dir_entries, list) {
-        if (strcmp(entry->name, name) == 0) {
-            list_del_init(&entry->list);
+    list_for_each_entry(entry, &dpi->dir_entries, list) {
+        total++;
+        if (entry->deleted)
+            deleted_count++;
+        if (strcmp(entry->name, name) == 0 && !entry->deleted) {
+            entry->deleted = true;
+            deleted_count++;
+            pr_info("powerfs: remove_dir_entry MARK_DELETED dir_ino=%lu "
+                    "name='%s' entry_ino=%llu (total=%d deleted=%d active=%d)\n",
+                    dir->i_ino, name, entry->ino, total, deleted_count,
+                    total - deleted_count);
             mutex_unlock(&dpi->dir_mutex);
-            kfree(entry);
             return 0;
         }
     }
     mutex_unlock(&dpi->dir_mutex);
+
+    pr_warn("powerfs: remove_dir_entry NOT_FOUND dir_ino=%lu name='%s' "
+            "(total=%d deleted=%d active=%d)\n",
+            dir->i_ino, name, total, deleted_count, total - deleted_count);
 
     return -ENOENT;
 }
@@ -3436,6 +3487,13 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
     struct powerfs_dir_entry *entry, *tmp;
     loff_t pos = 0;
 
+    pr_debug("powerfs: readdir ENTER dir_ino=%lu ctx_pos=%lld "
+             "dir_complete=%d lease_expire=%ld lease_epoch=%u\n",
+             dir->i_ino, (s64)ctx->pos,
+             READ_ONCE(dpi->dir_complete),
+             READ_ONCE(dpi->dir_lease_expire),
+             dpi->dir_lease_epoch);
+
     /* 处理 "." 和 ".." */
     if (ctx->pos == 0) {
         if (!dir_emit_dots(file, ctx))
@@ -3472,6 +3530,17 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
          * 网络拉取时通过 ino 去重, 旧条目保留, 新条目追加. */
         if (READ_ONCE(dpi->dir_complete) &&
             time_after(jiffies, READ_ONCE(dpi->dir_lease_expire))) {
+            int total = 0, del = 0;
+            struct powerfs_dir_entry *e;
+            list_for_each_entry(e, &dpi->dir_entries, list) {
+                total++;
+                if (e->deleted) del++;
+            }
+            pr_info("powerfs: readdir REFETCH dir_ino=%lu ctx_pos=%lld "
+                    "lease_expired (entries: total=%d deleted=%d active=%d, "
+                    "epoch=%u)\n",
+                    dir->i_ino, (s64)ctx->pos, total, del,
+                    total - del, dpi->dir_lease_epoch);
             WRITE_ONCE(dpi->dir_complete, false);
             WRITE_ONCE(dpi->dir_lease_expire, 0);
         }
@@ -3540,6 +3609,19 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
                 list_for_each_entry(de, &dpi->dir_entries, list) {
                     if (strcmp(de->name, ne->name) == 0) {
                         found = true;
+                        /* 如果本地标记为 deleted 但 Filer 仍返回该条目,
+                         * 说明文件被重建 (同名新 inode), un-delete 并更新元数据. */
+                        if (de->deleted) {
+                            pr_info("powerfs: readdir REFETCH_UN_DELETE "
+                                    "dir_ino=%lu name='%s' old_ino=%llu "
+                                    "new_ino=%llu (Filer still has it, "
+                                    "file was re-created)\n",
+                                    dir->i_ino, ne->name, de->ino,
+                                    ne->ino);
+                            de->deleted = false;
+                            de->ino = ne->ino;
+                            de->type = ne->mode & S_IFMT;
+                        }
                         break;
                     }
                 }
@@ -3555,6 +3637,7 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
 
                 de->ino = ne->ino;
                 de->type = ne->mode & S_IFMT;
+                de->deleted = false;
                 strncpy(de->name, ne->name, POWERFS_MAX_NAME_LEN - 1);
                 de->name[POWERFS_MAX_NAME_LEN - 1] = '\0';
                 list_add_tail(&de->list, &dpi->dir_entries);
@@ -3589,10 +3672,13 @@ emit_cached:
         buf = kmalloc_array(max, sizeof(*buf), GFP_KERNEL);
         if (!buf) {
             /* 分配失败，直接在锁内 emit (回退方案) */
+            int fb_skipped_deleted = 0, fb_emitted = 0;
             mutex_lock(&dpi->dir_mutex);
             list_for_each_entry_safe(entry, tmp, &dpi->dir_entries, list) {
                 unsigned char d_type;
                 if (pos > 0) { pos--; continue; }
+                /* 跳过已标记删除的条目, 但仍消耗位置槽以保持 ctx->pos 索引稳定 */
+                if (entry->deleted) { ctx->pos++; fb_skipped_deleted++; continue; }
                 switch (entry->type) {
                 case S_IFREG:  d_type = DT_REG; break;
                 case S_IFDIR:  d_type = DT_DIR; break;
@@ -3601,32 +3687,62 @@ emit_cached:
                 }
                 if (!dir_emit(ctx, entry->name, strlen(entry->name),
                               entry->ino, d_type)) {
+                    pr_debug("powerfs: readdir EMIT_FALLBACK dir_ino=%lu "
+                             "ctx_pos=%lld emitted=%d skipped_deleted=%d "
+                             "(buf full, returning early)\n",
+                             dir->i_ino, (s64)ctx->pos, fb_emitted,
+                             fb_skipped_deleted);
                     mutex_unlock(&dpi->dir_mutex);
                     return 0;
                 }
                 ctx->pos++;
+                fb_emitted++;
             }
+            pr_debug("powerfs: readdir EMIT_FALLBACK_DONE dir_ino=%lu "
+                     "ctx_pos=%lld emitted=%d skipped_deleted=%d (EOF)\n",
+                     dir->i_ino, (s64)ctx->pos, fb_emitted,
+                     fb_skipped_deleted);
             mutex_unlock(&dpi->dir_mutex);
             return 0;
         }
 
-        mutex_lock(&dpi->dir_mutex);
+        {
+            int skipped_deleted = 0;
+            loff_t pos_start = ctx->pos;
 
-        list_for_each_entry_safe(entry, tmp, &dpi->dir_entries, list) {
-            if (count >= max)
-                break;
-            if (pos > 0) {
-                pos--;
-                continue;
+            mutex_lock(&dpi->dir_mutex);
+
+            list_for_each_entry_safe(entry, tmp, &dpi->dir_entries, list) {
+                if (count >= max)
+                    break;
+                if (pos > 0) {
+                    pos--;
+                    continue;
+                }
+                /* 跳过已标记删除的条目, 但仍消耗位置槽以保持 ctx->pos 索引稳定.
+                 * 这确保 rm -rf 在 unlink 子条目后, 后续 getdents 不会因
+                 * 链表节点移除而导致 ctx->pos 偏移、漏掉未发射的条目 (C9f bug). */
+                if (entry->deleted) {
+                    ctx->pos++;
+                    skipped_deleted++;
+                    continue;
+                }
+                buf[count].ino = entry->ino;
+                buf[count].type = entry->type;
+                buf[count].namelen = strlen(entry->name);
+                memcpy(buf[count].name, entry->name, buf[count].namelen + 1);
+                count++;
             }
-            buf[count].ino = entry->ino;
-            buf[count].type = entry->type;
-            buf[count].namelen = strlen(entry->name);
-            memcpy(buf[count].name, entry->name, buf[count].namelen + 1);
-            count++;
-        }
 
-        mutex_unlock(&dpi->dir_mutex);
+            mutex_unlock(&dpi->dir_mutex);
+
+            if (skipped_deleted > 0)
+                pr_info("powerfs: readdir EMIT_SKIP dir_ino=%lu "
+                        "pos_start=%lld pos_end=%lld copied=%d "
+                        "skipped_deleted=%d (buf_max=%d)\n",
+                        dir->i_ino, (s64)pos_start, (s64)ctx->pos,
+                        count, skipped_deleted, max);
+        }
 
         /* 第二阶段: 释放锁后逐条 emit */
         for (i = 0; i < count; i++) {
@@ -3641,12 +3757,20 @@ emit_cached:
 
             if (!dir_emit(ctx, buf[i].name, buf[i].namelen,
                           buf[i].ino, d_type)) {
+                pr_debug("powerfs: readdir EMIT_PARTIAL dir_ino=%lu "
+                         "ctx_pos=%lld emitted=%d/%d (userspace buf full)\n",
+                         dir->i_ino, (s64)ctx->pos, i, count);
                 kfree(buf);
                 return 0;
             }
 
             ctx->pos++;
         }
+
+        if (count > 0)
+            pr_debug("powerfs: readdir EMIT_DONE dir_ino=%lu "
+                     "ctx_pos=%lld emitted=%d (EOF or buf exhausted)\n",
+                     dir->i_ino, (s64)ctx->pos, count);
 
         kfree(buf);
     }

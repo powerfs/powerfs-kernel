@@ -131,6 +131,7 @@ struct powerfs_dir_entry {
     u64 ino;                        /* inode 号 */
     unsigned int type;              /* 文件类型 (DT_REG, DT_DIR, 等) */
     char name[POWERFS_MAX_NAME_LEN]; /* 文件名 */
+    bool deleted;                   /* 标记删除: 保持链表位置稳定, readdir 跳过 */
 };
 
 /* ========== Inode 扩展结构 (参考 ceph_inode_info) ========== */

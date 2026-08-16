@@ -43,9 +43,10 @@ echo "=== 优化内核配置 (QEMU + 调试) ==="
 ./scripts/config --disable CONFIG_DEBUG_INFO_REDACTED
 
 # 启用 printk 详细输出
+# LOG_BUF_SHIFT=20 → 2^20 = 1MB ring buffer (原 17=128KB 在并发删除测试中溢出)
 ./scripts/config --enable CONFIG_PRINTK
 ./scripts/config --enable CONFIG_LOG_BUF_SHIFT
-./scripts/config --set-val CONFIG_LOG_BUF_SHIFT 17
+./scripts/config --set-val CONFIG_LOG_BUF_SHIFT 20
 
 # 启用文件系统调试
 ./scripts/config --enable CONFIG_DEBUG_FS
