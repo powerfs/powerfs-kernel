@@ -4379,7 +4379,7 @@ static void parse_file_layout(struct powerfs_tlv_dec *dec,
     /* K3-DEBUG: log parsed layout for diagnostics.
      * has_ec_chunks/ec_chunk_count 用于验证 remount 读路径修复:
      * Flat 文件的 PER_CHUNK 数据应被正确解析 (has_ec_chunks=1, ec_chunk_count>0). */
-    pr_info("powerfs: parse_file_layout RESULT placement=%u reliability=%u chunk_size=%u "
+    pr_debug("powerfs: parse_file_layout RESULT placement=%u reliability=%u chunk_size=%u "
             "has_placement=%d has_reliability=%d stripe_size=%llu stripe_count=%u "
             "volume_ids_count=%u inline_len=%u ec_data=%u ec_parity=%u replica_count=%u "
             "has_ec_chunks=%d ec_chunk_count=%u\n",

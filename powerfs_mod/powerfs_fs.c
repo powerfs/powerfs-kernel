@@ -789,7 +789,7 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
             layout->ec_chunks = NULL;
             layout->ec_chunk_count = 0;
             kfree(old);
-            pr_info("powerfs: apply_layout FLAT chunks count=%u (vid=%llu fkey=%llu)\n",
+            pr_debug("powerfs: apply_layout FLAT chunks count=%u (vid=%llu fkey=%llu)\n",
                     pi->chunk_count,
                     (unsigned long long)pi->volume_id,
                     (unsigned long long)pi->file_key);
@@ -959,7 +959,7 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
     if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
         mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK) ||
         local_content_size != size) {
-        pr_info("powerfs: refresh_work ino=%llu skip size update (local=%lld filer=%llu content_size=%llu)\n",
+        pr_debug("powerfs: refresh_work ino=%llu skip size update (local=%lld filer=%llu content_size=%llu)\n",
                 rw->ino, i_size_read(inode), (unsigned long long)size,
                 (unsigned long long)local_content_size);
     } else {
@@ -1020,12 +1020,12 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
      * extend fix). This is safe for single-client scenarios; for multi-client,
      * the NOTIFY mechanism handles invalidation. */
     if (local_content_size != size) {
-        pr_info("powerfs: refresh_work ino=%llu skip pagecache invalidate (local=%llu != filer=%llu)\n",
+        pr_debug("powerfs: refresh_work ino=%llu skip pagecache invalidate (local=%llu != filer=%llu)\n",
                 rw->ino, (unsigned long long)local_content_size,
                 (unsigned long long)size);
     } else if (pi->placement == POWERFS_PLACEMENT_FLAT &&
                pi->volume_id && pi->file_key) {
-        pr_info("powerfs: refresh_work ino=%llu skip pagecache invalidate (FLAT file, local=%llu == filer=%llu)\n",
+        pr_debug("powerfs: refresh_work ino=%llu skip pagecache invalidate (FLAT file, local=%llu == filer=%llu)\n",
                 rw->ino, (unsigned long long)local_content_size,
                 (unsigned long long)size);
     } else {
@@ -3004,12 +3004,12 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
                 pi->inline_data = NULL;
                 pi->inline_len = 0;
                 pi->inline_dirty = false;
-                pr_info("powerfs: SETATTR truncate INLINE ino=%lu size=0, cleared inline_data\n",
+                pr_debug("powerfs: SETATTR truncate INLINE ino=%lu size=0, cleared inline_data\n",
                         inode->i_ino);
             } else if (pi->inline_data && attr->ia_size < pi->inline_len) {
                 pi->inline_len = attr->ia_size;
                 pi->inline_dirty = true;
-                pr_info("powerfs: SETATTR truncate INLINE ino=%lu size=%llu, inline_len=%u\n",
+                pr_debug("powerfs: SETATTR truncate INLINE ino=%lu size=%llu, inline_len=%u\n",
                         inode->i_ino, attr->ia_size, pi->inline_len);
             }
             spin_unlock(&pi->i_lock);
@@ -3050,7 +3050,7 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
                 }
                 folio_batch_init(&fbatch);
             }
-            pr_info("powerfs: SETATTR truncate FLAT ino=%lu old=%llu new=%llu, re-dirtied %d pages for needle truncation\n",
+            pr_debug("powerfs: SETATTR truncate FLAT ino=%lu old=%llu new=%llu, re-dirtied %d pages for needle truncation\n",
                     inode->i_ino, (unsigned long long)old_size,
                     (unsigned long long)attr->ia_size, dirty_count);
 
@@ -3070,7 +3070,7 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
                     unlock_page(page);
                     put_page(page);
                     dirty_count = 1;
-                    pr_info("powerfs: SETATTR truncate FLAT ino=%lu read page %lu to trigger writeback\n",
+                    pr_debug("powerfs: SETATTR truncate FLAT ino=%lu read page %lu to trigger writeback\n",
                             inode->i_ino, (unsigned long)last_pg);
                 }
             }
@@ -3085,10 +3085,10 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
              * to zero the tails of partially-truncated pages. Without this,
              * a subsequent extend + writeback would read stale data from the
              * pagecache and send it to the server. */
-            pr_info("powerfs: SETATTR truncate FLAT ino=%lu second truncate_pagecache (size=%llu)\n",
+            pr_debug("powerfs: SETATTR truncate FLAT ino=%lu second truncate_pagecache (size=%llu)\n",
                     inode->i_ino, (unsigned long long)attr->ia_size);
             truncate_pagecache(inode, attr->ia_size);
-            pr_info("powerfs: SETATTR truncate FLAT ino=%lu second truncate_pagecache done\n",
+            pr_debug("powerfs: SETATTR truncate FLAT ino=%lu second truncate_pagecache done\n",
                     inode->i_ino);
         }
 
@@ -3161,7 +3161,7 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
                 dirty_count++;
             }
 
-            pr_info("powerfs: SETATTR extend FLAT ino=%lu old=%llu new=%llu, zeroed %d pages for sparse region\n",
+            pr_debug("powerfs: SETATTR extend FLAT ino=%lu old=%llu new=%llu, zeroed %d pages for sparse region\n",
                     inode->i_ino, (unsigned long long)old_size,
                     (unsigned long long)attr->ia_size, dirty_count);
 
@@ -3591,7 +3591,7 @@ static int powerfs_add_dir_entry(struct inode *dir, u64 ino,
     if (existing) {
         /* 复用已有条目: un-delete + 更新元数据 */
         if (existing->deleted) {
-            pr_info("powerfs: add_dir_entry UN_DELETE dir_ino=%lu name='%s' "
+            pr_debug("powerfs: add_dir_entry UN_DELETE dir_ino=%lu name='%s' "
                     "old_ino=%llu new_ino=%llu (was deleted, now reactivated)\n",
                     dir->i_ino, name, existing->ino, ino);
         }
@@ -3653,7 +3653,7 @@ static int powerfs_remove_dir_entry(struct inode *dir, const char *name)
         if (strcmp(entry->name, name) == 0 && !entry->deleted) {
             entry->deleted = true;
             deleted_count++;
-            pr_info("powerfs: remove_dir_entry MARK_DELETED dir_ino=%lu "
+            pr_debug("powerfs: remove_dir_entry MARK_DELETED dir_ino=%lu "
                     "name='%s' entry_ino=%llu (total=%d deleted=%d active=%d)\n",
                     dir->i_ino, name, entry->ino, total, deleted_count,
                     total - deleted_count);
@@ -3787,7 +3787,7 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
                 total++;
                 if (e->deleted) del++;
             }
-            pr_info("powerfs: readdir REFETCH dir_ino=%lu ctx_pos=%lld "
+            pr_debug("powerfs: readdir REFETCH dir_ino=%lu ctx_pos=%lld "
                     "lease_expired (entries: total=%d deleted=%d active=%d, "
                     "epoch=%u)\n",
                     dir->i_ino, (s64)ctx->pos, total, del,
@@ -3863,7 +3863,7 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
                         /* 如果本地标记为 deleted 但 Filer 仍返回该条目,
                          * 说明文件被重建 (同名新 inode), un-delete 并更新元数据. */
                         if (de->deleted) {
-                            pr_info("powerfs: readdir REFETCH_UN_DELETE "
+                            pr_debug("powerfs: readdir REFETCH_UN_DELETE "
                                     "dir_ino=%lu name='%s' old_ino=%llu "
                                     "new_ino=%llu (Filer still has it, "
                                     "file was re-created)\n",
@@ -3988,7 +3988,7 @@ emit_cached:
             mutex_unlock(&dpi->dir_mutex);
 
             if (skipped_deleted > 0)
-                pr_info("powerfs: readdir EMIT_SKIP dir_ino=%lu "
+                pr_debug("powerfs: readdir EMIT_SKIP dir_ino=%lu "
                         "pos_start=%lld pos_end=%lld copied=%d "
                         "skipped_deleted=%d (buf_max=%d)\n",
                         dir->i_ino, (s64)pos_start, (s64)ctx->pos,
@@ -4235,7 +4235,7 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
     struct inode *inode = wpw->inode;
     int ret;
 
-    pr_info("powerfs: WB_READ_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d) needle_len=%u\n",
+    pr_debug("powerfs: WB_READ_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d) needle_len=%u\n",
             inode->i_ino, (unsigned long long)ctx->needle_id,
             req->error, req->resp_status,
             ctx->needle_start_idx, ctx->needle_end_idx, ctx->needle_len);
@@ -4276,7 +4276,7 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
         ctx->needle_len = (__u32)req->resp_data_len;
     }
 
-    pr_info("powerfs: WB_READ_CB ino=%lu nid=%llu after_resp status=%u resp_data_len=%llu needle_len=%u\n",
+    pr_debug("powerfs: WB_READ_CB ino=%lu nid=%llu after_resp status=%u resp_data_len=%llu needle_len=%u\n",
             inode->i_ino, (unsigned long long)ctx->needle_id,
             req->resp_status, (unsigned long long)req->resp_data_len,
             ctx->needle_len);
@@ -4288,9 +4288,13 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
      * committed the data yet. If we proceed with RMW using only the server
      * data, any gaps between dirty pages are zeroed → data corruption.
      *
-     * Fix: ALWAYS fill the entire needle range from the page cache (both
-     * clean and dirty pages) before overlaying dirty pages. This ensures
-     * no data is lost even if the server returns empty or partial data.
+     * Optimization: fill from page cache ONLY when the server returned
+     * empty or partial data (needle_len < max_needle_len). When the server
+     * has complete data, dirty pages will be overlaid in the modify step
+     * below, and clean pages are already consistent with the server — no
+     * need to traverse the pagecache. This avoids 256 find_get_page+kmap
+     * per needle in the common writeback path.
+     *
      * Pages in the page cache are at least as new as the server data (they
      * were either read from the server or written by this client), so
      * overwriting server data with page cache data is safe.
@@ -4301,6 +4305,8 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
         loff_t first_offset = wpw->offsets[ctx->needle_start_idx];
         loff_t needle_start = first_offset - (first_offset % POWERFS_CHUNK_SIZE);
         loff_t isize = i_size_read(inode);
+        __u32 max_needle_len = (__u32)min_t(loff_t, isize - needle_start,
+                                            POWERFS_CHUNK_SIZE);
         loff_t fill_end = min_t(loff_t, isize,
                                 needle_start + POWERFS_CHUNK_SIZE);
         pgoff_t start_pg = needle_start >> PAGE_SHIFT;
@@ -4308,11 +4314,21 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
         pgoff_t pg;
         int pages_found = 0;
 
-        pr_info("powerfs: WB_READ_CB ino=%lu nid=%llu filling range %llu-%llu (i_size=%llu) from pagecache, server_needle_len=%u\n",
+        pr_debug("powerfs: WB_READ_CB ino=%lu nid=%llu filling range %llu-%llu (i_size=%llu) from pagecache, server_needle_len=%u\n",
                 inode->i_ino, (unsigned long long)ctx->needle_id,
                 (unsigned long long)needle_start,
                 (unsigned long long)fill_end,
                 (unsigned long long)isize, ctx->needle_len);
+
+        /* Skip pagecache fill when server already has complete data.
+         * Dirty pages will be overlaid in the modify step below. */
+        if (ctx->needle_len >= max_needle_len) {
+            pr_debug("powerfs: WB_READ_CB ino=%lu nid=%llu skip pagecache fill (server_len=%u >= max=%u)\n",
+                    inode->i_ino, (unsigned long long)ctx->needle_id,
+                    ctx->needle_len, max_needle_len);
+            goto skip_pagecache_fill;
+        }
+
         for (pg = start_pg; pg < end_pg; pg++) {
             struct page *pgc = find_get_page(inode->i_mapping, pg);
             if (pgc) {
@@ -4328,9 +4344,11 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
                     ctx->needle_len = off_in_needle + copy_len;
             }
         }
-        pr_info("powerfs: WB_READ_CB ino=%lu nid=%llu pagecache fill done: found %d pages, needle_len=%u\n",
+        pr_debug("powerfs: WB_READ_CB ino=%lu nid=%llu pagecache fill done: found %d pages, needle_len=%u\n",
                 inode->i_ino, (unsigned long long)ctx->needle_id,
                 pages_found, ctx->needle_len);
+    skip_pagecache_fill:
+        ; /* label target */
     }
 
     /* K2-10: After truncate, the server needle may still have stale data
@@ -4357,7 +4375,7 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
              * the first N bytes. So we must submit the FULL original server
              * needle length (with zeros beyond i_size) to overwrite the
              * stale data. The memset below zeros out the stale region. */
-            pr_info("powerfs: WB_READ_CB ino=%lu nid=%llu zeroing stale data beyond i_size (needle_len=%u, i_size=%llu, needle_start=%llu) — keeping full needle_len to overwrite server\n",
+            pr_debug("powerfs: WB_READ_CB ino=%lu nid=%llu zeroing stale data beyond i_size (needle_len=%u, i_size=%llu, needle_start=%llu) — keeping full needle_len to overwrite server\n",
                     inode->i_ino, (unsigned long long)ctx->needle_id,
                     ctx->needle_len,
                     (unsigned long long)isize,
@@ -4379,7 +4397,7 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
              * region. Extend needle_len to cover the full range up to i_size
              * so the server needle size matches i_size and subsequent reads
              * of the extended region return zeros instead of short reads. */
-            pr_info("powerfs: WB_READ_CB ino=%lu nid=%llu extending needle from %u to %u (i_size=%llu, needle_start=%llu, sparse region zero-filled)\n",
+            pr_debug("powerfs: WB_READ_CB ino=%lu nid=%llu extending needle from %u to %u (i_size=%llu, needle_start=%llu, sparse region zero-filled)\n",
                     inode->i_ino, (unsigned long long)ctx->needle_id,
                     ctx->needle_len, max_needle_len,
                     (unsigned long long)isize,
@@ -4412,7 +4430,7 @@ static int powerfs_wb_read_cb(struct powerfs_request *req)
     }
 
     /* 提交 write_needle_async (第二阶段) */
-    pr_info("powerfs: WB_WRITE_SUBMIT ino=%lu nid=%llu len=%u\n",
+    pr_debug("powerfs: WB_WRITE_SUBMIT ino=%lu nid=%llu len=%u\n",
             inode->i_ino, (unsigned long long)ctx->needle_id,
             ctx->needle_len);
     ret = powerfs_net_write_needle_async(
@@ -5942,6 +5960,7 @@ static long powerfs_fallocate(struct file *file, int mode,
                               loff_t offset, loff_t len)
 {
     struct inode *inode = file_inode(file);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
     loff_t new_size = offset + len;
     int ret;
 
@@ -5964,9 +5983,91 @@ static long powerfs_fallocate(struct file *file, int mode,
         ret = 0;
     } else if (!(mode & FALLOC_FL_KEEP_SIZE)) {
         /* Default mode: extend file size */
-        if (new_size > i_size_read(inode)) {
+        loff_t old_size = i_size_read(inode);
+
+        if (new_size > old_size) {
             i_size_write(inode, new_size);
             mark_inode_dirty(inode);
+
+            /* O-03: For FLAT files, explicitly zero the extended region
+             * [old_size, new_size) and trigger synchronous writeback so
+             * the server needle is extended with zeros. Without this:
+             *   - The extended region has no pagecache pages; a subsequent
+             *     writeback RMW gap-fill would find no pages and produce
+             *     uninitialized gap data.
+             *   - The server needle retains its old size; if refresh_work
+             *     later invalidates the pagecache (multi-client NOTIFY),
+             *     reads of the extended region would fetch stale/short
+             *     data from the server.
+             * This mirrors the powerfs_setattr extend path (K2-14). */
+            if (pi->placement == POWERFS_PLACEMENT_FLAT &&
+                pi->volume_id && pi->file_key) {
+                pgoff_t start_pg = old_size >> PAGE_SHIFT;
+                pgoff_t end_pg = (new_size - 1) >> PAGE_SHIFT;
+                pgoff_t pg;
+                int dirty_count = 0;
+
+                for (pg = start_pg; pg <= end_pg; pg++) {
+                    struct page *page;
+                    size_t off = 0;
+                    bool need_read = false;
+
+                    if (pg == start_pg) {
+                        off = old_size & (PAGE_SIZE - 1);
+                        /* If old_size is page-aligned, the entire page
+                         * is in the extended region — no need to read.
+                         * Otherwise, we need valid data before old_size. */
+                        need_read = (off > 0);
+                    }
+
+                    if (need_read) {
+                        /* Read existing page to preserve data before
+                         * old_size. read_mapping_page handles pagecache
+                         * lookup and server fetch. */
+                        page = read_mapping_page(inode->i_mapping,
+                                                  pg, NULL);
+                        if (IS_ERR(page)) {
+                            /* Server read failed — create zero page */
+                            page = find_or_create_page(
+                                inode->i_mapping, pg, GFP_NOFS);
+                            if (!page)
+                                continue;
+                            zero_user_segment(page, 0, PAGE_SIZE);
+                            SetPageUptodate(page);
+                            off = 0;
+                        } else {
+                            lock_page(page);
+                            zero_user_segment(page, off, PAGE_SIZE);
+                        }
+                    } else {
+                        /* Page is entirely in the extended region (or
+                         * old_size is page-aligned). Create zero page
+                         * without reading from server (avoids fetching
+                         * stale data). */
+                        page = find_or_create_page(
+                            inode->i_mapping, pg, GFP_NOFS);
+                        if (!page)
+                            continue;
+                        zero_user_segment(page, 0, PAGE_SIZE);
+                        SetPageUptodate(page);
+                    }
+
+                    set_page_dirty(page);
+                    unlock_page(page);
+                    put_page(page);
+                    dirty_count++;
+                }
+
+                pr_debug("powerfs: FALLOCATE extend FLAT ino=%lu old=%llu new=%llu, zeroed %d pages\n",
+                        inode->i_ino, (unsigned long long)old_size,
+                        (unsigned long long)new_size, dirty_count);
+
+                /* Synchronous writeback to update server needle with
+                 * zeros in the extended region. Do NOT re-dirty after
+                 * writeback; rely on refresh_work's K2-14 skip to keep
+                 * the zeroed pages resident in pagecache. */
+                filemap_write_and_wait(inode->i_mapping);
+            }
         }
         ret = 0;
     } else {
