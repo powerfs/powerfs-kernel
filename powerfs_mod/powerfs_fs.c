@@ -924,49 +924,55 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
     }
 
     /* 2. 更新 inode 属性 */
-    /* Read pi->content_size BEFORE inode->i_lock.
+    /* Read pi->content_size and inline_dirty BEFORE inode->i_lock.
      * Lock ordering: pi->i_lock → inode->i_lock (powerfs_setattr acquires
      * pi->i_lock first, then calls setattr_copy/mark_inode_dirty which use
      * inode->i_lock). Acquiring pi->i_lock inside inode->i_lock would invert
      * this order and risk deadlock. */
     u64 local_content_size;
+    bool local_inline_dirty;
     spin_lock(&pi->i_lock);
     local_content_size = pi->content_size;
+    local_inline_dirty = pi->inline_dirty;
     spin_unlock(&pi->i_lock);
 
+    /* Determine if local client has pending (uncommitted) modifications.
+     * If so, skip size/attribute updates — the GETATTR response may be stale
+     * (self-NOTIFY: Filer notifies the same client that made the change,
+     *  before the server has processed the local SETATTR/writeback).
+     *
+     * Multi-client fix (MC-302): Previously, the check also included
+     * `local_content_size != size`, which incorrectly fired when a REMOTE
+     * client modified the file (local size != new server size). This caused
+     * size, mode, and pagecache updates to be skipped on remote changes,
+     * leading to stale reads in multi-client scenarios.
+     *
+     * The fix: rely ONLY on dirty/writeback page tags and inline_dirty to
+     * detect pending LOCAL modifications. If no local writes are pending,
+     * always accept the server's attributes (the change came from another
+     * client or the local writeback has completed). */
+    bool local_pending = mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+                         mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK) ||
+                         local_inline_dirty;
+
     spin_lock(&inode->i_lock);
-    /* 如果本地有脏页 (未刷盘的写入), 不用 filer 端的 size 覆盖本地 i_size.
-     * 因为 write_end 已设置 i_size, 但 writeback 尚未通过 setattr 同步到 filer,
-     * filer 端的 size 可能是旧值 (0).
-     * 参考 ceph: 有 i_dirty_caps 时不覆盖 i_size.
-     *
-     * Additionally check pi->content_size: if the local "confirmed" size
-     * (set by powerfs_setattr before the SETATTR RPC) differs from the
-     * server's reported size, the GETATTR response is stale (sent before
-     * the server processed our SETATTR). Overwriting i_size with the stale
-     * value causes SIGBUS in mmap page faults (filemap_fault checks
-     * index >= DIV_ROUND_UP(i_size, PAGE_SIZE)).
-     * This happens when: ftruncate(N) → SETATTR sync → concurrent
-     * refresh_work GETATTR returns old size=0 → i_size reset to 0.
-     *
-     * K2-11: The check must be != (not just >), because after a truncate
-     * (size decrease), local_content_size < server size. The old check
-     * (local_content_size > size) only caught the extend case, missing
-     * the truncate case. This caused refresh_work to overwrite i_size
-     * with the stale (larger) server size, undoing the truncate and
-     * causing data mismatch in fsx-linux (stale data read from server
-     * needle after the file was re-extended). */
-    if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
-        mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK) ||
-        local_content_size != size) {
-        pr_debug("powerfs: refresh_work ino=%llu skip size update (local=%lld filer=%llu content_size=%llu)\n",
-                rw->ino, i_size_read(inode), (unsigned long long)size,
-                (unsigned long long)local_content_size);
+    if (local_pending) {
+        pr_debug("powerfs: refresh_work ino=%llu skip attr update (local pending: dirty/wb/inline)\n",
+                rw->ino);
     } else {
+        /* Accept server's size — no pending local modifications */
         if (i_size_read(inode) != size) {
             i_size_write(inode, size);
         }
+        /* Update permission bits and ownership from GETATTR response.
+         * Previously, mode/uid/gid were fetched but never applied, causing
+         * chmod/chown changes by other clients to be invisible (MC-304). */
+        inode->i_mode = mode;
+        i_uid_write(inode, uid);
+        i_gid_write(inode, gid);
     }
+    /* nlink, mtime, atime, ctime are always safe to update (metadata-only,
+     * no data consistency implications) */
     set_nlink(inode, nlink);
     inode_set_mtime(inode, mtime, 0);
     inode_set_atime(inode, atime, 0);
@@ -974,11 +980,9 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
     spin_unlock(&inode->i_lock);
 
     spin_lock(&pi->i_lock);
-    /* Sync content_size only when we accepted the server's size (i.e.,
-     * local_content_size == size, meaning no pending local truncate/write).
-     * K2-11: Changed from <= to == to avoid overwriting content_size with
-     * a stale (larger) server size after a local truncate. */
-    if (local_content_size == size)
+    /* Sync content_size only when we accepted the server's size (no pending
+     * local modifications). */
+    if (!local_pending)
         pi->content_size = size;
     /* 仅在 Filer 返回非零值时更新 volume_id/file_key.
      * close 前的 getattr 可能返回 0 (Filer 端 chunks 在 close 时才同步),
@@ -992,51 +996,60 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
     pi->need_refresh = false;
     spin_unlock(&pi->i_lock);
 
-    pr_debug("powerfs: refresh_work ino=%llu size=%llu vid=%llu fkey=%llu\n",
+    pr_debug("powerfs: refresh_work ino=%llu size=%llu vid=%llu fkey=%llu mode=%o local_pending=%d\n",
             rw->ino, (unsigned long long)size,
             (unsigned long long)volume_id,
-            (unsigned long long)file_key);
+            (unsigned long long)file_key, mode, local_pending);
 
     /* 3. 失效 page cache (clean unlocked pages), 使下次读从 volume 重新拉取.
      * 使用非阻塞版本 invalidate_mapping_pages: 跳过已锁定/脏页, 不阻塞等待.
      *
-     * K2-8/K2-11: Skip invalidation when local content_size != server size.
-     * If the local size differs from the server (either direction), a
-     * SETATTR is in flight and the server has stale data. Invalidating
-     * clean pages would cause:
-     *   - Next read to re-fetch stale data from server
-     *   - Writeback RMW to lose gap data (clean pages needed for gap fill)
-     * This is critical for:
-     *   - inline→Flat migration: server may not have committed needle yet
-     *   - truncate: server needle may not be truncated yet
-     *   - extend: server may not have the new size yet
+     * Multi-client fix (MC-302/O-04): Previously, pagecache invalidation was
+     * skipped for ALL FLAT files when local == server (K2-14), and for ALL
+     * files when local != server (K2-8/K2-11). Both conditions are wrong for
+     * multi-client: they prevent Client B from seeing Client A's writes.
      *
-     * K2-14: Also skip invalidation for FLAT files when local == server.
-     * The server's write_needle may not store zeros at the i_size boundary
-     * (byte old_size after a truncate-down). When the file is later extended,
-     * the server needle has stale data at this boundary. If we invalidate the
-     * pagecache, the next read fetches stale data from the server. By keeping
-     * the pagecache, reads use the locally-correct data (zeros from the
-     * extend fix). This is safe for single-client scenarios; for multi-client,
-     * the NOTIFY mechanism handles invalidation. */
-    if (local_content_size != size) {
-        pr_debug("powerfs: refresh_work ino=%llu skip pagecache invalidate (local=%llu != filer=%llu)\n",
-                rw->ino, (unsigned long long)local_content_size,
-                (unsigned long long)size);
-    } else if (pi->placement == POWERFS_PLACEMENT_FLAT &&
-               pi->volume_id && pi->file_key) {
-        pr_debug("powerfs: refresh_work ino=%llu skip pagecache invalidate (FLAT file, local=%llu == filer=%llu)\n",
-                rw->ino, (unsigned long long)local_content_size,
-                (unsigned long long)size);
+     * New behavior: only skip invalidation when the LOCAL client has pending
+     * writes (dirty/writeback pages or inline_dirty). If no local writes are
+     * pending, always invalidate — the data on the server is at least as new
+     * as the local pagecache (either a remote client wrote, or local
+     * writeback has completed and the server has the latest data).
+     *
+     * For FLAT files specifically: the K2-14 concern (server needle has stale
+     * zeros at i_size boundary) is no longer relevant because O-03/O-10 fixes
+     * now ensure the server needle is properly zeroed on extend/punch_hole.
+     * The truncate-extend fix (setattr) also triggers synchronous writeback,
+     * so by the time refresh_work runs, the server needle is up-to-date. */
+    if (local_pending) {
+        pr_debug("powerfs: refresh_work ino=%llu skip pagecache invalidate (local pending)\n",
+                rw->ino);
     } else {
         invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
     }
 
     /* 4. For directories, expire the readdir lease so next readdir
      * re-fetches entries from the Filer. (Moved from powerfs_invalidate_one
-     * since the inode lookup is now deferred to this work function.) */
-    if (S_ISDIR(inode->i_mode))
+     * since the inode lookup is now deferred to this work function.)
+     *
+     * Multi-client fix (MC-201/MC-203): When a remote client unlinks or
+     * rmdir's a child, the local dentry cache retains the stale dentry.
+     * Even though dir_lease expiry forces readdir re-fetch, individual
+     * dentry lookups (e.g. `ls <file>`) still hit the cached dentry and
+     * never re-query the Filer. shrink_dcache_parent evicts unreferenced
+     * child dentries so the next lookup goes to the Filer and returns
+     * -ENOENT for deleted entries. Referenced dentries (open files) are
+     * kept until release, which is the desired behavior. */
+    if (S_ISDIR(inode->i_mode)) {
+        struct dentry *dir_dentry;
         powerfs_invalidate_dir_lease(inode);
+        /* Evict unreferenced child dentries so the next lookup goes to
+         * the Filer instead of returning a stale cached dentry. */
+        dir_dentry = d_find_any_alias(inode);
+        if (dir_dentry) {
+            shrink_dcache_parent(dir_dentry);
+            dput(dir_dentry);
+        }
+    }
 
 out_iput:
     iput(inode);
