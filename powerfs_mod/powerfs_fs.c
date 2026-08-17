@@ -5978,8 +5978,112 @@ static long powerfs_fallocate(struct file *file, int mode,
     inode_lock(inode);
 
     if (mode & FALLOC_FL_PUNCH_HOLE) {
-        /* Punch hole: release page cache in the given range */
-        truncate_pagecache_range(inode, offset, new_size - 1);
+        /* PUNCH_HOLE: deallocate data in [offset, new_size), reads as zeros.
+         * File size is unchanged (KEEP_SIZE is required for PUNCH_HOLE).
+         *
+         * O-10: For FLAT files, truncate_pagecache_range alone is
+         * insufficient — it only zeroes/removes pagecache pages but
+         * does not update the server needle. After pagecache eviction
+         * (memory pressure, posix_fadvise, refresh_work invalidation),
+         * reads re-fetch the original (non-zero) data from the server.
+         *
+         * Fix: zero the punched region in pagecache, mark pages dirty,
+         * and trigger synchronous writeback so the server needle is
+         * updated with zeros. This mirrors the O-03 extend path.
+         *
+         * For non-FLAT files (INLINE), data lives in inline_data (not
+         * the server needle), so truncate_pagecache_range is sufficient.
+         */
+        if (pi->placement == POWERFS_PLACEMENT_FLAT &&
+            pi->volume_id && pi->file_key) {
+            loff_t file_size = i_size_read(inode);
+            loff_t punch_end = min(new_size, file_size);
+            pgoff_t start_pg, end_pg, pg;
+            int dirty_count = 0;
+
+            if (offset >= file_size) {
+                /* Hole entirely beyond file size — no-op */
+                ret = 0;
+                goto falloc_done;
+            }
+
+            start_pg = offset >> PAGE_SHIFT;
+            end_pg = (punch_end - 1) >> PAGE_SHIFT;
+
+            for (pg = start_pg; pg <= end_pg; pg++) {
+                struct page *page;
+                size_t pg_off = (size_t)pg << PAGE_SHIFT;
+                size_t z_start, z_end;
+                bool need_read = false;
+
+                /* Calculate zero range within this page.
+                 * z_start/z_end are offsets within the page (0..PAGE_SIZE).
+                 */
+                z_start = (pg_off < (size_t)offset)
+                          ? (size_t)(offset - pg_off) : 0;
+                z_end = (pg_off + PAGE_SIZE > (size_t)punch_end)
+                        ? (size_t)(punch_end - pg_off) : PAGE_SIZE;
+
+                /* If the page is partially outside the hole (first or
+                 * last page with non-page-aligned boundaries), we need
+                 * to read existing data to preserve the non-punched
+                 * portion. Pages fully within the hole can be zeroed
+                 * without reading from the server.
+                 */
+                if (z_start > 0 || z_end < PAGE_SIZE)
+                    need_read = true;
+
+                if (need_read) {
+                    page = read_mapping_page(inode->i_mapping, pg, NULL);
+                    if (IS_ERR(page)) {
+                        /* Server read failed — create zero page */
+                        page = find_or_create_page(
+                            inode->i_mapping, pg, GFP_NOFS);
+                        if (!page)
+                            continue;
+                        zero_user_segment(page, 0, PAGE_SIZE);
+                        SetPageUptodate(page);
+                    } else {
+                        lock_page(page);
+                    }
+                } else {
+                    /* Page is entirely within the hole — create/reuse
+                     * zero page without reading from server.
+                     */
+                    page = find_or_create_page(
+                        inode->i_mapping, pg, GFP_NOFS);
+                    if (!page)
+                        continue;
+                    zero_user_segment(page, 0, PAGE_SIZE);
+                    SetPageUptodate(page);
+                }
+
+                /* Zero the punched portion (for partial pages, this
+                 * preserves data outside the hole). For full pages,
+                 * z_start=0, z_end=PAGE_SIZE (already zeroed above).
+                 */
+                zero_user_segment(page, z_start, z_end);
+                set_page_dirty(page);
+                unlock_page(page);
+                put_page(page);
+                dirty_count++;
+            }
+
+            pr_debug("powerfs: FALLOCATE punch_hole FLAT ino=%lu offset=%llu len=%llu, zeroed %d pages\n",
+                    inode->i_ino, (unsigned long long)offset,
+                    (unsigned long long)len, dirty_count);
+
+            /* Synchronous writeback to update server needle with zeros
+             * in the punched region.
+             */
+            filemap_write_and_wait(inode->i_mapping);
+        } else {
+            /* Non-FLAT (INLINE): just release page cache (original
+             * behavior). INLINE data is in inline_data, not the server
+             * needle, so truncate_pagecache_range is sufficient.
+             */
+            truncate_pagecache_range(inode, offset, new_size - 1);
+        }
         ret = 0;
     } else if (!(mode & FALLOC_FL_KEEP_SIZE)) {
         /* Default mode: extend file size */
@@ -5999,7 +6103,8 @@ static long powerfs_fallocate(struct file *file, int mode,
              *     later invalidates the pagecache (multi-client NOTIFY),
              *     reads of the extended region would fetch stale/short
              *     data from the server.
-             * This mirrors the powerfs_setattr extend path (K2-14). */
+             * This mirrors the powerfs_setattr extend path (K2-14).
+             */
             if (pi->placement == POWERFS_PLACEMENT_FLAT &&
                 pi->volume_id && pi->file_key) {
                 pgoff_t start_pg = old_size >> PAGE_SHIFT;
@@ -6016,14 +6121,16 @@ static long powerfs_fallocate(struct file *file, int mode,
                         off = old_size & (PAGE_SIZE - 1);
                         /* If old_size is page-aligned, the entire page
                          * is in the extended region — no need to read.
-                         * Otherwise, we need valid data before old_size. */
+                         * Otherwise, we need valid data before old_size.
+                         */
                         need_read = (off > 0);
                     }
 
                     if (need_read) {
                         /* Read existing page to preserve data before
                          * old_size. read_mapping_page handles pagecache
-                         * lookup and server fetch. */
+                         * lookup and server fetch.
+                         */
                         page = read_mapping_page(inode->i_mapping,
                                                   pg, NULL);
                         if (IS_ERR(page)) {
@@ -6043,7 +6150,8 @@ static long powerfs_fallocate(struct file *file, int mode,
                         /* Page is entirely in the extended region (or
                          * old_size is page-aligned). Create zero page
                          * without reading from server (avoids fetching
-                         * stale data). */
+                         * stale data).
+                         */
                         page = find_or_create_page(
                             inode->i_mapping, pg, GFP_NOFS);
                         if (!page)
@@ -6065,7 +6173,8 @@ static long powerfs_fallocate(struct file *file, int mode,
                 /* Synchronous writeback to update server needle with
                  * zeros in the extended region. Do NOT re-dirty after
                  * writeback; rely on refresh_work's K2-14 skip to keep
-                 * the zeroed pages resident in pagecache. */
+                 * the zeroed pages resident in pagecache.
+                 */
                 filemap_write_and_wait(inode->i_mapping);
             }
         }
@@ -6075,6 +6184,7 @@ static long powerfs_fallocate(struct file *file, int mode,
         ret = 0;
     }
 
+falloc_done:
     inode_unlock(inode);
     return ret;
 }
