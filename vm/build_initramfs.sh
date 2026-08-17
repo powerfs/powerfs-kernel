@@ -5,10 +5,11 @@
 
 set -e
 
-OUTPUT_DIR="/home/portion/powerfs/kernel/vm/output"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUTPUT_DIR="${SCRIPT_DIR}/output"
 INITRAMFS_DIR="${OUTPUT_DIR}/initramfs"
 INITRAMFS_IMG="${OUTPUT_DIR}/initramfs.cpio.gz"
-POWERFS_MOD_DIR="/home/portion/powerfs/kernel/powerfs_mod"
+POWERFS_MOD_DIR="${SCRIPT_DIR}/../powerfs_mod"
 
 echo "=== PowerFS initramfs 构建 ==="
 

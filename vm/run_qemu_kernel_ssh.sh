@@ -6,7 +6,8 @@
 
 set -e
 
-OUTPUT_DIR="/home/portion/powerfs/kernel/vm/output"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUTPUT_DIR="${SCRIPT_DIR}/output"
 KERNEL_IMAGE="${OUTPUT_DIR}/bzImage"
 INITRAMFS="${OUTPUT_DIR}/initramfs.cpio.gz"
 QEMU_DISK="${OUTPUT_DIR}/qemu_disk.img"
@@ -32,7 +33,7 @@ POWERFS_VOLUME_ADDR="${POWERFS_VOLUME_ADDR:-172.30.0.21,172.30.0.22,172.30.0.23}
 POWERFS_VOLUME_PORT="${POWERFS_VOLUME_PORT:-8901}"
 
 # 9p 共享目录 (Host <-> VM 文件共享, 用于 hot deploy powerfs.ko 和测试脚本)
-SHARE_DIR="/home/portion/powerfs/kernel/vm/share"
+SHARE_DIR="${SCRIPT_DIR}/share"
 
 # QEMU 参数
 MEM_SIZE="4096"

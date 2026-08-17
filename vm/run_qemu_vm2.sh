@@ -4,11 +4,12 @@
 
 set -e
 
-OUTPUT_DIR="/home/portion/powerfs/kernel/vm/output"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUTPUT_DIR="${SCRIPT_DIR}/output"
 KERNEL_IMAGE="${OUTPUT_DIR}/bzImage"
 INITRAMFS="${OUTPUT_DIR}/initramfs.cpio.gz"
 QEMU_DISK="${OUTPUT_DIR}/qemu_disk2.img"
-SHARE_DIR="/home/portion/powerfs/kernel/vm/share"
+SHARE_DIR="${SCRIPT_DIR}/share"
 
 TAP_DEVICE="tap1"
 SSH_PORT="2224"
