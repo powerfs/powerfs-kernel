@@ -101,7 +101,7 @@ run_a() { $SSH_A "$1" 2>/dev/null; }
 run_b() { $SSH_B "$1" 2>/dev/null; }
 
 # Helper: wait for NOTIFY propagation
-wait_notify() { sleep ${1:-2}; }
+wait_notify() { sleep ${1:-${WAIT_NOTIFY_DEFAULT:-2}}; }
 
 # dmesg baseline
 DMESG_BASELINE_A=0
@@ -129,7 +129,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-002"; then case_start
 echo "=== MC-002: Shared directory visibility ==="
 run_a "rm -rf $PFS/mc_shared && mkdir -p $PFS/mc_shared"
-wait_notify 1
+wait_notify 3
 DIR_B=$(run_b "ls $PFS/ | grep -c mc_shared")
 if [ "$DIR_B" = "1" ]; then ok "MC-002 shared dir visible"; else ng "MC-002 shared dir not visible (B sees $DIR_B)"; fi
 fi
@@ -138,7 +138,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-003"; then case_start
 echo "=== MC-003: Shared file visibility ==="
 run_a "touch $PFS/mc_shared/f1"
-wait_notify 1
+wait_notify 3
 FILE_B=$(run_b "ls $PFS/mc_shared/ | grep -c f1")
 if [ "$FILE_B" = "1" ]; then ok "MC-003 shared file visible"; else ng "MC-003 shared file not visible"; fi
 fi
@@ -147,7 +147,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-101"; then case_start
 echo "=== MC-101: Write visibility ==="
 run_a "echo hello > $PFS/mc_shared/wtest && sync"
-wait_notify 2
+wait_notify 3
 READ_B=$(run_b "cat $PFS/mc_shared/wtest")
 if [ "$READ_B" = "hello" ]; then ok "MC-101 write visible"; else ng "MC-101 write not visible (B read '$READ_B')"; fi
 fi
@@ -156,7 +156,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-102"; then case_start
 echo "=== MC-102: Overwrite visibility ==="
 run_a "echo world > $PFS/mc_shared/wtest && sync"
-wait_notify 2
+wait_notify 3
 READ_B=$(run_b "cat $PFS/mc_shared/wtest")
 if [ "$READ_B" = "world" ]; then ok "MC-102 overwrite visible"; else ng "MC-102 overwrite not visible (B read '$READ_B')"; fi
 fi
@@ -175,7 +175,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-104"; then case_start
 echo "=== MC-104: Truncate down visibility ==="
 run_a "truncate -s 100 $PFS/mc_shared/wtest && sync"
-wait_notify 2
+wait_notify 3
 SZ_B=$(run_b "stat -c %s $PFS/mc_shared/wtest")
 if [ "$SZ_B" = "100" ]; then ok "MC-104 truncate visible (size=100)"; else ng "MC-104 truncate not visible (B sees size=$SZ_B)"; fi
 fi
@@ -184,7 +184,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-105"; then case_start
 echo "=== MC-105: Truncate up visibility ==="
 run_a "truncate -s 8192 $PFS/mc_shared/wtest && sync"
-wait_notify 2
+wait_notify 3
 SZ_B=$(run_b "stat -c %s $PFS/mc_shared/wtest")
 if [ "$SZ_B" = "8192" ]; then ok "MC-105 extend visible (size=8192)"; else ng "MC-105 extend not visible (B sees size=$SZ_B)"; fi
 fi
@@ -193,9 +193,9 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-106"; then case_start
 echo "=== MC-106: fallocate extend visibility ==="
 run_a "rm -f $PFS/mc_shared/fatest && dd if=/dev/zero of=$PFS/mc_shared/fatest bs=4096 count=4 2>/dev/null && sync"
-wait_notify 1
+wait_notify 3
 run_a "fallocate -l 65536 $PFS/mc_shared/fatest && sync"
-wait_notify 2
+wait_notify 3
 SZ_B=$(run_b "stat -c %s $PFS/mc_shared/fatest")
 if [ "$SZ_B" = "65536" ]; then
     # Check extended region is zeros
@@ -214,7 +214,7 @@ echo "=== MC-107: PUNCH_HOLE cross-client visibility (O-10) ==="
 run_a "rm -f $PFS/mc_shared/ptest"
 # Write 16KB known pattern on A
 run_a "dd if=/dev/urandom of=$PFS/mc_shared/ptest bs=4096 count=4 2>/dev/null && sync"
-wait_notify 1
+wait_notify 3
 # B reads to populate pagecache
 run_b "dd if=$PFS/mc_shared/ptest of=/dev/null bs=4096 count=4 2>/dev/null"
 # A punches hole using C program
@@ -240,7 +240,7 @@ int main() {
 CEOF
 gcc -o /tmp/punch_test /tmp/punch_test.c 2>/dev/null && /tmp/punch_test && echo PUNCH_OK || echo PUNCH_FAIL
 ')
-wait_notify 2
+wait_notify 3
 # B reads punched region
 NZ_B=$(run_b "dd if=$PFS/mc_shared/ptest bs=1 skip=4096 count=4096 2>/dev/null | tr -d '\\0' | wc -c")
 if echo "$HOLE_RESULT" | grep -q PUNCH_OK; then
@@ -254,12 +254,12 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-108"; then case_start
 echo "=== MC-108: Concurrent write different offsets ==="
 run_a "rm -f $PFS/mc_shared/cwtest && truncate -s 8192 $PFS/mc_shared/cwtest"
-wait_notify 1
+wait_notify 3
 run_a "dd if=/dev/urandom of=$PFS/mc_shared/cwtest bs=4096 count=1 seek=0 conv=notrunc 2>/dev/null && sync" &
 run_b "dd if=/dev/urandom of=$PFS/mc_shared/cwtest bs=4096 count=1 seek=1 conv=notrunc 2>/dev/null && sync" &
 wait
 wait
-wait_notify 2
+wait_notify 3
 HASH_A=$(run_a "md5sum $PFS/mc_shared/cwtest | cut -d' ' -f1")
 HASH_B=$(run_b "md5sum $PFS/mc_shared/cwtest | cut -d' ' -f1")
 if [ "$HASH_A" = "$HASH_B" ]; then ok "MC-108 concurrent write consistent ($HASH_A)"; else ng "MC-108 concurrent write divergent A=$HASH_A B=$HASH_B"; fi
@@ -269,7 +269,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-201"; then case_start
 echo "=== MC-201: unlink visibility ==="
 run_a "rm -f $PFS/mc_shared/f1"
-wait_notify 2
+wait_notify 3
 STAT_B=$(run_b "ls $PFS/mc_shared/f1 2>&1")
 if echo "$STAT_B" | grep -qi "No such"; then ok "MC-201 unlink visible"; else ng "MC-201 unlink not visible (B: $STAT_B)"; fi
 fi
@@ -278,7 +278,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-202"; then case_start
 echo "=== MC-202: mkdir visibility ==="
 run_a "mkdir -p $PFS/mc_shared/dir1"
-wait_notify 2
+wait_notify 3
 DIR_B=$(run_b "ls -d $PFS/mc_shared/dir1 2>/dev/null | grep -c dir1")
 if [ "$DIR_B" = "1" ]; then ok "MC-202 mkdir visible"; else ng "MC-202 mkdir not visible"; fi
 fi
@@ -287,7 +287,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-203"; then case_start
 echo "=== MC-203: rmdir visibility ==="
 run_a "rmdir $PFS/mc_shared/dir1"
-wait_notify 2
+wait_notify 3
 DIR_B=$(run_b "ls -d $PFS/mc_shared/dir1 2>/dev/null | grep -c dir1")
 if [ "$DIR_B" = "0" ]; then ok "MC-203 rmdir visible"; else ng "MC-203 rmdir not visible"; fi
 fi
@@ -296,9 +296,9 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-204"; then case_start
 echo "=== MC-204: rename visibility ==="
 run_a "echo data > $PFS/mc_shared/oldname"
-wait_notify 1
+wait_notify 3
 run_a "mv $PFS/mc_shared/oldname $PFS/mc_shared/newname"
-wait_notify 2
+wait_notify 3
 OLD_B=$(run_b "ls $PFS/mc_shared/oldname 2>&1 | grep -c 'No such'")
 NEW_B=$(run_b "cat $PFS/mc_shared/newname 2>/dev/null")
 if [ "$OLD_B" = "1" ] && [ "$NEW_B" = "data" ]; then ok "MC-204 rename visible"; else ng "MC-204 rename not fully visible (old_gone=$OLD_B new_content='$NEW_B')"; fi
@@ -308,7 +308,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-301"; then case_start
 echo "=== MC-301: pagecache stale - INLINE file ==="
 run_a "rm -f $PFS/mc_shared/stale1 && echo v1 > $PFS/mc_shared/stale1 && sync"
-wait_notify 1
+wait_notify 3
 # B reads to cache
 run_b "cat $PFS/mc_shared/stale1 > /dev/null"
 # A modifies
@@ -324,7 +324,7 @@ echo "=== MC-302: pagecache stale - FLAT file (O-04 KEY TEST) ==="
 run_a "rm -f $PFS/mc_shared/stale2"
 # Create FLAT file (>8KB to trigger migration)
 run_a "dd if=/dev/urandom of=$PFS/mc_shared/stale2 bs=4096 count=4 2>/dev/null && sync"
-wait_notify 2
+wait_notify 3
 HASH_ORIG=$(run_a "md5sum $PFS/mc_shared/stale2 | cut -d' ' -f1")
 # B reads to populate pagecache
 run_b "md5sum $PFS/mc_shared/stale2 > /dev/null 2>&1"
@@ -351,7 +351,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-303"; then case_start
 echo "=== MC-303: Directory lease expiry ==="
 run_a "mkdir -p $PFS/mc_shared/dirlist"
-wait_notify 1
+wait_notify 3
 # B lists directory
 run_b "ls $PFS/mc_shared/dirlist/ > /dev/null 2>&1"
 # A creates files in directory
@@ -365,7 +365,7 @@ fi
 if [ "$MODE" != "smoke" ] || should_run "MC-304"; then case_start
 echo "=== MC-304: inode attribute cache (chmod) ==="
 run_a "rm -f $PFS/mc_shared/chmod_test && echo x > $PFS/mc_shared/chmod_test && chmod 600 $PFS/mc_shared/chmod_test"
-wait_notify 1
+wait_notify 3
 # B stats
 run_b "stat -c %a $PFS/mc_shared/chmod_test > /dev/null 2>&1"
 # A changes mode
