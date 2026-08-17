@@ -3648,6 +3648,7 @@ static int powerfs_add_dir_entry(struct inode *dir, u64 ino,
  *       - powerfs_clear_dir_entries (rmdir/evict)
  *       - powerfs_add_dir_entry 同名复用
  *       - powerfs_readdir Filer 重新拉取时 un-delete (文件被重建)
+ *       - powerfs_compact_dir_entries (O-05: readdir ctx->pos==0 时阈值触发)
  */
 static int powerfs_remove_dir_entry(struct inode *dir, const char *name)
 {
@@ -3704,6 +3705,51 @@ static void powerfs_clear_dir_entries(struct inode *dir)
     mutex_unlock(&dpi->dir_mutex);
 }
 
+/**
+ * powerfs_compact_dir_entries - 物理清理已标记 deleted 的目录条目
+ *
+ * O-05: 防止长生命周期目录 (如 /tmp) 的 deleted 条目无限堆积导致内存泄漏.
+ *
+ * 清理条件: deleted 条目数 >= 64 且占总数 50% 以上
+ * 调用时机: powerfs_readdir 入口且 ctx->pos == 0 (新读或 rewind)
+ *           此时无 stale ctx->pos 需要保持, 物理删除安全
+ * 锁: 调用方须持 dir_mutex
+ *
+ * 返回: 清理的条目数
+ */
+static int powerfs_compact_dir_entries(struct inode *dir)
+{
+    struct powerfs_inode_info *dpi = POWERFS_I(dir);
+    struct powerfs_dir_entry *entry, *tmp;
+    int total = 0, deleted = 0, removed = 0;
+
+    /* 统计总数和已删除数 */
+    list_for_each_entry(entry, &dpi->dir_entries, list) {
+        total++;
+        if (entry->deleted)
+            deleted++;
+    }
+
+    /* 未达阈值, 不清理 */
+    if (deleted < 64 || deleted * 2 < total)
+        return 0;
+
+    /* 物理删除所有 deleted 条目 */
+    list_for_each_entry_safe(entry, tmp, &dpi->dir_entries, list) {
+        if (entry->deleted) {
+            list_del_init(&entry->list);
+            kfree(entry);
+            removed++;
+        }
+    }
+
+    pr_info("powerfs: compact_dir_entries dir_ino=%lu compacted %d/%d entries "
+            "(remaining=%d)\n",
+            dir->i_ino, removed, total, total - removed);
+
+    return removed;
+}
+
 /* Phase 1: 本地 mutation 后清父目录 lease + bump epoch.
  * 调用时机: mkdir/rmdir/create/unlink/symlink/link/rename 网络请求成功后,
  *           在修改本地数据结构的同时清目录 lease.
@@ -3757,6 +3803,14 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
              READ_ONCE(dpi->dir_complete),
              READ_ONCE(dpi->dir_lease_expire),
              dpi->dir_lease_epoch);
+
+    /* O-05: 清理 deleted 条目, 防止内存泄漏.
+     * 仅在 ctx->pos == 0 (新读/rewind) 时清理, 此时无 stale 位置需保持. */
+    if (ctx->pos == 0) {
+        mutex_lock(&dpi->dir_mutex);
+        powerfs_compact_dir_entries(dir);
+        mutex_unlock(&dpi->dir_mutex);
+    }
 
     /* 处理 "." 和 ".." */
     if (ctx->pos == 0) {

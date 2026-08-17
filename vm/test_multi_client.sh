@@ -25,11 +25,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Smoke mode: only run core cases
-SMOKE_CASES="MC-001 MC-002 MC-101 MC-201 MC-203 MC-302 MC-304"
+# Smoke mode: core consistency paths (mount, visibility, truncate, fallocate, stale, lease)
+SMOKE_CASES="MC-001 MC-002 MC-101 MC-104 MC-105 MC-106 MC-107 MC-201 MC-203 MC-301 MC-302 MC-303 MC-304"
 should_run() {
     case "$1" in
-        MC-001|MC-002|MC-101|MC-201|MC-203|MC-302|MC-304) return 0 ;;
+        MC-001|MC-002|MC-101|MC-104|MC-105|MC-106|MC-107|MC-201|MC-203|MC-301|MC-302|MC-303|MC-304) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -209,44 +209,23 @@ fi
 # === MC-107: PUNCH_HOLE visibility (O-10) ===
 if [ "$MODE" != "smoke" ] || should_run "MC-107"; then case_start
 echo "=== MC-107: PUNCH_HOLE cross-client visibility (O-10) ==="
-# Need C program for PUNCH_HOLE since BusyBox doesn't support -p
-# Use python or direct syscall
+# Pre-compiled static binary (no gcc needed on VM)
+PUNCH_BIN="/mnt/host/test_punch_hole"
 run_a "rm -f $PFS/mc_shared/ptest"
 # Write 16KB known pattern on A
 run_a "dd if=/dev/urandom of=$PFS/mc_shared/ptest bs=4096 count=4 2>/dev/null && sync"
 wait_notify 3
 # B reads to populate pagecache
 run_b "dd if=$PFS/mc_shared/ptest of=/dev/null bs=4096 count=4 2>/dev/null"
-# A punches hole using C program
-run_a "/mnt/host/test_fallocate_modes $PFS/mc_shared > /dev/null 2>&1; echo done"
-# Actually use a simpler approach: A writes zeros manually to simulate
-# Since BusyBox lacks fallocate -p, use C program on A
-HOLE_RESULT=$(run_a '
-cat > /tmp/punch_test.c << "CEOF"
-#include <fcntl.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <linux/falloc.h>
-#include <sys/stat.h>
-int main() {
-    int fd = open("'$PFS'/mc_shared/ptest", O_WRONLY);
-    if (fd < 0) { perror("open"); return 1; }
-    int ret = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 4096, 4096);
-    if (ret < 0) { perror("fallocate"); return 1; }
-    fsync(fd);
-    close(fd);
-    return 0;
-}
-CEOF
-gcc -o /tmp/punch_test /tmp/punch_test.c 2>/dev/null && /tmp/punch_test && echo PUNCH_OK || echo PUNCH_FAIL
-')
+# A punches hole using pre-compiled static binary
+HOLE_RESULT=$(run_a "$PUNCH_BIN $PFS/mc_shared/ptest 4096 4096 2>&1")
 wait_notify 3
 # B reads punched region
 NZ_B=$(run_b "dd if=$PFS/mc_shared/ptest bs=1 skip=4096 count=4096 2>/dev/null | tr -d '\\0' | wc -c")
 if echo "$HOLE_RESULT" | grep -q PUNCH_OK; then
     if [ "$NZ_B" = "0" ]; then ok "MC-107 PUNCH_HOLE visible (B sees zeros)"; else ng "MC-107 PUNCH_HOLE not visible (B sees $NZ_B non-zero)"; fi
 else
-    skip "MC-107 PUNCH_HOLE (no gcc on VM or punch failed: $HOLE_RESULT)"
+    skip "MC-107 PUNCH_HOLE (binary missing or punch failed: $HOLE_RESULT)"
 fi
 fi
 
