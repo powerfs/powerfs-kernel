@@ -229,6 +229,7 @@ mount -t sysfs sysfs /sys
 CMDLINE=$(cat /proc/cmdline 2>/dev/null)
 POWERFS_MASTER_ADDR=$(echo "$CMDLINE" | grep -o 'powerfs_master_addr=[^ ]*' | head -1 | cut -d= -f2)
 POWERFS_MASTER_PORT=$(echo "$CMDLINE" | grep -o 'powerfs_master_port=[^ ]*' | head -1 | cut -d= -f2)
+VM_IP=$(echo "$CMDLINE" | grep -o 'vm_ip=[^ ]*' | head -1 | cut -d= -f2)
 echo "内核命令行: $CMDLINE"
 
 # 如果未指定，使用默认值
@@ -239,6 +240,12 @@ fi
 if [ -z "$POWERFS_MASTER_PORT" ]; then
     POWERFS_MASTER_PORT="9334"
 fi
+
+# VM_IP: 默认 172.30.0.100 (VM1), VM2 通过内核命令行 vm_ip=172.30.0.101 指定
+if [ -z "$VM_IP" ]; then
+    VM_IP="172.30.0.100"
+fi
+echo "[INFO] VM IP: ${VM_IP} (通过 vm_ip= 内核参数配置)"
 
 echo "[INFO] PowerFS 后端:"
 echo "  Master:            ${POWERFS_MASTER_ADDR}:${POWERFS_MASTER_PORT}"
@@ -273,16 +280,15 @@ mount -t devpts devpts /dev/pts 2>/dev/null || mount -t devpts -o newinstance de
 stty raw -echo < /dev/console 2>/dev/null
 
 # 配置网络
-# eth0: virtio-net-pci (TAP -> Docker 网桥 powerfs-network, IP: 172.30.0.100)
+# eth0: virtio-net-pci (TAP -> Docker 网桥 powerfs-network)
+# VM_IP 通过内核命令行 vm_ip= 参数指定 (默认 172.30.0.100, VM2 用 172.30.0.101)
 # Docker powerfs-network 网段为 172.30.0.0/16, 网关 172.30.0.1,
-# tap0 已由 setup_network.sh 桥接到 br-xxx (172.30.0.1).
-# 注意: 之前误用 172.20.0.100/24 + 网关 172.20.0.1, 与实际网桥网段不匹配,
-# 导致 VM 无法访问 Docker 容器 (filer 等).
+# tap0/tap1 已由 setup_network.sh 桥接到 br-xxx (172.30.0.1).
 echo "配置网络..."
 if [ -x /bin/ip ]; then
     # eth0: TAP 网络 (用于访问 Docker 容器, 必须与 powerfs-network 同网段)
     ip link set eth0 up 2>/dev/null || true
-    ip addr add 172.30.0.100/16 dev eth0 2>/dev/null || true
+    ip addr add ${VM_IP}/16 dev eth0 2>/dev/null || true
 
     # 默认路由通过 TAP 网桥 (172.30.0.1 是 Docker 网桥网关)
     ip route del default 2>/dev/null || true
