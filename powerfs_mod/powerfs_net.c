@@ -3697,6 +3697,29 @@ int powerfs_request_submit(struct powerfs_request *req)
             if (powerfs_net_parse_redirect(req->resp_body, req->resp_body_len,
                                             leader_addr, sizeof(leader_addr),
                                             &leader_port) == 0) {
+                /*
+                 * Cross-filer redirect loop detection:
+                 * If the new leader is the same filer we redirected FROM
+                 * in the previous attempt, we have a loop (A→B→A→B…).
+                 * This happens when two filers' Raft state is inconsistent
+                 * (each thinks the other is leader for the same shard).
+                 * Break the loop with -EAGAIN so VFS retries the whole
+                 * operation, giving Raft time to converge.
+                 */
+                if (last_tried_conn &&
+                    strcmp(leader_addr, last_tried_conn->addr) == 0 &&
+                    leader_port == last_tried_conn->port) {
+                    pr_warn("powerfs: redirect loop detected: %s:%u -> %s:%u -> %s:%u, breaking with EAGAIN\n",
+                            last_tried_conn->addr, last_tried_conn->port,
+                            conn->addr, conn->port,
+                            leader_addr, leader_port);
+                    filer_idx = powerfs_conn_get_filer_idx(conn);
+                    if (filer_idx >= 0)
+                        powerfs_shard_route_on_filer_disconnect(filer_idx);
+                    req->error = -EAGAIN;
+                    powerfs_req_complete(req);
+                    return -EAGAIN;
+                }
                 pr_warn("powerfs: redirect to leader %s:%u (from %s:%u, filer_count=%d)\n",
                         leader_addr, leader_port, conn->addr, conn->port,
                         g_pool.filer_count);
@@ -3715,6 +3738,9 @@ int powerfs_request_submit(struct powerfs_request *req)
                     if (leader_conn) {
                         int new_idx = powerfs_conn_get_filer_idx(leader_conn);
                         if (new_idx >= 0) {
+                            /* 记录当前 filer 为上次尝试的 filer,
+                             * 用于下一轮的 cross-filer redirect loop 检测 */
+                            last_tried_conn = conn;
                             /* 更新 shard 路由到新 leader */
                             powerfs_shard_route_update(req->shard_id, new_idx);
                             /* 重试请求 (走新 leader) */

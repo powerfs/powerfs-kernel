@@ -158,7 +158,7 @@ test_t2_unpack() {
     echo "  Unpacking ${T9_DIR}/${tarball_name} ..."
     local start end rc
     start=$(date +%s)
-    vm "cd ${T9_DIR} && tar xf ${tarball_name} 2>&1" > "$T9_LOG" 2>&1
+    vm "cd ${T9_DIR} && tar xzf ${tarball_name} 2>&1" > "$T9_LOG" 2>&1
     rc=$?
     end=$(date +%s)
     local dur=$((end - start))
