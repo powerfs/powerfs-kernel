@@ -563,21 +563,28 @@ test_t5_fuse_to_kernel() {
 
     local fuse_mount="${FUSE_MNT}"
     local test_dir="k2_t5_cross"
-    local sizes=("100B" "1K" "4K")
+    # NOTE: dd "B" suffix is NOT portable across implementations (coreutils vs
+    # busybox vs toybox). Use plain byte counts and pass bs=1 count=<bytes>
+    # so every dd implementation produces the same file size deterministically.
+    local -a sizes_bytes=(100 1024 4096)
+    local -a sizes_label=("100B" "1K" "4K")
 
-    for sz in "${sizes[@]}"; do
+    local n=${#sizes_bytes[@]}
+    for ((i=0; i<n; i++)); do
+        local bytes=${sizes_bytes[$i]}
+        local label=${sizes_label[$i]}
         echo ""
-        echo "  [T5] FUSE 创建 ${sz} Inline 文件 → 内核读取"
+        echo "  [T5] FUSE 创建 ${label} Inline 文件 → 内核读取"
 
         local base=$(dmesg_line_count)
     SERIAL_BASE=$(serial_line_count)
 
         # FUSE 端创建并记录 MD5
         local fuse_md5
-        fuse_md5=$(docker exec ${FUSE_CONTAINER} sh -c "mkdir -p ${fuse_mount}/${test_dir} && dd if=/dev/urandom bs=${sz} count=1 2>/dev/null > ${fuse_mount}/${test_dir}/file_${sz}.bin && md5sum ${fuse_mount}/${test_dir}/file_${sz}.bin | awk '{print \$1}'" 2>/dev/null)
+        fuse_md5=$(docker exec ${FUSE_CONTAINER} sh -c "mkdir -p ${fuse_mount}/${test_dir} && dd if=/dev/urandom bs=1 count=${bytes} 2>/dev/null > ${fuse_mount}/${test_dir}/file_${label}.bin && md5sum ${fuse_mount}/${test_dir}/file_${label}.bin | awk '{print \$1}'" 2>/dev/null)
 
         if [ -z "$fuse_md5" ]; then
-            ng "FUSE 端创建 ${sz} 文件失败"
+            ng "FUSE 端创建 ${label} 文件失败"
             return 1
         fi
         echo "    FUSE 端 MD5: ${fuse_md5}"
@@ -587,18 +594,18 @@ test_t5_fuse_to_kernel() {
         sleep 1
 
         local kernel_md5
-        kernel_md5=$(vm "cat ${MNT}/${test_dir}/file_${sz}.bin | md5sum | awk '{print \$1}'" 2>/dev/null)
+        kernel_md5=$(vm "cat ${MNT}/${test_dir}/file_${label}.bin | md5sum | awk '{print \$1}'" 2>/dev/null)
         echo "    内核端 MD5: ${kernel_md5}"
 
         if [ "$fuse_md5" = "$kernel_md5" ]; then
-            ok "${sz} FUSE→内核 Inline MD5 一致"
+            ok "${label} FUSE→内核 Inline MD5 一致"
         else
-            ng "${sz} FUSE→内核 MD5 不一致 (fuse=${fuse_md5} kernel=${kernel_md5})"
+            ng "${label} FUSE→内核 MD5 不一致 (fuse=${fuse_md5} kernel=${kernel_md5})"
             return 1
         fi
 
-        if ! check_kernel_state "T5 ${sz}" "$base"; then
-            ng "T5 ${sz} 内核状态异常"
+        if ! check_kernel_state "T5 ${label}" "$base"; then
+            ng "T5 ${label} 内核状态异常"
             return 1
         fi
     done
