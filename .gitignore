@@ -119,3 +119,9 @@ powerfs_proxy/powerfs_proxy
 tests/concurrent_test
 tests/simple_test
 powerfs_mod/powerfs.mod
+
+# Design documents — do not track in repo (local only)
+*-design.md
+*-plan.md
+kernel-volume.md
+TESTING.md
