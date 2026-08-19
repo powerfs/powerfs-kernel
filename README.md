@@ -1,203 +1,207 @@
-# PowerFS 内核文件系统 (powerfs.ko)
+# PowerFS Kernel Filesystem (powerfs.ko)
 
-PowerFS 的内核态客户端，将分布式存储后端（Master + Filer + Volume Server）挂载为 Linux 内核文件系统，提供 POSIX 接口，与 FUSE 客户端功能对齐。
+The kernel-space client of PowerFS. It mounts the distributed storage backend (Master + Filer + Volume Server) as a Linux kernel filesystem, providing a POSIX interface aligned with the FUSE client.
 
-## 架构
+## Architecture
 
 ```
-  用户进程
+  User Process
      │  POSIX (open/read/write/...)
      ▼
 ┌─────────────────────────────────────┐
-│  powerfs.ko (本仓库)                │
-│  ┌──────────┐  ┌────────────────┐  │
-│  │ VFS 层   │  │ FileLayout 解析 │  │
-│  │ (inode/  │  │ (Inline/Stripe/ │  │
-│  │  dentry/ │  │  WideStripe/EC) │  │
-│  │  page)   │  └────────────────┘  │
-│  └────┬─────┘  ┌────────────────┐  │
-│       │        │ Lease 锁管理     │  │
-│       ▼        │ (线性一致性)     │  │
-│  ┌──────────┐  └────────────────┘  │
-│  │ 网络层   │  ┌────────────────┐  │
-│  │ (TX/RX   │  │ 流控 + 重连     │  │
-│  │  线程)   │  └────────────────┘  │
-│  └────┬─────┘                      │
+│  powerfs.ko (this repo)              │
+│  ┌──────────┐  ┌────────────────┐    │
+│  │ VFS Layer│  │ FileLayout Parse│    │
+│  │ (inode/  │  │ (Inline/Stripe/ │    │
+│  │  dentry/ │  │  WideStripe/EC) │    │
+│  │  page)   │  └────────────────┘    │
+│  └────┬─────┘  ┌────────────────┐    │
+│       │        │ Lease Lock Mgmt │    │
+│       ▼        │ (linearizability)│   │
+│  ┌──────────┐  └────────────────┘    │
+│  │ Network  │  ┌────────────────┐    │
+│  │ (TX/RX   │  │ Flow Control + │    │
+│  │  threads)│  │ Reconnect      │    │
+│  └────┬─────┘  └────────────────┘    │
 └───────┼─────────────────────────────┘
-        │  TLV 二进制协议 (TCP)
+        │  TLV binary protocol (TCP)
         ▼
   ┌───────────┐  ┌─────────┐  ┌────────────┐
   │  Master   │  │  Filer  │  │ Volume Srv │
-  │ (拓扑/分配)│  │(元数据) │  │  (数据)    │
+  │(topology/ │  │(metadata)│  │  (data)    │
+  │ allocation)│ │         │  │            │
   └───────────┘  └─────────┘  └────────────┘
 ```
 
-## 目录结构
+## Directory Layout
 
 ```
 kernel/
-├── powerfs_mod/           内核模块源码
-│   ├── powerfs_mod.c        模块入口 + 挂载参数解析
-│   ├── powerfs_fs.c         VFS 操作 (inode/dentry/page cache)
-│   ├── powerfs_net.c        网络协议层 (TLV 收发)
-│   ├── powerfs_transport.c  传输层 (TX/RX 线程 + 重连)
-│   ├── powerfs_tlv.c        TLV 编解码
-│   ├── powerfs_serializer.c 序列化/反序列化
-│   ├── powerfs_flow.c       流控 (背压 + 队列管理)
-│   ├── powerfs_ec.c         Reed-Solomon EC 编解码
-│   ├── powerfs.h            核心数据结构
-│   ├── powerfs_net.h        协议定义 (消息类型/FieldId)
-│   ├── Makefile             内核模块编译
-│   ├── verify_module.sh     静态符号验证
-│   ├── start_kernel_env.sh  内核测试环境启动
-│   └── start_fuse_env.sh    FUSE 对照环境启动
+├── powerfs_mod/           Kernel module source
+│   ├── powerfs_mod.c        Module entry + mount parameter parsing
+│   ├── powerfs_fs.c         VFS operations (inode/dentry/page cache)
+│   ├── powerfs_net.c        Network protocol layer (TLV send/recv)
+│   ├── powerfs_transport.c  Transport layer (TX/RX threads + reconnect)
+│   ├── powerfs_tlv.c        TLV encode/decode
+│   ├── powerfs_serializer.c Serialization/deserialization
+│   ├── powerfs_flow.c       Flow control (backpressure + queue mgmt)
+│   ├── powerfs_ec.c         Reed-Solomon EC encode/decode
+│   ├── powerfs.h            Core data structures
+│   ├── powerfs_net.h        Protocol definitions (MsgType/FieldId)
+│   ├── Makefile             Kernel module build
+│   ├── verify_module.sh     Static symbol verification
+│   ├── start_kernel_env.sh  Kernel test environment setup
+│   └── start_fuse_env.sh    FUSE comparison environment setup
 │
-├── tests/                 测试脚本 (Git 跟踪)
-│   ├── run_all_tests.sh     T1-T8 全量测试执行器
-│   ├── run_t1_local.sh      本地脚本逻辑验证 (无需 QEMU)
-│   ├── concurrent_test.c    并发测试程序
-│   └── simple_test.c        基础测试程序
+├── tests/                 Test scripts (git-tracked)
+│   ├── run_all_tests.sh     T1-T8 full test executor
+│   ├── run_t1_local.sh      Local script logic validation (no QEMU)
+│   ├── concurrent_test.c    Concurrent test program
+│   └── simple_test.c        Basic test program
 │
-├── vm/                    QEMU 测试环境 (.gitignore)
-│   ├── qemuctl.sh           QEMU 控制 (deploy/mount/log)
-│   ├── test_t1_vfs_basic.sh T1: VFS 基础操作
-│   ├── test_t2_correctness  T2: 文件系统正确性
-│   ├── test_k1_layout.sh    K1: 协议对齐 + Flat
-│   ├── test_k2_inline.sh    K2: Inline 小文件
-│   ├── test_k3_stripe.sh    K3: Stripe 多卷
-│   ├── test_k4_reliability  K4: 可靠性 failover
-│   ├── test_t4_integration  T4: 集成测试
-│   ├── test_t5_performance  T5: 性能 (fio/mdtest)
-│   ├── test_t6_stability    T6: 稳定性
-│   ├── test_t7_reliability  T7: 可靠性
-│   ├── test_t8_persistence  T8: 数据持久化
-│   └── fault_injection.sh   故障注入工具
+├── vm/                    QEMU test environment (.gitignore)
+│   ├── qemuctl.sh           QEMU control (deploy/mount/log)
+│   ├── test_t1_vfs_basic.sh T1: VFS basic operations
+│   ├── test_t2_correctness  T2: Filesystem correctness
+│   ├── test_k1_layout.sh    K1: Protocol alignment + Flat
+│   ├── test_k2_inline.sh    K2: Inline small files
+│   ├── test_k3_stripe.sh    K3: Stripe multi-volume
+│   ├── test_k4_reliability  K4: Reliability failover
+│   ├── test_t4_integration  T4: Integration test
+│   ├── test_t5_performance  T5: Performance (fio/mdtest)
+│   ├── test_t6_stability    T6: Stability
+│   ├── test_t7_reliability  T7: Reliability
+│   ├── test_t8_persistence  T8: Data persistence
+│   ├── test_t9_kernel_e2e   T9: Kernel source E2E (pack/unpack/build/delete)
+│   └── fault_injection.sh   Fault injection tool
 │
-├── kernel-test-plan.md    测试方案 (T1-T8 + T9 xfstests)
-├── kernel-layout-completion-plan.md  布局完善方案 (K1-K4)
-├── kernel-lease-plan.md   Lease 锁方案
-├── kernel-net-resilience-plan.md     网络韧性方案
-├── powerfs-net-design.md  网络架构设计
-├── flow-control-design.md 流控设计
-├── file-layout-design.md  文件布局设计
-└── kernel-volume.md       Volume 管理文档
+├── kernel-test-plan.md    Test plan (T1-T8 + T9 xfstests)
+├── kernel-layout-completion-plan.md  Layout completion plan (K1-K4)
+├── kernel-lease-plan.md   Lease lock plan
+├── kernel-net-resilience-plan.md     Network resilience plan
+├── powerfs-net-design.md  Network architecture design
+├── flow-control-design.md Flow control design
+├── file-layout-design.md  File layout design
+└── kernel-volume.md       Volume management documentation
 ```
 
-## 编译
+## Building
 
-### 依赖
+### Prerequisites
 
-- Linux 内核源码 (6.17+)
-- 内核构建工具链 (gcc, make, bc, flex, bison)
-- QEMU (x86_64, 用于测试)
+- Linux kernel source (6.17+)
+- Kernel build toolchain (gcc, make, bc, flex, bison)
+- QEMU (x86_64, for testing)
 
-### 编译内核模块
+### Build the kernel module
 
 ```bash
 cd powerfs_mod
 make clean && make -j$(nproc)
-# 产物: powerfs.ko
+# Output: powerfs.ko
 ```
 
-### 静态验证
+### Static verification
 
 ```bash
 cd powerfs_mod
 bash verify_module.sh
 ```
 
-## 测试
+## Testing
 
-### 测试原则
+### Testing Principles
 
-1. 所有内核调试在 QEMU 虚拟机中进行，禁止宿主机直接测试
-2. 从小到大逐级验证 (1KB → 1GB)，不可跳级
-3. 每次测试后检查 dmesg/slab/meminfo，不只看应用返回值
-4. 连续 IO ≥1 分钟 + 定期 dmesg 检查
-5. 所有测试通过脚本执行
+1. All kernel debugging is performed inside a QEMU virtual machine; never test directly on the host
+2. Verify incrementally from small to large (1KB → 1GB); do not skip levels
+3. After each test, check dmesg/slab/meminfo — not just application return values
+4. Sustained I/O for ≥1 minute + periodic dmesg checks
+5. All tests are executed via scripts
 
-### 全量测试 (T1-T8)
+### Full Test Suite (T1-T8 + T9)
 
 ```bash
 cd tests
 
-# 全量 (含环境准备: 启动后端 + QEMU + 挂载)
+# Full run (includes environment setup: start backend + QEMU + mount)
 ./run_all_tests.sh
 
-# 跳过环境准备
+# Skip environment setup
 ./run_all_tests.sh --no-env
 
-# 仅运行指定阶段
+# Run only specific stages
 ./run_all_tests.sh -s T1 -s T2
 
-# 失败时继续 (默认失败即停止)
+# Continue on failure (default: stop on first failure)
 ./run_all_tests.sh -c
 ```
 
-测试顺序遵循门禁原则：
+Test execution follows a gating sequence:
 
 ```
-T1 (VFS 基础) → T2 (正确性) → T3 (布局 K1-K4) → T4 (集成) → T8 (持久化)
-                                                                       ↓
-                         T7 (可靠性) ← T6 (稳定性) ← T5 (性能)
+T1 (VFS basics) → T2 (correctness) → T3 (layout K1-K4) → T4 (integration) → T8 (persistence)
+                                                                                    ↓
+                              T7 (reliability) ← T6 (stability) ← T5 (performance)
+                                                                                    ↓
+                                                                              T9 (kernel E2E)
 ```
 
-### 本地脚本验证 (无需 QEMU)
+### Local Script Validation (no QEMU required)
 
 ```bash
 cd tests
-./run_t1_local.sh              # 验证 T1 脚本逻辑
-./run_t1_local.sh 2 3          # 仅验证 T2, T3
+./run_t1_local.sh              # Validate T1 script logic
+./run_t1_local.sh 2 3          # Validate only T2, T3
 ```
 
-### 单阶段测试
+### Single-Stage Testing
 
 ```bash
 cd vm
-./qemuctl.sh service start     # 启动后端服务
-./qemuctl.sh deploy            # 编译 + 部署 QEMU
-./qemuctl.sh mount             # 挂载 powerfs
+./qemuctl.sh service start     # Start backend services
+./qemuctl.sh deploy            # Build + deploy to QEMU
+./qemuctl.sh mount             # Mount powerfs
 
-./test_t1_vfs_basic.sh         # T1 全部
-./test_t1_vfs_basic.sh 3       # T1 仅 T3
+./test_t1_vfs_basic.sh         # All T1 tests
+./test_t1_vfs_basic.sh 3       # Only T1 test 3
 ```
 
-详见 [kernel-test-plan.md](kernel-test-plan.md)。
+See [kernel-test-plan.md](kernel-test-plan.md) for details.
 
-## 功能特性
+## Features
 
-| 特性 | 状态 | 说明 |
-|------|------|------|
-| Flat 单卷读写 | ✅ | 基础文件存储 |
-| Inline 小文件 | ✅ | <8KB 内联存储 + 自动迁移 |
-| Stripe 多卷条带 | ✅ | 跨卷并行 + anti-affinity |
-| WideStripe | ✅ | 256 卷范围压缩 |
-| Reliability 副本 | ✅ | 读路径 failover + 状态机 |
-| CRC32 校验 | ✅ | 读后校验，不匹配返回 EIO |
-| EC (4+2) | ✅ | Reed-Solomon 编解码 + 降级读 |
-| Lease 锁 | ✅ | 线性一致性 (Follower→Leader) |
-| 网络韧性 | ✅ | 断连入队 + 自动重连 + Leader 切换 |
-| 流控 | ✅ | 背压 + 多队列 + 优先级 |
+| Feature | Status | Description |
+|---------|--------|-------------|
+| Flat single-volume R/W | ✅ | Basic file storage |
+| Inline small files | ✅ | <8KB inline storage + auto-migration |
+| Stripe multi-volume | ✅ | Cross-volume parallelism + anti-affinity |
+| WideStripe | ✅ | 256-volume range compression |
+| Replicated reliability | ✅ | Read-path failover + state machine |
+| CRC32 verification | ✅ | Post-read verification; returns EIO on mismatch |
+| EC (4+2) | ✅ | Reed-Solomon encode/decode + degraded read |
+| Lease locking | ✅ | Linearizability (Follower→Leader) |
+| Network resilience | ✅ | Disconnect queuing + auto-reconnect + leader switchover |
+| Flow control | ✅ | Backpressure + multi-queue + priority |
 
-## 模块参数
+## Module Parameters
 
 ```bash
-# 挂载示例
+# Mount example
 mount -t powerfs -o master_addr=10.0.2.10:9334,master_addr=10.0.2.11:9334 /mnt/pfs
 ```
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| master_addr | Master 地址 (最多 3 个) | 无 (必填) |
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| master_addr | Master address (up to 3) | None (required) |
 
-Filer 和 Volume 地址通过 Master 动态发现，无需配置。
+Filer and Volume addresses are dynamically discovered via Master; no configuration needed.
 
-## 相关仓库
+## Related Repositories
 
-| 仓库 | 说明 |
-|------|------|
-| powerfs | 主仓库 (FUSE 客户端 + Master + Filer + Volume Server) |
-| **kernel** | 本仓库 (内核客户端 powerfs.ko) |
+| Repository | Description |
+|------------|-------------|
+| powerfs | Main repo (FUSE client + Master + Filer + Volume Server) |
+| **kernel** | This repo (kernel client powerfs.ko) |
 
 ## License
 
