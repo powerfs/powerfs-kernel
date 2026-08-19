@@ -1,11 +1,11 @@
 #!/bin/bash
 # PowerFS 内核文件系统测试全量执行器
 #
-# 按实施顺序串行执行 T1-T8 所有阶段, 支持门禁、日志隔离、汇总报告.
+# 按实施顺序串行执行 T1-T9 所有阶段, 支持门禁、日志隔离、汇总报告.
 #
 # 实施顺序 (来自 kernel-test-plan.md 第4章):
 #   T1 (VFS 基础) → T2 (正确性) → T3 (布局功能 K1-K4) → T4 (集成)
-#                 → T8 (持久化) → T5 (性能) → T6 (稳定性) → T7 (可靠性)
+#                 → T8 (持久化) → T9 (内核源码 E2E) → T5 (性能) → T6 (稳定性) → T7 (可靠性)
 #
 # 每阶段全部 PASS 才进入下一阶段 (门禁原则, 失败即停止).
 #
@@ -84,6 +84,7 @@ STAGES=(
     "T3:Layout features (K1-K4):test_k3_stripe.sh:15"
     "T4:Integration (FUSE<->kernel):test_t4_integration.sh:10"
     "T8:Data persistence:test_t8_persistence.sh:15"
+    "T9:Kernel source E2E:test_t9_kernel_e2e.sh:30"
     "T5:Performance (fio/mdtest):test_t5_performance.sh:30"
     "T6:Stability:test_t6_stability.sh:60"
     "T7:Reliability (fault injection):test_t7_reliability.sh:20"
@@ -279,7 +280,7 @@ main() {
     echo -e "${C_CYAN}${C_BOLD}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║  PowerFS Kernel Filesystem Test Runner                       ║"
-    echo "║  Stages: T1 -> T2 -> T3 -> T4 -> T8 -> T5 -> T6 -> T7       ║"
+    echo "║  Stages: T1->T2->T3->T4->T8->T9->T5->T6->T7               ║"
     echo "║  Gate: each stage must PASS before next stage                ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${C_RESET}"
