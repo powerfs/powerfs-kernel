@@ -119,3 +119,4 @@ powerfs_proxy/powerfs_proxy
 tests/concurrent_test
 tests/simple_test
 powerfs_mod/powerfs.mod
+powerfs_mod/test_tlk_codec

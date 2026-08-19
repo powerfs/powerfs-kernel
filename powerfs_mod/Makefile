@@ -18,7 +18,10 @@ $(MODULE_NAME)-objs := \
     powerfs_transport.o \
     powerfs_serializer.o \
     powerfs_flow.o \
-    powerfs_ec.o
+    powerfs_ec.o \
+    tlk_codec.o \
+    lock_client.o \
+    page_cache.o
 
 # 编译选项
 ccflags-y += -Wall -Wextra -Wno-unused-parameter
@@ -58,6 +61,7 @@ all:
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
 	@rm -f *.o *.ko *.mod *.mod.c *.mod.o .*.o.cmd .*.cmd
+	@rm -f test_tlk_codec
 
 install:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules_install
@@ -82,6 +86,23 @@ test:
 	@echo "  lsmod | grep powerfs"
 	@echo "  dmesg | tail -20"
 	@echo "  mount -t powerfs /dev/null /mnt/powerfs"
+
+# Userspace codec round-trip test (phase 4-6 §6e).
+# Compiles tlk_codec.c with -U__KERNEL__ to validate the dual-environment
+# codec against test_tlk_codec.c. The kernel build picks the same .c
+# file up via $(MODULE_NAME)-objs above; this target is independent so
+# the codec can be regression-tested without a kernel tree.
+TLK_CODEC_CFLAGS := -Wall -Wextra -Werror -U__KERNEL__ -I$(PWD)
+
+test_codec: test_tlk_codec.c tlk_codec.c tlk_codec.h
+	$(CC) $(TLK_CODEC_CFLAGS) -o test_tlk_codec \
+		test_tlk_codec.c tlk_codec.c
+	@echo "=== running tlk_codec round-trip tests ==="
+	./test_tlk_codec
+	@echo "=== all tests passed ==="
+
+clean_codec:
+	@rm -f test_tlk_codec
 
 # 开发辅助命令
 help:
