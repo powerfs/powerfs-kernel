@@ -887,6 +887,87 @@ int powerfs_comm_readdir(struct inode *dir, __u64 offset, __u32 count,
 int powerfs_comm_readlink(struct inode *inode, char *target, size_t buflen);
 int powerfs_comm_statfs(struct kstatfs *stats);
 
+/* ========== Capability 管理接口 (powerfs_fs.c) ==========
+ *
+ * 对齐 Ceph caps.c 客户端 cap 生命周期:
+ *   - issued/implemented 双轨: grant 更新 issued, revoke 先降 implemented,
+ *     dirty flush 完成后才 implemented=issued (优雅降级, 避免丢数据)
+ *   - wanted 由 open 模式 + refcount 派生, 与 issued 不匹配时主动 AcquireCap
+ *   - dirty_caps 标记本地脏位, revoke/flush 时写回 Filer
+ *   - i_cap_wq 等待 flush ACK, 保证 revoke 期间数据一致
+ *
+ * 锁约定: 所有 cap rbtree / issued / implemented / refcount / dirty_caps
+ * 字段的访问必须在 pi->i_lock 保护下 (对齐 Ceph i_ceph_lock).
+ */
+
+/* cap 有效性检查 (cap_gen 匹配 + 未过期).
+ * 调用方持 pi->i_lock. */
+bool powerfs_cap_is_valid(struct powerfs_cap *cap);
+
+/* 遍历 i_caps rbtree, 返回所有有效 cap 的 issued 并集.
+ * @implemented 非 NULL 时同时返回 implemented 并集.
+ * 调用方持 pi->i_lock. */
+unsigned int powerfs_caps_issued(struct powerfs_inode_info *pi,
+                                 unsigned int *implemented);
+
+/* 检查 mask 是否被 issued 完全覆盖.
+ * @touch=true 时把命中的 cap 移到 LRU 尾部.
+ * 返回 1 = 满足, 0 = 不满足. 调用方持 pi->i_lock. */
+int powerfs_caps_issued_mask(struct powerfs_inode_info *pi,
+                             unsigned int mask, int touch);
+
+/* 从 refcount 派生 used caps (PIN/RD/CACHE/WR/EXCL).
+ * 调用方持 pi->i_lock. */
+unsigned int powerfs_caps_used(struct powerfs_inode_info *pi);
+
+/* 从 open 模式 + 时间窗口派生 file_wanted caps.
+ * 调用方持 pi->i_lock. */
+unsigned int powerfs_caps_file_wanted(struct powerfs_inode_info *pi);
+
+/* wanted = file_wanted | used, 文件脏数据时追加 EXCL.
+ * 调用方持 pi->i_lock. */
+unsigned int powerfs_caps_wanted(struct powerfs_inode_info *pi);
+
+/* 引用计数获取 — 调用方不持锁, 内部加 i_lock.
+ * @got 指明要取哪些 cap 的引用 (PIN/RD/CACHE/WR/EXCL 位掩码). */
+void powerfs_cap_get_refs(struct powerfs_inode_info *pi, unsigned int got);
+
+/* 引用计数释放 — 调用方不持锁, 内部加 i_lock.
+ * @had 指明释放哪些 cap 引用 (与 get_refs 对称).
+ * 最后一个引用释放时触发 check_caps (评估是否可归还 cap). */
+void powerfs_cap_put_refs(struct powerfs_inode_info *pi, unsigned int had);
+
+/* Filer 授予 cap (grant 消息处理).
+ * 更新 issued / implemented, 处理 FILE_SHARED 变化 (i_shared_gen / I_COMPLETE).
+ * 调用方持 pi->i_lock. */
+void powerfs_cap_issue(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
+                       unsigned int issued);
+
+/* 服务端撤回 cap (revoke 消息处理).
+ * 降级 issued; 若 dirty_caps 与被撤位有交集, 先 flush 再 ack;
+ * flush 完成后 implemented = issued (降级生效).
+ * 调用方持 pi->i_lock (内部会临时释放以发送 flush RPC). */
+void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
+                        unsigned int revoking);
+
+/* 写回 dirty_caps 并等待 ACK.
+ * 构造 CapFlush 消息发送到 Filer, 将 dirty_caps 移到 flushing_caps,
+ * 等待 i_cap_wq 唤醒.
+ * 调用方不持锁. */
+int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask);
+
+/* 评估并可能发送 cap 状态更新 (对齐 ceph_check_caps).
+ * 比较 wanted vs issued, 决定是否 AcquireCap / ReleaseCap.
+ * @flags: POWERFS_CHECK_CAPS_* 位掩码.
+ * 调用方不持锁. */
+#define POWERFS_CHECK_CAPS_FLUSH    (1 << 0)
+#define POWERFS_CHECK_CAPS_AUTHONLY (1 << 1)
+void powerfs_check_caps(struct powerfs_inode_info *pi, int flags);
+
+/* 标记 cap dirty 位 (write/setattr 路径调用, 对齐 __ceph_mark_caps_dirty).
+ * 调用方不持锁. */
+void powerfs_cap_mark_dirty(struct powerfs_inode_info *pi, unsigned int caps);
+
 /* powerfs-net 初始化/清理 (powerfs_net.c) */
 int  powerfs_net_init(void);
 void powerfs_net_exit(void);

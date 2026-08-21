@@ -1652,6 +1652,543 @@ void powerfs_evict_inode(struct inode *inode)
     powerfs_clear_dir_entries(inode);
 }
 
+/* ================================================================== *
+ * Capability 管理层 — 对齐 Ceph caps.c 客户端 cap 生命周期
+ *
+ * 核心数据流:
+ *   open()    → powerfs_cap_get_refs(RD|WR|CACHE)  → refcount++
+ *   read()    → powerfs_caps_issued_mask(RDCACHE)   → 命中则走缓存
+ *   write()   → mark dirty_caps |= FILE_WR          → 后台 flush
+ *   release() → powerfs_cap_put_refs(had)           → 最后 ref 触发 check_caps
+ *   grant     → powerfs_cap_issue(cap, issued)      → 更新 issued/implemented
+ *   revoke    → powerfs_cap_revoke(cap, revoking)   → flush dirty → ack → 降级
+ *   flush     → powerfs_cap_flush(mask)             → 写回 + 等 i_cap_wq
+ *
+ * 锁约定: cap 字段访问持 pi->i_lock (对齐 Ceph i_ceph_lock).
+ *         flush/check_caps 需要发 RPC 时临时释放 i_lock.
+ * ================================================================== */
+
+/* cap 有效性检查 — cap_gen 匹配且未过期.
+ * 对齐 Ceph __cap_is_valid (caps.c L787).
+ * 调用方持 pi->i_lock. */
+bool powerfs_cap_is_valid(struct powerfs_cap *cap)
+{
+    if (!cap || !cap->ci)
+        return false;
+
+    /* cap_gen 不匹配 = 会话重建后旧 cap 失效 */
+    if (cap->cap_gen == 0)
+        return false;
+
+    /* expire_jiffies 为 0 表示未设置过期 (永不过期), 仅靠 cap_gen 控制 */
+    if (cap->expire_jiffies && time_after_eq(jiffies, cap->expire_jiffies))
+        return false;
+
+    return true;
+}
+
+/* 遍历 i_caps rbtree, 返回有效 cap 的 issued 并集.
+ * 对齐 Ceph __ceph_caps_issued (caps.c L812).
+ * 调用方持 pi->i_lock. */
+unsigned int powerfs_caps_issued(struct powerfs_inode_info *pi,
+                                 unsigned int *implemented)
+{
+    struct powerfs_cap *cap;
+    struct rb_node *p;
+    unsigned int have = pi->i_snap_caps;
+
+    if (implemented)
+        *implemented = 0;
+
+    for (p = rb_first(&pi->i_caps); p; p = rb_next(p)) {
+        cap = rb_entry(p, struct powerfs_cap, ci_node);
+        if (!powerfs_cap_is_valid(cap))
+            continue;
+        have |= cap->issued;
+        if (implemented)
+            *implemented |= cap->implemented;
+    }
+
+    /* 排除 auth_cap 正在 revoke 的位 (implemented & ~issued)
+     * 对齐 Ceph: have &= ~cap->implemented | cap->issued */
+    if (pi->i_auth_cap) {
+        cap = pi->i_auth_cap;
+        have &= ~cap->implemented | cap->issued;
+    }
+
+    return have;
+}
+
+/* 检查 mask 是否被 issued 完全覆盖.
+ * 对齐 Ceph __ceph_caps_issued_mask (caps.c L891).
+ * @touch=true 时把命中的 cap 移到 LRU 尾部 (保持 cap 热度).
+ * 调用方持 pi->i_lock. */
+int powerfs_caps_issued_mask(struct powerfs_inode_info *pi,
+                             unsigned int mask, int touch)
+{
+    struct powerfs_cap *cap;
+    struct rb_node *p;
+    unsigned int have = pi->i_snap_caps;
+
+    /* snap_caps 已满足 */
+    if ((have & mask) == mask)
+        return 1;
+
+    for (p = rb_first(&pi->i_caps); p; p = rb_next(p)) {
+        cap = rb_entry(p, struct powerfs_cap, ci_node);
+        if (!powerfs_cap_is_valid(cap))
+            continue;
+
+        /* 单个 cap 满足 */
+        if ((cap->issued & mask) == mask) {
+            if (touch)
+                cap->last_used = jiffies;
+            return 1;
+        }
+
+        /* 组合满足 */
+        have |= cap->issued;
+        if ((have & mask) == mask) {
+            if (touch) {
+                struct rb_node *q;
+                cap->last_used = jiffies;
+                for (q = rb_first(&pi->i_caps); q != p; q = rb_next(q)) {
+                    cap = rb_entry(q, struct powerfs_cap, ci_node);
+                    if (!powerfs_cap_is_valid(cap))
+                        continue;
+                    if (cap->issued & mask)
+                        cap->last_used = jiffies;
+                }
+            }
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* 从 refcount 派生 used caps.
+ * 对齐 Ceph __ceph_caps_used (caps.c L981).
+ * 调用方持 pi->i_lock. */
+unsigned int powerfs_caps_used(struct powerfs_inode_info *pi)
+{
+    struct inode *inode = &pi->netfs.inode;
+    unsigned int used = 0;
+
+    if (pi->i_pin_ref)
+        used |= POWERFS_CAP_PIN;
+    if (pi->i_rd_ref)
+        used |= POWERFS_CAP_FILE_SHARED;
+    if (pi->i_rdcache_ref ||
+        (S_ISREG(inode->i_mode) && inode->i_data.nrpages))
+        used |= POWERFS_CAP_FILE_CACHE;
+    if (pi->i_wr_ref)
+        used |= POWERFS_CAP_FILE_WR;
+    if (pi->i_wb_ref || pi->i_wrbuffer_ref)
+        used |= POWERFS_CAP_FILE_WR;
+    if (pi->i_fx_ref)
+        used |= POWERFS_CAP_FILE_EXCL;
+
+    return used;
+}
+
+/* 从 open 模式 + 时间窗口派生 file_wanted caps.
+ * 对齐 Ceph __ceph_caps_file_wanted (caps.c L1006).
+ *
+ * PowerFS 简化: 不区分 caps_wanted_delay_min/max (用单一 TTL),
+ * 不支持 LAZY 模式. 目录/文件分别处理.
+ * 调用方持 pi->i_lock. */
+unsigned int powerfs_caps_file_wanted(struct powerfs_inode_info *pi)
+{
+    struct inode *inode = &pi->netfs.inode;
+    unsigned long used_cutoff = jiffies - POWERFS_DIR_LEASE_TTL;
+    unsigned long idle_cutoff = jiffies - POWERFS_INODE_CACHE_TTL;
+
+    if (S_ISDIR(inode->i_mode)) {
+        unsigned int want = 0;
+
+        /* 目录有读打开 or 最近读过 → 要 SHARED */
+        if (pi->i_nr_by_mode[POWERFS_FILE_MODE_RD] > 0 ||
+            time_after(pi->i_last_rd, used_cutoff))
+            want |= POWERFS_CAP_ANY_RD;
+
+        /* 目录有写打开 or 最近写过 → 要 SHARED + EXCL */
+        if (pi->i_nr_by_mode[POWERFS_FILE_MODE_WR] > 0 ||
+            time_after(pi->i_last_wr, used_cutoff)) {
+            want |= POWERFS_CAP_ANY_RD | POWERFS_CAP_FILE_EXCL;
+        }
+
+        if (want || pi->i_nr_by_mode[POWERFS_FILE_MODE_RD] > 0)
+            want |= POWERFS_CAP_PIN;
+
+        return want;
+    } else {
+        unsigned int want = 0;
+
+        /* 文件读打开 or 空闲期内读过 → 要 RD */
+        if (pi->i_nr_by_mode[POWERFS_FILE_MODE_RD] > 0) {
+            want |= POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_CACHE;
+        } else if (time_after(pi->i_last_rd, idle_cutoff)) {
+            want |= POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_CACHE;
+        }
+
+        /* 文件写打开 → 要 WR + EXCL */
+        if (pi->i_nr_by_mode[POWERFS_FILE_MODE_WR] > 0 ||
+            time_after(pi->i_last_wr, used_cutoff)) {
+            want |= POWERFS_CAP_FILE_WR | POWERFS_CAP_FILE_EXCL;
+        }
+
+        if (want)
+            want |= POWERFS_CAP_PIN;
+
+        return want;
+    }
+}
+
+/* wanted = file_wanted | used, 脏数据时追加 EXCL.
+ * 对齐 Ceph __ceph_caps_wanted (caps.c L1067).
+ * 调用方持 pi->i_lock. */
+unsigned int powerfs_caps_wanted(struct powerfs_inode_info *pi)
+{
+    unsigned int w = powerfs_caps_file_wanted(pi) | powerfs_caps_used(pi);
+
+    if (S_ISDIR(pi->netfs.inode.i_mode)) {
+        /* 目录有写操作 wanted → 要 EXCL (原子目录修改) */
+        if (w & POWERFS_CAP_FILE_EXCL)
+            w |= POWERFS_CAP_FILE_EXCL;
+    } else {
+        /* 文件有脏数据 → 要 EXCL (可追加/truncate) */
+        if (pi->i_dirty_caps & POWERFS_CAP_ANY_DIRTY)
+            w |= POWERFS_CAP_FILE_EXCL;
+    }
+
+    return w;
+}
+
+/* 内部: 获取 cap 引用计数 (调用方持 i_lock).
+ * 对齐 Ceph ceph_take_cap_refs (caps.c L2761). */
+static void powerfs_cap_take_refs(struct powerfs_inode_info *pi,
+                                  unsigned int got)
+{
+    struct inode *inode = &pi->netfs.inode;
+
+    if (got & POWERFS_CAP_PIN)
+        pi->i_pin_ref++;
+    if (got & POWERFS_CAP_FILE_SHARED)
+        pi->i_rd_ref++;
+    if (got & POWERFS_CAP_FILE_CACHE)
+        pi->i_rdcache_ref++;
+    if (got & POWERFS_CAP_FILE_EXCL)
+        pi->i_fx_ref++;
+    if (got & POWERFS_CAP_FILE_WR) {
+        if (pi->i_wr_ref == 0)
+            ihold(inode);
+        pi->i_wr_ref++;
+    }
+}
+
+/* 公共: 获取 cap 引用计数.
+ * 对齐 Ceph ceph_get_cap_refs (caps.c L3185). */
+void powerfs_cap_get_refs(struct powerfs_inode_info *pi, unsigned int got)
+{
+    spin_lock(&pi->i_lock);
+    powerfs_cap_take_refs(pi, got);
+    spin_unlock(&pi->i_lock);
+}
+
+/* 公共: 释放 cap 引用计数.
+ * 对齐 Ceph __ceph_put_cap_refs (caps.c L3232).
+ * 最后一个引用释放时触发 check_caps. */
+void powerfs_cap_put_refs(struct powerfs_inode_info *pi, unsigned int had)
+{
+    struct inode *inode = &pi->netfs.inode;
+    int last = 0;
+    int put_inode = 0;
+
+    spin_lock(&pi->i_lock);
+
+    if (had & POWERFS_CAP_PIN)
+        pi->i_pin_ref--;
+    if (had & POWERFS_CAP_FILE_SHARED) {
+        if (--pi->i_rd_ref == 0)
+            last++;
+    }
+    if (had & POWERFS_CAP_FILE_CACHE) {
+        if (--pi->i_rdcache_ref == 0)
+            last++;
+    }
+    if (had & POWERFS_CAP_FILE_EXCL) {
+        if (--pi->i_fx_ref == 0)
+            last++;
+    }
+    if (had & POWERFS_CAP_FILE_WR) {
+        if (--pi->i_wr_ref == 0) {
+            last++;
+            /* wr_ref 归零, 释放 take_refs 时持有的 inode 引用 */
+            if (pi->i_wb_ref == 0)
+                put_inode = 1;
+        }
+    }
+
+    spin_unlock(&pi->i_lock);
+
+    /* 最后一个引用释放 → 评估是否可归还 cap */
+    if (last)
+        powerfs_check_caps(pi, 0);
+
+    /* 释放 ihold 引用 (在锁外做, 避免 AB-BA) */
+    while (put_inode-- > 0)
+        iput(inode);
+}
+
+/* Filer 授予 cap (grant / issue 消息处理).
+ * 对齐 Ceph __check_cap_issue + ceph_add_cap 的 issue 部分.
+ *
+ * 更新 issued/implemented; FILE_SHARED 变化时递增 i_shared_gen
+ * 并清除 I_COMPLETE (目录缓存失效, 需要重新 readdir).
+ * 调用方持 pi->i_lock. */
+void powerfs_cap_issue(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
+                       unsigned int issued)
+{
+    struct inode *inode = &pi->netfs.inode;
+    unsigned int had;
+
+    had = powerfs_caps_issued(pi, NULL);
+
+    /* 更新授权位 (单调: issued 只增不减, revoke 时才降) */
+    cap->issued = issued;
+    /* implemented 取 issued 的超集 (保留本地仍用的位) */
+    cap->implemented |= issued;
+
+    /* 刷新过期时间 (grant 意味着 cap 有效) */
+    cap->cap_gen = 1;
+    cap->expire_jiffies = jiffies + POWERFS_LEASE_DURATION;
+
+    /*
+     * FILE_SHARED 新发授 → 目录缓存可能 stale, 递增 shared_gen
+     * 对齐 Ceph __check_cap_issue L603-610
+     */
+    if (S_ISDIR(inode->i_mode) &&
+        (issued & POWERFS_CAP_FILE_SHARED) &&
+        !(had & POWERFS_CAP_FILE_SHARED)) {
+        atomic_inc(&pi->i_shared_gen);
+        pi->i_flags &= ~POWERFS_I_COMPLETE;
+        pi->dir_complete = false;
+    }
+
+    /*
+     * FILE_CACHE 新发授 → 递增 rdcache_gen (缓存代次)
+     * 对齐 Ceph __check_cap_issue L591-595
+     */
+    if (S_ISREG(inode->i_mode) &&
+        (issued & POWERFS_CAP_FILE_CACHE) &&
+        !(had & POWERFS_CAP_FILE_CACHE)) {
+        pi->i_rdcache_gen++;
+    }
+
+    /* 设置 auth_cap (首个 cap 或 issuer 匹配) */
+    if (!pi->i_auth_cap)
+        pi->i_auth_cap = cap;
+
+    pr_debug("powerfs: cap_issue ino=%lu issued=0x%x had=0x%x shared_gen=%d\n",
+             inode->i_ino, issued, had, atomic_read(&pi->i_shared_gen));
+}
+
+/* 服务端撤回 cap (revoke 消息处理).
+ * 对齐 Ceph handle_cap_revoke 的客户端降级逻辑.
+ *
+ * 流程:
+ *   1. issued &= ~revoking (降级授权)
+ *   2. 若 dirty_caps & revoking != 0 → 需要 flush 脏数据
+ *   3. flush 完成后 implemented = issued (降级生效)
+ *   4. 唤醒 i_cap_wq 等待者
+ *
+ * 调用方持 pi->i_lock (内部临时释放以发 flush RPC). */
+void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
+                        unsigned int revoking)
+{
+    struct inode *inode = &pi->netfs.inode;
+    unsigned int dirty_to_flush;
+    bool need_flush = false;
+
+    /* 1. 降级 issued */
+    cap->issued &= ~revoking;
+
+    /* 2. 检查是否有脏数据需要 flush */
+    dirty_to_flush = pi->i_dirty_caps & revoking;
+    if (dirty_to_flush) {
+        /* 将 dirty 位移到 flushing 位, 清除 dirty */
+        pi->i_flushing_caps |= dirty_to_flush;
+        pi->i_dirty_caps &= ~dirty_to_flush;
+        need_flush = true;
+    }
+
+    pr_debug("powerfs: cap_revoke ino=%lu revoking=0x%x dirty_flush=0x%x need_flush=%d\n",
+             inode->i_ino, revoking, dirty_to_flush, need_flush);
+
+    if (need_flush) {
+        /* 临时释放锁发 flush RPC (flush 内部自行加锁) */
+        spin_unlock(&pi->i_lock);
+        powerfs_cap_flush(pi, dirty_to_flush);
+        spin_lock(&pi->i_lock);
+    }
+
+    /* 3. flush 完成后 implemented = issued (降级生效) */
+    cap->implemented = cap->issued;
+
+    /* 4. 如果 FILE_SHARED 被撤, 目录缓存失效 */
+    if (revoking & POWERFS_CAP_FILE_SHARED) {
+        atomic_inc(&pi->i_shared_gen);
+        pi->i_flags &= ~POWERFS_I_COMPLETE;
+        pi->dir_complete = false;
+    }
+
+    /* 5. 唤醒等待者 */
+    wake_up_all(&pi->i_cap_wq);
+}
+
+/* 写回 dirty_caps 并等待 ACK.
+ * 对齐 Ceph ceph_flush_dirty_caps + __send_cap.
+ *
+ * 流程:
+ *   1. 分配 powerfs_cap_flush 记录, 挂到 i_cap_flush_list + 全局 cap_flush_list
+ *   2. 将 dirty_caps 移到 flushing_caps
+ *   3. 发送 CapFlush RPC 到 Filer (TODO: 接入 powerfs_net 层)
+ *   4. 等待 i_cap_wq 唤醒 (ACK 回调唤醒)
+ *
+ * 调用方不持锁. */
+int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
+{
+    struct inode *inode = &pi->netfs.inode;
+    struct powerfs_cap_flush *cf;
+    struct powerfs_sb_info *sbi;
+    unsigned int flushing;
+    int ret = 0;
+
+    sbi = POWERFS_SB_INFO(inode->i_sb);
+
+    spin_lock(&pi->i_lock);
+
+    /* 取 dirty_caps 与 mask 的交集 */
+    flushing = pi->i_dirty_caps & mask;
+    if (!flushing) {
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+
+    /* 移到 flushing_caps */
+    pi->i_dirty_caps &= ~flushing;
+    pi->i_flushing_caps |= flushing;
+
+    /* 分配 flush 记录 (优先用预分配的) */
+    if (pi->i_prealloc_cap_flush) {
+        cf = pi->i_prealloc_cap_flush;
+        pi->i_prealloc_cap_flush = NULL;
+    } else {
+        cf = kmem_cache_alloc(sbi->cap_flush_cachep, GFP_NOFS);
+        if (!cf) {
+            /* 内存不足: 回滚, dirty 保留 */
+            pi->i_dirty_caps |= flushing;
+            pi->i_flushing_caps &= ~flushing;
+            spin_unlock(&pi->i_lock);
+            return -ENOMEM;
+        }
+    }
+
+    cf->tid = atomic64_inc_return(&pi->i_release_count);
+    cf->caps = flushing;
+    cf->wake = true;
+    cf->is_capsnap = false;
+    INIT_LIST_HEAD(&cf->g_list);
+    INIT_LIST_HEAD(&cf->i_list);
+
+    list_add_tail(&cf->i_list, &pi->i_cap_flush_list);
+
+    /* TODO: 发送 CapFlush RPC 到 Filer.
+     * 当前阶段: 同步标记完成 (无网络层), 直接清除 flushing.
+     * 后续接入 powerfs_net_cap_flush() 后改为异步等待 i_cap_wq.
+     *
+     * 对齐 Ceph: __send_cap() 发送 CEPH_MSG_CLIENT_CAP,
+     * 收到 CAP_ACK 回调后从 i_cap_flush_list 移除并 wake_up. */
+
+    pr_debug("powerfs: cap_flush ino=%lu caps=0x%x tid=%llu (sync stub)\n",
+             inode->i_ino, flushing, cf->tid);
+
+    /* Stub: 同步完成 (无 ACK 等待).
+     * TODO: 替换为异步 RPC + wait_event(i_cap_wq, ...) */
+    pi->i_flushing_caps &= ~flushing;
+    list_del(&cf->i_list);
+
+    /* 回收 flush 记录 (复用预分配槽) */
+    if (!pi->i_prealloc_cap_flush)
+        pi->i_prealloc_cap_flush = cf;
+    else
+        kmem_cache_free(sbi->cap_flush_cachep, cf);
+
+    spin_unlock(&pi->i_lock);
+
+    /* 唤醒可能等待 flush 的 revoke 路径 */
+    wake_up_all(&pi->i_cap_wq);
+
+    return ret;
+}
+
+/* 评估并可能发送 cap 状态更新.
+ * 对齐 Ceph ceph_check_caps (caps.c L2018).
+ *
+ * 比较 wanted vs issued:
+ *   - wanted > issued → 发 AcquireCap (请求更多权限)
+ *   - wanted < issued → 发 ReleaseCap (归还多余权限)
+ *   - dirty_caps 非空 → 触发 flush
+ *
+ * 当前阶段: 仅记录日志, 实际 RPC 发送待接入 net 层.
+ * 调用方不持锁. */
+void powerfs_check_caps(struct powerfs_inode_info *pi, int flags)
+{
+    struct inode *inode = &pi->netfs.inode;
+    unsigned int issued, implemented, wanted, used, file_wanted;
+    unsigned int revoking;
+
+    spin_lock(&pi->i_lock);
+
+    issued = powerfs_caps_issued(pi, &implemented);
+    revoking = implemented & ~issued;
+    used = powerfs_caps_used(pi);
+    file_wanted = powerfs_caps_file_wanted(pi);
+    wanted = file_wanted | used;
+
+    pr_debug("powerfs: check_caps ino=%lu want=0x%x used=0x%x issued=0x%x "
+             "impl=0x%x revoke=0x%x dirty=0x%x flush=0x%x\n",
+             inode->i_ino, wanted, used, issued, implemented, revoking,
+             pi->i_dirty_caps, pi->i_flushing_caps);
+
+    /* FLUSH 标志: 有脏数据时立即 flush */
+    if ((flags & POWERFS_CHECK_CAPS_FLUSH) && pi->i_dirty_caps) {
+        spin_unlock(&pi->i_lock);
+        powerfs_cap_flush(pi, pi->i_dirty_caps);
+        return;
+    }
+
+    /* TODO: 接入 net 层后, 根据 wanted vs issued 决定:
+     *   - wanted & ~issued → 发送 AcquireCap RPC
+     *   - issued & ~wanted & ~used → 发送 ReleaseCap RPC
+     *   - revoking & ~dirty → 发送 CapAck 确认降级
+     * 当前阶段仅日志, 不实际发送. */
+
+    spin_unlock(&pi->i_lock);
+}
+
+/* 标记 cap dirty 位 (write/setattr 路径调用).
+ * 对齐 Ceph __ceph_mark_caps_dirty.
+ * @caps: 要标记的 dirty 位掩码 (POWERFS_CAP_FILE_WR / POWERFS_CAP_AUTH_EXCL 等).
+ * 调用方不持锁. */
+void powerfs_cap_mark_dirty(struct powerfs_inode_info *pi, unsigned int caps)
+{
+    spin_lock(&pi->i_lock);
+    pi->i_dirty_caps |= caps;
+    spin_unlock(&pi->i_lock);
+}
+
 /*
  * powerfs_setattr_work_fn - 异步 setattr work 函数 (WQ_UNBOUND 上下文)
  *
@@ -3426,6 +3963,11 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
     setattr_copy(idmap, inode, attr);
     mark_inode_dirty(inode);
 
+    /* 标记 AUTH_EXCL cap dirty — setattr 修改了 inode 元数据 (size/mode/uid/...).
+     * 对齐 Ceph ceph_setattr → __ceph_mark_caps_dirty(CEPH_CAP_AUTH_EXCL).
+     * revoke 时会 flush 这些属性到 Filer. */
+    powerfs_cap_mark_dirty(pi, POWERFS_CAP_AUTH_EXCL);
+
     /* 更新缓存标志 */
     spin_lock(&pi->i_lock);
     pi->cache_valid = true;
@@ -3658,6 +4200,7 @@ int powerfs_rename(struct mnt_idmap *idmap,
 int powerfs_dir_open(struct inode *inode, struct file *file)
 {
     struct powerfs_dir_file_info *dfi;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
 
     pr_debug("powerfs: dir_open ino=%lu\n", inode->i_ino);
 
@@ -3666,7 +4209,7 @@ int powerfs_dir_open(struct inode *inode, struct file *file)
         return -ENOMEM;
 
     dfi->file = file;
-    dfi->dir = POWERFS_I(inode);
+    dfi->dir = pi;
     dfi->last_ino = 0;
     dfi->last_name = NULL;
     dfi->next_offset = 0;
@@ -3676,6 +4219,13 @@ int powerfs_dir_open(struct inode *inode, struct file *file)
     mutex_init(&dfi->lock);
 
     file->private_data = dfi;
+
+    /* Cap 引用: 目录打开 → PIN + FILE_SHARED (对齐 Ceph ceph_init_file dir 路径) */
+    spin_lock(&pi->i_lock);
+    pi->i_nr_by_mode[POWERFS_FILE_MODE_RD]++;
+    pi->i_last_rd = jiffies;
+    spin_unlock(&pi->i_lock);
+    powerfs_cap_get_refs(pi, POWERFS_CAP_PIN | POWERFS_CAP_FILE_SHARED);
 
     pr_debug("powerfs: dir_open success, fop=%p\n", file->f_op);
 
@@ -3690,8 +4240,16 @@ int powerfs_dir_open(struct inode *inode, struct file *file)
 int powerfs_dir_release(struct inode *inode, struct file *file)
 {
     struct powerfs_dir_file_info *dfi = file->private_data;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
 
     pr_debug("powerfs: dir_release ino=%lu\n", inode->i_ino);
+
+    /* Cap 引用释放 (与 dir_open 对称) */
+    spin_lock(&pi->i_lock);
+    if (pi->i_nr_by_mode[POWERFS_FILE_MODE_RD] > 0)
+        pi->i_nr_by_mode[POWERFS_FILE_MODE_RD]--;
+    spin_unlock(&pi->i_lock);
+    powerfs_cap_put_refs(pi, POWERFS_CAP_PIN | POWERFS_CAP_FILE_SHARED);
 
     if (!dfi)
         return 0;
@@ -5693,6 +6251,10 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
         }
         folio_mark_dirty(folio);
 
+        /* 标记 FILE_WR cap dirty — writeback/revoke 时 flush 到 Filer.
+         * 对齐 Ceph ceph_write_end → __ceph_mark_caps_dirty(CEPH_CAP_FILE_WR). */
+        powerfs_cap_mark_dirty(pi, POWERFS_CAP_FILE_WR);
+
         /* K2: Inline 模式 — 同步写入数据到 inline_data 缓冲.
          * writeback 不会将 Inline 文件的数据发送到 Volume Server,
          * 而是在 close 时通过 UPDATE_INODE 提交 inline_data 到 Filer.
@@ -6056,6 +6618,28 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
     int ret = 0;
     bool synced = false;
 
+    /* Cap 引用释放 (与 powerfs_file_open 对称).
+     * 对齐 Ceph __ceph_put_cap_refs: 递减 i_nr_by_mode + cap_put_refs.
+     * 必须在 release 逻辑前执行, 避免 flush 脏数据时 cap 已失效. */
+    {
+        unsigned int had = POWERFS_CAP_PIN;
+
+        spin_lock(&pi->i_lock);
+        if (file->f_mode & FMODE_READ) {
+            if (pi->i_nr_by_mode[POWERFS_FILE_MODE_RD] > 0)
+                pi->i_nr_by_mode[POWERFS_FILE_MODE_RD]--;
+            had |= POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_CACHE;
+        }
+        if (file->f_mode & FMODE_WRITE) {
+            if (pi->i_nr_by_mode[POWERFS_FILE_MODE_WR] > 0)
+                pi->i_nr_by_mode[POWERFS_FILE_MODE_WR]--;
+            had |= POWERFS_CAP_FILE_WR;
+        }
+        spin_unlock(&pi->i_lock);
+
+        powerfs_cap_put_refs(pi, had);
+    }
+
     /* Inline 模式 + dirty: 同步 inline_data 到 Filer (K2-5).
      * Flat 模式: 同步 size+chunks 到 Filer (对齐 FUSE sync_size_chunks_on_close).
      *   不同步的话 Filer 端 chunks 为空, remount/lookup 后 read locate 失败 (-EINVAL). */
@@ -6249,11 +6833,52 @@ static long powerfs_fallocate(struct file *file, int mode,
                               loff_t offset, loff_t len);
 
 /*
+ * powerfs_file_open - 文件打开 cap 接入
+ *
+ * 对齐 Ceph ceph_init_file + __ceph_touch_fmode:
+ *   1. 根据 f_mode 记录 i_nr_by_mode[] (RD/WR 计数)
+ *   2. 更新 i_last_rd / i_last_wr 时间戳
+ *   3. 获取 cap 引用: RD → FILE_SHARED|FILE_CACHE, WR → FILE_WR
+ *
+ * cap 引用在 release 时通过 powerfs_cap_put_refs 对称释放.
+ * 若 Filer 尚未授予足够 cap, powerfs_check_caps 会在后台请求.
+ */
+static int powerfs_file_open(struct inode *inode, struct file *file)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    unsigned int got = POWERFS_CAP_PIN;
+
+    spin_lock(&pi->i_lock);
+
+    if (file->f_mode & FMODE_READ) {
+        pi->i_nr_by_mode[POWERFS_FILE_MODE_RD]++;
+        pi->i_last_rd = jiffies;
+        got |= POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_CACHE;
+    }
+    if (file->f_mode & FMODE_WRITE) {
+        pi->i_nr_by_mode[POWERFS_FILE_MODE_WR]++;
+        pi->i_last_wr = jiffies;
+        got |= POWERFS_CAP_FILE_WR;
+    }
+
+    spin_unlock(&pi->i_lock);
+
+    /* 获取 cap 引用 (内部自行加锁) */
+    powerfs_cap_get_refs(pi, got);
+
+    pr_debug("powerfs: file_open ino=%lu mode=0x%x got=0x%x\n",
+             inode->i_ino, file->f_mode, got);
+
+    return 0;
+}
+
+/*
  * 文件操作表 - 尽可能复用 VFS 通用实现
  *
  * 参考 ramfs_file_operations (fs/ramfs/file-mmu.c)
  */
 static const struct file_operations powerfs_file_operations = {
+    .open         = powerfs_file_open,
     .read_iter    = powerfs_file_read_iter,
     .write_iter   = powerfs_file_write_iter,
     .mmap         = generic_file_mmap,
