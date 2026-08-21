@@ -307,6 +307,20 @@ int powerfs_d_init(struct dentry *dentry)
     di->dentry = dentry;
     di->time = jiffies;
 
+    /* === Per-dentry lease 初始化 (对齐 ceph_d_init) ===
+     * 新 dentry 无 lease, 需 lookup/readdir 从 Filer 获取后填充.
+     * lease_expire=0 表示无 lease, d_revalidate Layer 1 直接 miss. */
+    di->flags = 0;
+    di->lease_issuer_id = 0;
+    di->lease_renew_after = 0;
+    di->lease_renew_from = 0;
+    di->lease_expire = 0;
+    di->lease_duration_ms = 0;
+    di->lease_gen = 0;
+    di->lease_seq = 0;
+    di->dir_shared_gen = 0;
+    INIT_LIST_HEAD(&di->lease_list);
+
     dentry->d_fsdata = di;
 
     pr_debug("powerfs: d_init '%pd' (di=%p)\n", dentry, di);
@@ -335,7 +349,7 @@ static void powerfs_di_free_rcu(struct rcu_head *head)
 /*
  * d_release - dentry 销毁前释放私有数据
  *
- * 目录级 lease 方案: 不再有 lease_list 需要摘除, 仅做 RCU 延迟释放.
+ * Per-dentry lease 方案: 从全局 dentry_lease_list 摘除 (如果在上面).
  *
  * 重要: d_fsdata 必须用 call_rcu 延迟释放, 不能裸 kmem_cache_free.
  * 原因: RCU path walk (__d_lookup_rcu + d_revalidate) 可能并发读 d_fsdata.
@@ -345,16 +359,24 @@ static void powerfs_di_free_rcu(struct rcu_head *head)
 void powerfs_d_release(struct dentry *dentry)
 {
     struct powerfs_dentry_info *di = dentry->d_fsdata;
+    struct powerfs_sb_info *sbi;
 
     if (!di)
         return;
 
     pr_debug("powerfs: d_release '%pd' (di=%p)\n", dentry, di);
 
-    /* 设置 d_fsdata = NULL 并通过 RCU 延迟释放 di.
-     * RCU reader 在 d_revalidate 中读 d_fsdata 可看到 NULL (安全:
-     * d_revalidate 不再解引用 di) 或旧指针 (仍有效, 因为 di 还没被 free).
-     * grace period 后才真正 free, 保证无 UAF. */
+    /* 从全局 dentry_lease_list 摘除 (如果已挂载且 di 在链表上).
+     * 对齐 ceph_d_release: __dentry_unhash_lru. */
+    sbi = POWERFS_SB_INFO(dentry->d_sb);
+    if (sbi && sbi->client && (di->flags & POWERFS_DN_LEASE_LIST)) {
+        spin_lock(&sbi->client->dentry_lease_lock);
+        list_del_init(&di->lease_list);
+        spin_unlock(&sbi->client->dentry_lease_lock);
+        di->flags &= ~POWERFS_DN_LEASE_LIST;
+    }
+
+    /* 设置 d_fsdata = NULL 并通过 RCU 延迟释放 di. */
     dentry->d_fsdata = NULL;
     call_rcu(&di->rcu, powerfs_di_free_rcu);
 }
@@ -363,54 +385,143 @@ void powerfs_d_release(struct dentry *dentry)
 static void powerfs_invalidate_dir_lease(struct inode *dir);
 
 /*
- * d_revalidate - 基于父目录 Lease 校验 dentry 有效性
+ * powerfs_fill_dentry_lease — 在 lookup/readdir 成功后填充 per-dentry lease
  *
- * 核心原则 (目录级 Lease 方案):
- *   1. RCU 路径: 无锁读取父目录 dir_lease_expire, 有效返回 1, 过期返回 -ECHILD
- *   2. REF 路径: 统一返回 1 (永不返回 0)
- *   3. 永不触发 d_invalidate + d_drop + re-lookup 循环
+ * 对齐 Ceph __update_dentry_lease (fs/ceph/inode.c L1388-1453) +
+ *      Rust cache.rs DentryLease (powerfs-fuse/src/cache.rs L153-160)
  *
- * 为什么永不返回 0:
- *   return 0 触发 VFS 的 d_invalidate → d_drop → dput → d_alloc_parallel →
- *   __d_lookup_rcu. 负 dentry 释放路径短 (无 iput), 与 __d_lookup_rcu 的
- *   RCU 遍历竞态 → dentry 哈希链环 → RCU stall.
- *   返回 1 让 VFS 使用缓存, stale dentry 由 readdir/shrinker 清理.
+ * 填充内容:
+ *   - lease_expire: now + TTL (对齐 Rust DentryLease::expire_at)
+ *   - dir_shared_gen: 父目录当前 i_shared_gen (对齐 Rust dir_shared_gen)
+ *   - lease_gen / lease_seq: 预留 (Filer 后续在响应中携带)
+ *
+ * 调用上下文: lookup/readdir 成功后, 持有 dentry 引用
+ * 注意: 不需要持锁 (单线程 VFS lookup 路径, dentry 尚未被并发访问)
+ */
+static void powerfs_fill_dentry_lease(struct dentry *dentry,
+                                       struct inode *dir,
+                                       u64 lease_ttl_ms)
+{
+    struct powerfs_dentry_info *di;
+    struct powerfs_inode_info *parent_pi;
+    struct powerfs_sb_info *sbi;
+
+    if (!dentry || !dir)
+        return;
+
+    di = POWERFS_D(dentry);
+    if (!di)
+        return;
+
+    parent_pi = POWERFS_I(dir);
+    sbi = POWERFS_SB_INFO(dir->i_sb);
+
+    /* 填充 lease TTL (Layer 1) */
+    if (lease_ttl_ms > 0) {
+        di->lease_duration_ms = lease_ttl_ms;
+        di->lease_expire = jiffies + msecs_to_jiffies(lease_ttl_ms);
+        di->lease_renew_after = jiffies +
+            msecs_to_jiffies(lease_ttl_ms / 3);  /* renew at 2/3 TTL */
+        di->lease_renew_from = 0;
+    } else {
+        /* Filer 未发放 lease, 使用默认目录 TTL */
+        di->lease_duration_ms = jiffies_to_msecs(POWERFS_DIR_LEASE_TTL);
+        di->lease_expire = jiffies + POWERFS_DIR_LEASE_TTL;
+        di->lease_renew_after = jiffies + POWERFS_DIR_LEASE_TTL * 2 / 3;
+    }
+
+    /* 填充 dir_shared_gen (Layer 2) — 对齐 Rust cache.rs dir_shared_gen */
+    di->dir_shared_gen = (u64)atomic_read(&parent_pi->i_shared_gen);
+
+    /* 挂到全局 dentry_lease_list (用于 shrinker/LRU 管理) */
+    if (sbi && sbi->client && !(di->flags & POWERFS_DN_LEASE_LIST)) {
+        spin_lock(&sbi->client->dentry_lease_lock);
+        list_add_tail(&di->lease_list, &sbi->client->dentry_lease_list);
+        di->flags |= POWERFS_DN_LEASE_LIST;
+        spin_unlock(&sbi->client->dentry_lease_lock);
+    }
+
+    pr_debug("powerfs: fill_dentry_lease '%pd' expire=%lu gen=%llu\n",
+             dentry, di->lease_expire, di->dir_shared_gen);
+}
+
+/*
+ * d_revalidate — 三层校验 (对齐 Ceph + Rust DentryLeaseStatus)
+ *
+ * Layer 1: per-dentry lease (di->lease_expire > now → valid)
+ * Layer 2: dir_shared_gen matches parent's i_shared_gen && parent has I_COMPLETE
+ * Layer 3: RPC (返回 1 让 VFS 重试 lookup, lookup 会向 Filer 发 RPC)
+ *
+ * RCU 路径: 无锁快速检查 Layer 1 + Layer 2, miss 则 -ECHILD 降级
+ * REF 路径: 同样检查, miss 则返回 1 (VFS 会触发 re-lookup)
  *
  * 返回值:
- *   1: dentry 有效, 使用缓存 (正/负 dentry 无差别)
- *   -ECHILD: 退出 RCU, 切换 REF 路径 (仅 RCU 模式)
+ *   1: dentry 有效 (正/负), 使用缓存
+ *   -ECHILD: 退出 RCU (仅 RCU 模式)
  *
- * 参考: ceph_d_revalidate (fs/ceph/dir.c)
+ * 参考: ceph_d_revalidate (fs/ceph/dir.c L1280-1370)
+ *       Rust DentryLeaseStatus (powerfs-fuse/src/cache.rs L167-179)
  */
 int powerfs_d_revalidate(struct inode *dir, const struct qstr *name,
                          struct dentry *dentry, unsigned int flags)
 {
     struct powerfs_inode_info *parent_pi;
+    struct powerfs_dentry_info *di;
+    unsigned long now = jiffies;
     unsigned long lease_expire;
+    u64 parent_shared_gen;
 
-    /* === RCU 路径: 无锁检查父目录 lease ===
-     *
-     * 用 READ_ONCE 读取 dir_lease_expire, 不持任何 spinlock (RCU 临界区禁止
-     * 取 spinlock, 否则会导致 RCU stall).
-     * 值可能略旧 (并发 mutation 刚清零), 但最差情况是放行一个 stale dentry,
-     * 下次访问会纠正, 不会导致 stall. */
+    /* === RCU 路径: 无锁检查 === */
     if (flags & LOOKUP_RCU) {
         if (!dir)
             return -ECHILD;
         parent_pi = POWERFS_I(dir);
-        lease_expire = READ_ONCE(parent_pi->dir_lease_expire);
+        di = dentry->d_fsdata;
+        if (!di)
+            return -ECHILD;
 
-        if (time_before(jiffies, lease_expire))
-            return 1;       /* 父目录 lease 有效: 正/负 dentry 全部放行 */
-        else
-            return -ECHILD; /* lease 过期: 降级 REF 路径 */
+        /* Layer 1: per-dentry lease (无锁读, 可能略旧) */
+        lease_expire = READ_ONCE(di->lease_expire);
+        if (lease_expire && time_before(now, lease_expire))
+            return 1;       /* dentry lease 有效: 正/负 dentry 全部放行 */
+
+        /* Layer 2: dir_shared_gen + parent I_COMPLETE (无锁读) */
+        parent_shared_gen = (u64)atomic_read(&parent_pi->i_shared_gen);
+        if (di->dir_shared_gen == parent_shared_gen &&
+            (READ_ONCE(parent_pi->i_flags) & POWERFS_I_COMPLETE))
+            return 1;       /* shared_gen 匹配 + 目录完整 → 信任缓存 */
+
+        /* Layer 3: miss → 降级 REF 路径 (REF 路径可做 RPC) */
+        return -ECHILD;
     }
 
-    /* === REF 路径: 统一返回 1 ===
+    /* === REF 路径: 带锁三层校验 === */
+    if (!dir)
+        return 1;
+    parent_pi = POWERFS_I(dir);
+    di = dentry->d_fsdata;
+    if (!di)
+        return 1;
+
+    /* Layer 1: per-dentry lease */
+    lease_expire = READ_ONCE(di->lease_expire);
+    if (lease_expire && time_before(now, lease_expire))
+        return 1;
+
+    /* Layer 2: dir_shared_gen + I_COMPLETE */
+    parent_shared_gen = (u64)atomic_read(&parent_pi->i_shared_gen);
+    if (di->dir_shared_gen == parent_shared_gen &&
+        (READ_ONCE(parent_pi->i_flags) & POWERFS_I_COMPLETE))
+        return 1;
+
+    /* Layer 3: lease miss → 返回 1 让 VFS 使用缓存.
+     * 不在此处做 RPC (d_revalidate 在路径遍历中频繁调用).
+     * VFS 会在需要时重新 lookup (向 Filer 发 RPC), 届时填充新 lease.
+     * stale dentry 由 readdir 刷新 / shrinker 回收 / 本地 mutation 失效.
      *
-     * 不在此处做 lease 续约 RPC (d_revalidate 在路径遍历中频繁调用, 内嵌
-     * RPC 会阻塞). lease 续约由 readdir / lookup 统一处理.
-     * stale dentry 通过 readdir 刷新 / shrinker 回收 / 本地 mutation 失效. */
+     * Note: 返回 0 (invalid) 会触发 d_invalidate→d_drop→re-lookup 循环,
+     * 与 __d_lookup_rcu 竞态可能导致 RCU stall. 统一返回 1 更安全.
+     * 正/负 dentry 无差别: 负 dentry 的 inode==NULL, Layer 1/2 仍可信任. */
     return 1;
 }
 
@@ -1237,6 +1348,80 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->lease_tree = RB_ROOT;
     spin_lock_init(&pi->lease_lock);
     INIT_DELAYED_WORK(&pi->lease_renew_work, powerfs_lease_renew_work_func);
+
+    /* === Cap 管理层初始化 (对齐 ceph_alloc_inode) === */
+    pi->i_caps = RB_ROOT;
+    pi->i_auth_cap = NULL;
+    pi->i_dirty_caps = 0;
+    pi->i_flushing_caps = 0;
+    INIT_LIST_HEAD(&pi->i_dirty_item);
+    INIT_LIST_HEAD(&pi->i_flushing_item);
+    INIT_LIST_HEAD(&pi->i_cap_delay_list);
+    INIT_LIST_HEAD(&pi->i_cap_flush_list);
+    pi->i_prealloc_cap_flush = NULL;
+    init_waitqueue_head(&pi->i_cap_wq);
+    INIT_LIST_HEAD(&pi->i_cap_snaps);
+    pi->i_snap_caps = 0;
+    pi->i_head_snapc_epoch = 0;
+
+    /* Cap 引用计数清零 */
+    pi->i_pin_ref = 0;
+    pi->i_rd_ref = 0;
+    pi->i_rdcache_ref = 0;
+    pi->i_wr_ref = 0;
+    pi->i_wb_ref = 0;
+    pi->i_fx_ref = 0;
+    pi->i_wrbuffer_ref = 0;
+    pi->i_wrbuffer_ref_head = 0;
+    atomic_set(&pi->i_filelock_ref, 0);
+
+    /* shared_gen / cache_gen 初始化 (对齐 ceph i_shared_gen=0, i_rdcache_gen=0) */
+    atomic_set(&pi->i_shared_gen, 0);
+    pi->i_rdcache_gen = 0;
+    pi->i_rdcache_revoking = 0;
+    memset(pi->i_nr_by_mode, 0, sizeof(pi->i_nr_by_mode));
+    pi->i_last_rd = 0;
+    pi->i_last_wr = 0;
+
+    /* Inode 版本与 flag 层 */
+    pi->i_version = 0;
+    pi->i_time_warp_seq = 0;
+    pi->i_flags = 0;
+    atomic64_set(&pi->i_release_count, 0);
+    atomic64_set(&pi->i_ordered_count, 0);
+
+    /* size/truncate 同步 (对齐 Ceph 四方 size) */
+    pi->i_max_size = 0;
+    pi->i_reported_size = 0;
+    pi->i_wanted_max_size = 0;
+    pi->i_requested_max_size = 0;
+    mutex_init(&pi->i_truncate_mutex);
+    pi->i_truncate_seq = 0;
+    pi->i_truncate_size_visible = 0;
+    pi->i_xattr_version = 0;
+
+    /* 目录递归统计 + quota + btime */
+    pi->i_rbytes = 0;
+    pi->i_rfiles = 0;
+    pi->i_rsubdirs = 0;
+    pi->i_rsnaps = 0;
+    pi->i_files = 0;
+    pi->i_subdirs = 0;
+    pi->i_max_bytes = 0;
+    pi->i_max_files = 0;
+    pi->i_fragtree = RB_ROOT;
+    pi->i_fragtree_nsplits = 0;
+    mutex_init(&pi->i_fragtree_mutex);
+
+    /* unsafe ops 链表 */
+    INIT_LIST_HEAD(&pi->i_unsafe_dirops);
+    INIT_LIST_HEAD(&pi->i_unsafe_iops);
+    spin_lock_init(&pi->i_unsafe_lock);
+
+    /* inode work (多工作项位图, 对齐 Ceph i_work/i_work_mask) */
+    INIT_WORK(&pi->i_work, NULL);  /* 后续 powerfs_inode_work_fn */
+    pi->i_work_mask = 0;
+
     pi->chunks = NULL;
     pi->chunk_count = 0;
     pi->content_size = 0;
@@ -1383,6 +1568,38 @@ void powerfs_evict_inode(struct inode *inode)
         rb_erase(n, &pi->lease_tree);
         kfree(rb_entry(n, struct powerfs_lease, node));
     }
+
+    /* 5b. 清理 i_caps rbtree (对齐 ceph_evict_inode: remove caps)
+     *    evict 时所有 cap 应已被 revoke/release, 但安全起见遍历释放. */
+    while (!RB_EMPTY_ROOT(&pi->i_caps)) {
+        struct rb_node *n = rb_first(&pi->i_caps);
+        struct powerfs_cap *cap = rb_entry(n, struct powerfs_cap, ci_node);
+        rb_erase(n, &pi->i_caps);
+        kfree(cap);
+    }
+    pi->i_auth_cap = NULL;
+
+    /* 5c. 清理 cap_flush_list (不应有残留, 但安全起见) */
+    while (!list_empty(&pi->i_cap_flush_list)) {
+        struct powerfs_cap_flush *cf;
+        cf = list_first_entry(&pi->i_cap_flush_list,
+                              struct powerfs_cap_flush, i_list);
+        list_del(&cf->i_list);
+        list_del(&cf->g_list);
+        kfree(cf);
+    }
+
+    /* 5d. 清理 cap_snaps (对齐 ceph: put all cap_snaps) */
+    while (!list_empty(&pi->i_cap_snaps)) {
+        struct powerfs_cap_snap *cs;
+        cs = list_first_entry(&pi->i_cap_snaps,
+                              struct powerfs_cap_snap, ci_item);
+        list_del(&cs->ci_item);
+        kfree(cs);
+    }
+
+    /* 5e. 唤醒所有等待 i_cap_wq 的线程 (对齐 ceph: wake up cap waiters) */
+    wake_up_all(&pi->i_cap_wq);
 
     /* 释放动态分配的布局数据. 持锁防止与 refresh_work/apply_layout 竞争.
      * 修复 crash: 连接断开时 refresh_work getattr 失败 → iput → evict_inode,
@@ -2218,6 +2435,10 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
              */
             d_add(dentry, inode);
 
+            /* Per-dentry lease: lookup 成功后填充 (对齐 Ceph __update_dentry_lease).
+             * 正 dentry: lease 有效期间信任缓存, d_revalidate Layer 1 命中. */
+            powerfs_fill_dentry_lease(dentry, dir, 0);
+
             /* 目录级 lease: lookup 成功后续约父目录 lease.
              * 一次 RPC 同时完成查询+续约, 后续同目录的 d_revalidate
              * 全部 RCU 命中, 无网络交互. */
@@ -2243,6 +2464,18 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
             kfree(lookup_layout.replica_chunks);
             kfree(lookup_layout.ec_chunks);
             d_add(dentry, NULL);
+
+            /* Per-dentry lease: 负 dentry 也填充 lease (对齐 Ceph 负 dentry 信任).
+             * 负 dentry lease 有效期间, d_revalidate Layer 1 命中 → 直接返回 ENOENT,
+             * 无需 RPC. 对齐 Rust DentryLeaseStatus::LeaseValid (negative). */
+            powerfs_fill_dentry_lease(dentry, dir, 0);
+            /* 标记为负 dentry (用于 Layer 2 的 I_COMPLETE + ENOENT 信任) */
+            {
+                struct powerfs_dentry_info *di = POWERFS_D(dentry);
+                if (di)
+                    di->flags |= POWERFS_DN_NEGATIVE;
+            }
+
             WRITE_ONCE(POWERFS_I(dir)->dir_lease_expire,
                        jiffies + POWERFS_DIR_LEASE_TTL);
             total_us = div_u64(ktime_get_ns() - ts_entry, 1000);
@@ -2348,10 +2581,12 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 
     /* For newly created directories, mark dir_complete=true (empty directory,
      * no need to fetch from Filer). powerfs_init_inode sets it to false for
-     * the general case (LOOKUP path), so we override it here for mkdir. */
+     * the general case (LOOKUP path), so we override it here for mkdir.
+     * Also set I_COMPLETE flag (对齐 Ceph: new empty dir is complete). */
     if (S_ISDIR(mode)) {
         struct powerfs_inode_info *pi = POWERFS_I(inode);
         WRITE_ONCE(pi->dir_complete, true);
+        pi->i_flags |= POWERFS_I_COMPLETE;
         WRITE_ONCE(pi->dir_lease_expire, jiffies + POWERFS_DIR_LEASE_TTL);
     }
 
@@ -3537,9 +3772,11 @@ static int powerfs_fill_readdir_cache(struct powerfs_dir_file_info *dfi,
 
     if (resp_hdr.data_len == 0) {
         kfree(resp_data);
-        /* 没有更多条目，标记目录完整 */
+        /* 没有更多条目，标记目录完整 (I_COMPLETE)
+         * 对齐 Ceph: __ceph_dir_set_complete(ci) + i_flags |= I_COMPLETE. */
         spin_lock(&dpi->i_lock);
         dpi->dir_complete = true;
+        dpi->i_flags |= POWERFS_I_COMPLETE;
         spin_unlock(&dpi->i_lock);
         return 0;
     }
@@ -3563,9 +3800,11 @@ static int powerfs_fill_readdir_cache(struct powerfs_dir_file_info *dfi,
 
     kfree(resp_data);
 
-    /* 获取成功，标记目录内容已完整缓存 */
+    /* 获取成功，标记目录内容已完整缓存 (I_COMPLETE)
+     * 对齐 Ceph: ceph_readdir_prepopulate → __ceph_dir_set_complete. */
     spin_lock(&dpi->i_lock);
     dpi->dir_complete = true;
+    dpi->i_flags |= POWERFS_I_COMPLETE;
     spin_unlock(&dpi->i_lock);
 
     pr_debug("powerfs: fill_readdir_cache got %u entries (dir_complete=true)\n",
@@ -3750,12 +3989,13 @@ static int powerfs_compact_dir_entries(struct inode *dir)
     return removed;
 }
 
-/* Phase 1: 本地 mutation 后清父目录 lease + bump epoch.
+/* Phase 1: 本地 mutation 后清父目录 lease + bump shared_gen.
  * 调用时机: mkdir/rmdir/create/unlink/symlink/link/rename 网络请求成功后,
  *           在修改本地数据结构的同时清目录 lease.
  * 效果: 下次 readdir 看到 lease 过期会重新拉取, 看到自己刚加/删的项.
- *       epoch++ 留给 Phase 3 callback 比对 (callback 携带 epoch,
- *       不匹配说明有过本地修改, 需重新拉取).
+ *       i_shared_gen++ 使所有子 dentry 的 dir_shared_gen 失效,
+ *       d_revalidate Layer 2 不再命中 → 触发 re-lookup.
+ *       清 I_COMPLETE 使负 dentry 不再被信任 (目录内容已变).
  * 注意: 调用方已持 dir->i_rwsem 写锁 (VFS 保证), 此处无需额外锁. */
 static void powerfs_invalidate_dir_lease(struct inode *dir)
 {
@@ -3769,6 +4009,15 @@ static void powerfs_invalidate_dir_lease(struct inode *dir)
     mutex_lock(&dpi->dir_mutex);
     WRITE_ONCE(dpi->dir_lease_expire, 0);
     dpi->dir_lease_epoch++;
+    /* Bump i_shared_gen: 使所有子 dentry 的 dir_shared_gen 不再匹配.
+     * 对齐 Ceph atomic_inc(&ci->i_shared_gen) + Rust cache.rs bump_dir_version.
+     * 对齐 Rust: "Bump dir_version so stale dentries with dir_shared_gen
+     * mismatch are detected." */
+    atomic_inc(&dpi->i_shared_gen);
+    /* 清 I_COMPLETE: 目录内容已变, 不再信任负 dentry.
+     * 对齐 Ceph: __ceph_dir_clear_complete(ci). */
+    dpi->i_flags &= ~POWERFS_I_COMPLETE;
+    dpi->dir_complete = false;
     mutex_unlock(&dpi->dir_mutex);
 }
 
@@ -3965,9 +4214,11 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
 
         kfree(net_entries);
 
-        /* 拉取成功 (或部分成功): 设置 dir_complete + dir_lease_expire.
-         * 部分成功时也设 dir_complete (避免反复部分拉取), 下次 lease 过期再补. */
+        /* 拉取成功 (或部分成功): 设置 dir_complete + I_COMPLETE + dir_lease_expire.
+         * 部分成功时也设 dir_complete (避免反复部分拉取), 下次 lease 过期再补.
+         * 对齐 Ceph: __ceph_dir_set_complete + I_COMPLETE. */
         WRITE_ONCE(dpi->dir_complete, true);
+        dpi->i_flags |= POWERFS_I_COMPLETE;
         WRITE_ONCE(dpi->dir_lease_expire, jiffies + POWERFS_DIR_LEASE_TTL);
     }
 
