@@ -21,7 +21,7 @@
 #define POWERFS_ROOT_INO        1
 #define POWERFS_INO_START       2
 #define POWERFS_MAX_NAME_LEN    255
-#define POWERFS_VERSION         "2.0.0-ceph-style"
+#define POWERFS_VERSION         "2.0.0-powerfs-style"
 
 /* 目录 lease 超时 (jiffies, 默认 5 秒).
  * 绑定在父目录 inode 上, 控制该目录下所有子 dentry (正/负) 的缓存有效期.
@@ -50,13 +50,13 @@
 #define POWERFS_LEASE_DURATION  (30 * HZ)
 /* Phase 3: lease 续约阈值. 当 lease 剩余有效期 < 阈值时触发续约.
  * 设为 DURATION/3 (10s): 在过期前 10s 续约, 留足网络往返 + 重试时间.
- * 参考 Ceph cap renew 在 expiry 前主动续约. */
+ * 参考  cap renew 在 expiry 前主动续约. */
 #define POWERFS_LEASE_RENEW_THRESHOLD (POWERFS_LEASE_DURATION / 3)
 
-/* ========== Capability (Lease) 位定义 — 对齐 Ceph CEPH_CAP_* (src/include/cephfs/types.h)
+/* ========== Capability (Lease) 位定义 — 对齐  CEPH_CAP_* (src/include/powerfsfs/types.h)
  *
  * 用于 struct powerfs_cap 的 issued / implemented / wanted / dirty_caps 字段.
- * 与 Ceph 完全对齐的 8 位掩码 + PIN 高阶位, 为后续 revoke/release 三层语义铺路:
+ * 与  完全对齐的 8 位掩码 + PIN 高阶位, 为后续 revoke/release 三层语义铺路:
  *   - issued:       Filer/Master 授予的能力 (权威权限位, 来自 lookup/open/getattr 响应)
  *   - implemented:  本地仍持有的权限超集, 用于优雅降级 (先收到 issued<old,
  *                   写回脏数据后才能 implemented=issued, 避免 revoke 期间丢失数据)
@@ -65,8 +65,8 @@
  *   - dirty_caps:   哪些字段 (size/mtime/uid/...) 本地有脏数据需要写回,
  *                   revoke 发现 dirty_caps & 目标要撤的位 != 0 必须 FlushThenAck
  * 参考:
- *   - linux-6.17/include/linux/ceph/ceph_fs.h
- *   - ceph/src/client/Inode.h Cap + Inode::dirty_caps */
+ *   - linux-6.17/include/linux/powerfs/powerfs_fs.h
+ *   - powerfs/src/client/Inode.h Cap + Inode::dirty_caps */
 
 #define POWERFS_CAP_PIN        (1 << 0)   /* 基础引用 (有 inode 活着就有) */
 #define POWERFS_CAP_AUTH_SHARED (1 << 1)  /* AUTH_SHARED: 读权限 (attrs+data) */
@@ -79,7 +79,7 @@
 #define POWERFS_CAP_FILE_WR    (1 << 8)   /* FILE_WR: 可写文件数据 (独占/主副本) */
 #define POWERFS_CAP_FILE_EXCL  (1 << 9)   /* FILE_EXCL: 独占写 (可追加/truncate) */
 
-/* 常用组合位掩码 (派生, 与 Ceph CEPH_CAP_ANY_* 对齐) */
+/* 常用组合位掩码 (派生, 与  CEPH_CAP_ANY_* 对齐) */
 #define POWERFS_CAP_RDCACHE     (POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_CACHE)
 #define POWERFS_CAP_WR_DATA     (POWERFS_CAP_FILE_WR | POWERFS_CAP_FILE_EXCL)
 #define POWERFS_CAP_ANY_RD      (POWERFS_CAP_AUTH_SHARED | POWERFS_CAP_FILE_SHARED)
@@ -96,7 +96,7 @@ enum {
 };
 #define POWERFS_FILE_MODE_BITS  POWERFS_FILE_MODE_MAX
 
-/* inode 级 flag (对齐 Ceph Inode.h I_COMPLETE / I_DIR_ORDERED 等)
+/* inode 级 flag (对齐  Inode.h I_COMPLETE / I_DIR_ORDERED 等)
  * 放在 struct powerfs_inode_info.i_flags, 取代原来的几个孤立 bool. */
 #define POWERFS_I_COMPLETE       (1 << 0)  /* 目录缓存完整, 支持负 dentry 信任 */
 #define POWERFS_I_DIR_ORDERED    (1 << 1)  /* 目录操作有序, readdir 顺序是原子快照 */
@@ -107,7 +107,7 @@ enum {
 #define POWERFS_I_DIRTY          (1 << 6)  /* 元数据 (attrs/xattr) 有脏位 */
 #define POWERFS_I_WRITEBACK      (1 << 7)  /* 正在数据写回中 (wb_batch_count > 0) */
 
-/* mount_state 枚举 (对齐 Ceph CEPH_MOUNT_*)
+/* mount_state 枚举 (对齐  CEPH_MOUNT_*)
  * 取代原来 shutting_down / initialized 两个 bool, 避免中间态 race. */
 enum {
     POWERFS_MOUNT_MOUNTING = 0,
@@ -151,7 +151,7 @@ struct powerfs_dirent;
 struct powerfs_lookup_req;
 struct powerfs_create_req;
 
-/* ========== Dentry 私有数据 — 对齐 ceph_dentry_info (linux-6.17/fs/ceph/super.h L303-315)
+/* ========== Dentry 私有数据 — 对齐 powerfs_dentry_info (linux-6.17/fs/powerfs/super.h L303-315)
  *                                        + Dentry.h L99-L110 (用户态)
  *                                        + Rust CachedEntry (powerfs-fuse/src/cache.rs L129-L144)
  * 三层语义对齐:
@@ -175,19 +175,19 @@ struct powerfs_dentry_info {
     u64 offset;                       /* readdir 偏移 (保持) */
     struct rcu_head rcu;              /* RCU 延迟释放 (保持) */
 
-    /* === 对齐 ceph_dentry_info: lease 链 + LRU + shrinker === */
+    /* === 对齐 powerfs_dentry_info: lease 链 + LRU + shrinker === */
     struct list_head lease_list;      /* 挂 client->dentry_lease_list */
     struct hlist_node hnode;          /* 全局/按 dir hash (可选) */
     unsigned long flags;              /* POWERFS_DN_* 位掩码 */
 
-    /* === 对齐 ceph_dentry_info: per-dentry lease 三层校验 (Layer 1) === */
+    /* === 对齐 powerfs_dentry_info: per-dentry lease 三层校验 (Layer 1) === */
     u64 lease_issuer_id;              /* 发放 lease 的 Filer node_id (session 关联) */
     unsigned long lease_renew_after;  /* 到达此 jiffies 开始异步续约 */
     unsigned long lease_renew_from;   /* 续约窗口起点 (可开始发 Renew 请求) */
     unsigned long lease_expire;       /* Layer 1: dentry lease 到期时间 (jiffies) */
     u64 lease_duration_ms;            /* 本次发放的 TTL (ms), 续约用 */
 
-    /* === 序列号屏障 (对齐 ceph lease_gen/lease_seq) === */
+    /* === 序列号屏障 (对齐 powerfs lease_gen/lease_seq) === */
     u32 lease_gen;                    /* lease 代次, Filer 重发新 lease 时 +1 */
     u32 lease_seq;                    /* 序列号, revoke/invalidate 消息需要 seq > 此数才生效 */
 
@@ -204,7 +204,7 @@ static inline struct powerfs_dentry_info *POWERFS_D(struct dentry *dentry)
     return dentry->d_fsdata;
 }
 
-/* ========== 目录文件私有数据 (参考 ceph_dir_file_info) ========== */
+/* ========== 目录文件私有数据 (参考 powerfs_dir_file_info) ========== */
 
 struct powerfs_dir_file_info {
     struct file *file;
@@ -233,7 +233,7 @@ struct powerfs_dir_entry {
     bool deleted;                   /* 标记删除: 保持链表位置稳定, readdir 跳过 */
 };
 
-/* ========== Inode 扩展结构 (参考 ceph_inode_info) ========== */
+/* ========== Inode 扩展结构 (参考 powerfs_inode_info) ========== */
 
 /* Chunk 映射条目 */
 struct powerfs_chunk_map {
@@ -244,18 +244,18 @@ struct powerfs_chunk_map {
 };
 
 /* ==============================================================
- * Cap / Lease / Flush 结构层 — 对齐 Ceph ceph_cap / ceph_cap_flush / ceph_cap_snap
+ * Cap / Lease / Flush 结构层 — 对齐  powerfs_cap / powerfs_cap_flush / powerfs_cap_snap
  *
  * 说明:
- *   powerfs_cap       → ceph_cap (per-inode-per-session 授权单元, 含双轨 issued/implemented)
- *   powerfs_cap_flush → ceph_cap_flush (正在向 Filer 发送的 CapFlush/CapRelease 消息)
- *   powerfs_cap_snap  → ceph_cap_snap (snapshot 发生时，冻结被 snap 出去的 size/mtime/...
+ *   powerfs_cap       → powerfs_cap (per-inode-per-session 授权单元, 含双轨 issued/implemented)
+ *   powerfs_cap_flush → powerfs_cap_flush (正在向 Filer 发送的 CapFlush/CapRelease 消息)
+ *   powerfs_cap_snap  → powerfs_cap_snap (snapshot 发生时，冻结被 snap 出去的 size/mtime/...
  *                                      直到 flush 完才合并)
  * 为了兼容现有 powerfs_lease_* 代码，保留 typedef powerfs_lease。
  * ============================================================== */
 
 /* 正在 flush (等待 Filer ACK) 的 CapFlush/CapRelease 记录
- * 对齐 ceph_cap_flush (linux-6.17/fs/ceph/super.h L208-215). */
+ * 对齐 powerfs_cap_flush (linux-6.17/fs/powerfs/super.h L208-215). */
 struct powerfs_cap_flush {
     u64 tid;               /* 对应通信层 request->tid, 用于 ACK 匹配 */
     unsigned int caps;     /* 本次 flush 携带的 dirty cap bitmask */
@@ -267,7 +267,7 @@ struct powerfs_cap_flush {
 
 /* Cap Snap — 快照发生时的"冻结状态"，用于在新 epoch 写回未完成之前
  * 保证旧 epoch 状态能被正确 flush.
- * 对齐 ceph_cap_snap (linux-6.17/fs/ceph/super.h L222-249) */
+ * 对齐 powerfs_cap_snap (linux-6.17/fs/powerfs/super.h L222-249) */
 struct powerfs_cap_snap {
     refcount_t nref;
     struct list_head ci_item;   /* 挂在 inode->i_cap_snaps */
@@ -293,7 +293,7 @@ struct powerfs_cap_snap {
     bool need_flush;       /* 本 snap 需要先 flush 才能 ack revoke */
 };
 
-/* 主 Cap 结构 — 对齐 ceph_cap + 合并原 powerfs_lease 的 per-stripe 字段
+/* 主 Cap 结构 — 对齐 powerfs_cap + 合并原 powerfs_lease 的 per-stripe 字段
  *
  * 每个 inode 按 "session (Filer node id)" 有一个 cap (PowerFS 单 Filer 场景下通常只有
  * 一个 auth_cap)；多 Filer 分片 + authority migration 场景支持多 cap 红黑树。 */
@@ -312,13 +312,13 @@ struct powerfs_cap {
     struct list_head session_caps;       /* 挂到 session cap list (未来) */
     struct list_head lru_item;           /* LRU item, 用于 cap_reclaim / shrinker */
 
-    /* 授权 4 轨 (核心语义, 对齐 Ceph) */
+    /* 授权 4 轨 (核心语义, 对齐 ) */
     unsigned int issued;       /* Filer 最新授予的权限位 (权威) */
     unsigned int implemented;  /* 本地仍在使用的权限超集 (≥issued, 用于优雅降级) */
     unsigned int wanted;       /* 客户端根据 open/IO 实际想要的位 */
     unsigned int mds_wanted;   /* 已经向 issuer 请求过的 wanted (防止重复请求) */
 
-    /* 序列号屏障 (对齐 ceph seq/issue_seq/mseq + cap_gen) */
+    /* 序列号屏障 (对齐 powerfs seq/issue_seq/mseq + cap_gen) */
     u64 seq;           /* 最新消息序列号, revoke/grant 消息 seq 老的丢弃 */
     u64 issue_seq;     /* 最近一次 grant 携带的 issue_seq, 区分不同 lease 代 */
     u32 mseq;          /* authority migration 序号, Filer 主从切换 +1 */
@@ -431,27 +431,27 @@ struct powerfs_inode_info {
     spinlock_t i_lock;
 
     /* ==============================================================
-     * === Inode 版本与 flag 层 — 对齐 ceph_inode_info (super.h L353-L360) ===
+     * === Inode 版本与 flag 层 — 对齐 powerfs_inode_info (super.h L353-L360) ===
      * ============================================================== */
     u64 i_version;               /* Filer 侧 inode 全局版本, 每次 setattr/op 返回的最新 */
     u32 i_time_warp_seq;         /* mtime/atime timewarp 计数, 防止用户显式 utimes() 被晚到的 lease 回写覆盖 */
     unsigned long i_flags;       /* POWERFS_I_* 位图 (COMPLETE / DIR_ORDERED / TRUNC_PENDING / ...) */
 
-    /* 目录 ops 完成计数 (Ceph i_release_count / i_ordered_count),
+    /* 目录 ops 完成计数 ( i_release_count / i_ordered_count),
      * 用于 cross-client barrier: mkdir 返回时 release_count<=ordered_count
      * 表示该目录所有历史 mutation 已对其它客户端可见. */
     atomic64_t i_release_count;
     atomic64_t i_ordered_count;
 
     /* ==============================================================
-     * === Cap / Lease 管理层 (对齐 ceph i_caps, dirty_caps 等) ===
+     * === Cap / Lease 管理层 (对齐 powerfs i_caps, dirty_caps 等) ===
      * ============================================================== */
-    /* Lease 强一致 (参考 ceph i_caps rbtree) */
+    /* Lease 强一致 (参考 powerfs i_caps rbtree) */
     struct rb_root lease_tree;         /* per-stripe lease，按 stripe_start 排序 */
     spinlock_t lease_lock;             /* 保护 lease_tree */
     struct delayed_work lease_renew_work;
 
-    /* === 对齐 Ceph ceph_inode_info: 多 session cap + 脏/flush 追踪 === */
+    /* === 对齐  powerfs_inode_info: 多 session cap + 脏/flush 追踪 === */
     struct rb_root i_caps;             /* per-session cap rbtree (key = issuer_id,
                                         * 含 powerfs_cap 的 issued/implemented) */
     struct powerfs_cap *i_auth_cap;    /* authoritative cap (主 Filer 的 cap, 快速路径) */
@@ -461,24 +461,24 @@ struct powerfs_inode_info {
     struct list_head i_flushing_item;  /* 挂到全局 flushing_cap 列表 */
     struct list_head i_cap_delay_list; /* 延迟释放的 cap list (close→reopen 抖动避免) */
 
-    /* 正在等待 ACK 的 CapFlush 消息追踪 + 等待队列 (对齐 ceph i_cap_flush_list + i_cap_wq) */
+    /* 正在等待 ACK 的 CapFlush 消息追踪 + 等待队列 (对齐 powerfs i_cap_flush_list + i_cap_wq) */
     struct powerfs_cap_flush *i_prealloc_cap_flush;  /* 预分配 1 个, 避免内存压力下 ENOMEM */
     struct list_head i_cap_flush_list; /* powerfs_cap_flush.i_list 链表头 */
     wait_queue_head_t i_cap_wq;        /* 等待 cap acquire/revoke ACK 的线程挂这里 */
 
-    /* Cap snap 列表 (snapshot 冻结状态), 对齐 ceph i_cap_snaps / i_head_snapc / i_snap_caps */
+    /* Cap snap 列表 (snapshot 冻结状态), 对齐 powerfs i_cap_snaps / i_head_snapc / i_snap_caps */
     struct list_head i_cap_snaps;      /* cap_snap list 头 */
     unsigned int i_snap_caps;          /* cap bits for snapped files */
     u64 i_head_snapc_epoch;            /* 当前写快照的 epoch */
 
-    /* Cap 引用计数 (对齐 ceph i_pin_ref / i_rd_ref / i_wr_ref 等)
+    /* Cap 引用计数 (对齐 powerfs i_pin_ref / i_rd_ref / i_wr_ref 等)
      * 释放 cap 前必须 ref==0，防止写回途中 revoke 丢数据 */
     int i_pin_ref;
     int i_rd_ref, i_rdcache_ref, i_wr_ref, i_wb_ref, i_fx_ref;
     int i_wrbuffer_ref, i_wrbuffer_ref_head;
     atomic_t i_filelock_ref;           /* POSIX/FLK file lock 持有引用 */
 
-    /* shared_gen + cache_gen (对齐 Ceph atomic_t i_shared_gen + rdcache_gen + rdcache_revoking)
+    /* shared_gen + cache_gen (对齐  atomic_t i_shared_gen + rdcache_gen + rdcache_revoking)
      * - shared_gen: 每次该 inode 下 dentry 发生 FILE_SHARED 事件时自增
      *   子 dentry 的 dir_shared_gen 要和 父 inode 的 shared_gen 比对
      * - rdcache_gen:   每次获得 FILE_CACHE +1, 读路径上缓存的页如果 rdcache_gen 匹配则可信
@@ -487,18 +487,18 @@ struct powerfs_inode_info {
     u32 i_rdcache_gen;
     u32 i_rdcache_revoking;
 
-    /* per-mode open file count (对齐 ceph i_nr_by_mode[])
+    /* per-mode open file count (对齐 powerfs i_nr_by_mode[])
      * mode = [RD, WR, CACHE], 用于派生 wanted caps. */
     int i_nr_by_mode[POWERFS_FILE_MODE_BITS];
 
-    /* 读写计时 (对齐 ceph i_last_rd / i_last_wr) */
+    /* 读写计时 (对齐 powerfs i_last_rd / i_last_wr) */
     unsigned long i_last_rd;
     unsigned long i_last_wr;
 
     /* ==============================================================
-     * === size/truncate 同步 (对齐 Ceph 四方 size 同步) ===
+     * === size/truncate 同步 (对齐  四方 size 同步) ===
      * ============================================================== */
-    /* Max file size 四象限 (CTO 语义核心, 对齐 ceph i_max_size / reported_size / ...):
+    /* Max file size 四象限 (CTO 语义核心, 对齐 powerfs i_max_size / reported_size / ...):
      *   i_max_size           = Filer 授权可写的上限 (大于此 offset 不能写, 必须先 CapUpdate)
      *   i_reported_size      = 已向 Filer 报告 (请求) 过的 max_size
      *   i_wanted_max_size    = 实际 (从 write_iter kiocb.ki_pos 推导) 想写到的上限
@@ -578,22 +578,22 @@ struct powerfs_inode_info {
     unsigned long cache_expire;
     bool need_refresh;  /* NOTIFY 置位: 需异步 getattr 刷新元数据 */
 
-    /* === 对齐 Ceph: truncate 顺序屏障 + btime + xattr version === */
+    /* === 对齐 : truncate 顺序屏障 + btime + xattr version === */
     struct mutex i_truncate_mutex;        /* 与写回/setattr 互斥 */
-    u32 i_truncate_seq;                   /* 最近一次截断的序号 (Ceph 同名字段) */
+    u32 i_truncate_seq;                   /* 最近一次截断的序号 ( 同名字段) */
     u64 i_truncate_size_visible;          /* 用户可见 truncate_size (已 vmtruncate 完成) */
     struct timespec64 i_btime;            /* 文件创建时间 (birth/creation time,
-                                           * 对齐 Ceph inode i_btime / snap_btime) */
+                                           * 对齐  inode i_btime / snap_btime) */
     struct timespec64 i_snap_btime;
     u64 i_xattr_version;                  /* xattr 版本号, Filer 返回的最新 */
 
-    /* === 对齐 Ceph: 目录递归统计 + 配额 (rbytes / rfiles / rsubdirs / quota) === */
+    /* === 对齐 : 目录递归统计 + 配额 (rbytes / rfiles / rsubdirs / quota) === */
     struct timespec64 i_rctime;
     u64 i_rbytes, i_rfiles, i_rsubdirs, i_rsnaps;
     u64 i_files, i_subdirs;
     u64 i_max_bytes, i_max_files;        /* 目录级 quota (0 = 未设置) */
 
-    /* === 对齐 Ceph: 目录 frag tree (大目录分片, 预留) === */
+    /* === 对齐 : 目录 frag tree (大目录分片, 预留) === */
     struct rb_root i_fragtree;
     int i_fragtree_nsplits;
     struct mutex i_fragtree_mutex;
@@ -614,12 +614,12 @@ struct powerfs_inode_info {
     unsigned long dir_lease_expire;
     u64 dir_lease_epoch;
 
-    /* === 对齐 Ceph: 未 commit 的 async dirop / iop 链表 (Async DIROPS 核心) === */
+    /* === 对齐 : 未 commit 的 async dirop / iop 链表 (Async DIROPS 核心) === */
     struct list_head i_unsafe_dirops;    /* uncommitted mds dir op 链表 */
     struct list_head i_unsafe_iops;      /* uncommitted mds inode op 链表 */
     spinlock_t i_unsafe_lock;            /* 保护两个 unsafe_* 链表 */
 
-    /* 异步 inode 工作项 (对齐 Ceph i_work + i_work_mask).
+    /* 异步 inode 工作项 (对齐  i_work + i_work_mask).
      * 取代原来单一 setattr_work, 扩展为多工作项位图:
      *   BIT(0) = INODE_SETATTR,
      *   BIT(1) = INODE_INVALIDATE_PAGES,
@@ -639,7 +639,7 @@ struct powerfs_inode_info {
     struct mutex wb_mutex;
     atomic_t wb_batch_count;
 
-    /* shutdown 标志 (参考 ceph_inode_is_shutdown) */
+    /* shutdown 标志 (参考 powerfs_inode_is_shutdown) */
     bool shutdown;
 
     /* === xattr 存储 (simple_xattr in-memory) ===
@@ -679,12 +679,115 @@ int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
 void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
                                    struct powerfs_file_layout *layout);
 
-/* ========== 客户端结构 (参考 ceph_fs_client / linux-6.17/fs/ceph/super.h L120-L164) ========== */
+/* ========== P3-5: 全局性能计数 (对齐  powerfs_client_metric) ========== */
+
+/*
+ * powerfs_metric - 单个操作类型的延迟/吞吐统计.
+ *
+ * 对齐  powerfs_metric (metric.h L154):
+ *   total: 操作次数
+ *   size_sum/min/max: 操作大小统计
+ *   latency_sum/min/max: 延迟统计 (ns 精度)
+ */
+struct powerfs_metric {
+    spinlock_t lock;
+    u64 total;
+    u64 size_sum;
+    u64 size_min;
+    u64 size_max;
+    u64 latency_sum;      /* ns */
+    u64 latency_min;      /* ns */
+    u64 latency_max;      /* ns */
+};
+
+/* 操作类型枚举 */
+enum powerfs_metric_type {
+    POWERFS_METRIC_READ,
+    POWERFS_METRIC_WRITE,
+    POWERFS_METRIC_METADATA,
+    POWERFS_METRIC_MAX,
+};
+
+/*
+ * powerfs_metrics - 全局性能计数器集合.
+ *
+ * 对齐  powerfs_client_metric (metric.h L168):
+ *   - percpu_counter 用于高频 hit/miss 计数 (无锁, 高性能)
+ *   - spinlock 保护的 metric[] 用于延迟/吞吐统计 (低频更新)
+ *   - atomic64_t 用于 opened_files/total_inodes 等简单计数
+ */
+struct powerfs_metrics {
+    /* IO 延迟/吞吐 (read/write/metadata) */
+    struct powerfs_metric metric[POWERFS_METRIC_MAX];
+
+    /* Dentry lease 命中率 */
+    struct percpu_counter d_lease_hit;
+    struct percpu_counter d_lease_mis;
+
+    /* Cap 命中率 */
+    struct percpu_counter i_caps_hit;
+    struct percpu_counter i_caps_mis;
+
+    /* 文件/inode 计数 */
+    atomic64_t opened_files;
+    atomic64_t total_caps;
+    struct percpu_counter opened_inodes;
+    struct percpu_counter total_inodes;
+};
+
+/* Metrics API */
+int powerfs_metrics_init(struct powerfs_metrics *m);
+void powerfs_metrics_destroy(struct powerfs_metrics *m);
+void powerfs_update_metric(struct powerfs_metric *m, ktime_t start, ktime_t end,
+                           unsigned int size, int rc);
+
+static inline void powerfs_update_read_metrics(struct powerfs_metrics *m,
+                                                ktime_t start, ktime_t end,
+                                                unsigned int size, int rc)
+{
+    powerfs_update_metric(&m->metric[POWERFS_METRIC_READ], start, end, size, rc);
+}
+
+static inline void powerfs_update_write_metrics(struct powerfs_metrics *m,
+                                                 ktime_t start, ktime_t end,
+                                                 unsigned int size, int rc)
+{
+    powerfs_update_metric(&m->metric[POWERFS_METRIC_WRITE], start, end, size, rc);
+}
+
+static inline void powerfs_update_metadata_metrics(struct powerfs_metrics *m,
+                                                    ktime_t start, ktime_t end,
+                                                    int rc)
+{
+    powerfs_update_metric(&m->metric[POWERFS_METRIC_METADATA], start, end, 0, rc);
+}
+
+static inline void powerfs_metric_cap_hit(struct powerfs_metrics *m)
+{
+    percpu_counter_inc(&m->i_caps_hit);
+}
+
+static inline void powerfs_metric_cap_mis(struct powerfs_metrics *m)
+{
+    percpu_counter_inc(&m->i_caps_mis);
+}
+
+static inline void powerfs_metric_dentry_hit(struct powerfs_metrics *m)
+{
+    percpu_counter_inc(&m->d_lease_hit);
+}
+
+static inline void powerfs_metric_dentry_mis(struct powerfs_metrics *m)
+{
+    percpu_counter_inc(&m->d_lease_mis);
+}
+
+/* ========== 客户端结构 (参考 powerfs_fs_client / linux-6.17/fs/powerfs/super.h L120-L164) ========== */
 
 struct powerfs_client {
     struct super_block *sb;
 
-    /* 对齐 Ceph: mount 状态机 (取代 initialized / shutting_down bool, 避免中间态 race) */
+    /* 对齐 : mount 状态机 (取代 initialized / shutting_down bool, 避免中间态 race) */
     int mount_state;            /* POWERFS_MOUNT_MOUNTING / MOUNTED / UNMOUNTING / ... */
     bool blocklisted;           /* 被 Master/Filer 拉黑, 需发起 clean reconnect */
 
@@ -692,25 +795,32 @@ struct powerfs_client {
     char master_addr[64];
     u16 master_port;
 
+    /* §13 Cap model: 客户端唯一字符串标识 (ClientId string, TLV FieldId::ClientId = 0x30).
+     * 对齐 FUSE MetaShardClient::cap_open_grant 入参 client_id, 服务端 cap_manager
+     * 用此键维护 per-client 状态并在 recall 时推送 NOTIFY 到对应 net 连接.
+     * 内核态填: "powerfs-kernel-<tgid>" (mount 时生成, 单 mount 唯一). */
+    char client_id[64];
+    size_t client_id_len;
+
     /* 通信层 */
     struct powerfs_comm *comm;
 
-    /* 对齐 Ceph: per-file handle generation — 每次 revoke 自增,
+    /* 对齐 : per-file handle generation — 每次 revoke 自增,
      * 防止 file private data 被跨 revoke 复用. */
     u32 filp_gen;
 
-    /* 对齐 Ceph: 全局最大文件大小 (Filer/Master 告知的全局上限) */
+    /* 对齐 : 全局最大文件大小 (Filer/Master 告知的全局上限) */
     loff_t max_file_size;
 
-    /* 对齐 Ceph: 全局 writeback 统计 + congestion 指示 */
+    /* 对齐 : 全局 writeback 统计 + congestion 指示 */
     atomic_long_t writeback_count;
     bool write_congested;
 
-    /* 工作队列 (对齐 Ceph inode_wq + cap_wq 分工) */
+    /* 工作队列 (对齐  inode_wq + cap_wq 分工) */
     struct workqueue_struct *inode_wq;   /* inode 异步工作 (setattr/invalidate_pages/truncate) */
     struct workqueue_struct *cap_wq;     /* cap acquire/release/flush/renew 串行化队列 */
 
-    /* dentry lease 链表 (Ceph s_dentry_lru 对应) */
+    /* dentry lease 链表 ( s_dentry_lru 对应) */
     struct list_head dentry_lease_list;
     spinlock_t dentry_lease_lock;
 
@@ -718,15 +828,18 @@ struct powerfs_client {
     struct list_head cap_lru_list;
     spinlock_t cap_lru_lock;
 
-    /* 全局 CapFlush 列表 (对齐 Ceph mdsc->cap_dirty_lock 级别的 g_list) */
+    /* 全局 CapFlush 列表 (对齐  mdsc->cap_dirty_lock 级别的 g_list) */
     struct list_head cap_flush_list;
     spinlock_t cap_flush_lock;
+
+    /* P3-5: 全局性能计数 (对齐  powerfs_client_metric) */
+    struct powerfs_metrics metrics;
 
     /* 全局锁 */
     struct mutex mount_mutex;
 };
 
-/* ========== 超级块私有信息 (参考 ceph_fs_client + 挂载层 slab) ========== */
+/* ========== 超级块私有信息 (参考 powerfs_fs_client + 挂载层 slab) ========== */
 
 struct powerfs_sb_info {
     struct super_block *sb;
@@ -736,7 +849,7 @@ struct powerfs_sb_info {
     char master_addr[64];
     u16  master_port;
 
-    /* 多组 kmem_cache: 对齐 Ceph init_caches() (ceph_cap_snap_cachep / inode / dentry) */
+    /* 多组 kmem_cache: 对齐  init_caches() (powerfs_cap_snap_cachep / inode / dentry) */
     struct kmem_cache *inode_cache;       /* powerfs_inode_info (内含 netfs_inode) */
     struct kmem_cache *dentry_cachep;     /* powerfs_dentry_info */
     struct kmem_cache *cap_cachep;        /* powerfs_cap — 每 cap 独立分配 */
@@ -757,7 +870,7 @@ struct powerfs_sb_info {
     /* Stage C: writeback 异步 workqueue.
      * writepage 提交异步写请求到此 workqueue, 避免在 writeback
      * 上下文同步等待网络. fill_super 创建, kill_sb 销毁.
-     * (等价于 Ceph 把 writeback 提交到 inode_wq 上下文, 但 PowerFS 数据走 Volume
+     * (等价于  把 writeback 提交到 inode_wq 上下文, 但 PowerFS 数据走 Volume
      * 分离路径, 所以保留独立 writeback_wq) */
     struct workqueue_struct *writeback_wq;
 
@@ -776,6 +889,12 @@ struct powerfs_sb_info {
      * 每个 work item 占用 2MB needle_buf, 限制为 2 个并发 = 最多 4MB. */
     atomic_t wb_in_flight;
 #define POWERFS_WB_MAX_IN_FLIGHT  2
+
+    /* P3-4: debugfs 根目录 (/sys/kernel/debug/powerfs/<sb_id>/) */
+    struct dentry *debugfs_dir;
+
+    /* P3-5: /proc/powerfs/<sb_id>/ 入口 */
+    struct proc_dir_entry *proc_dir;
 };
 
 #define POWERFS_SB_INFO(sb) ((struct powerfs_sb_info *)(sb)->s_fs_info)
@@ -837,7 +956,7 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                       struct folio *folio, void *fsdata);
 sector_t powerfs_bmap(struct address_space *mapping, sector_t block);
 
-/* inode 管理 (参考 ceph iget5_locked/ilookup5 机制) */
+/* inode 管理 (参考 powerfs iget5_locked/ilookup5 机制) */
 struct inode *powerfs_iget(struct super_block *sb, u64 ino);
 struct inode *powerfs_find_inode(struct super_block *sb, u64 ino);
 struct inode *powerfs_new_inode(struct super_block *sb, umode_t mode,
@@ -889,7 +1008,7 @@ int powerfs_comm_statfs(struct kstatfs *stats);
 
 /* ========== Capability 管理接口 (powerfs_fs.c) ==========
  *
- * 对齐 Ceph caps.c 客户端 cap 生命周期:
+ * 对齐  caps.c 客户端 cap 生命周期:
  *   - issued/implemented 双轨: grant 更新 issued, revoke 先降 implemented,
  *     dirty flush 完成后才 implemented=issued (优雅降级, 避免丢数据)
  *   - wanted 由 open 模式 + refcount 派生, 与 issued 不匹配时主动 AcquireCap
@@ -897,7 +1016,7 @@ int powerfs_comm_statfs(struct kstatfs *stats);
  *   - i_cap_wq 等待 flush ACK, 保证 revoke 期间数据一致
  *
  * 锁约定: 所有 cap rbtree / issued / implemented / refcount / dirty_caps
- * 字段的访问必须在 pi->i_lock 保护下 (对齐 Ceph i_ceph_lock).
+ * 字段的访问必须在 pi->i_lock 保护下 (对齐  i_powerfs_lock).
  */
 
 /* cap 有效性检查 (cap_gen 匹配 + 未过期).
@@ -956,7 +1075,7 @@ void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
  * 调用方不持锁. */
 int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask);
 
-/* 评估并可能发送 cap 状态更新 (对齐 ceph_check_caps).
+/* 评估并可能发送 cap 状态更新 (对齐 powerfs_check_caps).
  * 比较 wanted vs issued, 决定是否 AcquireCap / ReleaseCap.
  * @flags: POWERFS_CHECK_CAPS_* 位掩码.
  * 调用方不持锁. */
@@ -964,9 +1083,35 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask);
 #define POWERFS_CHECK_CAPS_AUTHONLY (1 << 1)
 void powerfs_check_caps(struct powerfs_inode_info *pi, int flags);
 
-/* 标记 cap dirty 位 (write/setattr 路径调用, 对齐 __ceph_mark_caps_dirty).
+/* 标记 cap dirty 位 (write/setattr 路径调用, 对齐 __powerfs_mark_caps_dirty).
  * 调用方不持锁. */
 void powerfs_cap_mark_dirty(struct powerfs_inode_info *pi, unsigned int caps);
+
+/* 非阻塞尝试获取 cap 引用 (对齐 powerfs_try_get_caps).
+ * 若已持有 >= need 的 issued 位, 调 cap_get_refs 递增引用并返回 true;
+ * 否则触发 check_caps(0) 向服务端申请, 返回 false (调用方决定降级或重试).
+ * need 只允许 POWERFS_CAP_FILE_SHARED (纯读必须位), want 是推荐位掩码.
+ * @got: 非 NULL 时返回实际拿到的 cap 引用位 (供 put_refs 对称释放).
+ * 调用方不持锁. */
+bool powerfs_try_get_caps(struct powerfs_inode_info *pi,
+                          unsigned int need, unsigned int want,
+                          bool nonblock, unsigned int *got);
+
+/* 阻塞等待 cap 授权 (对齐 powerfs_get_caps).
+ * 循环调 try_get_cap_refs, 不满足时挂在 i_cap_wq 上等待服务端 cap_issue 唤醒.
+ * @filp: 打开的文件描述符 (可 NULL, 如 write_begin 从 iocb 取不到时).
+ * @endoff: 写路径的写入末尾偏移 (0 表示不限制).
+ * @got: 输出实际拿到的引用位.
+ * 返回 0 成功, <0 错误 (如 -ERESTARTSYS/-ENOTCONN).
+ * 调用方不持锁, 可阻塞. */
+int powerfs_get_caps(struct inode *inode, struct file *filp,
+                     unsigned int need, unsigned int want,
+                     loff_t endoff, unsigned int *got);
+
+/* inode permission 鉴权 — 对齐 powerfs_permission.
+ * 先拿 AUTH_SHARED cap 保证 inode attrs 最新, 再调 generic_permission.
+ * 返回 0 允许访问, <0 错误码 (-EACCES/-ECHILD). */
+int powerfs_permission(struct mnt_idmap *idmap, struct inode *inode, int mask);
 
 /* powerfs-net 初始化/清理 (powerfs_net.c) */
 int  powerfs_net_init(void);

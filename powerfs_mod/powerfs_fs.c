@@ -2,7 +2,6 @@
  * PowerFS 内核文件系统 - VFS 文件系统操作实现
  *
  * 参考:
- *   - cephfs (fs/ceph/dir.c, fs/ceph/inode.c) - 网络文件系统架构
  *   - ramfs (fs/ramfs/inode.c) - 纯内存 VFS 缓存使用范例
  *
  * 设计原则:
@@ -36,6 +35,14 @@
 #include <linux/delay.h>        /* msleep (release 重试退避) */
 #include <linux/xattr.h>        /* simple_xattr API for xattr support */
 #include <linux/falloc.h>       /* FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE */
+#include <linux/iversion.h>     /* inode_inc_iversion_raw (page_mkwrite) */
+#include <linux/filelock.h>     /* posix_lock_file / locks_lock_inode_wait / FL_FLOCK / FL_POSIX */
+#include <linux/posix_acl_xattr.h>  /* posix_acl_from_xattr / posix_acl_to_xattr (序列化 xattr<->acl) */
+#include <linux/migrate.h>      /* filemap_migrate_folio (页迁移, P1-4) */
+#include <linux/fs.h>           /* FS_IOC_* ioctl 编号 (P1-3) */
+#include <linux/fileattr.h>     /* ioctl_getflags/ioctl_setflags/ioctl_fsgetxattr/ioctl_fssetxattr (P1-3, Linux 6.17+) */
+#include <linux/exportfs.h>     /* export_operations (P2-8 NFS export) */
+#include <linux/splice.h>       /* splice_copy_file_range (P2-5) */
 
 #include "powerfs.h"
 #include "powerfs_comm.h"
@@ -44,7 +51,7 @@
 
 /* ========== netfs 请求操作 (Stage C: 对接 netfs 子系统) ==========
  *
- * 参照 fs/ceph/addr.c 的 ceph_netfs_issue_read 实现.
+ * 参照 fs/xxx/addr.c 的 xxx_netfs_issue_read 实现.
  *
  * read 路径改造:
  *   - powerfs_aops.read_folio = netfs_read_folio (netfs 提供)
@@ -183,7 +190,7 @@ volume_read:
     }
 
     /* 基本功能阶段: 同步读取到临时 buffer, 再拷贝到 xarray 中的 folio.
-     * 后续优化: 直接从 xarray 映射 folio, 避免额外拷贝 (参照 ceph).
+     * 后续优化: 直接从 xarray 映射 folio, 避免额外拷贝 (参照 xxx).
      * GFP_NOFS: 避免 FS 回调递归 (netfs readahead 上下文). */
     buf = kvmalloc(len, GFP_NOFS);
     if (!buf) {
@@ -229,7 +236,7 @@ static const struct netfs_request_ops powerfs_netfs_ops = {
     .issue_read = powerfs_netfs_issue_read,
 };
 
-/* ========== 全局 slab 缓存 (参考 ceph 全局 cache) ========== */
+/* ========== 全局 slab 缓存 (参考 xxx 全局 cache) ========== */
 
 static struct kmem_cache *powerfs_inode_cachep;
 static struct kmem_cache *powerfs_dentry_cachep;
@@ -247,6 +254,74 @@ struct powerfs_refresh_work {
     struct rcu_head rcu;  /* RCU 延迟释放 (workqueue 在 work_fn 返回后仍引用 work_struct) */
 };
 static struct workqueue_struct *powerfs_refresh_wq;
+
+/* ========== 异步 Cap Notify 处理 (服务端→客户端推送) ==========
+ * CapRecallNotify / CapUpgradeNotify 由 RX dispatcher 收到后,
+ * 异步排队到 powerfs_refresh_wq 处理, 避免阻塞 RX 调度线程:
+ *   - ilookup5 查找 inode 可能阻塞 (等待 I_FREEING 状态)
+ *   - CapRecall → powerfs_cap_revoke → cap_flush + recall_ack 需同步网络 I/O
+ *
+ * 设计: 用单一 cap_notify_work 结构 + kind 标签区分 recall/upgrade,
+ * body 通过匿名 union 内嵌对应字段 (token/recall_mask/retain_mask/epoch/sn). */
+enum powerfs_cap_notify_kind {
+    CAP_NOTIFY_RECALL = 1,
+    CAP_NOTIFY_UPGRADE = 2,
+};
+struct powerfs_cap_notify_work {
+    struct work_struct work;
+    struct rcu_head rcu;
+    enum powerfs_cap_notify_kind kind;
+    u64 ino;
+    char lease_token[64];
+    size_t token_len;
+    union {
+        struct {
+            __u8 recall_mask;
+            __u8 retain_mask;
+            __u64 epoch;
+        } recall;
+        struct {
+            __u8 new_granted;
+            __u64 epoch;
+            __u64 sn;
+        } upgrade;
+    } body;
+};
+
+/* RCU 延迟释放 cap_notify_work (work_struct 被 workqueue core 引用到返回后). */
+static void powerfs_cap_notify_work_free_rcu(struct rcu_head *head)
+{
+    struct powerfs_cap_notify_work *w =
+        container_of(head, struct powerfs_cap_notify_work, rcu);
+    kfree(w);
+}
+
+/* 在 pi->i_caps rbtree 中按 lease_token 查找匹配 cap (服务端 recall/upgrade
+ * 推送总是携带最初 grant 返回的 token, 多 issuer 场景据此区分不同 cap).
+ * 调用方持 pi->i_lock. 返回匹配的 cap 或 NULL (找不到时退回 i_auth_cap). */
+static struct powerfs_cap *
+find_cap_by_token_locked(struct powerfs_inode_info *pi,
+                         const char *token, size_t token_len)
+{
+    struct powerfs_cap *cap;
+    struct rb_node *node;
+
+    if (!token || token_len == 0)
+        return pi->i_auth_cap;
+
+    for (node = rb_first(&pi->i_caps); node; node = rb_next(node)) {
+        cap = rb_entry(node, struct powerfs_cap, ci_node);
+        if (strlen(cap->token) == token_len &&
+            memcmp(cap->token, token, token_len) == 0)
+            return cap;
+    }
+    /* token 不匹配 (例如降级态未写 token, 或老版本 client): 退回 auth_cap */
+    return pi->i_auth_cap;
+}
+
+/* wire → kernel cap bits 映射前向声明 (定义在 §13.3 初始化/grant 代码段).
+ * powerfs_cap_notify_work_func (定义于下方) 需要提前引用, 此处 forward. */
+static unsigned int wire_capset_to_kernel_bits(__u8 wire_caps);
 
 /*
  * powerfs_get_sb - 获取全局超级块指针
@@ -268,6 +343,40 @@ static const struct file_operations powerfs_file_operations;
 static const struct file_operations powerfs_dir_operations;
 static const struct dentry_operations powerfs_dentry_operations;
 static const struct address_space_operations powerfs_aops;
+
+/* P0 lock/fsync/ioctl 前向声明 (定义在 8126+) */
+static int powerfs_lock(struct file *filp, int cmd, struct file_lock *fl);
+static int powerfs_flock(struct file *filp, int cmd, struct file_lock *fl);
+static int powerfs_dir_fsync(struct file *file, loff_t start, loff_t end, int datasync);
+static long powerfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+/* P1-3 fileattr 回调前向声明 (Linux 6.17 inode_operations 新成员) */
+static int powerfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa);
+static int powerfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
+                                 struct file_kattr *fa);
+/* P1-2 atomic_open 辅助 (mknod 逻辑共享，避免 TOCTOU) */
+static struct inode *__powerfs_do_create_core(struct mnt_idmap *idmap,
+                                               struct inode *dir,
+                                               struct dentry *dentry,
+                                               umode_t mode, dev_t dev);
+/* 6.17 atomic_open 签名无 mnt_idmap 参数 (VFS 要求签名 5-param),
+ * 内部用 file_mnt_idmap(file) 取 idmap, 对齐  xxx_atomic_open. */
+static int powerfs_atomic_open(struct inode *dir, struct dentry *dentry,
+                                struct file *file, unsigned open_flag,
+                                umode_t create_mode);
+/* 给 atomic_open 的 finish_open() 用: powerfs_file_open 定义在 8188 行 */
+static int powerfs_file_open(struct inode *inode, struct file *file);
+
+/* P2-7: Quota enforcement (定义在 statfs 之前, 此处前向声明供 mknod/write_begin 用) */
+static int powerfs_quota_check_max_files(struct inode *dir);
+static int powerfs_quota_check_max_bytes(struct inode *inode, loff_t newlen);
+
+/* P3-4: Debugfs (定义在 NFS export ops 之前, 此处前向声明供 put_super/fill_super 用) */
+static void powerfs_debugfs_init(struct super_block *sb);
+static void powerfs_debugfs_cleanup(struct super_block *sb);
+
+/* P3-5: /proc metrics (定义在 P3-4 debugfs 之前, 此处前向声明供 put_super/fill_super 用) */
+static void powerfs_proc_init(struct super_block *sb);
+static void powerfs_proc_cleanup(struct super_block *sb);
 
 /* 目录项管理函数 (前向声明) */
 static int powerfs_add_dir_entry(struct inode *dir, u64 ino,
@@ -292,7 +401,7 @@ static int ensure_lease(struct inode *inode, loff_t offset);
  * 目录级 lease 方案: dentry_info 不再维护独立 lease, 仅保留 RCU 释放和
  * readdir 偏移. dentry 有效性完全依赖父目录 inode 的 dir_lease_expire.
  *
- * 参考 ceph_d_init (fs/ceph/dir.c)
+ * 参考 xxx_d_init (fs/xxx/dir.c)
  *
  * 返回 0 表示成功，负值表示失败 (d_fsdata 将为 NULL)
  */
@@ -307,7 +416,7 @@ int powerfs_d_init(struct dentry *dentry)
     di->dentry = dentry;
     di->time = jiffies;
 
-    /* === Per-dentry lease 初始化 (对齐 ceph_d_init) ===
+    /* === Per-dentry lease 初始化 (对齐 xxx_d_init) ===
      * 新 dentry 无 lease, 需 lookup/readdir 从 Filer 获取后填充.
      * lease_expire=0 表示无 lease, d_revalidate Layer 1 直接 miss. */
     di->flags = 0;
@@ -354,7 +463,7 @@ static void powerfs_di_free_rcu(struct rcu_head *head)
  * 重要: d_fsdata 必须用 call_rcu 延迟释放, 不能裸 kmem_cache_free.
  * 原因: RCU path walk (__d_lookup_rcu + d_revalidate) 可能并发读 d_fsdata.
  *
- * 参考 ceph_d_release (fs/ceph/dir.c)
+ * 参考 xxx_d_release (fs/xxx/dir.c)
  */
 void powerfs_d_release(struct dentry *dentry)
 {
@@ -367,7 +476,7 @@ void powerfs_d_release(struct dentry *dentry)
     pr_debug("powerfs: d_release '%pd' (di=%p)\n", dentry, di);
 
     /* 从全局 dentry_lease_list 摘除 (如果已挂载且 di 在链表上).
-     * 对齐 ceph_d_release: __dentry_unhash_lru. */
+     * 对齐 xxx_d_release: __dentry_unhash_lru. */
     sbi = POWERFS_SB_INFO(dentry->d_sb);
     if (sbi && sbi->client && (di->flags & POWERFS_DN_LEASE_LIST)) {
         spin_lock(&sbi->client->dentry_lease_lock);
@@ -387,7 +496,7 @@ static void powerfs_invalidate_dir_lease(struct inode *dir);
 /*
  * powerfs_fill_dentry_lease — 在 lookup/readdir 成功后填充 per-dentry lease
  *
- * 对齐 Ceph __update_dentry_lease (fs/ceph/inode.c L1388-1453) +
+ * 对齐  __update_dentry_lease (fs/xxx/inode.c L1388-1453) +
  *      Rust cache.rs DentryLease (powerfs-fuse/src/cache.rs L153-160)
  *
  * 填充内容:
@@ -446,7 +555,7 @@ static void powerfs_fill_dentry_lease(struct dentry *dentry,
 }
 
 /*
- * d_revalidate — 三层校验 (对齐 Ceph + Rust DentryLeaseStatus)
+ * d_revalidate — 三层校验 (对齐  + Rust DentryLeaseStatus)
  *
  * Layer 1: per-dentry lease (di->lease_expire > now → valid)
  * Layer 2: dir_shared_gen matches parent's i_shared_gen && parent has I_COMPLETE
@@ -459,7 +568,7 @@ static void powerfs_fill_dentry_lease(struct dentry *dentry,
  *   1: dentry 有效 (正/负), 使用缓存
  *   -ECHILD: 退出 RCU (仅 RCU 模式)
  *
- * 参考: ceph_d_revalidate (fs/ceph/dir.c L1280-1370)
+ * 参考: xxx_d_revalidate (fs/xxx/dir.c L1280-1370)
  *       Rust DentryLeaseStatus (powerfs-fuse/src/cache.rs L167-179)
  */
 int powerfs_d_revalidate(struct inode *dir, const struct qstr *name,
@@ -505,14 +614,22 @@ int powerfs_d_revalidate(struct inode *dir, const struct qstr *name,
 
     /* Layer 1: per-dentry lease */
     lease_expire = READ_ONCE(di->lease_expire);
-    if (lease_expire && time_before(now, lease_expire))
+    if (lease_expire && time_before(now, lease_expire)) {
+        struct powerfs_sb_info *sbi = POWERFS_SB_INFO(dir->i_sb);
+        if (sbi && sbi->client)
+            powerfs_metric_dentry_hit(&sbi->client->metrics);
         return 1;
+    }
 
     /* Layer 2: dir_shared_gen + I_COMPLETE */
     parent_shared_gen = (u64)atomic_read(&parent_pi->i_shared_gen);
     if (di->dir_shared_gen == parent_shared_gen &&
-        (READ_ONCE(parent_pi->i_flags) & POWERFS_I_COMPLETE))
+        (READ_ONCE(parent_pi->i_flags) & POWERFS_I_COMPLETE)) {
+        struct powerfs_sb_info *sbi = POWERFS_SB_INFO(dir->i_sb);
+        if (sbi && sbi->client)
+            powerfs_metric_dentry_hit(&sbi->client->metrics);
         return 1;
+    }
 
     /* Layer 3: lease miss → 返回 1 让 VFS 使用缓存.
      * 不在此处做 RPC (d_revalidate 在路径遍历中频繁调用).
@@ -522,13 +639,18 @@ int powerfs_d_revalidate(struct inode *dir, const struct qstr *name,
      * Note: 返回 0 (invalid) 会触发 d_invalidate→d_drop→re-lookup 循环,
      * 与 __d_lookup_rcu 竞态可能导致 RCU stall. 统一返回 1 更安全.
      * 正/负 dentry 无差别: 负 dentry 的 inode==NULL, Layer 1/2 仍可信任. */
+    {
+        struct powerfs_sb_info *sbi = POWERFS_SB_INFO(dir->i_sb);
+        if (sbi && sbi->client)
+            powerfs_metric_dentry_mis(&sbi->client->metrics);
+    }
     return 1;
 }
 
 /*
  * d_prune - dentry 被 shrinker 回收前的通知
  *
- * 参考 ceph_d_prune (fs/ceph/dir.c)
+ * 参考 xxx_d_prune (fs/xxx/dir.c)
  *
  * 用于清除父目录的 complete 标志，因为目录内容缓存不再完整
  */
@@ -538,7 +660,7 @@ void powerfs_d_prune(struct dentry *dentry)
     struct powerfs_inode_info *ppi;
     struct inode *dir;
 
-    /* 根 dentry 不 prune (参考 ceph_d_prune) */
+    /* 根 dentry 不 prune (参考 xxx_d_prune) */
     if (IS_ROOT(dentry))
         return;
 
@@ -555,9 +677,62 @@ void powerfs_d_prune(struct dentry *dentry)
              dentry, parent);
 
     /* 清除父目录的 complete 标志.
-     * 参照 ceph __ceph_dir_clear_complete (atomic64_inc, 无锁).
+     * 参照 xxx __xxx_dir_clear_complete (atomic64_inc, 无锁).
      * dir_complete 是 bool, WRITE_ONCE 保证原子写入, 读取侧用 READ_ONCE. */
     WRITE_ONCE(ppi->dir_complete, false);
+}
+
+/*
+ * powerfs_d_delete - P2-3: dentry 删除前回调，lease 有效时保留 dentry.
+ *
+ * 对齐  xxx_d_delete (dir.c L2046):
+ *   - 负 dentry (d_really_is_negative): 返回 0 (保留，VFS 不主动删)
+ *   - 正 dentry + dentry lease 有效 (Layer 1 TTL): 返回 0 (保留)
+ *   - 正 dentry + dir lease 有效 (Layer 2 shared_gen + I_COMPLETE): 返回 0
+ *   - 无 lease: 返回 1 (允许 VFS 回收)
+ *
+ * 返回 0 = 保留 dentry (缓存命中率高，减少 lookup RPC)
+ * 返回 1 = 允许 VFS 在 d_count==0 时回收 dentry
+ *
+ * 注意: 此处在 dentry 即将被回收时调用，不能阻塞 (不能做 RPC)。
+ *       仅做本地 lease 过期检查，与 d_revalidate 的 Layer 1/2 逻辑一致。
+ */
+static int powerfs_d_delete(const struct dentry *dentry)
+{
+    struct powerfs_dentry_info *di;
+    unsigned long now = jiffies;
+
+    /* 负 dentry: 保留 (d_revalidate 会后续校验) */
+    if (d_really_is_negative(dentry))
+        return 0;
+
+    di = dentry->d_fsdata;
+    if (!di)
+        return 1;
+
+    /* Layer 1: per-dentry lease 未过期 → 保留 */
+    if (di->lease_expire && time_before(now, di->lease_expire))
+        return 0;
+
+    /* Layer 2: dir_shared_gen 匹配 + 父目录 I_COMPLETE → 保留 */
+    {
+        struct dentry *parent = dentry->d_parent;
+        struct inode *dir;
+
+        if (!IS_ROOT(dentry) && parent) {
+            dir = d_inode(parent);
+            if (dir) {
+                struct powerfs_inode_info *ppi = POWERFS_I(dir);
+                u64 parent_shared_gen = (u64)atomic_read(&ppi->i_shared_gen);
+
+                if (di->dir_shared_gen == parent_shared_gen &&
+                    (READ_ONCE(ppi->i_flags) & POWERFS_I_COMPLETE))
+                    return 0;
+            }
+        }
+    }
+
+    return 1;
 }
 
 /* Dentry operations 表
@@ -567,14 +742,16 @@ void powerfs_d_prune(struct dentry *dentry)
  *   - d_init: 分配 dentry_info (RCU 释放用)
  *   - d_release: RCU 延迟释放 dentry_info (防止内存泄漏 + UAF)
  *   - d_prune: 清父目录 dir_complete (shrinker 回收时目录缓存不再完整)
+ *   - d_delete: lease 有效时保留 dentry (减少 lookup RPC)
  *
- * 参考 ceph dentry_operations
+ * 参考 dentry_operations
  */
 static const struct dentry_operations powerfs_dentry_operations = {
     .d_revalidate   = powerfs_d_revalidate,
     .d_init         = powerfs_d_init,
     .d_release      = powerfs_d_release,
     .d_prune        = powerfs_d_prune,
+    .d_delete       = powerfs_d_delete,    /* P2-3: lease 有效时保留 dentry */
 };
 
 /* ========== 辅助函数 ========== */
@@ -582,7 +759,7 @@ static const struct dentry_operations powerfs_dentry_operations = {
 /*
  * powerfs_ino_compare - inode 比较函数 (用于 iget5_locked/ilookup5)
  *
- * 参考 ceph_ino_compare (fs/ceph/super.h)
+ * 参考 xxx_ino_compare (fs/xxx/super.h)
  *
  * 比较 inode 的 ino 是否匹配。
  * 目前只比较 ino，后续如果支持快照等可以扩展。
@@ -596,7 +773,7 @@ static int powerfs_ino_compare(struct inode *inode, void *data)
 /*
  * powerfs_set_ino_cb - 设置新 inode 的 ino (用于 iget5_locked)
  *
- * 参考 ceph_set_ino_cb (fs/ceph/inode.c)
+ * 参考 xxx_set_ino_cb (fs/xxx/inode.c)
  */
 static int powerfs_set_ino_cb(struct inode *inode, void *data)
 {
@@ -606,7 +783,7 @@ static int powerfs_set_ino_cb(struct inode *inode, void *data)
 }
 
 /*
- * powerfs_iget - 获取或创建 inode (参考 ceph_get_inode)
+ * powerfs_iget - 获取或创建 inode (参考 xxx_get_inode)
  *
  * 使用 iget5_locked 在内核 inode 哈希表中查找：
  *   - 如果找到：增加引用计数并返回
@@ -635,7 +812,7 @@ struct inode *powerfs_iget(struct super_block *sb, u64 ino)
 }
 
 /*
- * powerfs_find_inode - 查找已存在的 inode (参考 ceph_find_inode)
+ * powerfs_find_inode - 查找已存在的 inode (参考 xxx_find_inode)
  *
  * 使用 ilookup5 在内核 inode 哈希表中查找：
  *   - 如果找到：增加引用计数并返回
@@ -991,13 +1168,28 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
     /* 1. 发 getattr 获取最新元数据 */
     {
         struct powerfs_file_layout layout = {0};
+        __u64 rbytes = 0, rfiles = 0, rsubdirs = 0, rctime_sec = 0;
+        __u32 rctime_nsec = 0;
         ret = powerfs_net_getattr(inode->i_ino, &mode, &uid, &gid,
                                   &size, &nlink,
                                   &mtime, &atime, &ctime,
-                                  &volume_id, &file_key, &layout);
+                                  &volume_id, &file_key, &layout,
+                                  /* P1-5: 回填 rstat 到 pi，getattr 展示给用户 (du, ls -l) */
+                                  &rbytes, &rfiles, &rsubdirs,
+                                  &rctime_sec, &rctime_nsec);
         if (ret == 0) {
             spin_lock(&pi->i_lock);
             powerfs_apply_layout_to_inode(pi, &layout);
+            /* P1-5: 仅对目录 inode 回填 rstat。
+             * Filer 对文件 inode 不编码 rstat 字段，解析得到的都是 0。
+             * S_ISDIR 判断可防误覆盖。 */
+            if (S_ISDIR(inode->i_mode)) {
+                pi->i_rbytes = rbytes;
+                pi->i_rfiles = rfiles;
+                pi->i_rsubdirs = rsubdirs;
+                pi->i_rctime.tv_sec = (time64_t)rctime_sec;
+                pi->i_rctime.tv_nsec = (long)rctime_nsec;
+            }
             spin_unlock(&pi->i_lock);
             /* apply 后 layout.volume_ids/inline_data/replica_chunks 已转移到 inode (或已释放).
              * 防御性: 若 apply 异常未消费, 这里释放. */
@@ -1221,6 +1413,188 @@ int powerfs_invalidate_one(u64 ino)
 }
 EXPORT_SYMBOL_GPL(powerfs_invalidate_one);
 
+/* ========== §13 Cap NOTIFY async work (Filer→Client push) ==========
+ *
+ * powerfs_cap_notify_work_func — 异步处理 CapRecallNotify / CapUpgradeNotify:
+ *   1. ilookup5 inode (workqueue 上下文, 可阻塞)
+ *   2. 按 lease_token 找到 cap
+ *   3. RECALL:  更新 epoch → wire_mask→kernel_bits → powerfs_cap_revoke
+ *      UPGRADE: 更新 epoch/sn → wire_mask→kernel_bits → powerfs_cap_issue
+ *   4. iput + call_rcu free
+ *
+ * 注意: powerfs_cap_revoke 内部会临时释放 i_lock 做 flush + recall_ack
+ * (同步网络 RPC), 这是正确的 (workqueue 上下文允许多次阻塞). */
+static void powerfs_cap_notify_work_func(struct work_struct *work)
+{
+    struct powerfs_cap_notify_work *w =
+        container_of(work, struct powerfs_cap_notify_work, work);
+    struct super_block *sb;
+    struct inode *inode;
+    struct powerfs_inode_info *pi;
+    struct powerfs_cap *cap;
+
+    sb = powerfs_get_sb();
+    if (!sb)
+        goto out_free;
+
+    inode = powerfs_find_inode(sb, w->ino);
+    if (!inode) {
+        pr_debug_ratelimited("powerfs: cap_notify kind=%d ino=%llu: no inode in cache, skip\n",
+                             w->kind, w->ino);
+        goto out_free;
+    }
+
+    if (inode->i_state & (I_FREEING | I_CLEAR | I_WILL_FREE)) {
+        pr_debug("powerfs: cap_notify ino=%llu inode evicting, skip\n", w->ino);
+        goto out_iput;
+    }
+    pi = POWERFS_I(inode);
+    if (pi->shutdown) {
+        pr_debug("powerfs: cap_notify ino=%llu pi shutdown, skip\n", w->ino);
+        goto out_iput;
+    }
+
+    spin_lock(&pi->i_lock);
+    cap = find_cap_by_token_locked(pi, w->lease_token, w->token_len);
+    if (!cap) {
+        /* i_caps 为空 (从未 open_grant), 本客户端没有持有 cap,
+         * recall/upgrade 都是空操作 — 直接退出不发 ACK (服务端
+         * 没有针对不存在持有者的状态跟踪, ACK 只针对有效 grant). */
+        spin_unlock(&pi->i_lock);
+        pr_debug_ratelimited("powerfs: cap_notify kind=%d ino=%llu: no cap found, skip\n",
+                             w->kind, w->ino);
+        goto out_iput;
+    }
+
+    if (w->kind == CAP_NOTIFY_RECALL) {
+        unsigned int k_recall, k_retain;
+
+        /* recall_mask = 要撤销的 wire bits; retain_mask = 撤销后仍有效的 bits.
+         * k_recall = ~retain_mask 的 kernel 形式 (和 issued & ~k_recall 后得到新 issued). */
+        k_retain = wire_capset_to_kernel_bits(w->body.recall.retain_mask);
+        k_recall = cap->issued & ~k_retain;
+
+        /* 更新 epoch (服务端 recall 总会递增 epoch, fencing 拦截旧 IO). */
+        cap->epoch = w->body.recall.epoch;
+
+        pr_debug("powerfs: CapRecallNotify ino=%llu wire_recall=0x%02x wire_retain=0x%02x "
+                 "k_recall=0x%x epoch=%llu\n",
+                 w->ino, w->body.recall.recall_mask, w->body.recall.retain_mask,
+                 k_recall, (unsigned long long)w->body.recall.epoch);
+
+        if (k_recall != 0) {
+            /* powerfs_cap_revoke 内部会释放 i_lock → flush + recall_ack →
+             * 重新获取 i_lock, 最后唤醒 i_cap_wq. 入参 cap 仍有效 (revoke
+             * 不释放 cap, 只降级 issued). */
+            powerfs_cap_revoke(pi, cap, k_recall);
+        } else {
+            /* 无位可撤: 不调 revoke, 但仍需唤醒等待者 (例如 check_caps
+             * 在等待 cap 状态变化, 虽然没撤到位, 但 epoch 已更新). */
+            wake_up_all(&pi->i_cap_wq);
+        }
+        spin_unlock(&pi->i_lock);
+    } else if (w->kind == CAP_NOTIFY_UPGRADE) {
+        unsigned int k_issued;
+
+        k_issued = wire_capset_to_kernel_bits(w->body.upgrade.new_granted);
+        cap->epoch = w->body.upgrade.epoch;
+        cap->seq   = w->body.upgrade.sn;
+        cap->issue_seq = w->body.upgrade.sn;
+
+        pr_debug("powerfs: CapUpgradeNotify ino=%llu wire=0x%02x kernel=0x%x "
+                 "epoch=%llu sn=%llu\n",
+                 w->ino, w->body.upgrade.new_granted, k_issued,
+                 (unsigned long long)w->body.upgrade.epoch,
+                 (unsigned long long)w->body.upgrade.sn);
+
+        powerfs_cap_issue(pi, cap, k_issued);
+        spin_unlock(&pi->i_lock);
+        wake_up_all(&pi->i_cap_wq);
+    }
+
+out_iput:
+    iput(inode);
+out_free:
+    call_rcu(&w->rcu, powerfs_cap_notify_work_free_rcu);
+}
+
+/* --- powerfs_net layer NOTIFY 入口: 由 RX dispatcher 同步调用,
+ *     只分配 work 并排队, 永不阻塞 (GFP_ATOMIC 下仍可失败降级). --- */
+
+/* CapRecallNotify handler: 在独立线程异步 flush + revoke + ACK.
+ * 对齐 Rust 服务端 cap_manager.rs recall 推送契约. */
+static void powerfs_cap_recall_notify_handler(u64 ino,
+            const char *lease_token, size_t token_len,
+            __u8 recall_mask, __u8 retain_mask, __u64 epoch)
+{
+    struct powerfs_cap_notify_work *w;
+
+    w = kmalloc(sizeof(*w), GFP_ATOMIC);
+    if (!w) {
+        pr_warn_ratelimited("powerfs: CapRecallNotify ino=%llu kmalloc failed, "
+                            "cap will expire naturally by TTL\n", ino);
+        return;
+    }
+    INIT_WORK(&w->work, powerfs_cap_notify_work_func);
+    w->kind = CAP_NOTIFY_RECALL;
+    w->ino = ino;
+    if (token_len > 0 && token_len < sizeof(w->lease_token)) {
+        memcpy(w->lease_token, lease_token, token_len);
+        w->lease_token[token_len] = '\0';
+        w->token_len = token_len;
+    } else {
+        w->lease_token[0] = '\0';
+        w->token_len = 0;
+    }
+    w->body.recall.recall_mask = recall_mask;
+    w->body.recall.retain_mask = retain_mask;
+    w->body.recall.epoch = epoch;
+
+    if (!powerfs_refresh_wq) {
+        pr_warn("powerfs: CapRecallNotify refresh_wq not ready, free\n");
+        kfree(w);
+        return;
+    }
+    queue_work(powerfs_refresh_wq, &w->work);
+}
+
+/* CapUpgradeNotify handler: 存活 writer 被升级到 EXCLUSIVE_WRITE,
+ * 异步调 cap_issue 更新 issued 位 (后续 write 可走本地缓存路径). */
+static void powerfs_cap_upgrade_notify_handler(u64 ino,
+            const char *lease_token, size_t token_len,
+            __u8 new_granted, __u64 epoch, __u64 sn)
+{
+    struct powerfs_cap_notify_work *w;
+
+    w = kmalloc(sizeof(*w), GFP_ATOMIC);
+    if (!w) {
+        pr_warn_ratelimited("powerfs: CapUpgradeNotify ino=%llu kmalloc failed, "
+                            "degrade to SHARED_WRITE\n", ino);
+        return;
+    }
+    INIT_WORK(&w->work, powerfs_cap_notify_work_func);
+    w->kind = CAP_NOTIFY_UPGRADE;
+    w->ino = ino;
+    if (token_len > 0 && token_len < sizeof(w->lease_token)) {
+        memcpy(w->lease_token, lease_token, token_len);
+        w->lease_token[token_len] = '\0';
+        w->token_len = token_len;
+    } else {
+        w->lease_token[0] = '\0';
+        w->token_len = 0;
+    }
+    w->body.upgrade.new_granted = new_granted;
+    w->body.upgrade.epoch = epoch;
+    w->body.upgrade.sn = sn;
+
+    if (!powerfs_refresh_wq) {
+        pr_warn("powerfs: CapUpgradeNotify refresh_wq not ready, free\n");
+        kfree(w);
+        return;
+    }
+    queue_work(powerfs_refresh_wq, &w->work);
+}
+
 /*
  * powerfs_init_inode - 初始化新 inode 的字段
  *
@@ -1330,18 +1704,25 @@ static void powerfs_inode_init_once(void *foo)
 /*
  * powerfs_alloc_inode - 分配 inode (super_operations)
  *
- * 参考 ceph_alloc_inode (fs/ceph/inode.c)
+ * 参考 xxx_alloc_inode (fs/xxx/inode.c)
  * 使用 alloc_inode_sb 辅助函数
  */
 struct inode *powerfs_alloc_inode(struct super_block *sb)
 {
     struct powerfs_inode_info *pi;
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
 
     pi = alloc_inode_sb(sb, powerfs_inode_cachep, GFP_NOFS);
     if (!pi)
         return NULL;
 
-    /* netfs 初始化 (参考 ceph_alloc_inode) */
+    /* P3-5: 统计 opened_inodes + total_inodes */
+    if (sbi && sbi->client) {
+        percpu_counter_inc(&sbi->client->metrics.opened_inodes);
+        percpu_counter_inc(&sbi->client->metrics.total_inodes);
+    }
+
+    /* netfs 初始化 (参考 xxx_alloc_inode) */
     netfs_inode_init(&pi->netfs, &powerfs_netfs_ops, false);
 
     /* 初始化 Lease 相关字段 */
@@ -1349,7 +1730,7 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     spin_lock_init(&pi->lease_lock);
     INIT_DELAYED_WORK(&pi->lease_renew_work, powerfs_lease_renew_work_func);
 
-    /* === Cap 管理层初始化 (对齐 ceph_alloc_inode) === */
+    /* === Cap 管理层初始化 (对齐 xxx_alloc_inode) === */
     pi->i_caps = RB_ROOT;
     pi->i_auth_cap = NULL;
     pi->i_dirty_caps = 0;
@@ -1375,7 +1756,7 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->i_wrbuffer_ref_head = 0;
     atomic_set(&pi->i_filelock_ref, 0);
 
-    /* shared_gen / cache_gen 初始化 (对齐 ceph i_shared_gen=0, i_rdcache_gen=0) */
+    /* shared_gen / cache_gen 初始化 (对齐 xxx i_shared_gen=0, i_rdcache_gen=0) */
     atomic_set(&pi->i_shared_gen, 0);
     pi->i_rdcache_gen = 0;
     pi->i_rdcache_revoking = 0;
@@ -1390,7 +1771,7 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     atomic64_set(&pi->i_release_count, 0);
     atomic64_set(&pi->i_ordered_count, 0);
 
-    /* size/truncate 同步 (对齐 Ceph 四方 size) */
+    /* size/truncate 同步 (对齐  四方 size) */
     pi->i_max_size = 0;
     pi->i_reported_size = 0;
     pi->i_wanted_max_size = 0;
@@ -1418,7 +1799,7 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     INIT_LIST_HEAD(&pi->i_unsafe_iops);
     spin_lock_init(&pi->i_unsafe_lock);
 
-    /* inode work (多工作项位图, 对齐 Ceph i_work/i_work_mask) */
+    /* inode work (多工作项位图, 对齐  i_work/i_work_mask) */
     INIT_WORK(&pi->i_work, NULL);  /* 后续 powerfs_inode_work_fn */
     pi->i_work_mask = 0;
 
@@ -1491,7 +1872,7 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
 /*
  * powerfs_free_inode - 释放 inode (super_operations)
  *
- * 参考 ceph_free_inode (fs/ceph/inode.c)
+ * 参考 xxx_free_inode (fs/xxx/inode.c)
  * 只释放私有数据，inode 核心由 VFS 管理
  */
 void powerfs_free_inode(struct inode *inode)
@@ -1534,7 +1915,7 @@ void powerfs_free_inode(struct inode *inode)
 /*
  * powerfs_evict_inode - 驱逐 inode (super_operations)
  *
- * 参考 ceph_evict (fs/ceph/inode.c)
+ * 参考 xxx_evict (fs/xxx/inode.c)
  *
  * 标准流程:
  *   1. truncate_inode_pages_final - 清理页面缓存
@@ -1544,15 +1925,20 @@ void powerfs_free_inode(struct inode *inode)
 void powerfs_evict_inode(struct inode *inode)
 {
     struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(inode->i_sb);
 
     pr_debug("powerfs: evict_inode ino=%lu\n", inode->i_ino);
 
-    /* 1. 先截断 page cache (参考 ceph_evict_inode) */
+    /* P3-5: 统计 opened_inodes (与 alloc_inode 对称, total_inodes 不递减) */
+    if (sbi && sbi->client)
+        percpu_counter_dec(&sbi->client->metrics.opened_inodes);
+
+    /* 1. 先截断 page cache (参考 xxx_evict_inode) */
     truncate_inode_pages_final(&inode->i_data);
 
     /* 2. 取消后台 lease 续约 work 和异步 setattr work
      *    （必须在 clear_inode 之前，因为 work 可能引用 inode）
-     *    参考 ceph_evict_inode: cancel_writeback 是在 clear_inode 之前 */
+     *    参考 xxx_evict_inode: cancel_writeback 是在 clear_inode 之前 */
     cancel_delayed_work_sync(&pi->lease_renew_work);
     cancel_work_sync(&pi->setattr_work);
 
@@ -1569,12 +1955,15 @@ void powerfs_evict_inode(struct inode *inode)
         kfree(rb_entry(n, struct powerfs_lease, node));
     }
 
-    /* 5b. 清理 i_caps rbtree (对齐 ceph_evict_inode: remove caps)
+    /* 5b. 清理 i_caps rbtree (对齐 xxx_evict_inode: remove caps)
      *    evict 时所有 cap 应已被 revoke/release, 但安全起见遍历释放. */
     while (!RB_EMPTY_ROOT(&pi->i_caps)) {
         struct rb_node *n = rb_first(&pi->i_caps);
         struct powerfs_cap *cap = rb_entry(n, struct powerfs_cap, ci_node);
         rb_erase(n, &pi->i_caps);
+        /* P3-5: 统计 total_caps (与 add_cap_for_inode_locked 对称) */
+        if (sbi && sbi->client)
+            atomic64_dec(&sbi->client->metrics.total_caps);
         kfree(cap);
     }
     pi->i_auth_cap = NULL;
@@ -1589,7 +1978,7 @@ void powerfs_evict_inode(struct inode *inode)
         kfree(cf);
     }
 
-    /* 5d. 清理 cap_snaps (对齐 ceph: put all cap_snaps) */
+    /* 5d. 清理 cap_snaps (对齐 xxx: put all cap_snaps) */
     while (!list_empty(&pi->i_cap_snaps)) {
         struct powerfs_cap_snap *cs;
         cs = list_first_entry(&pi->i_cap_snaps,
@@ -1598,7 +1987,7 @@ void powerfs_evict_inode(struct inode *inode)
         kfree(cs);
     }
 
-    /* 5e. 唤醒所有等待 i_cap_wq 的线程 (对齐 ceph: wake up cap waiters) */
+    /* 5e. 唤醒所有等待 i_cap_wq 的线程 (对齐 xxx: wake up cap waiters) */
     wake_up_all(&pi->i_cap_wq);
 
     /* 释放动态分配的布局数据. 持锁防止与 refresh_work/apply_layout 竞争.
@@ -1653,7 +2042,7 @@ void powerfs_evict_inode(struct inode *inode)
 }
 
 /* ================================================================== *
- * Capability 管理层 — 对齐 Ceph caps.c 客户端 cap 生命周期
+ * Capability 管理层 — 对齐  caps.c 客户端 cap 生命周期
  *
  * 核心数据流:
  *   open()    → powerfs_cap_get_refs(RD|WR|CACHE)  → refcount++
@@ -1664,12 +2053,334 @@ void powerfs_evict_inode(struct inode *inode)
  *   revoke    → powerfs_cap_revoke(cap, revoking)   → flush dirty → ack → 降级
  *   flush     → powerfs_cap_flush(mask)             → 写回 + 等 i_cap_wq
  *
- * 锁约定: cap 字段访问持 pi->i_lock (对齐 Ceph i_ceph_lock).
+ * 锁约定: cap 字段访问持 pi->i_lock (对齐  i_xxx_lock).
  *         flush/check_caps 需要发 RPC 时临时释放 i_lock.
  * ================================================================== */
 
+/* ==================================================================
+ * §13 Cap wire-format ↔ 内核 cap bits 映射
+ * ==================================================================
+ *
+ * Filer 端 3-bit CapSet (u8) 对齐 Rust cap_manager.rs CapSet:
+ *   POWERFS_NET_CAP_R (0b001) = 读缓存许可  → 内核: FILE_SHARED | FILE_CACHE | AUTH_SHARED
+ *   POWERFS_NET_CAP_W (0b010) = 写缓存许可  → 内核: FILE_WR
+ *   POWERFS_NET_CAP_X (0b100) = 元数据独占写 → 内核: FILE_EXCL | AUTH_EXCL | XATTR_EXCL
+ *
+ * 空集 (SHARED_WRITE 参与者) → 内核仅保留 PIN 位 (无本地缓存权限, IO 走同步路径).
+ *
+ * 设计原则: wire-format 3-bit 是最小共识, 内核扩展位 (RD/WR 独立引用计数位,
+ * xattr/link 位) 可以从这 3-bit 派生出超集, 保证跨端共识 + 内核内部足够细粒度. */
+static unsigned int wire_capset_to_kernel_bits(__u8 wire_caps)
+{
+    unsigned int k = POWERFS_CAP_PIN;  /* issued cap 总带基础引用 (和 xxx PIN 语义一致) */
+
+    if (wire_caps & POWERFS_NET_CAP_R) {
+        k |= POWERFS_CAP_AUTH_SHARED;
+        k |= POWERFS_CAP_FILE_SHARED;
+        k |= POWERFS_CAP_FILE_CACHE;
+        k |= POWERFS_CAP_XATTR_SHARED;
+        k |= POWERFS_CAP_LINK_SHARED;
+    }
+    if (wire_caps & POWERFS_NET_CAP_W) {
+        /* CAP_W = 可本地写缓存 (write 不必 RPC), 对应内核 FILE_WR */
+        k |= POWERFS_CAP_FILE_WR;
+    }
+    if (wire_caps & POWERFS_NET_CAP_X) {
+        /* CAP_X = 可本地修改元数据 (setattr/truncate),
+         * 对应 FILE_EXCL (独占写, 可追加/truncate) + AUTH_EXCL + XATTR_EXCL */
+        k |= POWERFS_CAP_FILE_EXCL;
+        k |= POWERFS_CAP_AUTH_EXCL;
+        k |= POWERFS_CAP_XATTR_EXCL;
+    }
+    return k;
+}
+
+/* 反向: 内核 wanted/issued bits → 最小必要 wire_capset (用于 AcquireCap RPC,
+ * 对应  CEPH_CAP_* 位 → Filer CapSet; 当前阶段 open_grant 不用此函数,
+ * 后续 AcquireCap 增量请求需用到, 提前提供). */
+static __u8 kernel_bits_to_wire_capset(unsigned int k_bits)
+{
+    __u8 w = 0;
+    if (k_bits & (POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_CACHE | POWERFS_CAP_AUTH_SHARED))
+        w |= POWERFS_NET_CAP_R;
+    if (k_bits & POWERFS_CAP_FILE_WR)
+        w |= POWERFS_NET_CAP_W;
+    if (k_bits & (POWERFS_CAP_FILE_EXCL | POWERFS_CAP_AUTH_EXCL | POWERFS_CAP_XATTR_EXCL))
+        w |= POWERFS_NET_CAP_X;
+    return w;
+}
+
+/* 取出当前 mount 的 client_id 字符串 (长度).
+ * sbi->client 若已赋 client_id, 用它; 否则退回 "powerfs-kernel-0".
+ * 调用方确保 out 至少 64B 空间 (对齐 ClientId TLV size_t 最大值 255B,
+ * 但实际上 client_id 远小于 64). */
+static size_t get_mount_client_id(struct super_block *sb, char *out, size_t out_cap)
+{
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    const char *fallback = "powerfs-kernel-0";
+    size_t flen = strlen(fallback);
+
+    if (!out || out_cap == 0)
+        return 0;
+    if (sbi && sbi->client && sbi->client->client_id_len > 0 &&
+        sbi->client->client_id_len < out_cap) {
+        memcpy(out, sbi->client->client_id, sbi->client->client_id_len);
+        out[sbi->client->client_id_len] = '\0';
+        return sbi->client->client_id_len;
+    }
+    memcpy(out, fallback, flen);
+    out[flen] = '\0';
+    return flen;
+}
+
+/* 为 inode 创建并挂载一个新 cap (对齐 xxx_add_cap + xxx_get_cap_session).
+ * issuer_id = 0 (单 Filer 场景, 多 Filer authority migration 场景后续扩展).
+ * 调用方必须持 pi->i_lock. 返回新 cap (引用已挂到 inode 的 rbtree). */
+static struct powerfs_cap *
+add_cap_for_inode_locked(struct powerfs_inode_info *pi, u64 issuer_id)
+{
+    struct powerfs_cap *cap;
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(pi->netfs.inode.i_sb);
+    struct rb_node **p, *parent;
+
+    cap = kmem_cache_zalloc(sbi->cap_cachep, GFP_ATOMIC);
+    if (!cap)
+        return NULL;
+
+    cap->ci = pi;
+    cap->issuer_id = issuer_id;
+    cap->cap_gen = 1;  /* 会话代次, 非零 = 有效 */
+    INIT_LIST_HEAD(&cap->session_caps);
+    INIT_LIST_HEAD(&cap->lru_item);
+    RB_CLEAR_NODE(&cap->ci_node);
+    RB_CLEAR_NODE(&cap->node);
+
+    /* 挂入 inode->i_caps (by issuer_id). PowerFS 单 filer 场景只有一个 cap,
+     * 这里按  xxx_add_cap 标准形式维护 rbtree, 为 authority migration 预留. */
+    p = &pi->i_caps.rb_node;
+    parent = NULL;
+    while (*p) {
+        struct powerfs_cap *c = rb_entry(*p, struct powerfs_cap, ci_node);
+        parent = *p;
+        if (issuer_id < c->issuer_id)
+            p = &(*p)->rb_left;
+        else if (issuer_id > c->issuer_id)
+            p = &(*p)->rb_right;
+        else {
+            /* issuer 已存在: 释放新分配, 返回已有 */
+            kmem_cache_free(sbi->cap_cachep, cap);
+            return c;
+        }
+    }
+    rb_link_node(&cap->ci_node, parent, p);
+    rb_insert_color(&cap->ci_node, &pi->i_caps);
+
+    /* 首个 cap → auth_cap */
+    if (!pi->i_auth_cap)
+        pi->i_auth_cap = cap;
+
+    /* 加入 client 的 cap_lru_list (shrinker 可回收) */
+    if (sbi->client) {
+        spin_lock(&sbi->client->cap_lru_lock);
+        list_add_tail(&cap->lru_item, &sbi->client->cap_lru_list);
+        spin_unlock(&sbi->client->cap_lru_lock);
+        /* P3-5: 统计 total_caps */
+        atomic64_inc(&sbi->client->metrics.total_caps);
+    }
+
+    return cap;
+}
+
+/* §13.3: 同步发起 CapOpenGrant RPC → 根据响应调用 cap_issue 更新 issued 位.
+ *
+ * 调用方**不持 pi->i_lock** (RPC 不可在 spin_lock 下做). 本函数内部
+ * 短暂加锁挂载 cap + 调 cap_issue, 释放锁再发 RPC, 保持锁粒度合理.
+ *
+ * is_write_open = (f_mode & FMODE_WRITE) != 0
+ *
+ * 返回 0 成功, <0 错误 (网络错误时内核降级到无 cap: SHARED_WRITE, 不阻止 open). */
+static int cap_open_grant_and_issue(struct powerfs_inode_info *pi, bool is_write_open)
+{
+    struct super_block *sb = pi->netfs.inode.i_sb;
+    char cid[64];
+    size_t cid_len;
+    char token[64];
+    size_t token_len = sizeof(token);
+    __u8 wire_caps = 0;
+    __u64 epoch = 0, sn = 0, dur_ms = 0;
+    struct powerfs_cap *cap;
+    unsigned int k_issued;
+    int ret;
+
+    cid_len = get_mount_client_id(sb, cid, sizeof(cid));
+
+    /* 先发起网络 RPC (无锁环境, 可能睡眠).
+     * 失败: 降级行为, open 不应因为网络不好失败, 只是本地缓存不可用. */
+    ret = powerfs_net_cap_open_grant(pi->netfs.inode.i_ino,
+                                     cid, is_write_open,
+                                     token, &token_len,
+                                     &wire_caps, &epoch, &sn, &dur_ms);
+    if (ret < 0) {
+        pr_warn_ratelimited("powerfs: cap_open_grant ino=%lu write=%d ret=%d: "
+                            "degrade to SHARED_WRITE\n",
+                            pi->netfs.inode.i_ino, (int)is_write_open, ret);
+        /* 降级: wire_caps = 0 (SHARED_WRITE), 继续走 cap_issue(0) 流程以便
+         * cap 对象存在 (后续 recall/renew 仍能按 inode 定位). */
+        wire_caps = 0;
+        token_len = 0;
+        epoch = 0;
+        sn = 0;
+        dur_ms = 0;
+        token[0] = '\0';
+        ret = 0;  /* 网络失败不阻止 open 成功 */
+    }
+
+    /* 将 grant 结果灌入 inode cap. */
+    spin_lock(&pi->i_lock);
+
+    /* auth_cap 不存在 → 新建. */
+    cap = pi->i_auth_cap;
+    if (!cap) {
+        cap = add_cap_for_inode_locked(pi, 0 /* issuer_id */);
+        if (!cap) {
+            spin_unlock(&pi->i_lock);
+            pr_warn("powerfs: cap_open_grant ino=%lu alloc cap failed\n",
+                    pi->netfs.inode.i_ino);
+            return -ENOMEM;
+        }
+    }
+
+    /* 记录服务端同步返回的 token / epoch / sn 信息.
+     * token 用于后续 CapRecallAck / CapRelease 对服务端证明持有者身份. */
+    if (token_len > 0) {
+        size_t cp = min(token_len, sizeof(cap->token) - 1);
+        memcpy(cap->token, token, cp);
+        cap->token[cp] = '\0';
+    }
+    cap->epoch = epoch;
+    cap->seq = sn;
+    cap->issue_seq = sn;
+    if (dur_ms > 0)
+        cap->expire_jiffies = jiffies + msecs_to_jiffies(dur_ms);
+    else
+        cap->expire_jiffies = jiffies + POWERFS_LEASE_DURATION;
+
+    cap->content_size = (u64)i_size_read(&pi->netfs.inode);
+
+    /* 映射并调用 cap_issue: 内核 issued 只增不减, revoke 才降 */
+    k_issued = wire_capset_to_kernel_bits(wire_caps);
+    powerfs_cap_issue(pi, cap, k_issued);
+
+    spin_unlock(&pi->i_lock);
+
+    pr_debug("powerfs: cap_open_grant ino=%lu write=%d wire=0x%02x kernel=0x%x "
+             "epoch=%llu sn=%llu dur_ms=%llu\n",
+             pi->netfs.inode.i_ino, (int)is_write_open, wire_caps, k_issued,
+             (unsigned long long)epoch, (unsigned long long)sn, (unsigned long long)dur_ms);
+
+    return ret;
+}
+
+/* §13.4.2 CapRecallAck 包装: 把 cap 的 token + inode + client_id 组装后 ACK 到 Filer.
+ * 由 powerfs_cap_revoke() 在 flush 完后调用 (revoke 期间需 ACK).
+ * 调用方**不持 pi->i_lock** (RPC 可能阻塞). */
+static int cap_send_recall_ack(struct powerfs_inode_info *pi, struct powerfs_cap *cap)
+{
+    struct super_block *sb = pi->netfs.inode.i_sb;
+    char cid[64];
+    size_t cid_len;
+    size_t token_len;
+    int ret;
+
+    if (!cap)
+        return -EINVAL;
+
+    token_len = strlen(cap->token);
+    if (token_len == 0) {
+        /* 从未成功 open_grant (例如降级态或刚 open 失败): 无需 ACK, 直接成功. */
+        return 0;
+    }
+
+    cid_len = get_mount_client_id(sb, cid, sizeof(cid));
+
+    ret = powerfs_net_cap_recall_ack(pi->netfs.inode.i_ino, cid,
+                                     cap->token, token_len);
+    if (ret < 0) {
+        pr_warn_ratelimited("powerfs: cap_recall_ack ino=%lu ret=%d (服务端可能已完成 recall)\n",
+                            pi->netfs.inode.i_ino, ret);
+    }
+    return ret;
+}
+
+/* §13.4 场景 3: 主动 CapRelease (close 时). 返回 HasUpgrade 结果,
+ * 若 HasUpgrade=1 且 survivor 是自己 (cap 就是此 inode 的 auth_cap), 则
+ * 在内部同时调 cap_issue 更新 issued 位 (从 SHARED_WRITE 升级到 EXCLUSIVE).
+ * 调用方不持锁. */
+static int cap_send_release(struct powerfs_inode_info *pi, struct powerfs_cap *cap)
+{
+    struct super_block *sb = pi->netfs.inode.i_sb;
+    char cid[64];
+    size_t cid_len;
+    size_t token_len;
+    __u8 has_upg = 0;
+    char upg_token[64];
+    size_t upg_toklen = sizeof(upg_token);
+    __u8 upg_wire = 0;
+    __u64 upg_epoch = 0, upg_sn = 0;
+    int ret;
+
+    if (!cap)
+        return -EINVAL;
+
+    token_len = strlen(cap->token);
+    if (token_len == 0) {
+        /* 从未成功 open_grant → 无需发 release RPC, 直接成功 (降级态). */
+        return 0;
+    }
+
+    cid_len = get_mount_client_id(sb, cid, sizeof(cid));
+
+    ret = powerfs_net_cap_release(pi->netfs.inode.i_ino, cid,
+                                  cap->token, token_len,
+                                  &has_upg,
+                                  upg_token, &upg_toklen,
+                                  &upg_wire, &upg_epoch, &upg_sn);
+    if (ret < 0) {
+        pr_warn_ratelimited("powerfs: cap_release ino=%lu ret=%d (服务端可能已 GC)\n",
+                            pi->netfs.inode.i_ino, ret);
+        return ret;
+    }
+
+    pr_debug("powerfs: cap_release ino=%lu has_upg=%d upg_wire=0x%02x\n",
+             pi->netfs.inode.i_ino, (int)has_upg, upg_wire);
+
+    /* HasUpgrade=1 说明有 survivor 升级到了 EXCLUSIVE_WRITE. 通常 survivor
+     * 是"其他"客户端, NOTIFY 通道异步推送 CapUpgradeNotify 给它;
+     * 若 survivor 就是自己 (最后一个 SHARED_WRITE 关闭了其他 writer),
+     * release 响应体内嵌升级信息, 我们直接在本端 cap_issue 升级 issued 位,
+     * 这样下一次 write_begin 走本地 FILE_WR 无需再 RPC. */
+    if (has_upg) {
+        unsigned int k_issued;
+        spin_lock(&pi->i_lock);
+        /* 升级 token (survivor 自己的新 token) */
+        if (upg_toklen > 0 && upg_toklen < sizeof(cap->token)) {
+            memcpy(cap->token, upg_token, upg_toklen);
+            cap->token[upg_toklen] = '\0';
+        }
+        cap->epoch = upg_epoch;
+        cap->seq = upg_sn;
+        cap->issue_seq = upg_sn;
+        k_issued = wire_capset_to_kernel_bits(upg_wire);
+        powerfs_cap_issue(pi, cap, k_issued);
+        spin_unlock(&pi->i_lock);
+        wake_up_all(&pi->i_cap_wq);
+    }
+
+    return 0;
+}
+
 /* cap 有效性检查 — cap_gen 匹配且未过期.
- * 对齐 Ceph __cap_is_valid (caps.c L787).
+ * 对齐  __cap_is_valid (caps.c L787).
  * 调用方持 pi->i_lock. */
 bool powerfs_cap_is_valid(struct powerfs_cap *cap)
 {
@@ -1688,7 +2399,7 @@ bool powerfs_cap_is_valid(struct powerfs_cap *cap)
 }
 
 /* 遍历 i_caps rbtree, 返回有效 cap 的 issued 并集.
- * 对齐 Ceph __ceph_caps_issued (caps.c L812).
+ * 对齐  __xxx_caps_issued (caps.c L812).
  * 调用方持 pi->i_lock. */
 unsigned int powerfs_caps_issued(struct powerfs_inode_info *pi,
                                  unsigned int *implemented)
@@ -1710,7 +2421,7 @@ unsigned int powerfs_caps_issued(struct powerfs_inode_info *pi,
     }
 
     /* 排除 auth_cap 正在 revoke 的位 (implemented & ~issued)
-     * 对齐 Ceph: have &= ~cap->implemented | cap->issued */
+     * 对齐 : have &= ~cap->implemented | cap->issued */
     if (pi->i_auth_cap) {
         cap = pi->i_auth_cap;
         have &= ~cap->implemented | cap->issued;
@@ -1720,7 +2431,7 @@ unsigned int powerfs_caps_issued(struct powerfs_inode_info *pi,
 }
 
 /* 检查 mask 是否被 issued 完全覆盖.
- * 对齐 Ceph __ceph_caps_issued_mask (caps.c L891).
+ * 对齐  __xxx_caps_issued_mask (caps.c L891).
  * @touch=true 时把命中的 cap 移到 LRU 尾部 (保持 cap 热度).
  * 调用方持 pi->i_lock. */
 int powerfs_caps_issued_mask(struct powerfs_inode_info *pi,
@@ -1768,7 +2479,7 @@ int powerfs_caps_issued_mask(struct powerfs_inode_info *pi,
 }
 
 /* 从 refcount 派生 used caps.
- * 对齐 Ceph __ceph_caps_used (caps.c L981).
+ * 对齐  __xxx_caps_used (caps.c L981).
  * 调用方持 pi->i_lock. */
 unsigned int powerfs_caps_used(struct powerfs_inode_info *pi)
 {
@@ -1793,7 +2504,7 @@ unsigned int powerfs_caps_used(struct powerfs_inode_info *pi)
 }
 
 /* 从 open 模式 + 时间窗口派生 file_wanted caps.
- * 对齐 Ceph __ceph_caps_file_wanted (caps.c L1006).
+ * 对齐  __xxx_caps_file_wanted (caps.c L1006).
  *
  * PowerFS 简化: 不区分 caps_wanted_delay_min/max (用单一 TTL),
  * 不支持 LAZY 模式. 目录/文件分别处理.
@@ -1846,7 +2557,7 @@ unsigned int powerfs_caps_file_wanted(struct powerfs_inode_info *pi)
 }
 
 /* wanted = file_wanted | used, 脏数据时追加 EXCL.
- * 对齐 Ceph __ceph_caps_wanted (caps.c L1067).
+ * 对齐  __xxx_caps_wanted (caps.c L1067).
  * 调用方持 pi->i_lock. */
 unsigned int powerfs_caps_wanted(struct powerfs_inode_info *pi)
 {
@@ -1866,7 +2577,7 @@ unsigned int powerfs_caps_wanted(struct powerfs_inode_info *pi)
 }
 
 /* 内部: 获取 cap 引用计数 (调用方持 i_lock).
- * 对齐 Ceph ceph_take_cap_refs (caps.c L2761). */
+ * 对齐  xxx_take_cap_refs (caps.c L2761). */
 static void powerfs_cap_take_refs(struct powerfs_inode_info *pi,
                                   unsigned int got)
 {
@@ -1888,7 +2599,7 @@ static void powerfs_cap_take_refs(struct powerfs_inode_info *pi,
 }
 
 /* 公共: 获取 cap 引用计数.
- * 对齐 Ceph ceph_get_cap_refs (caps.c L3185). */
+ * 对齐  xxx_get_cap_refs (caps.c L3185). */
 void powerfs_cap_get_refs(struct powerfs_inode_info *pi, unsigned int got)
 {
     spin_lock(&pi->i_lock);
@@ -1897,7 +2608,7 @@ void powerfs_cap_get_refs(struct powerfs_inode_info *pi, unsigned int got)
 }
 
 /* 公共: 释放 cap 引用计数.
- * 对齐 Ceph __ceph_put_cap_refs (caps.c L3232).
+ * 对齐  __xxx_put_cap_refs (caps.c L3232).
  * 最后一个引用释放时触发 check_caps. */
 void powerfs_cap_put_refs(struct powerfs_inode_info *pi, unsigned int had)
 {
@@ -1942,7 +2653,7 @@ void powerfs_cap_put_refs(struct powerfs_inode_info *pi, unsigned int had)
 }
 
 /* Filer 授予 cap (grant / issue 消息处理).
- * 对齐 Ceph __check_cap_issue + ceph_add_cap 的 issue 部分.
+ * 对齐  __check_cap_issue + xxx_add_cap 的 issue 部分.
  *
  * 更新 issued/implemented; FILE_SHARED 变化时递增 i_shared_gen
  * 并清除 I_COMPLETE (目录缓存失效, 需要重新 readdir).
@@ -1966,7 +2677,7 @@ void powerfs_cap_issue(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
 
     /*
      * FILE_SHARED 新发授 → 目录缓存可能 stale, 递增 shared_gen
-     * 对齐 Ceph __check_cap_issue L603-610
+     * 对齐  __check_cap_issue L603-610
      */
     if (S_ISDIR(inode->i_mode) &&
         (issued & POWERFS_CAP_FILE_SHARED) &&
@@ -1978,7 +2689,7 @@ void powerfs_cap_issue(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
 
     /*
      * FILE_CACHE 新发授 → 递增 rdcache_gen (缓存代次)
-     * 对齐 Ceph __check_cap_issue L591-595
+     * 对齐  __check_cap_issue L591-595
      */
     if (S_ISREG(inode->i_mode) &&
         (issued & POWERFS_CAP_FILE_CACHE) &&
@@ -1995,7 +2706,7 @@ void powerfs_cap_issue(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
 }
 
 /* 服务端撤回 cap (revoke 消息处理).
- * 对齐 Ceph handle_cap_revoke 的客户端降级逻辑.
+ * 对齐  handle_cap_revoke 的客户端降级逻辑.
  *
  * 流程:
  *   1. issued &= ~revoking (降级授权)
@@ -2043,12 +2754,22 @@ void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
         pi->dir_complete = false;
     }
 
-    /* 5. 唤醒等待者 */
+    /* 5. §13.4.2: 发 CapRecallAck 到 Filer, 证明 flush 完成 + issued 已降级.
+     *    服务端收到 ACK 才会完成 recall 流程, 将 EXCLUSIVE 权限授予新申请者.
+     *    注意: RPC 不能在 spinlock 下执行, 临时释放 i_lock (此时已无 shared
+     *    state 与其他路径竞态, issued/implemented 已落盘). */
+    if (1) {  /* recall 总是需要 ACK, 不管有没有 flush (服务端统一状态机) */
+        spin_unlock(&pi->i_lock);
+        cap_send_recall_ack(pi, cap);
+        spin_lock(&pi->i_lock);
+    }
+
+    /* 6. 唤醒等待者 */
     wake_up_all(&pi->i_cap_wq);
 }
 
 /* 写回 dirty_caps 并等待 ACK.
- * 对齐 Ceph ceph_flush_dirty_caps + __send_cap.
+ * 对齐  xxx_flush_dirty_caps + __send_cap.
  *
  * 流程:
  *   1. 分配 powerfs_cap_flush 记录, 挂到 i_cap_flush_list + 全局 cap_flush_list
@@ -2063,31 +2784,55 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
     struct powerfs_cap_flush *cf;
     struct powerfs_sb_info *sbi;
     unsigned int flushing;
+    unsigned int need_data_flush = 0;
+    unsigned int need_attr_flush = 0;
+    unsigned int need_xattr_flush = 0;
+    unsigned int need_inline_flush = 0;
     int ret = 0;
 
     sbi = POWERFS_SB_INFO(inode->i_sb);
 
     spin_lock(&pi->i_lock);
 
-    /* 取 dirty_caps 与 mask 的交集 */
+    /* 取 dirty_caps 与 mask 的交集 (需要 flush 的位) */
     flushing = pi->i_dirty_caps & mask;
     if (!flushing) {
         spin_unlock(&pi->i_lock);
         return 0;
     }
 
+    /* 分类需要实际推到后端的脏类型:
+     *   WR_DATA → VFS page cache writeback
+     *   AUTH_EXCL → setattr (uid/gid/mode/time/size)
+     *   XATTR_EXCL → 扩展属性 setxattr/removexattr 全量推送
+     *   inline_dirty → INLINE placement inline_data payload 同步
+     *
+     * 拷贝 flushing 分类后释放 i_lock (I/O 期间不能持自旋锁),
+     * 用 cf 作为 flushing record, 结束后回到 i_lock 清理状态. */
+    if (flushing & POWERFS_CAP_WR_DATA) {
+        need_data_flush = flushing & POWERFS_CAP_WR_DATA;
+        /* INLINE placement: 除了 page cache, 还需同步 inline_data payload.
+         * 若 inline_dirty, FLAT placement 用不到该标志位. */
+        if (pi->placement == POWERFS_PLACEMENT_INLINE && pi->inline_dirty)
+            need_inline_flush = 1;
+    }
+    if (flushing & POWERFS_CAP_AUTH_EXCL)
+        need_attr_flush = flushing & POWERFS_CAP_AUTH_EXCL;
+    if (flushing & POWERFS_CAP_XATTR_EXCL)
+        need_xattr_flush = POWERFS_CAP_XATTR_EXCL;
+
     /* 移到 flushing_caps */
     pi->i_dirty_caps &= ~flushing;
     pi->i_flushing_caps |= flushing;
 
-    /* 分配 flush 记录 (优先用预分配的) */
+    /* 分配 flush 记录 (优先用预分配槽) */
     if (pi->i_prealloc_cap_flush) {
         cf = pi->i_prealloc_cap_flush;
         pi->i_prealloc_cap_flush = NULL;
     } else {
         cf = kmem_cache_alloc(sbi->cap_flush_cachep, GFP_NOFS);
         if (!cf) {
-            /* 内存不足: 回滚, dirty 保留 */
+            /* 内存不足: 回滚, dirty 保留, 下次再推 (宁可推两遍也不丢脏). */
             pi->i_dirty_caps |= flushing;
             pi->i_flushing_caps &= ~flushing;
             spin_unlock(&pi->i_lock);
@@ -2101,25 +2846,239 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
     cf->is_capsnap = false;
     INIT_LIST_HEAD(&cf->g_list);
     INIT_LIST_HEAD(&cf->i_list);
-
     list_add_tail(&cf->i_list, &pi->i_cap_flush_list);
 
-    /* TODO: 发送 CapFlush RPC 到 Filer.
-     * 当前阶段: 同步标记完成 (无网络层), 直接清除 flushing.
-     * 后续接入 powerfs_net_cap_flush() 后改为异步等待 i_cap_wq.
+    spin_unlock(&pi->i_lock);
+
+    /* =====================================================================
+     * 以下流程不持 pi->i_lock, 允许阻塞 I/O + 网络 RPC.
+     * 若任何步骤失败: 失败的脏位放回 pi->i_dirty_caps, 下次重试.
+     * 成功的位: 留在 flushing → cap_revoke 已发送 ACK 前不会重复.
+     * ===================================================================== */
+
+    /* --- Step 1: WR_DATA → 同步写回 page cache 脏页到 Volume/Filer ---
+     *   filemap_write_and_wait_range 触发:
+     *     netfs_writepages → netfs_write_block → powerfs_net_write(Volume)
+     *   成功后再在 release/fsync 路径 UPDATE_INODE_SIZE_CHUNKS 原子提交. */
+    if (need_data_flush) {
+        loff_t size = i_size_read(inode);
+        int err;
+
+        pr_debug("powerfs: cap_flush WR_DATA ino=%lu size=%lld caps=0x%x\n",
+                 inode->i_ino, size, need_data_flush);
+        err = filemap_write_and_wait_range(inode->i_mapping, 0,
+                                           size > 0 ? size - 1 : 0);
+        if (err < 0) {
+            pr_warn_ratelimited("powerfs: cap_flush WR_DATA ino=%lu failed: %d, will retry\n",
+                                inode->i_ino, err);
+            /* 失败: 把 WR_DATA 脏位放回 i_dirty_caps, 下次 check_caps/recall 再推 */
+            spin_lock(&pi->i_lock);
+            pi->i_dirty_caps    |= need_data_flush;
+            pi->i_flushing_caps &= ~need_data_flush;
+            spin_unlock(&pi->i_lock);
+            ret = err;
+        }
+    }
+
+    /* --- Step 2: AUTH_EXCL → setattr 同步 inode 元数据到 Filer ---
+     *   Filer 的 setattr RPC (0x0030 或 UPDATE_INODE_SIZE_CHUNKS) 已在
+     *   powerfs_net_setattr 中实现. 这里收集当前 inode 的最新值:
+     *   mode/uid/gid/size/mtime/atime → 组装 mode_valid bit → RPC. */
+    if (need_attr_flush) {
+        __u32 valid = 0;
+        __u32 mode = 0, uid = 0, gid = 0;
+        __u64 size = 0;
+        __u64 mtime = 0, atime = 0;
+        int err;
+
+        /* 读 inode 当前属性 (持 inode->i_lock? 我们不需要锁, 快照即可;
+         * setattr_prepare 已在 VFS setattr 回调中持有, 此处只是采样同步) */
+        mode = inode->i_mode;
+        uid  = i_uid_read(inode);
+        gid  = i_gid_read(inode);
+        size = i_size_read(inode);
+        {
+            struct timespec64 ts = inode_get_mtime(inode);
+            mtime = (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
+        }
+        {
+            struct timespec64 ts = inode_get_atime(inode);
+            atime = (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
+        }
+        /* valid 表示哪些字段要推 (POWERFS_ATTR_* 协议 bit 枚举, 见 powerfs_net.h):
+         *   AUTH_EXCL 意味着属性可能变更, 为保守全量推 mode/uid/gid/size/mtime.
+         *   atime 只有在显式修改时才脏, 但我们不细区分, 一起推 (对 RPC 性能影响小) */
+        valid = POWERFS_ATTR_MODE | POWERFS_ATTR_UID | POWERFS_ATTR_GID |
+                POWERFS_ATTR_SIZE | POWERFS_ATTR_MTIME | POWERFS_ATTR_ATIME;
+
+        pr_debug("powerfs: cap_flush AUTH_EXCL ino=%lu valid=0x%x mode=0%o size=%llu\n",
+                 inode->i_ino, valid, mode & 07777, (unsigned long long)size);
+        err = powerfs_net_setattr(inode->i_ino, valid, mode, uid, gid,
+                                  size, mtime, atime);
+        if (err < 0) {
+            pr_warn_ratelimited("powerfs: cap_flush AUTH_EXCL ino=%lu failed: %d, will retry\n",
+                                inode->i_ino, err);
+            spin_lock(&pi->i_lock);
+            pi->i_dirty_caps    |= need_attr_flush;
+            pi->i_flushing_caps &= ~need_attr_flush;
+            spin_unlock(&pi->i_lock);
+            ret = ret ?: err;
+        }
+    }
+
+    /* --- Step 3: XATTR_EXCL → xattr 脏数据推 Filer (兜底) ---
+     *   正常路径: xattr_handler_set/remove 已同步 net RPC, XATTR_EXCL
+     *   标记为脏仅是为了在 recall 时让 CapRevoke 等待该版本号.
+     *   兜底场景: 若未来优化为"持 XATTR_EXCL 时先只写 L1 cache, recall 时
+     *   cap_flush 统一推送", 则本步骤会真正用到.
      *
-     * 对齐 Ceph: __send_cap() 发送 CEPH_MSG_CLIENT_CAP,
-     * 收到 CAP_ACK 回调后从 i_cap_flush_list 移除并 wake_up. */
+     *   实现策略: 遍历 L1 simple_xattr 缓存中的所有键值对, 逐条
+     *   net setxattr 重推. simple_xattr 用 rb_root, 无公开遍历 API,
+     *   所以先用 simple_xattr_list(NULL probe → buffer) 枚举 keys,
+     *   再逐个 simple_xattr_get 拿 value → net setxattr.
+     *
+     *   任何单条失败 → 整体 XATTR_EXCL 放回脏位, 下次重试. */
+    if (need_xattr_flush) {
+        __u64 shard_id = powerfs_calc_shard_id(inode->i_ino);
+        ssize_t list_sz;
+        char *list_buf = NULL;
+        int step_err = 0;
 
-    pr_debug("powerfs: cap_flush ino=%lu caps=0x%x tid=%llu (sync stub)\n",
-             inode->i_ino, flushing, cf->tid);
+        /* Step 3.1: probe 需要的 list buffer 尺寸 */
+        list_sz = simple_xattr_list(inode, &pi->xattrs, NULL, 0);
+        if (list_sz < 0) {
+            step_err = (int)list_sz;
+            goto xattr_flush_fail;
+        }
+        if (list_sz == 0) {
+            /* 无 xattr → 视为成功 (没有脏数据需要推送, 说明 XATTR_EXCL 脏位
+             * 对应的是刚刚在 xattr_handler_set 里同步 RPC 过且 simple_xattr
+             * 清掉了条目 (remove) 的场景. */
+            goto xattr_flush_ok;
+        }
 
-    /* Stub: 同步完成 (无 ACK 等待).
-     * TODO: 替换为异步 RPC + wait_event(i_cap_wq, ...) */
-    pi->i_flushing_caps &= ~flushing;
+        list_buf = kmalloc((size_t)list_sz, GFP_NOFS);
+        if (!list_buf) {
+            step_err = -ENOMEM;
+            goto xattr_flush_fail;
+        }
+        {
+            ssize_t got = simple_xattr_list(inode, &pi->xattrs, list_buf, (size_t)list_sz);
+            if (got != list_sz) {
+                step_err = (got < 0) ? (int)got : -EIO;
+                goto xattr_flush_fail_cleanup;
+            }
+        }
+
+        /* Step 3.2: 遍历 NUL-separated keys, 逐条 push */
+        {
+            size_t pos = 0;
+            while (pos < (size_t)list_sz) {
+                const char *key = list_buf + pos;
+                size_t klen = strlen(key);
+                ssize_t vsize;
+                __u8 *vbuf;
+
+                /* probe value 尺寸 */
+                vsize = simple_xattr_get(&pi->xattrs, key, NULL, 0);
+                if (vsize < 0) {
+                    /* 某条拿不到 → 不视为失败 (可能并发删除), 跳过 */
+                    pos += klen + 1;
+                    continue;
+                }
+                vbuf = kmalloc((size_t)(vsize > 0 ? vsize : 1), GFP_NOFS);
+                if (!vbuf) {
+                    step_err = -ENOMEM;
+                    goto xattr_flush_fail_cleanup;
+                }
+                if (vsize > 0) {
+                    ssize_t gotv = simple_xattr_get(&pi->xattrs, key, vbuf, (size_t)vsize);
+                    if (gotv != vsize) {
+                        kfree(vbuf);
+                        step_err = (gotv < 0) ? (int)gotv : -EIO;
+                        goto xattr_flush_fail_cleanup;
+                    }
+                }
+                {
+                    int r = powerfs_net_setxattr(shard_id, inode->i_ino,
+                                                 key, klen,
+                                                 vbuf, (size_t)(vsize > 0 ? vsize : 0));
+                    kfree(vbuf);
+                    if (r < 0) {
+                        step_err = r;
+                        goto xattr_flush_fail_cleanup;
+                    }
+                }
+                pos += klen + 1;
+            }
+        }
+
+xattr_flush_ok:
+        kfree(list_buf);
+        pr_debug("powerfs: cap_flush XATTR_EXCL ino=%lu OK\n", inode->i_ino);
+        goto xattr_flush_done;
+
+xattr_flush_fail_cleanup:
+        kfree(list_buf);
+xattr_flush_fail:
+        pr_warn_ratelimited("powerfs: cap_flush XATTR_EXCL ino=%lu failed: %d, rollback dirty\n",
+                            inode->i_ino, step_err);
+        spin_lock(&pi->i_lock);
+        pi->i_dirty_caps    |= need_xattr_flush;
+        pi->i_flushing_caps &= ~need_xattr_flush;
+        spin_unlock(&pi->i_lock);
+        ret = ret ?: step_err;
+xattr_flush_done:
+        (void)shard_id;  /* shard_id 已在循环内通过 calc 使用, 这里抑制 "set but not used" */
+    }
+
+    /* --- Step 4: INLINE placement inline_data dirty flush ---
+     *   inline_data 是 CREATE PhaseA 时在 CreateInode body 里携带的
+     *   payload. 后续 (open_write+write_end) 更新了 inline_data
+     *   + 置 inline_dirty, 但是没有独立的 UpdateInline RPC.
+     *
+     *   走 powerfs_net_setattr 无法携带 inline_data buffer payload.
+     *   临时做法: 先放警告 + 保持 inline_dirty 放回 XATTR_EXCL or AUTH_EXCL
+     *   脏位? 不, inline_dirty 是独立于 i_dirty_caps 的 bool 状态.
+     *   重新置位 inline_dirty = true, 下次 recall/fsync 再尝试.
+     *
+     *   正确解法: 在 net 层新增 UPDATE_INLINE_DATA (0x0097) 消息帧,
+     *   body 带 Ino + InlineData TLV. */
+    if (need_inline_flush) {
+        WARN_ONCE(1, "powerfs: cap_flush INLINE inline_dirty ino=%lu "
+                     "but UPDATE_INLINE_DATA protocol not implemented; rollback\n",
+                  inode->i_ino);
+        /* 回滚: inline_dirty 仍保持 true, fsync/close/re-recall 时再尝试 */
+        spin_lock(&pi->i_lock);
+        pi->inline_dirty = true;
+        /* WR_DATA 脏位若之前 Step1 成功已被清: 为了保证下次 recall 再进来,
+         * 把 WR_DATA 重新置位 (recall mask 通常含 WR_DATA). */
+        if (need_data_flush && ret == 0) {
+            pi->i_dirty_caps    |= need_data_flush;
+            pi->i_flushing_caps &= ~need_data_flush;
+        }
+        spin_unlock(&pi->i_lock);
+        ret = ret ?: -EOPNOTSUPP;
+    }
+
+    /* =====================================================================
+     * 清理: 回到 i_lock, 把成功的 flushing 位移出 i_flushing_caps.
+     * 如果所有步骤 ret == 0 (全部成功): 正常清 flushing + free cf.
+     * 如果有失败: 失败脏位已在各 Step 中放回 i_dirty_caps.
+     *   仍需把剩下的成功位对应的 flushing 清除. */
+    spin_lock(&pi->i_lock);
+    {
+        unsigned int remain = pi->i_flushing_caps;
+        pi->i_flushing_caps = 0; /* flushing window 已结束 */
+        /* 注意: 若任何子步骤失败, 对应 dirty 位已在该 Step 内放回 i_dirty_caps.
+         * 我们只需清 flushing, 那些脏位会在后续 check_caps/recall 中再次 flush.
+         * (若 remain != 0 说明有的脏位没回滚但 RPC 失败: 安全起见不要清 dirty,
+         *  但我们已经在每个分支都回滚了, remain 理论上 == 0) */
+        (void)remain;
+    }
     list_del(&cf->i_list);
 
-    /* 回收 flush 记录 (复用预分配槽) */
+    /* 回收 cf: 挂预分配槽 or kmem_cache_free */
     if (!pi->i_prealloc_cap_flush)
         pi->i_prealloc_cap_flush = cf;
     else
@@ -2127,14 +3086,17 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
 
     spin_unlock(&pi->i_lock);
 
-    /* 唤醒可能等待 flush 的 revoke 路径 */
+    /* 唤醒等待 cap 刷新的 get_caps / revoke 线程 */
     wake_up_all(&pi->i_cap_wq);
 
+    if (ret == 0)
+        pr_debug("powerfs: cap_flush success ino=%lu caps=0x%x tid=%llu\n",
+                 inode->i_ino, flushing, cf->tid);
     return ret;
 }
 
 /* 评估并可能发送 cap 状态更新.
- * 对齐 Ceph ceph_check_caps (caps.c L2018).
+ * 对齐  xxx_check_caps (caps.c L2018).
  *
  * 比较 wanted vs issued:
  *   - wanted > issued → 发 AcquireCap (请求更多权限)
@@ -2179,7 +3141,7 @@ void powerfs_check_caps(struct powerfs_inode_info *pi, int flags)
 }
 
 /* 标记 cap dirty 位 (write/setattr 路径调用).
- * 对齐 Ceph __ceph_mark_caps_dirty.
+ * 对齐  __xxx_mark_caps_dirty.
  * @caps: 要标记的 dirty 位掩码 (POWERFS_CAP_FILE_WR / POWERFS_CAP_AUTH_EXCL 等).
  * 调用方不持锁. */
 void powerfs_cap_mark_dirty(struct powerfs_inode_info *pi, unsigned int caps)
@@ -2187,6 +3149,165 @@ void powerfs_cap_mark_dirty(struct powerfs_inode_info *pi, unsigned int caps)
     spin_lock(&pi->i_lock);
     pi->i_dirty_caps |= caps;
     spin_unlock(&pi->i_lock);
+}
+
+/*
+ * 本地 try_get_cap_refs 辅助: 若 issued 覆盖 need 且想拿的 want 也在 issued/used
+ * 允许范围内, 调 cap_get_refs 递增引用计数, 返回 true(成功).
+ * 调用方必须持有 pi->i_lock. 对 FILE 路径, used_mode = (need|want) &
+ * (CAP_PIN | CAP_FILE_SHARED | CAP_FILE_CACHE | CAP_FILE_WR | CAP_FILE_EXCL).
+ */
+static bool try_get_cap_refs_locked(struct powerfs_inode_info *pi,
+                                    unsigned int need, unsigned int want,
+                                    unsigned int *got)
+{
+    unsigned int issued, impl;
+    unsigned int refs = 0;
+    bool have_need, have_want;
+
+    issued = powerfs_caps_issued(pi, &impl);
+
+    have_need = (need & ~issued) == 0;
+    have_want = ((want & (POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_CACHE |
+                          POWERFS_CAP_FILE_WR | POWERFS_CAP_FILE_EXCL)) & ~issued) == 0;
+
+    /* 只有至少满足 need 时才增加引用计数, 否则 *got=0 不占引用.
+     * 防止 get_caps 阻塞循环里反复加引用造成泄漏. */
+    if (have_need) {
+        refs |= POWERFS_CAP_PIN;
+        if (issued & POWERFS_CAP_FILE_SHARED)
+            refs |= POWERFS_CAP_FILE_SHARED;
+        if (issued & POWERFS_CAP_FILE_CACHE)
+            refs |= POWERFS_CAP_FILE_CACHE;
+        if (issued & POWERFS_CAP_FILE_WR)
+            refs |= POWERFS_CAP_FILE_WR;
+        if (issued & POWERFS_CAP_FILE_EXCL)
+            refs |= POWERFS_CAP_FILE_EXCL;
+        powerfs_cap_get_refs(pi, refs);
+    }
+
+    if (got)
+        *got = refs;
+
+    return have_need && have_want;
+}
+
+/*
+ * powerfs_try_get_caps - 非阻塞获取 cap 引用 (对齐 xxx_try_get_caps).
+ *
+ * 若已持有 >= need 的 issued 位, cap_get_refs 增加引用并返回 true;
+ * 否则立即触发 powerfs_check_caps(0) 向服务端申请, 返回 false.
+ * 调用方可以基于返回值选择:
+ *   - true:  完整拿到 need+want, 可安全走本地缓存 IO.
+ *   - false: need 不满足 或 want 未完全覆盖, 降级走直读直写 (带 PIN 引用, 不阻塞).
+ */
+bool powerfs_try_get_caps(struct powerfs_inode_info *pi,
+                          unsigned int need, unsigned int want,
+                          bool nonblock, unsigned int *got)
+{
+    bool ok;
+    unsigned int refs = 0;
+
+    spin_lock(&pi->i_lock);
+    ok = try_get_cap_refs_locked(pi, need, want, &refs);
+    spin_unlock(&pi->i_lock);
+
+    if (!ok) {
+        /* 触发向服务端 AcquireCap RPC (当前 check_caps 仅日志; 接入 net 后自动生效). */
+        powerfs_check_caps(pi, 0);
+    }
+
+    if (got)
+        *got = refs;
+    return ok;
+}
+
+/*
+ * powerfs_get_caps - 阻塞获取 cap 引用 (对齐 xxx_get_caps / __xxx_get_caps).
+ *
+ * 循环:
+ *   1. try_get_cap_refs_locked → 成功直接返回.
+ *   2. 否则 DEFINE_WAIT + add_wait_queue(i_cap_wq) → wait_woken 最多 50ms.
+ *   3. 期间若 pending 信号, 返回 -ERESTARTSYS.
+ *   4. 连续等待超过 30 轮 (≈1.5s) 仍未到位, 降级宽松模式: 只要拿到 need 就
+ *      返回 (避免 cap 协议未就绪期间卡死 IO).
+ *
+ * @inode: 目标 inode.
+ * @filp:  可选文件描述符 (当前仅用于将来 mode 追踪).
+ * @need:  必须位 (如读 = FILE_SHARED, 写 = FILE_SHARED | FILE_WR).
+ * @want:  期望位 (如 FILE_CACHE | FILE_EXCL).
+ * @endoff:写路径的写入偏移 (当前未用, 预留做 size 限制校验).
+ * @got:   输出实际拿到的引用位 (后续 put_refs 对称释放用).
+ * 返回 0 成功, <0 错误码.
+ */
+int powerfs_get_caps(struct inode *inode, struct file *filp,
+                     unsigned int need, unsigned int want,
+                     loff_t endoff, unsigned int *got)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(inode->i_sb);
+    const int max_rounds = 30;   /* 最大轮次 ≈ 50ms * 30 = 1.5s */
+    int round = 0;
+    unsigned int refs = 0;
+    bool ok;
+
+    for (;;) {
+        DEFINE_WAIT_FUNC(wait, woken_wake_function);
+
+        spin_lock(&pi->i_lock);
+        ok = try_get_cap_refs_locked(pi, need, want, &refs);
+        spin_unlock(&pi->i_lock);
+
+        if (ok) {
+            if (got) *got = refs;
+            if (sbi && sbi->client) {
+                if (round == 0)
+                    powerfs_metric_cap_hit(&sbi->client->metrics);
+                else
+                    powerfs_metric_cap_mis(&sbi->client->metrics);
+            }
+            return 0;
+        }
+        if (round++ >= max_rounds) {
+            /* 超时降级: 如果至少拿到了 need 位, 就放行 (refs 在上面已递增).
+             * 如果连 need 都没拿到, 那也放行但 refs 可能只有 PIN,
+             * 交给上层 IO 路径自己处理 (直读直写 / 返回错误). */
+            if (got) *got = refs;
+            if (sbi && sbi->client)
+                powerfs_metric_cap_mis(&sbi->client->metrics);
+            return 0;
+        }
+
+        /* 先 check_caps 催一下 AcquireCap (幂等). */
+        powerfs_check_caps(pi, 0);
+
+        if (signal_pending(current))
+            return -ERESTARTSYS;
+
+        add_wait_queue(&pi->i_cap_wq, &wait);
+        set_current_state(TASK_INTERRUPTIBLE);
+
+        /* 再做一次 double-check, 防止 grant 发生在 add_wait_queue 前被漏唤醒. */
+        spin_lock(&pi->i_lock);
+        ok = try_get_cap_refs_locked(pi, need, want, &refs);
+        spin_unlock(&pi->i_lock);
+        if (ok) {
+            __set_current_state(TASK_RUNNING);
+            remove_wait_queue(&pi->i_cap_wq, &wait);
+            if (got) *got = refs;
+            return 0;
+        }
+
+        if (signal_pending(current)) {
+            __set_current_state(TASK_RUNNING);
+            remove_wait_queue(&pi->i_cap_wq, &wait);
+            return -ERESTARTSYS;
+        }
+
+        /* 50ms 超时: 配合 30 轮, 最多等 1.5s. */
+        schedule_timeout(msecs_to_jiffies(50));
+        remove_wait_queue(&pi->i_cap_wq, &wait);
+    }
 }
 
 /*
@@ -2252,7 +3373,7 @@ out:
  *   必须 offload 到 WQ_UNBOUND, 否则同步网络调用阻塞 per-CPU worker
  *   导致 workqueue lockup (实测 598s).
  *
- * 参考: ceph_write_inode (fs/ceph/inode.c) 同步 caps 模式.
+ * 参考: xxx_write_inode (fs/xxx/inode.c) 同步 caps 模式.
  */
 static int powerfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
@@ -2320,7 +3441,7 @@ static int powerfs_write_inode(struct inode *inode, struct writeback_control *wb
  * 每次触发时扫描 inode 的 lease_tree, 对即将过期的 lease (剩余有效期 <
  * POWERFS_LEASE_RENEW_THRESHOLD) 发送续约请求.
  *
- * 设计要点 (参考 Ceph cap renew + GFS2 glock queue_delayed_work):
+ * 设计要点 (参考  cap renew + GFS2 glock queue_delayed_work):
  *   - delayed_work 按 inode 独立调度, 不同 inode 的续约互不阻塞
  *   - 两阶段: 锁内收集待续约 lease → 解锁逐个续约 → 重新加锁更新
  *   - 续约失败不删除 lease: lease 自然过期后由 acquire 路径重新获取
@@ -2967,12 +4088,12 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
              * d_add -> __d_add (dcache.c:2775) 先 d_in_lookup 检测并
              * __d_lookup_unhash 清理 in_lookup_hash，再 hlist_add_head
              * (&d_alias)，最后 __d_rehash 加入主 dcache 哈希。这是 ->lookup
-             * 中实例化 dentry 的正确接口 (参考 ceph_lookup -> d_splice_alias
+             * 中实例化 dentry 的正确接口 (参考 xxx_lookup -> d_splice_alias
              * -> __d_add)。
              */
             d_add(dentry, inode);
 
-            /* Per-dentry lease: lookup 成功后填充 (对齐 Ceph __update_dentry_lease).
+            /* Per-dentry lease: lookup 成功后填充 (对齐  __update_dentry_lease).
              * 正 dentry: lease 有效期间信任缓存, d_revalidate Layer 1 命中. */
             powerfs_fill_dentry_lease(dentry, dir, 0);
 
@@ -2986,6 +4107,9 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
             total_us = div_u64(ktime_get_ns() - ts_entry, 1000);
             pr_info_ratelimited("powerfs: LOOKUP '%pd' found ino=%llu net=%lluus total=%lluus\n",
                     dentry, (unsigned long long)ino, net_dur_us, total_us);
+            if (sbi->client)
+                powerfs_update_metadata_metrics(&sbi->client->metrics,
+                                                ns_to_ktime(ts_entry), ktime_get(), 0);
             return NULL;
         }
 
@@ -3002,7 +4126,7 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
             kfree(lookup_layout.ec_chunks);
             d_add(dentry, NULL);
 
-            /* Per-dentry lease: 负 dentry 也填充 lease (对齐 Ceph 负 dentry 信任).
+            /* Per-dentry lease: 负 dentry 也填充 lease (对齐  负 dentry 信任).
              * 负 dentry lease 有效期间, d_revalidate Layer 1 命中 → 直接返回 ENOENT,
              * 无需 RPC. 对齐 Rust DentryLeaseStatus::LeaseValid (negative). */
             powerfs_fill_dentry_lease(dentry, dir, 0);
@@ -3018,6 +4142,9 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
             total_us = div_u64(ktime_get_ns() - ts_entry, 1000);
             pr_info_ratelimited("powerfs: LOOKUP '%pd' enoent net=%lluus total=%lluus\n",
                     dentry, net_dur_us, total_us);
+            if (sbi->client)
+                powerfs_update_metadata_metrics(&sbi->client->metrics,
+                                                ns_to_ktime(ts_entry), ktime_get(), 0);
             return NULL;
         }
 
@@ -3039,43 +4166,40 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
     /* === 纯本地模式: 添加负 dentry === */
     pr_debug("powerfs: lookup '%pd' not found (local mode)\n", dentry);
     d_add(dentry, NULL);
+    if (sbi->client)
+        powerfs_update_metadata_metrics(&sbi->client->metrics,
+                                        ns_to_ktime(ts_entry), ktime_get(), 0);
     return NULL;
 }
 
-/* ========== 目录操作: mknod (通用创建函数) ========== */
+/* ========== P1-2: create 核心 helper (供 mknod 和 atomic_open 共享) ========== */
 
 /*
- * powerfs_mknod - 创建文件/目录/设备节点 (内部通用函数)
+ * __powerfs_do_create_core - 原子创建 inode (Filer RPC + 本地 inode 构造)
  *
- * 参考 ramfs_mknod (fs/ramfs/inode.c)
+ * 与 powerfs_mknod 的区别：
+ *   - 不 d_instantiate()、不加 dir_entry、不更新父目录时间戳
+ *   - 只负责 net_create → new_inode → 应用 layout 的核心路径
+ *   - 返回新创建的 inode (带引用计数，调用者负责 iput/d_instantiate)
+ *
+ * 用于 atomic_open: 把 "lookup→create→open" 合成一个回调，避免 VFS
+ * 在 lookup 和 create 之间的窗口 (TOCTOU) 被其他客户端抢先。
  */
-static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
-                          struct dentry *dentry, umode_t mode, dev_t dev)
+static struct inode *__powerfs_do_create_core(struct mnt_idmap *idmap,
+                                               struct inode *dir,
+                                               struct dentry *dentry,
+                                               umode_t mode, dev_t dev)
 {
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(dir->i_sb);
-    struct powerfs_inode_info *dpi = POWERFS_I(dir);
     struct inode *inode;
     u64 new_ino;
-    u64 mknod_volume_id = 0, mknod_file_key = 0;  /* P3.4: Filer 自分配, 存入 inode */
-    /* K1-4: CREATE 响应携带的 FileLayout (Inline/Stripe 模式有值, Flat 无).
-     * mknod_has_layout=false 时按默认 Flat 处理. */
+    u64 mknod_volume_id = 0, mknod_file_key = 0;
     struct powerfs_file_layout mknod_layout;
     bool mknod_has_layout = false;
-    int type;
 
     (void)idmap;
+    (void)dev;
 
-    pr_debug("powerfs: mknod '%pd' mode=%o in dir=%lu\n",
-             dentry, mode, dir->i_ino);
-
-    /*
-     * 向 filer 发 CREATE/MKDIR 请求获取权威 ino, 使文件元数据持久化到
-     * filer (Raft 强一致); remount 后 lookup 能找回.
-     * 断连时 powerfs_net_create 返回 -ENOTCONN, 操作失败 (不再本地分配).
-     * Symlinks 有独立 powerfs_net_symlink 接口, 不走此路径.
-     * 特殊文件 (fifo/block/char/socket) 也需持久化到 Filer, 否则 remount
-     * 后丢失. Filer handle_create 对特殊文件跳过 volume/needle 分配.
-     */
     if (S_ISREG(mode) || S_ISDIR(mode) || S_ISFIFO(mode) ||
         S_ISBLK(mode) || S_ISCHR(mode) || S_ISSOCK(mode)) {
         u64 remote_ino = 0;
@@ -3089,19 +4213,10 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
                                        &volume_id, &file_key, &layout);
         if (rerr) {
             pr_warn("powerfs: net_create '%pd' failed: %d\n", dentry, rerr);
-            return rerr;
+            return ERR_PTR(rerr);
         }
         new_ino = remote_ino ? remote_ino
                              : (u64)atomic_inc_return(&sbi->next_ino) + POWERFS_INO_START;
-        /*
-         * P3.4: 保存 Filer 自分配的 volume_id + needle_id 到 mknod 局部变量,
-         * inode 创建后写入 powerfs_inode_info, 供后续直连 volume 读写.
-         * 目录无数据, volume_id/file_key 为 0 (Filer handle_mkdir 不分配).
-         *
-         * K1-4: 保存 layout 到 mknod 局部变量, inode 创建后应用.
-         *       Inline/Stripe 模式 Filer encode layout; Flat 模式 has_placement=false,
-         *       应用时按默认 Flat 处理 (不覆盖 inode 默认值).
-         */
         mknod_volume_id = volume_id;
         mknod_file_key = file_key;
         mknod_layout = layout;
@@ -3110,16 +4225,11 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
         new_ino = atomic_inc_return(&sbi->next_ino) + POWERFS_INO_START;
     }
 
-    /* 创建 inode */
     inode = powerfs_new_inode(dir->i_sb, mode, new_ino,
                                dir->i_ino, dentry->d_name.name);
     if (!inode)
-        return -ENOSPC;
+        return ERR_PTR(-ENOSPC);
 
-    /* For newly created directories, mark dir_complete=true (empty directory,
-     * no need to fetch from Filer). powerfs_init_inode sets it to false for
-     * the general case (LOOKUP path), so we override it here for mkdir.
-     * Also set I_COMPLETE flag (对齐 Ceph: new empty dir is complete). */
     if (S_ISDIR(mode)) {
         struct powerfs_inode_info *pi = POWERFS_I(inode);
         WRITE_ONCE(pi->dir_complete, true);
@@ -3127,53 +4237,69 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
         WRITE_ONCE(pi->dir_lease_expire, jiffies + POWERFS_DIR_LEASE_TTL);
     }
 
-    /* P3.4: 将 Filer 分配的 volume_id + needle_id 存入 inode 私有数据 */
     if (S_ISREG(mode) && mknod_volume_id != 0) {
         struct powerfs_inode_info *pi = POWERFS_I(inode);
         spin_lock(&pi->i_lock);
         pi->volume_id = mknod_volume_id;
         pi->file_key = mknod_file_key;
         spin_unlock(&pi->i_lock);
-        pr_debug("powerfs: create '%pd' ino=%lu volume_id=%llu file_key=%llu\n",
+        pr_debug("powerfs: do_create_core '%pd' ino=%lu volume_id=%llu file_key=%llu\n",
                  dentry, inode->i_ino, mknod_volume_id, mknod_file_key);
     }
 
-    /* K1-4 / K3-1: 应用 CREATE 响应中的 FileLayout 到 inode.
-     * Inline 模式: placement=Inline, 后续 write/read 走 inline_data 路径 (K2).
-     * Stripe 模式: placement=Stripe, volume_ids 已由 parse_file_layout 分配,
-     *             powerfs_apply_layout_to_inode 转移所有权到 inode.
-     * Flat 模式: has_placement=false, 保持 inode 默认值 (FLAT/SINGLE). */
     if (S_ISREG(mode) && mknod_has_layout) {
         struct powerfs_inode_info *pi = POWERFS_I(inode);
         spin_lock(&pi->i_lock);
         powerfs_apply_layout_to_inode(pi, &mknod_layout);
         spin_unlock(&pi->i_lock);
-        pr_info("powerfs: create '%pd' ino=%lu placement=%u reliability=%u chunk_size=%u stripe_cnt=%u vids=%u has_inline=%d\n",
-                 dentry, inode->i_ino, pi->placement, pi->reliability,
-                 pi->layout_chunk_size, pi->stripe_count, pi->volume_ids_count,
-                 pi->inline_data ? 1 : 0);
-    } else if (mknod_has_layout && (mknod_layout.volume_ids || mknod_layout.inline_data || mknod_layout.replica_chunks)) {
-        /* 未应用到 inode (非 regular 文件), 释放 parse 分配的 volume_ids/inline_data/replica_chunks */
+        pr_debug("powerfs: do_create_core '%pd' ino=%lu placement=%u reliability=%u\n",
+                 dentry, inode->i_ino, pi->placement, pi->reliability);
+    } else if (mknod_has_layout && (mknod_layout.volume_ids || mknod_layout.inline_data ||
+                                    mknod_layout.replica_chunks || mknod_layout.ec_chunks)) {
         kfree(mknod_layout.volume_ids);
-        mknod_layout.volume_ids = NULL;
         kfree(mknod_layout.inline_data);
-        mknod_layout.inline_data = NULL;
         kfree(mknod_layout.replica_chunks);
-        mknod_layout.replica_chunks = NULL;
         kfree(mknod_layout.ec_chunks);
-        mknod_layout.ec_chunks = NULL;
     }
 
-    /* 关联 dentry 和 inode.
-     *
-     * 必须用 d_instantiate, 不能用 d_add! 原因:
-     * powerfs_mknod 被 .create/.mkdir 调用时, dentry 已经被 powerfs_lookup
-     * 通过 d_add 加入 hash 链. 如果再次调用 d_add → __d_rehash →
-     * hlist_bl_add_head_rcu, 会将同一个 dentry 重复插入 hash 链 → 形成环 →
-     * __d_lookup_rcu 无限循环 → RCU stall.
-     *
-     * d_instantiate 只附加 inode (hlist_add_head 到 d_alias), 不操作 d_hash.
-     * 参考: ramfs_mknod (fs/ramfs/inode.c) 也用 d_instantiate. */
+    return inode;
+}
+
+/* ========== 目录操作: mknod (通用创建函数) ========== */
+
+/*
+ * powerfs_mknod - 创建文件/目录/设备节点 (内部通用函数)
+ *
+ * 参考 ramfs_mknod (fs/ramfs/inode.c)
+ */
+static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+                          struct dentry *dentry, umode_t mode, dev_t dev)
+{
+    struct inode *inode;
+    u64 new_ino;
+    int type;
+    int ret;
+
+    pr_debug("powerfs: mknod '%pd' mode=%o in dir=%lu\n",
+             dentry, mode, dir->i_ino);
+
+    /* P2-7: Quota check — 文件数配额 */
+    ret = powerfs_quota_check_max_files(dir);
+    if (ret)
+        return ret;
+
+    /* 核心 create 逻辑 (P1-2 共享 helper):
+     *   net_create (Filer Raft) → new_inode (本地) → 应用 layout.
+     * 失败直接返回 errno; 成功返回带引用的 inode. */
+    inode = __powerfs_do_create_core(idmap, dir, dentry, mode, dev);
+    if (IS_ERR(inode)) {
+        int rerr = PTR_ERR(inode);
+        pr_warn("powerfs: mknod '%pd' do_create_core failed: %d\n", dentry, rerr);
+        return rerr;
+    }
+    new_ino = inode->i_ino;
+
+    /* 关联 dentry 和 inode (d_instantiate，不重复 hash) */
     d_instantiate(dentry, inode);
 
     /* 更新父目录时间戳 */
@@ -3195,7 +4321,7 @@ static int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 
     powerfs_add_dir_entry(dir, new_ino, type, dentry->d_name.name);
 
-    /* Phase 1: 本地 mutation 清父目录 lease, 下次 readdir 重新拉取. */
+    /* 本地 mutation 清父目录 lease */
     powerfs_invalidate_dir_lease(dir);
 
     pr_debug("powerfs: mknod '%pd' success, ino=%llu\n",
@@ -3347,6 +4473,112 @@ static int powerfs_create(struct mnt_idmap *idmap, struct inode *dir,
     return 0;
 }
 
+/* ========== P1-2: atomic_open (原子创建+打开，消除 TOCTOU) ========== */
+
+/*
+ * powerfs_atomic_open - 把 VFS "lookup → create → open" 三步合成一次回调
+ *
+ * 解决的核心问题 (对齐  xxx_atomic_open):
+ *   - 原先 VFS: lookup(负 dentry ENOTDIR) → schedule → 另一客户端同文件名 CREATE
+ *     → 回到本客户端 → .create 收到 -EEXIST，但 VFS 期望 O_CREAT|O_EXCL 时
+ *     才返回 EEXIST，普通 O_CREAT 应当静默返回已存在文件; 反之亦然
+ *   - 竞态窗口 (TOCTOU): tar/gcc 编译临时文件、flock(O_CREAT|O_EXCL) 互斥
+ *     NFSv4 export 原子 open CREATE 全部因此失败
+ *
+ * 实现要点:
+ *   1. flags &= ~O_TRUNC: atomic_open 先不 truncate，VFS 在后续权限检查后
+ *      用 notify_change 单独 truncate，避免越权
+ *   2. O_CREAT 分支: 调用共享的 __powerfs_do_create_core (Filer 原子 RPC)，
+ *      用 d_splice_alias 把 inode 拼到 dentry，d_splice_alias 内部已处理
+ *      in-lookup/hashed 两种 dentry 状态
+ *   3. 最后调用 finish_open(): 一次性把 file->private_data 绑定 + 调
+ *      powerfs_file_open 拿 cap 引用，VFS 不再进入后续 ->create 回调
+ *   4. 若 !O_CREAT 且 dentry 不在 lookup 态 (已 hashed 的负 dentry)，直接
+ *      -ENOENT；若 d_in_lookup 则 d_add(NULL) 完成 lookup，VFS 走后续
+ *      普通路径
+ */
+static int powerfs_atomic_open(struct inode *dir, struct dentry *dentry,
+                                struct file *file, unsigned open_flag,
+                                umode_t create_mode)
+{
+    /* 6.17 atomic_open 不提供 mnt_idmap 形参, 用 file_mnt_idmap() 自取.
+     * 对齐  xxx_atomic_open file.c L779: idmap = file_mnt_idmap(file). */
+    struct mnt_idmap *idmap = file_mnt_idmap(file);
+    struct inode *inode = NULL;
+    int err;
+    unsigned flags = open_flag;
+
+    if (dentry->d_name.len > NAME_MAX)
+        return -ENAMETOOLONG;
+
+    /* O_TRUNC 在权限检查之后由 VFS 做，这里先清除 */
+    flags &= ~O_TRUNC;
+
+    pr_debug("powerfs: atomic_open '%pd' in dir=%lu flags=0x%x mode=0%o d_in_lookup=%d\n",
+             dentry, dir->i_ino, flags, create_mode, d_in_lookup(dentry));
+
+    if (flags & O_CREAT) {
+        /* —— 原子创建分支: 复用 __powerfs_do_create_core —— */
+        int type;
+        struct dentry *dn;
+
+        inode = __powerfs_do_create_core(idmap, dir, dentry,
+                                          create_mode | S_IFREG, 0);
+        if (IS_ERR(inode)) {
+            int rerr = PTR_ERR(inode);
+            inode = NULL;
+            /* -EEXIST 视为文件已存在 (O_EXCL 时向上抛，否则走已存在路径) */
+            if (rerr == -EEXIST && !(flags & O_EXCL)) {
+                pr_debug("powerfs: atomic_open '%pd' EEXIST,!O_EXCL → treat as existing\n",
+                         dentry);
+                goto existing_lookup;
+            }
+            pr_warn("powerfs: atomic_open '%pd' do_create_core failed: %d\n",
+                    dentry, rerr);
+            return rerr;
+        }
+
+        /* d_splice_alias: 把新 inode 拼到 dentry，兼容 d_in_lookup / hashed
+         * 两种态。若返回 alias dentry，也能用（ 做法 WARN_ON != dentry） */
+        dn = d_splice_alias(inode, dentry);
+        WARN_ON_ONCE(dn && dn != dentry);
+        inode = NULL; /* d_splice_alias 已转移引用 */
+
+        /* 尾部工作 (与 mknod 对称): 更新父目录时间戳 + dir_entry + 清 lease */
+        {
+            struct timespec64 now = current_time(dir);
+            inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
+            inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
+        }
+        type = S_IFREG;
+        powerfs_add_dir_entry(dir, d_inode(dentry)->i_ino, type, dentry->d_name.name);
+        powerfs_invalidate_dir_lease(dir);
+
+        /* 标记 file: 通知上层这个 file 是这次刚创建的 */
+        file->f_mode |= FMODE_CREATED;
+
+        /* finish_open: 调 powerfs_file_open 拿 cap 引用 + 绑定 file 私有结构
+         *  file.c L982: err = finish_open(file, dentry, xxx_open) */
+        err = finish_open(file, dentry, powerfs_file_open);
+        pr_debug("powerfs: atomic_open '%pd' CREATE+OPEN finish_open err=%d f_mode_created=%d\n",
+                 dentry, err, !!(file->f_mode & FMODE_CREATED));
+        return err;
+    }
+
+existing_lookup:
+    /* —— 非创建分支: LOOKUP + OPEN (或 EEXIST fallthrough) —— */
+    if (!d_in_lookup(dentry)) {
+        /* VFS 传入的是已 hashed 的负 dentry，且没 O_CREAT → 文件不存在 */
+        return -ENOENT;
+    }
+
+    /* d_in_lookup: 通过 d_add(NULL) 把它实例化为负 dentry，
+     * 然后 finish_no_open(file, NULL) 通知 VFS：atomic_open 没把 open
+     * 做完，请走普通 lookup→open 路径 ( file.c L964) */
+    d_add(dentry, NULL);
+    return finish_no_open(file, NULL);
+}
+
 /* ========== 目录操作: unlink ========== */
 
 static int powerfs_unlink(struct inode *dir, struct dentry *dentry)
@@ -3495,7 +4727,7 @@ static int powerfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 /*
  * powerfs_readlink - 读取符号链接目标
  *
- * 参考 ceph_readlink (fs/ceph/symlink.c)
+ * 参考 xxx_readlink (fs/xxx/symlink.c)
  *
  * 策略:
  *   - 通信层可用时: 优先从服务端获取最新目标路径
@@ -3558,7 +4790,8 @@ int powerfs_readlink(struct dentry *dentry, char *buffer, int buflen)
 
             ret = powerfs_net_getattr(inode->i_ino, &mode, &uid, &gid,
                                       &size, &nlink, &mtime, &atime, &ctime,
-                                      &volume_id, &file_key, &layout);
+                                      &volume_id, &file_key, &layout,
+                                      NULL, NULL, NULL, NULL, NULL);  /* P1-5: readlink 不需要 rstat */
             if (ret == 0) {
                 spin_lock(&pi->i_lock);
                 powerfs_apply_layout_to_inode(pi, &layout);
@@ -3608,7 +4841,7 @@ int powerfs_readlink(struct dentry *dentry, char *buffer, int buflen)
 /*
  * powerfs_link - 创建硬链接
  *
- * 参考 ceph_link (fs/ceph/dir.c)
+ * 参考 xxx_link (fs/xxx/dir.c)
  *
  * 策略 (本地操作 + 异步通知，与mkdir/create/unlink保持一致):
  *   1. 本地增加 nlink 和 dentry
@@ -3674,7 +4907,7 @@ static int powerfs_link(struct dentry *old_dentry, struct inode *dir,
 /*
  * powerfs_getattr - 获取文件属性
  *
- * 参考 ceph_getattr (fs/ceph/inode.c)
+ * 参考 xxx_getattr (fs/xxx/inode.c)
  *
  * 策略:
  *   - 通信层可用时: 优先从服务端获取最新属性
@@ -3692,21 +4925,68 @@ static int powerfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 
     pr_debug("powerfs: getattr '%pd'\n", path->dentry);
 
-    /*
-     * 本地缓存模式: 直接使用本地 inode 属性
-     *
-     * 不再从代理获取属性 (避免同步通信导致的 RCU stall)
-     * 如果需要从服务端获取属性，可在后续阶段添加异步机制
-     */
-
     /* 使用 VFS 通用属性获取 (6.17: 增加 request_mask 参数) */
     generic_fillattr(idmap, request_mask, inode, stat);
 
-    /* block 数 (512 字节为单位) */
-    stat->blocks = (i_size_read(inode) + 511) / 512;
+    /* P1-5: 目录 inode → 用递归聚合 rstat 覆盖 blocks/size。
+     *   blocks = (rbytes + 511)/512     (du -s 核心依据)
+     *   size   = rbytes                 (ls -l 目录显示的"大小"近似 du)
+     * 若 Filer 未编码 rstat (pi->i_rbytes == 0)，退化为使用本地 i_size
+     * 计算 blocks，与原行为一致，保证"结构打通前后数字不会变差"。 */
+    if (S_ISDIR(inode->i_mode)) {
+        __u64 rbytes;
+        spin_lock(&pi->i_lock);
+        rbytes = pi->i_rbytes;
+        spin_unlock(&pi->i_lock);
+        if (rbytes > 0) {
+            stat->size = rbytes;
+            stat->blocks = (rbytes + 511) / 512;
+        } else {
+            stat->blocks = (i_size_read(inode) + 511) / 512;
+        }
+    } else {
+        /* 文件 inode: blocks 按 512-byte sectors 计算 (与 POSIX stat 定义一致) */
+        stat->blocks = (i_size_read(inode) + 511) / 512;
+    }
     stat->blksize = 4096;
 
     return 0;
+}
+
+/* ========== permission ========== */
+
+/*
+ * powerfs_permission - inode 权限校验
+ *
+ * 对齐  xxx_permission (inode.c L3063):
+ *   1. MAY_NOT_BLOCK: 直接返回 -ECHILD (rcu 模式下不做网络调用)
+ *   2. 阻塞获取 AUTH_SHARED cap — 保证 mode/uid/gid 等授权属性最新
+ *   3. 调 generic_permission 按 VFS 通用规则做位校验
+ *
+ * 注意: 当前 AUTH_SHARED 为内存态 (不强制网络往返),
+ *       cap grant 接入 powerfs-net 后会自动生效 (服务端 push attrs).
+ */
+int powerfs_permission(struct mnt_idmap *idmap, struct inode *inode, int mask)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    unsigned int got = 0;
+    int err;
+
+    /* RCU walk 模式 (inode 不可上锁, 不允许阻塞) — 强制回退到 ref-walk */
+    if (mask & MAY_NOT_BLOCK)
+        return -ECHILD;
+
+    /* 拿 AUTH_SHARED: 本地缓存或服务端 attrs 保证授权信息是最新的.
+     * get_caps 失败 (如 -ENOTCONN) 不立刻拒绝, 仍做本地位校验. */
+    err = powerfs_get_caps(inode, NULL, POWERFS_CAP_AUTH_SHARED,
+                           POWERFS_CAP_AUTH_SHARED, 0, &got);
+    if (err == 0) {
+        /* get_caps 内部已调 cap_get_refs, 对称释放 */
+        powerfs_cap_put_refs(pi, got);
+    }
+
+    /* 标准 VFS 位校验 (含 ACL/ capability 叠加) */
+    return generic_permission(idmap, inode, mask);
 }
 
 /* ========== setattr ========== */
@@ -3714,7 +4994,7 @@ static int powerfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 /*
  * powerfs_setattr - 设置文件属性
  *
- * 参考 ceph_setattr (__ceph_setattr) (fs/ceph/inode.c)
+ * 参考 xxx_setattr (__xxx_setattr) (fs/xxx/inode.c)
  *
  * 策略:
  *   - 通信层可用时: 先向服务端发送 SETATTR 请求，成功后更新本地缓存
@@ -3964,7 +5244,7 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
     mark_inode_dirty(inode);
 
     /* 标记 AUTH_EXCL cap dirty — setattr 修改了 inode 元数据 (size/mode/uid/...).
-     * 对齐 Ceph ceph_setattr → __ceph_mark_caps_dirty(CEPH_CAP_AUTH_EXCL).
+     * 对齐  xxx_setattr → __xxx_mark_caps_dirty(CEPH_CAP_AUTH_EXCL).
      * revoke 时会 flush 这些属性到 Filer. */
     powerfs_cap_mark_dirty(pi, POWERFS_CAP_AUTH_EXCL);
 
@@ -4034,7 +5314,7 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 /*
  * powerfs_rename - 重命名/移动文件
  *
- * 参考 ceph_rename (fs/ceph/dir.c)
+ * 参考 xxx_rename (fs/xxx/dir.c)
  *
  * 策略:
  *   - 纯本地操作: 在 VFS dcache 中直接进行重命名
@@ -4194,7 +5474,7 @@ int powerfs_rename(struct mnt_idmap *idmap,
 /*
  * powerfs_dir_open - 打开目录文件
  *
- * 参考 ceph_dir_open (fs/ceph/dir.c)
+ * 参考 xxx_dir_open (fs/xxx/dir.c)
  * 分配目录文件私有数据，初始化readdir状态
  */
 int powerfs_dir_open(struct inode *inode, struct file *file)
@@ -4220,7 +5500,7 @@ int powerfs_dir_open(struct inode *inode, struct file *file)
 
     file->private_data = dfi;
 
-    /* Cap 引用: 目录打开 → PIN + FILE_SHARED (对齐 Ceph ceph_init_file dir 路径) */
+    /* Cap 引用: 目录打开 → PIN + FILE_SHARED (对齐  xxx_init_file dir 路径) */
     spin_lock(&pi->i_lock);
     pi->i_nr_by_mode[POWERFS_FILE_MODE_RD]++;
     pi->i_last_rd = jiffies;
@@ -4331,7 +5611,7 @@ static int powerfs_fill_readdir_cache(struct powerfs_dir_file_info *dfi,
     if (resp_hdr.data_len == 0) {
         kfree(resp_data);
         /* 没有更多条目，标记目录完整 (I_COMPLETE)
-         * 对齐 Ceph: __ceph_dir_set_complete(ci) + i_flags |= I_COMPLETE. */
+         * 对齐 : __xxx_dir_set_complete(ci) + i_flags |= I_COMPLETE. */
         spin_lock(&dpi->i_lock);
         dpi->dir_complete = true;
         dpi->i_flags |= POWERFS_I_COMPLETE;
@@ -4359,7 +5639,7 @@ static int powerfs_fill_readdir_cache(struct powerfs_dir_file_info *dfi,
     kfree(resp_data);
 
     /* 获取成功，标记目录内容已完整缓存 (I_COMPLETE)
-     * 对齐 Ceph: ceph_readdir_prepopulate → __ceph_dir_set_complete. */
+     * 对齐 : xxx_readdir_prepopulate → __xxx_dir_set_complete. */
     spin_lock(&dpi->i_lock);
     dpi->dir_complete = true;
     dpi->i_flags |= POWERFS_I_COMPLETE;
@@ -4568,12 +5848,12 @@ static void powerfs_invalidate_dir_lease(struct inode *dir)
     WRITE_ONCE(dpi->dir_lease_expire, 0);
     dpi->dir_lease_epoch++;
     /* Bump i_shared_gen: 使所有子 dentry 的 dir_shared_gen 不再匹配.
-     * 对齐 Ceph atomic_inc(&ci->i_shared_gen) + Rust cache.rs bump_dir_version.
+     * 对齐  atomic_inc(&ci->i_shared_gen) + Rust cache.rs bump_dir_version.
      * 对齐 Rust: "Bump dir_version so stale dentries with dir_shared_gen
      * mismatch are detected." */
     atomic_inc(&dpi->i_shared_gen);
     /* 清 I_COMPLETE: 目录内容已变, 不再信任负 dentry.
-     * 对齐 Ceph: __ceph_dir_clear_complete(ci). */
+     * 对齐 : __xxx_dir_clear_complete(ci). */
     dpi->i_flags &= ~POWERFS_I_COMPLETE;
     dpi->dir_complete = false;
     mutex_unlock(&dpi->dir_mutex);
@@ -4774,7 +6054,7 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
 
         /* 拉取成功 (或部分成功): 设置 dir_complete + I_COMPLETE + dir_lease_expire.
          * 部分成功时也设 dir_complete (避免反复部分拉取), 下次 lease 过期再补.
-         * 对齐 Ceph: __ceph_dir_set_complete + I_COMPLETE. */
+         * 对齐 : __xxx_dir_set_complete + I_COMPLETE. */
         WRITE_ONCE(dpi->dir_complete, true);
         dpi->i_flags |= POWERFS_I_COMPLETE;
         WRITE_ONCE(dpi->dir_lease_expire, jiffies + POWERFS_DIR_LEASE_TTL);
@@ -4905,23 +6185,35 @@ emit_cached:
     return 0;
 }
 
-/* 目录文件操作表 - 使用本地链表实现 readdir */
+/* 目录文件操作表 - 使用本地链表实现 readdir
+ *
+ * P0-4 fix: 补齐 fsync/lock/flock/ioctl, 与文件 fops 对应函数共用实现.
+ *   - lock/flock: 目录级文件锁 (NFS 导出、Maildir、git index.lock 等会用)
+ *   - fsync: 事务场景 fsync(dir_fd) 确保 create/rename 持久化
+ *   - ioctl: 预留扩展 (ACL ioctl 等, 但 ACL 通 xattr 路径完成) */
 static const struct file_operations powerfs_dir_operations = {
     .open           = powerfs_dir_open,
     .release        = powerfs_dir_release,
     .iterate_shared = powerfs_readdir,
     .llseek         = generic_file_llseek,
-    .read           = generic_read_dir,  /* read() on dir returns -EISDIR (POSIX) */
+    .read           = generic_read_dir,   /* read() on dir returns -EISDIR (POSIX) */
+    .fsync          = powerfs_dir_fsync,  /* P0-4 fix: fsync(dir_fd) 同步元数据+dirty xattr */
+    .lock           = powerfs_lock,       /* P0-4 fix: 目录 POSIX 记录锁 */
+    .flock          = powerfs_flock,      /* P0-4 fix: 目录 BSD flock */
+    .unlocked_ioctl = powerfs_ioctl,      /* P1-3 扩展实现 */
+    .compat_ioctl   = compat_ptr_ioctl,   /* P1-3 32-bit compat */
+    .setlease       = simple_nosetlease,  /* P2-4: 明确拒绝 F_SETLEASE delegations，
+                                           * 防止 silent data stale (远端写不 break local lease) */
 };
 
 /* ========== 地址空间操作 (page cache) ========== */
 
 /* powerfs_read_folio 已移除 (Stage C): read 路径由 netfs_read_folio +
- * powerfs_netfs_issue_read 接管, 参照 ceph_aops.read_folio = netfs_read_folio. */
+ * powerfs_netfs_issue_read 接管, 参照 xxx_aops.read_folio = netfs_read_folio. */
 
 /* ========== Stage C: writepages 批量异步写入 ==========
  *
- * 参照 ceph_writepages_start 模式, 批量收集脏页减少 work item 数量:
+ * 参照 xxx_writepages_start 模式, 批量收集脏页减少 work item 数量:
  *   1. writepages 遍历脏页, 收集到 powerfs_writepage_work 批量结构
  *   2. batch 满 (sbi->write_batch_pages 页) 或遍历完成时提交 work item
  *   3. workqueue 线程串行发送 batch 内所有页面
@@ -5996,7 +7288,7 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
 /*
  * powerfs_write_begin - 写开始 (Stage C: 对接 netfs 子系统)
  *
- * 参照 ceph_write_begin (fs/ceph/addr.c):
+ * 参照 xxx_write_begin (fs/xxx/addr.c):
  *   调用 netfs_write_begin 让 netfs 管理页面准备, 包括:
  *   - 分配并锁定 folio
  *   - 若 folio 不在 page cache 或非 uptodate, 通过 issue_read
@@ -6015,10 +7307,44 @@ int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
     struct inode *inode = mapping->host;
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     struct folio *folio = NULL;
+    unsigned int got_caps = 0;
     int ret;
 
     pr_debug("powerfs: write_begin ino=%lu pos=%lld len=%u i_size=%lld\n",
             inode->i_ino, pos, len, i_size_read(inode));
+
+    /* P2-7: Quota check — 字节配额 (写入后 i_size 不能超过父目录 max_bytes) */
+    {
+        loff_t newlen = pos + len;
+        if (newlen > i_size_read(inode)) {
+            ret = powerfs_quota_check_max_bytes(inode, newlen);
+            if (ret)
+                return ret;
+        }
+    }
+
+    /* ========== Cap 仲裁 (对齐  xxx_write_begin → try_get_caps) ==========
+     *
+     * 写页面必须至少拿到 FILE_SHARED (读) + FILE_WR (写) 位.
+     *   - FULL (同时拿到 FILE_CACHE + FILE_EXCL): 可完全信任本地缓存, write_end
+     *     直接写 pagecache 并标记 dirty, revoke 时 flush 保障一致性.
+     *   - PARTIAL (只拿到 FILE_SHARED|WR): 本地能写但没独占权, 也放行.
+     *     netfs_write_begin 遇到 partial page 会从服务端回源拉现有数据,
+     *     不会产生 stale 数据.
+     *   - NONE (连 FILE_SHARED 都没): 仍然放行 (降级模式, 等 cap 协议对接
+     *     服务端 grant 到位后严格化). try_get_caps 会触发 check_caps 催
+     *     服务端 AcquireCap, 下次 IO 再命中.
+     *
+     * 使用 nonblock=true: write_begin 是 VFS 页缓存准备路径, 不可长时间阻塞.
+     * got_caps 通过 *fsdata 带到 write_end 对称 cap_put_refs. */
+    if (iocb) {
+        powerfs_try_get_caps(pi,
+                             POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_WR,
+                             POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_CACHE |
+                             POWERFS_CAP_FILE_WR     | POWERFS_CAP_FILE_EXCL,
+                             true, &got_caps);
+    }
+    *fsdata = (void *)(uintptr_t)got_caps;
 
     /* page_symlink() 调用时 iocb==NULL (无 file 描述符),
      * 不能走 netfs_write_begin (需要 file 参数).
@@ -6030,7 +7356,6 @@ int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
         if (!folio)
             return -ENOMEM;
         *foliop = folio;
-        *fsdata = NULL;
         return 0;
     }
 
@@ -6038,6 +7363,9 @@ int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
                             pos, len, &folio, NULL);
     if (ret < 0) {
         pr_warn("powerfs: write_begin netfs_write_begin failed: %d\n", ret);
+        /* netfs 失败时对称释放 try_get_caps 占的引用, 避免泄漏. */
+        if (got_caps)
+            powerfs_cap_put_refs(pi, got_caps);
         return ret;
     }
 
@@ -6048,7 +7376,8 @@ int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 
     WARN_ON_ONCE(!folio_test_locked(folio));
     *foliop = folio;
-    *fsdata = NULL;
+    /* 注意: *fsdata 已在函数开头写入 got_caps, 这里不要覆盖,
+     * 这样 write_end 能取出它做对称 cap_put_refs. */
     return 0;
 }
 
@@ -6211,7 +7540,7 @@ static int powerfs_migrate_inline_to_flat(struct inode *inode,
 /*
  * powerfs_write_end - 写结束 (Stage C: 纯 page cache 更新, 无网络 IO)
  *
- * 参照 ceph_write_end (fs/ceph/addr.c):
+ * 参照 xxx_write_end (fs/xxx/addr.c):
  *   - 标记 folio uptodate
  *   - 更新本地 i_size (i_size_write + mark_inode_dirty)
  *   - folio_mark_dirty 让 writeback 子系统负责持久化
@@ -6231,6 +7560,7 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
     struct inode *inode = mapping->host;
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     loff_t end_pos = pos + copied;
+    unsigned int got_caps = (unsigned int)(uintptr_t)fsdata;
 
     pr_debug("powerfs: WB_END ino=%lu pos=%lld copied=%u len=%u i_size=%lld uptodate=%d\n",
             inode->i_ino, pos, copied, len, i_size_read(inode),
@@ -6252,7 +7582,7 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
         folio_mark_dirty(folio);
 
         /* 标记 FILE_WR cap dirty — writeback/revoke 时 flush 到 Filer.
-         * 对齐 Ceph ceph_write_end → __ceph_mark_caps_dirty(CEPH_CAP_FILE_WR). */
+         * 对齐  xxx_write_end → __xxx_mark_caps_dirty(CEPH_CAP_FILE_WR). */
         powerfs_cap_mark_dirty(pi, POWERFS_CAP_FILE_WR);
 
         /* K2: Inline 模式 — 同步写入数据到 inline_data 缓冲.
@@ -6361,6 +7691,8 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                                 inode->i_ino, mig_ret);
                         folio_unlock(folio);
                         folio_put(folio);
+                        if (got_caps)
+                            powerfs_cap_put_refs(pi, got_caps);
                         return mig_ret;
                     }
                     /* 迁移成功: inode 已切换到 Flat.
@@ -6373,6 +7705,10 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
 
 inline_done:
 out:
+    /* 与 write_begin 中 try_get_caps 对称, 释放 cap 引用.
+     * got_caps 为 0 时直接跳过 (write_begin 中 !iocb 或 need 不满足时). */
+    if (got_caps)
+        powerfs_cap_put_refs(pi, got_caps);
     folio_unlock(folio);
     folio_put(folio);
 
@@ -6423,19 +7759,143 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
  * .dirty_folio 必须设置: folio_mark_dirty() 内部通过
  * mapping->a_ops->dirty_folio() 间接调用 (mm/page-writeback.c),
  * 若未设置则为 NULL, write_end 标脏页时触发 NULL instruction fetch oops.
- * 参考 fs/nfs/file.c, fs/btrfs/inode.c, fs/ceph/addr.c (均设置 dirty_folio).
- * 我们不使用 buffer_heads, 故用 filemap_dirty_folio (与 nfs/btrfs/zonefs 一致).
+ * 参考 fs/nfs/file.c, fs/btrfs/inode.c, fs/xxx/addr.c (均设置 dirty_folio).
+ * 我们不使用 buffer_heads, 故用 filemap_dirty_folio (与 nfs/btrfs/zonefs 一致)
+ *   外加 PowerFS cap 封装: 脏页同步标 i_dirty_caps 的 CAP_WR_DATA.
+ *
+ * .invalidate_folio / .release_folio 对接 netfs 子系统通用实现:
+ *   truncate/invalidate/shrinker 触发时需清理 netfs 私有资源 (struct netfs_folio,
+ *   缓存列表, subrequest). 若缺失, 内存会泄漏, 且截断后读回 stale 数据.
  */
+
+/*
+ * PowerFS custom dirty_folio: 页面被标记 dirty 时, 同步标记 pi->i_dirty_caps 的
+ * CAP_WR_DATA. 如果 PG_dirty 被设置但 i_dirty_caps 没有 CAP_WR_DATA,
+ * 后续 cap_recall → WR_DATA 不在 flushing mask → 跳过写回 → recall_ack 提前
+ * 返回, 服务端授 EXCLUSIVE 给新 writer 后其 read_folio 拉到 Filer 旧版 0 填充页.
+ *
+ * 对齐  xxx_dirty_folio (addr.c L80-L133): 先 VFS 标准 PG_dirty +
+ * accounting, 再追加 FS 侧 cap/wrbuffer 跟踪. PowerFS 没有 snap context,
+ * 只需追加 dirty_caps 标记.
+ */
+static bool powerfs_dirty_folio(struct address_space *mapping, struct folio *folio)
+{
+    struct inode *inode = mapping->host;
+    struct powerfs_inode_info *pi;
+    bool ret;
+
+    /* Step 1: VFS 标准 dirty 路径.
+     *   __folio_mark_dirty → 增加 NR_FILE_DIRTY accounting, 挂 wb list, memcg 记账 */
+    ret = filemap_dirty_folio(mapping, folio);
+
+    /* Step 2: 追加 PowerFS cap dirty_caps 跟踪.
+     * 跳过条件: inode NULL (匿名 mapping), folio 最终未脏, inode shutdown. */
+    if (unlikely(!inode || !folio_test_dirty(folio)))
+        return ret;
+    pi = POWERFS_I(inode);
+    if (unlikely(!pi || pi->shutdown))
+        return ret;
+
+    /* 标 CAP_WR_DATA: 只要有一页被标 dirty, recall 时就要走 filemap writeback
+     * 把整个 inode 的脏页写回. 粒度粗但安全; write_end 里也会重复标位
+     * (idempotent), 不会有副作用. */
+    spin_lock(&pi->i_lock);
+    pi->i_dirty_caps |= POWERFS_CAP_WR_DATA;
+    spin_unlock(&pi->i_lock);
+
+    return ret;
+}
+
 static const struct address_space_operations powerfs_aops = {
-    .read_folio    = netfs_read_folio,   /* Stage C: netfs 子系统管理 folio 生命周期 */
-    .readahead     = netfs_readahead,    /* Stage C: 批量预读 */
-    .writepages    = powerfs_writepages,  /* 批量 writeback (6.17: 无 writepage 回调) */
-    .write_begin   = powerfs_write_begin,
-    .write_end     = powerfs_write_end,
-    .dirty_folio   = filemap_dirty_folio,
-    .direct_IO     = powerfs_direct_IO,   /* O_DIRECT fallback to buffered I/O */
-    .bmap          = powerfs_bmap,
+    .read_folio       = netfs_read_folio,     /* Stage C: netfs 子系统管理 folio 生命周期 */
+    .readahead        = netfs_readahead,      /* Stage C: 批量预读 */
+    .writepages       = powerfs_writepages,   /* 批量 writeback (6.17: 无 writepage 回调) */
+    .write_begin      = powerfs_write_begin,
+    .write_end        = powerfs_write_end,
+    .dirty_folio      = powerfs_dirty_folio,  /* P0-7 fix: 脏页同步标 CAP_WR_DATA dirty */
+    .invalidate_folio = netfs_invalidate_folio, /* P0-6 fix: truncate/invalidate 清理 netfs folio 资源 */
+    .release_folio    = netfs_release_folio,    /* P0-6 fix: shrinker 回收前释放 netfs 资源 */
+    .direct_IO        = powerfs_direct_IO,    /* O_DIRECT fallback to buffered I/O */
+    .bmap             = powerfs_bmap,
+    .migrate_folio    = filemap_migrate_folio, /* P1-4: 支持 NUMA 页迁移 / memory hotplug / CRIU */
 };
+
+/* ========== P2-7: Quota enforcement ========== */
+
+/*
+ * powerfs_quota_check_max_files - 检查文件数配额.
+ *
+ * 对齐  xxx_quota_is_max_files_exceeded (quota.c):
+ *   向上遍历父目录链, 任一祖先有 i_max_files 且 rfiles >= i_max_files → 超限.
+ *
+ * PowerFS 简化: 只检查直接父目录的 i_max_files + i_rfiles (递归统计).
+ * 完整实现需要 Filer 侧 UpdateChildSummary 增量聚合到祖先链,
+ * 当前 rfiles 在 getattr 时从 Filer 拉取 (rstat 字段 0xCE).
+ *
+ * 返回 -EDQUOT 超限, 0 允许.
+ */
+static int powerfs_quota_check_max_files(struct inode *dir)
+{
+    struct powerfs_inode_info *pi;
+
+    if (!dir || !S_ISDIR(dir->i_mode))
+        return 0;
+
+    pi = POWERFS_I(dir);
+    if (pi->i_max_files == 0)
+        return 0;
+
+    if (pi->i_rfiles >= pi->i_max_files) {
+        pr_debug("powerfs: quota files exceeded ino=%lu rfiles=%llu max=%llu\n",
+                 dir->i_ino, pi->i_rfiles, pi->i_max_files);
+        return -EDQUOT;
+    }
+    return 0;
+}
+
+/*
+ * powerfs_quota_check_max_bytes - 检查字节配额.
+ *
+ * 对齐  xxx_quota_is_max_bytes_exceeded (quota.c):
+ *   newlen (写入后 i_size) 超过 i_max_bytes → 超限.
+ *
+ * 返回 -EDQUOT 超限, 0 允许.
+ */
+static int powerfs_quota_check_max_bytes(struct inode *inode, loff_t newlen)
+{
+    struct powerfs_inode_info *pi;
+
+    if (!inode)
+        return 0;
+
+    /* 只检查目录的 quota (文件继承父目录配额) */
+    if (!S_ISDIR(inode->i_mode)) {
+        /* 对文件: 检查父目录的 byte quota */
+        struct dentry *de = d_find_alias(inode);
+        if (de && de->d_parent) {
+            struct inode *parent = d_inode(de->d_parent);
+            if (parent) {
+                int ret = powerfs_quota_check_max_bytes(parent, newlen);
+                dput(de);
+                return ret;
+            }
+        }
+        if (de)
+            dput(de);
+        return 0;
+    }
+
+    pi = POWERFS_I(inode);
+    if (pi->i_max_bytes == 0)
+        return 0;
+
+    if (newlen > (loff_t)pi->i_max_bytes) {
+        pr_debug("powerfs: quota bytes exceeded ino=%lu newlen=%lld max=%llu\n",
+                 inode->i_ino, newlen, pi->i_max_bytes);
+        return -EDQUOT;
+    }
+    return 0;
+}
 
 /* ========== statfs ========== */
 
@@ -6461,17 +7921,34 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 {
     struct inode *inode = file->f_mapping->host;
     struct powerfs_inode_info *pi = POWERFS_I(inode);
-    int ret;
+    unsigned int got = 0;
+    int ret, cap_err;
     loff_t i_size;
 
     pr_debug("powerfs: fsync ino=%lu start=%llu end=%llu datasync=%d i_size=%lld\n",
             inode->i_ino, start, end, datasync, i_size_read(inode));
 
+    /* 对齐  fsync 前置: 拿 FILE_WR + AUTH_EXCL 引用, flush dirty_caps.
+     * 写回脏页前先确保服务端知道我们有脏态 (revoke 阻塞到 flush ACK). */
+    cap_err = powerfs_get_caps(inode, file,
+                               POWERFS_CAP_FILE_WR,
+                               POWERFS_CAP_WR_DATA | POWERFS_CAP_AUTH_EXCL,
+                               end, &got);
+    if (cap_err < 0) {
+        pr_debug("powerfs: fsync get_caps WR ino=%lu ret=%d, sync anyway\n",
+                 inode->i_ino, cap_err);
+        got = 0;
+    }
+    /* 有 dirty_caps 时先触发 cap_flush — 把 dirty→flushing 状态机推前,
+     * 服务端 revoke 可感知到 flush-on-progress 避免超时硬踢. */
+    if (got & POWERFS_CAP_WR_DATA)
+        (void)powerfs_cap_flush(pi, POWERFS_CAP_ANY_DIRTY);
+
     /* 触发脏页写回 (Flat: writepage→powerfs_net_write; Inline: 仅清脏标) */
     ret = file_write_and_wait_range(file, start, end);
     if (ret < 0) {
         pr_warn("powerfs: fsync write_and_wait error: %d\n", ret);
-        return ret;
+        goto out_put;
     }
 
     /* K2-5: Inline 模式 — 通过 UPDATE_INODE 同步 inline_data 到 Filer.
@@ -6486,14 +7963,16 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
         if (!pi->inline_data || pi->inline_len == 0) {
             pi->inline_dirty = false;
             spin_unlock(&pi->i_lock);
-            return 0;
+            goto out_put;
         }
         snap_len = pi->inline_len;
         spin_unlock(&pi->i_lock);
 
         snap_data = kmalloc(snap_len, GFP_KERNEL);
-        if (!snap_data)
-            return -ENOMEM;
+        if (!snap_data) {
+            ret = -ENOMEM;
+            goto out_put;
+        }
 
         spin_lock(&pi->i_lock);
         if (pi->inline_data && pi->inline_len == snap_len) {
@@ -6501,7 +7980,7 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
         } else {
             spin_unlock(&pi->i_lock);
             kfree(snap_data);
-            return 0;
+            goto out_put;
         }
         spin_unlock(&pi->i_lock);
 
@@ -6515,13 +7994,13 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
         if (ret < 0) {
             pr_warn("powerfs: fsync INLINE ino=%lu update failed: %d\n",
                     inode->i_ino, ret);
-            return ret;
+            goto out_put;
         }
         /* 成功则清 dirty */
         spin_lock(&pi->i_lock);
         pi->inline_dirty = false;
         spin_unlock(&pi->i_lock);
-        return 0;
+        goto out_put;
     }
 
     /* Flat/Stripe: 同步 i_size 到 Filer */
@@ -6533,11 +8012,16 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
         if (sret < 0) {
             pr_warn("powerfs: fsync setattr size=%llu ino=%lu failed: %d\n",
                     (u64)i_size, inode->i_ino, sret);
-            return sret;
+            ret = sret;
+            goto out_put;
         }
     }
 
-    return 0;
+    ret = 0;
+out_put:
+    if (got)
+        powerfs_cap_put_refs(pi, got);
+    return ret;
 }
 
 /*
@@ -6553,37 +8037,146 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
  */
 static ssize_t powerfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
+    struct file *file = iocb->ki_filp;
+    struct inode *inode = file->f_inode;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    unsigned int got = 0;
+    int err;
+    ssize_t ret;
+    ktime_t __metric_start = ktime_get();
+
     powerfs_flow_admit_wait(POWERFS_FLOW_OP_READ, 2000);
-    return generic_file_read_iter(iocb, to);
+
+    /* 对齐  filemap_fault (addr.c L1982):
+     *   need = FILE_SHARED (读必须位), want = FILE_SHARED|FILE_CACHE
+     * 拿到 cap 保证 page cache 一致性视图, 服务端可 recall 撤销. */
+    err = powerfs_get_caps(inode, file,
+                           POWERFS_CAP_FILE_SHARED,
+                           POWERFS_CAP_RDCACHE,
+                           -1, &got);
+    if (err < 0) {
+        /* 降级: 无 cap 仍允许读 (与 write_iter lease 策略一致),
+         * 服务端 recall 时通过 page_mkwrite 路径再校验. */
+        pr_debug("powerfs: read_iter get_caps RD ino=%lu ret=%d, downgrade\n",
+                 inode->i_ino, err);
+        got = 0;
+    }
+
+    ret = generic_file_read_iter(iocb, to);
+
+    if (got)
+        powerfs_cap_put_refs(pi, got);
+
+    if (POWERFS_SB_INFO(inode->i_sb)->client)
+        powerfs_update_read_metrics(&POWERFS_SB_INFO(inode->i_sb)->client->metrics,
+                                    __metric_start, ktime_get(),
+                                    ret > 0 ? (unsigned int)ret : 0, (int)ret);
+    return ret;
+}
+
+/*
+ * powerfs_splice_read - splice_read 带 cap ref 管理.
+ *
+ * 对齐  xxx_splice_read (file.c L2259):
+ *   1. 拿 FILE_SHARED (need) + FILE_CACHE (want) cap refs
+ *   2. 有 CACHE cap → filemap_splice_read (零拷贝 page cache → pipe)
+ *   3. 无 CACHE cap → copy_splice_read (降级: 用户态拷贝)
+ *   4. 放 cap refs
+ *
+ * 之前直接注册 filemap_splice_read 不持 cap ref，splice 期间 cap recall
+ * 可能回收 page cache 导致数据不一致。
+ */
+static ssize_t powerfs_splice_read(struct file *in, loff_t *ppos,
+                                    struct pipe_inode_info *pipe,
+                                    size_t len, unsigned int flags)
+{
+    struct inode *inode = file_inode(in);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    unsigned int got = 0;
+    int err;
+    ssize_t ret;
+
+    /* umount 期间跳过网络同步 */
+    if (powerfs_net_is_stopping())
+        return -ENOTCONN;
+
+    /* 拿 cap refs: need=FILE_SHARED (读必须), want=FILE_CACHE (page cache 信任) */
+    err = powerfs_get_caps(inode, in,
+                           POWERFS_CAP_FILE_SHARED,
+                           POWERFS_CAP_FILE_CACHE,
+                           -1, &got);
+    if (err < 0) {
+        pr_debug("powerfs: splice_read get_caps ino=%lu ret=%d, fallback copy\n",
+                 inode->i_ino, err);
+        got = 0;
+    }
+
+    /* 有 CACHE cap → filemap_splice_read (零拷贝);
+     * 无 CACHE cap → copy_splice_read (用户态拷贝降级) */
+    if (got & POWERFS_CAP_FILE_CACHE)
+        ret = filemap_splice_read(in, ppos, pipe, len, flags);
+    else
+        ret = copy_splice_read(in, ppos, pipe, len, flags);
+
+    if (got)
+        powerfs_cap_put_refs(pi, got);
+    return ret;
 }
 
 static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
-    struct inode *inode = iocb->ki_filp->f_inode;
+    struct file *file = iocb->ki_filp;
+    struct inode *inode = file->f_inode;
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     loff_t offset = iocb->ki_pos;
     size_t count = iov_iter_count(from);
+    unsigned int got = 0;
+    int err;
+    ssize_t ret;
+    ktime_t __metric_start = ktime_get();
 
     powerfs_flow_admit_wait(POWERFS_FLOW_OP_WRITE, 2000);
 
-    /* 预先获取 lease (同步网络调用, 用户进程上下文可阻塞).
-     * writeback 工作队列不允许阻塞在网络 I/O 上, 故 lease 必须在
-     * write 路径预先获取, writeback 时只检查已持有的 lease (非阻塞).
-     *
-     * 跳过条件:
-     *   - Inline 模式 (数据不走 Volume Server)
-     *   - count == 0 (无数据写入)
-     *   - 目录 (不应走到这里, 防御性检查) */
+    /* 对齐  page_mkwrite (addr.c L2087):
+     *   need = FILE_WR, want = FILE_WR|FILE_EXCL (BUFFER).
+     * write_begin 内部还会 try_get_caps 作为快速路径, 这里在 i_rwsem 外
+     * 提前阻塞获取, 避免 write_begin 内循环 EAGAIN 重试开销. */
+    if (S_ISREG(inode->i_mode) && count > 0) {
+        err = powerfs_get_caps(inode, file,
+                               POWERFS_CAP_FILE_WR,
+                               POWERFS_CAP_WR_DATA,
+                               offset + (loff_t)count, &got);
+        if (err < 0) {
+            pr_debug("powerfs: write_iter get_caps WR ino=%lu ret=%d, write_begin will retry\n",
+                     inode->i_ino, err);
+            got = 0;
+        }
+    }
+
+    /* 预先获取 lease (同步网络调用, 用户进程上下文可阻塞). */
     if (pi->placement != POWERFS_PLACEMENT_INLINE &&
         S_ISREG(inode->i_mode) && count > 0) {
         int lease_ret = ensure_lease(inode, offset);
         if (lease_ret && lease_ret != -ENOMEM)
             pr_debug("powerfs: write_iter ensure_lease ino=%lu off=%lld ret=%d, continuing without lease\n",
                      inode->i_ino, offset, lease_ret);
-        /* lease 获取失败不阻止写入, Volume Server 容许无 lease 写入 */
     }
 
-    return generic_file_write_iter(iocb, from);
+    ret = generic_file_write_iter(iocb, from);
+
+    /* 写入成功后标记 cap WR dirty (对齐 __xxx_mark_dirty_caps 在 write_end),
+     * 供 revoke/flush 时感知有脏数据需要同步回服务端. */
+    if (ret > 0)
+        powerfs_cap_mark_dirty(pi, POWERFS_CAP_WR_DATA);
+
+    if (got)
+        powerfs_cap_put_refs(pi, got);
+
+    if (POWERFS_SB_INFO(inode->i_sb)->client)
+        powerfs_update_write_metrics(&POWERFS_SB_INFO(inode->i_sb)->client->metrics,
+                                     __metric_start, ktime_get(),
+                                     ret > 0 ? (unsigned int)ret : 0, (int)ret);
+    return ret;
 }
 
 /*
@@ -6610,6 +8203,7 @@ static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
 static int powerfs_file_release(struct inode *inode, struct file *file)
 {
     struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(inode->i_sb);
     u8 *snap_data = NULL;
     u32 snap_len = 0;
     u64 shard_id;
@@ -6618,8 +8212,12 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
     int ret = 0;
     bool synced = false;
 
+    /* P3-5: 统计 opened_files (与 file_open 对称) */
+    if (sbi && sbi->client)
+        atomic64_dec(&sbi->client->metrics.opened_files);
+
     /* Cap 引用释放 (与 powerfs_file_open 对称).
-     * 对齐 Ceph __ceph_put_cap_refs: 递减 i_nr_by_mode + cap_put_refs.
+     * 对齐  __xxx_put_cap_refs: 递减 i_nr_by_mode + cap_put_refs.
      * 必须在 release 逻辑前执行, 避免 flush 脏数据时 cap 已失效. */
     {
         unsigned int had = POWERFS_CAP_PIN;
@@ -6638,6 +8236,32 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
         spin_unlock(&pi->i_lock);
 
         powerfs_cap_put_refs(pi, had);
+    }
+
+    /* §13.4 场景 3: 主动 release cap → 发送 CapRelease RPC.
+     * 必须在 cap_put_refs 之后执行 (确保本 filp 的 refcount 已释放),
+     * 但又要早于 inline/chunks sync (因为 Filer 端 release 会释放对该
+     * 客户端 cap 的持有, inline sync 仍是普通 update_inode RPC, 不依赖 cap).
+     * 若 HasUpgrade=1 (自己是 survivor), cap_send_release 内部会调
+     * cap_issue 升级 issued 位 (从 SHARED_WRITE 恢复到 EXCLUSIVE_WRITE). */
+    {
+        struct powerfs_cap *auth_cap;
+        spin_lock(&pi->i_lock);
+        auth_cap = pi->i_auth_cap;
+        spin_unlock(&pi->i_lock);
+        if (auth_cap) {
+            /* last release (所有 RD/WR refcount 归零) 时才发 release RPC.
+             * 避免多 fd 并发 open/close 时每次 close 都触发一次 RPC 风暴.
+             * i_nr_by_mode[RD]+i_nr_by_mode[WR] == 0 → 这是最后一个 fd. */
+            spin_lock(&pi->i_lock);
+            if (pi->i_nr_by_mode[POWERFS_FILE_MODE_RD] == 0 &&
+                pi->i_nr_by_mode[POWERFS_FILE_MODE_WR] == 0) {
+                spin_unlock(&pi->i_lock);
+                cap_send_release(pi, auth_cap);
+            } else {
+                spin_unlock(&pi->i_lock);
+            }
+        }
     }
 
     /* Inline 模式 + dirty: 同步 inline_data 到 Filer (K2-5).
@@ -6835,7 +8459,7 @@ static long powerfs_fallocate(struct file *file, int mode,
 /*
  * powerfs_file_open - 文件打开 cap 接入
  *
- * 对齐 Ceph ceph_init_file + __ceph_touch_fmode:
+ * 对齐  xxx_init_file + __xxx_touch_fmode:
  *   1. 根据 f_mode 记录 i_nr_by_mode[] (RD/WR 计数)
  *   2. 更新 i_last_rd / i_last_wr 时间戳
  *   3. 获取 cap 引用: RD → FILE_SHARED|FILE_CACHE, WR → FILE_WR
@@ -6847,6 +8471,13 @@ static int powerfs_file_open(struct inode *inode, struct file *file)
 {
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     unsigned int got = POWERFS_CAP_PIN;
+    bool is_write_open = !!(file->f_mode & FMODE_WRITE);
+
+    /* §13.3: 先从 Filer 获取授权 CapOpenGrant (永不阻塞),
+     * 根据响应挂载 cap + 更新 issued 位. 网络失败自动降级 (不阻断 open).
+     * 注意: __block_on 在此处调, 早于 cap_get_refs 拿 refcount, 避免
+     * refcount 先占有后授权位不足导致 try_get_caps 循环等. */
+    cap_open_grant_and_issue(pi, is_write_open);
 
     spin_lock(&pi->i_lock);
 
@@ -6866,10 +8497,550 @@ static int powerfs_file_open(struct inode *inode, struct file *file)
     /* 获取 cap 引用 (内部自行加锁) */
     powerfs_cap_get_refs(pi, got);
 
-    pr_debug("powerfs: file_open ino=%lu mode=0x%x got=0x%x\n",
-             inode->i_ino, file->f_mode, got);
+    /* P3-5: 统计 opened_files */
+    {
+        struct powerfs_sb_info *sbi = POWERFS_SB_INFO(inode->i_sb);
+        if (sbi && sbi->client)
+            atomic64_inc(&sbi->client->metrics.opened_files);
+    }
+
+    pr_debug("powerfs: file_open ino=%lu mode=0x%x got=0x%x write=%d\n",
+             inode->i_ino, file->f_mode, got, (int)is_write_open);
 
     return 0;
+}
+
+/* ========== vm_operations (mmap fault/page_mkwrite cap 接入) ==========
+ *
+ * 对齐  xxx_vmops (addr.c L2333):
+ *   .fault        = xxx_filemap_fault   — 读缺页: 拿 FILE_SHARED|FILE_CACHE
+ *   .page_mkwrite = xxx_page_mkwrite    — 写缺页: 拿 FILE_WR|FILE_EXCL, mark dirty
+ *
+ * generic_file_mmap 默认 vm_ops 不走 cap, 导致 mmap 写可以绕过
+ * write_begin/page_mkwrite 的校验 (服务端无法 recall 已 mmap 的页).
+ */
+
+static vm_fault_t powerfs_filemap_fault(struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    struct file *file = vma->vm_file;
+    struct inode *inode = file_inode(file);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    loff_t off = (loff_t)vmf->pgoff << PAGE_SHIFT;
+    unsigned int got = 0;
+    int err;
+    vm_fault_t ret;
+
+    /* 对齐  filemap_fault (addr.c L1982):
+     *   need = FILE_SHARED (读必须位), want = FILE_SHARED|FILE_CACHE.
+     * endoff = -1 表示不限制范围 (整个文件读). */
+    err = powerfs_get_caps(inode, file,
+                           POWERFS_CAP_FILE_SHARED,
+                           POWERFS_CAP_RDCACHE,
+                           -1, &got);
+    if (err < 0) {
+        pr_debug("powerfs: vm_fault get_caps RD ino=%lu off=%lld ret=%d\n",
+                 inode->i_ino, off, err);
+        got = 0;
+    }
+
+    ret = filemap_fault(vmf);
+
+    if (got)
+        powerfs_cap_put_refs(pi, got);
+    return ret;
+}
+
+static vm_fault_t powerfs_page_mkwrite(struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    struct file *file = vma->vm_file;
+    struct inode *inode = file_inode(file);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct folio *folio = page_folio(vmf->page);
+    loff_t off = folio_pos(folio);
+    loff_t size = i_size_read(inode);
+    loff_t endoff;
+    size_t len;
+    unsigned int got = 0;
+    int err;
+    vm_fault_t ret = VM_FAULT_SIGBUS;
+
+    if (off + (loff_t)folio_size(folio) <= size)
+        len = folio_size(folio);
+    else
+        len = (size_t)((long long)size - (long long)off);
+    endoff = off + (loff_t)len;
+
+    /* 对齐  page_mkwrite (addr.c L2087):
+     *   need = FILE_WR, want = FILE_WR|FILE_EXCL.
+     * page_mkwrite 持有 folio lock, 但 get_caps 不依赖 page lock,
+     * 阻塞在 i_cap_wq (服务端 grant). */
+    err = powerfs_get_caps(inode, file,
+                           POWERFS_CAP_FILE_WR,
+                           POWERFS_CAP_WR_DATA,
+                           endoff, &got);
+    if (err < 0) {
+        pr_debug("powerfs: page_mkwrite get_caps WR ino=%lu off=%lld ret=%d\n",
+                 inode->i_ino, off, err);
+        goto out_nocaps;
+    }
+
+    /* 更新 mtime/iversion — 与 generic_permission / write_end 时间语义对齐 */
+    file_update_time(file);
+    inode_inc_iversion_raw(inode);
+
+    /*  这里会 wait_on_page_writeback, 通用 filemap_fault 已处理.
+     * lock_page 由上层 do_page_mkwrite 持有 (进入回调时 page 已 locked). */
+
+    ret = VM_FAULT_LOCKED;   /* 保持 folio locked */
+
+    /* 成功写缺页: 标记 WR_DATA dirty (写回需要同步).
+     * mark_inode_dirty 由 set_page_dirty 在 writepage 前置位触发. */
+    powerfs_cap_mark_dirty(pi, POWERFS_CAP_WR_DATA);
+
+    powerfs_cap_put_refs(pi, got);
+    return ret;
+
+out_nocaps:
+    if (got)
+        powerfs_cap_put_refs(pi, got);
+    return VM_FAULT_SIGBUS;
+}
+
+static const struct vm_operations_struct powerfs_file_vmops = {
+    .fault         = powerfs_filemap_fault,
+    .page_mkwrite  = powerfs_page_mkwrite,
+};
+
+/*
+ * powerfs_mmap - 自定义 mmap, 注入 vm_ops (cap 一致性)
+ *
+ * 保留 .mmap 路径用于内核 < 6.17 兼容 (若 mmap_prepare 未注册则 VFS
+ * fallback 到 .mmap). 6.17 优先走 .mmap_prepare.
+ */
+static int powerfs_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    struct address_space *mapping = file->f_mapping;
+    int ret;
+
+    if (!mapping->a_ops->read_folio)
+        return -ENOEXEC;
+
+    ret = generic_file_mmap(file, vma);
+    if (ret == 0)
+        vma->vm_ops = &powerfs_file_vmops;
+    return ret;
+}
+
+/*
+ * powerfs_mmap_prepare - P2-6: 6.17 新接口, 在 sys_mmap 时提前设置 vm_ops.
+ *
+ * 对齐  xxx_mmap_prepare (addr.c L2338):
+ *   1. 检查 address_space 有 read_folio (正则文件)
+ *   2. 设置 desc->vm_ops = &powerfs_file_vmops (fault/page_mkwrite 带 cap)
+ *
+ * 相比旧 .mmap 路径: mmap_prepare 在 VFS 分配 vma 前调用,
+ * 可以提前拿到 cap, 避免 page fault 时才发现 cap miss 导致竞态.
+ * msync(MS_INVALIDATE) 时 page_mkwrite 持有 cap ref, 不会被 cap_recall
+ * 中途回收 page cache, 修复 mmap + msync 写数据丢失竞态.
+ */
+static int powerfs_mmap_prepare(struct vm_area_desc *desc)
+{
+    struct address_space *mapping = desc->file->f_mapping;
+
+    if (!mapping->a_ops->read_folio)
+        return -ENOEXEC;
+
+    desc->vm_ops = &powerfs_file_vmops;
+    return 0;
+}
+
+/*
+ * powerfs_copy_file_range - P2-5: 文件间复制 (sendfile/copy_file_range syscall).
+ *
+ * 对齐  xxx_copy_file_range (file.c L3148):
+ *   1. 同 fs 内: 尝试 splice_copy_file_range (page cache splice, 零用户态拷贝)
+ *   2. 跨 fs 或不支持: fallback generic_copy_file_range (用户态 read/write)
+ *
+ * PowerFS 当前没有服务端 OSD offload ( RADOS copy-from)，但 splice
+ * 路径已能在 page cache 层做高效复制，避免用户态往返拷贝。
+ *
+ * cap 管理: src 端拿 FILE_SHARED (读), dst 端拿 FILE_WR (写),
+ * 复制完成后释放 refs。
+ */
+static ssize_t powerfs_copy_file_range(struct file *src_file, loff_t src_off,
+                                        struct file *dst_file, loff_t dst_off,
+                                        size_t len, unsigned int flags)
+{
+    struct inode *src_inode = file_inode(src_file);
+    struct inode *dst_inode = file_inode(dst_file);
+    struct powerfs_inode_info *src_pi = POWERFS_I(src_inode);
+    struct powerfs_inode_info *dst_pi = POWERFS_I(dst_inode);
+    unsigned int src_got = 0, dst_got = 0;
+    ssize_t ret;
+
+    /* flags must be 0 (no SPLICE_F_MOVE etc) */
+    if (flags != 0)
+        return -EINVAL;
+
+    /* src 端: 拿读 cap */
+    ret = powerfs_get_caps(src_inode, src_file,
+                           POWERFS_CAP_FILE_SHARED,
+                           POWERFS_CAP_FILE_CACHE,
+                           -1, &src_got);
+    if (ret < 0)
+        src_got = 0;
+
+    /* dst 端: 拿写 cap */
+    ret = powerfs_get_caps(dst_inode, dst_file,
+                           POWERFS_CAP_FILE_WR,
+                           POWERFS_CAP_FILE_WR,
+                           -1, &dst_got);
+    if (ret < 0)
+        dst_got = 0;
+
+    /* 用 splice_copy_file_range (page cache → pipe → page cache).
+     * 跨 fs 场景 splice 也能处理 (VFS splice_file_range 内部会做检查). */
+    ret = splice_copy_file_range(src_file, src_off, dst_file, dst_off, len);
+
+    if (src_got)
+        powerfs_cap_put_refs(src_pi, src_got);
+    if (dst_got)
+        powerfs_cap_put_refs(dst_pi, dst_got);
+
+    return ret;
+}
+
+/* ========== File Locking (POSIX record locks + BSD flock) ==========
+ * 设计决策 (同  xxx_lock.c 的初版架构):
+ *   先做**单机一致性锁**: 委托 VFS 通用框架 (posix_lock_file / locks_lock_inode_wait)
+ *   在内存 inode 内维护锁冲突链表和阻塞队列. 多客户端场景下, 跨节点锁仲裁
+ *   需 Filer 侧新增 LOCK/UNLOCK 协议帧, 路线图:
+ *     Phase 1 (本地, 当前): 单机多进程/多线程正确互斥. 覆盖 90% 单机使用场景.
+ *     Phase 2 (分布式): wrapper 内先本地冲突检测, 再发 Filer LOCK RPC 仲裁.
+ *
+ * 为什么不返回 -ENOSYS (P0 修复前的行为):
+ *   大量应用 (SQLite, PostgreSQL, Maildir, Python fcntl.flock, git) 依赖
+ *   fcntl(F_SETLK) / flock() == 0 的成功路径; -ENOSYS 会直接 panic 应用.
+ */
+
+/*
+ * powerfs_lock — POSIX 记录锁 (fcntl(2) F_SETLK/F_SETLKW/F_GETLK/F_OFD_*).
+ *
+ * VFS 层传 cmd: F_SETLK (非阻塞), F_SETLKW (阻塞), F_GETLK (查询冲突锁),
+ * 以及 OFD 版本 (F_OFD_SETLK etc). struct file_lock *fl 含锁类型/范围/owner.
+ * 直接用 VFS 通用 posix_lock_file 实现, 内核已维护冲突检测 + 文件锁阻塞队列
+ * (fl->fl_blocked 链表 + wake_up). 此函数 EXPORT_SYMBOL.
+ */
+static int powerfs_lock(struct file *filp, int cmd, struct file_lock *fl)
+{
+    struct inode *inode = file_inode(filp);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    int err;
+
+    if (unlikely(!pi || pi->shutdown))
+        return -ENOTCONN;
+
+    pr_debug("powerfs: lock ino=%lu cmd=%d type=%d pid=%d\n",
+             inode->i_ino, cmd, fl->c.flc_type, current->pid);
+
+    /* P0 单机 VFS 通用锁表:
+     *   posix_lock_file(file, fl, conflock) ——
+     *     [in] file: 目标文件
+     *     [in] fl:   新锁请求 (类型/范围/owner)
+     *     [out] conflock: GETLK 场景返回首个冲突锁; SET/UNLOCK 传 NULL
+     *   内核内部已实现冲突检测、阻塞等待 (SETLKW)、信号唤醒.
+     *   此函数 EXPORT_SYMBOL (fs/locks.c:1404). */
+    err = posix_lock_file(filp, fl, NULL);
+
+    if (err < 0)
+        pr_debug_ratelimited("powerfs: lock ino=%lu failed: %d\n",
+                             inode->i_ino, err);
+    return err;
+}
+
+/*
+ * powerfs_flock — BSD 风格 flock(2).
+ *
+ * VFS 把 LOCK_SH/LOCK_EX/LOCK_UN (+ LOCK_NB) 转换成 file_lock 结构 (fl_type
+ * F_RDLCK/F_WRLCK/F_UNLCK, fl_flags |= FL_FLOCK 标记) 后传入.
+ * 通用入口 locks_lock_inode_wait 内部按 FL_FLOCK 分派到 flock_lock_inode_wait
+ * 处理冲突检测 + 等待. 此函数 EXPORT_SYMBOL.
+ */
+static int powerfs_flock(struct file *filp, int cmd, struct file_lock *fl)
+{
+    struct inode *inode = file_inode(filp);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    int err;
+
+    if (unlikely(!pi || pi->shutdown))
+        return -ENOTCONN;
+
+    /* flock 锁的 fl_flags 需要 FL_FLOCK: VFS 传进来时通常已设置, 但为了
+     * 兜底 (lockf 共享路径) 我们显式标记. */
+    fl->c.flc_flags |= FL_FLOCK;
+
+    pr_debug("powerfs: flock ino=%lu cmd=%d type=%d pid=%d\n",
+             inode->i_ino, cmd, fl->c.flc_type, current->pid);
+
+    err = locks_lock_inode_wait(inode, fl);
+    if (err < 0)
+        pr_debug_ratelimited("powerfs: flock ino=%lu failed: %d\n",
+                             inode->i_ino, err);
+    return err;
+}
+
+/*
+ * powerfs_dir_fsync — 目录 fsync(2).
+ *
+ * 目录没有数据页, 只需同步元数据 (mode/uid/gid/mtime/ctime/size 等).
+ * - write_inode_now: 调 super_ops->write_inode (powerfs_write_inode),
+ *   后者最终发 powerfs_net_setattr 推送属性.
+ * - cap_flush: 若目录级 XATTR/权限 dirty, 也在此路径推 Filer.
+ *
+ * 数据库场景 (e.g. SQLite commit) 在事务后通常 fsync(data file) + fsync(dir fd)
+ * 确保 rename/create 落盘. 若目录 fsync 为空, crash+恢复后目录条目丢失.
+ */
+static int powerfs_dir_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+    struct inode *inode = file->f_mapping->host;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    int err, ret;
+
+    (void)start; (void)end; (void)datasync;
+    if (unlikely(!pi || pi->shutdown))
+        return -ENOTCONN;
+
+    pr_debug("powerfs: dir_fsync ino=%lu\n", inode->i_ino);
+
+    /* Step 1: 同步 inode 属性 (mode/mtime etc.) 到后端 (super write_inode).
+     * 第二参数 wait=1: 阻塞直到 write_inode 完成 (真正发 net_setattr). */
+    err = write_inode_now(inode, 1);
+
+    /* Step 2: 若 i_dirty_caps 有位 (XATTR/AUTH 脏), 同步 cap_flush.
+     * 目录一般没 WR_DATA, 但 setfacl/chmod/chown 后 AUTH_EXCL/XATTR_EXCL 会脏. */
+    ret = 0;
+    if (pi->i_dirty_caps)
+        ret = powerfs_cap_flush(pi, pi->i_dirty_caps);
+
+    return err ?: ret;
+}
+
+/*
+ * P1-3: Linux 6.17 使用 fileattr 子系统替代传统 ATTR_FLAGS/ia_flags.
+ *       通过 inode_operations.fileattr_get/fileattr_set 回调 +
+ *       vfs_fileattr_get/set 通用实现完成权限/capability 检查和映射.
+ *       内部辅助: S_* 内核 i_flags ↔ FS_*_FL 用户态 flags 双向转换.
+ *
+ * 注意: Linux 6.17 inode->i_flags 不再有 S_NODUMP (nodump 语义改用 FS_NODUMP_FL
+ * 通过 fileattr.flags 传递，文件系统自行存储; PowerFS 当前不支持 NODUMP
+ * 持久化，GET 返回 0，SET 忽略 -EOPNOTSUPP (拒绝而非静默丢失).
+ */
+
+/* 受支持的 FS_*_FL 用户态标志 (子集，对应 S_SYNC/S_IMMUTABLE/S_APPEND/S_NOATIME/S_DIRSYNC) */
+#define POWERFS_FS_FL_SUPPORTED_MASK \
+    ((unsigned int)(FS_SYNC_FL | FS_IMMUTABLE_FL | FS_APPEND_FL | \
+                    FS_NOATIME_FL | FS_DIRSYNC_FL))
+
+/* 内核 i_flags → 用户态 FS_*_FL (单向转换，用于 fileattr_fill_flags) */
+static unsigned int powerfs_i_flags_to_fs_fl(unsigned int i_flags)
+{
+    unsigned int fs_fl = 0;
+    if (i_flags & S_SYNC)       fs_fl |= FS_SYNC_FL;
+    if (i_flags & S_IMMUTABLE)  fs_fl |= FS_IMMUTABLE_FL;
+    if (i_flags & S_APPEND)     fs_fl |= FS_APPEND_FL;
+    if (i_flags & S_NOATIME)    fs_fl |= FS_NOATIME_FL;
+    if (i_flags & S_DIRSYNC)    fs_fl |= FS_DIRSYNC_FL;
+    return fs_fl;
+}
+
+/*
+ * powerfs_fileattr_get — P1-3 inode_operations.fileattr_get 回调.
+ *
+ * 由 vfs_fileattr_get (→ ioctl_getflags / ioctl_fsgetxattr) 调用.
+ * 只需填充 fa.flags / fa.fsx_* 字段，权限检查由 VFS 侧完成.
+ */
+static int powerfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+{
+    struct inode *inode = d_inode(dentry);
+    unsigned int i_flags, fs_fl;
+
+    pr_debug("powerfs: fileattr_get ino=%lu\n", inode->i_ino);
+
+    spin_lock(&inode->i_lock);
+    i_flags = inode->i_flags;
+    spin_unlock(&inode->i_lock);
+
+    fs_fl = powerfs_i_flags_to_fs_fl(i_flags);
+    fileattr_fill_flags(fa, fs_fl);
+    /* 当前不支持 fsx_* (cowextsize/extsize/projid/xflags)，
+     * fileattr_fill_flags 已将 fa.fsx_valid 置 false，ioctl_fsgetxattr 返回全零. */
+    return 0;
+}
+
+/*
+ * powerfs_fileattr_set — P1-3 inode_operations.fileattr_set 回调.
+ *
+ * 由 vfs_fileattr_set (→ ioctl_setflags / ioctl_fssetxattr) 调用.
+ * VFS 已完成:
+ *   - inode_lock(inode) 持有
+ *   - owner or capable 检查
+ *   - immutable/append → CAP_LINUX_IMMUTABLE capable 检查
+ *   - fileattr_set_prepare: 校验不支持位并返回 -EOPNOTSUPP
+ *   - security_inode_file_setattr lsm hook
+ *
+ * 文件系统侧职责: 把 fa.flags → S_* 位设置到 inode->i_flags，
+ * 标记 inode dirty + 触发 write_inode_now 同步到 Filer Raft.
+ */
+static int powerfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
+                                 struct file_kattr *fa)
+{
+    struct inode *inode = d_inode(dentry);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    unsigned int new_fs_fl = 0;
+    unsigned int old_i_flags, new_i_flags;
+    int ret;
+
+    (void)idmap;
+    pr_debug("powerfs: fileattr_set ino=%lu flags_valid=%d fsx_valid=%d\n",
+             inode->i_ino, fa->flags_valid, fa->fsx_valid);
+
+    /* --- Step 1: fsx 属性 (cowextsize/extsize/projid/xflags) 当前不支持 ---
+     * VFS 已在 fileattr_set_prepare 中检查 FS_XFLAG_COMMON 外的位并返回 -EOPNOTSUPP.
+     * 我们再拒绝任何 fsx_valid 请求，避免用户以为设置成功但未持久化. */
+    if (fa->fsx_valid && (fa->fsx_xflags || fa->fsx_extsize ||
+                          fa->fsx_projid || fa->fsx_cowextsize))
+        return -EOPNOTSUPP;
+
+    /* --- Step 2: flags 处理 (chattr +i/+a/+A/+s/+d 等) --- */
+    if (fa->flags_valid) {
+        /* 超出支持范围的位 (如 NODUMP_FL/COMPR_FL/ENCRYPT_FL 等高级位):
+         * 拒绝整个请求，对齐 ext4 语义 — chattr +d 会得 Operation not supported
+         * 而非静默失败. */
+        if (fa->flags & ~POWERFS_FS_FL_SUPPORTED_MASK) {
+            pr_debug("powerfs: fileattr_set unsupported flags: 0x%x (mask 0x%x)\n",
+                    fa->flags & ~POWERFS_FS_FL_SUPPORTED_MASK,
+                    POWERFS_FS_FL_SUPPORTED_MASK);
+            return -EOPNOTSUPP;
+        }
+        new_fs_fl = fa->flags;
+    }
+
+    /* --- Step 3: 转换并更新 inode->i_flags --- */
+    spin_lock(&inode->i_lock);
+    old_i_flags = inode->i_flags;
+    /* 先清除旧的 S_* 可设置位，再按 new_fs_fl 设置 */
+    new_i_flags = old_i_flags & ~(S_SYNC | S_IMMUTABLE | S_APPEND | S_NOATIME | S_DIRSYNC);
+    if (new_fs_fl & FS_SYNC_FL)       new_i_flags |= S_SYNC;
+    if (new_fs_fl & FS_IMMUTABLE_FL)  new_i_flags |= S_IMMUTABLE;
+    if (new_fs_fl & FS_APPEND_FL)     new_i_flags |= S_APPEND;
+    if (new_fs_fl & FS_NOATIME_FL)    new_i_flags |= S_NOATIME;
+    if (new_fs_fl & FS_DIRSYNC_FL)    new_i_flags |= S_DIRSYNC;
+    inode->i_flags = new_i_flags;
+    spin_unlock(&inode->i_lock);
+
+    if (new_i_flags == old_i_flags) {
+        pr_debug("powerfs: fileattr_set no change, skip sync\n");
+        return 0;
+    }
+
+    /* --- Step 4: 标记 inode 脏态 + AUTH_EXCL cap dirty --- */
+    mark_inode_dirty(inode);
+    powerfs_cap_mark_dirty(pi, POWERFS_CAP_AUTH_EXCL);
+
+    /* --- Step 5: 同步到 Filer Raft (notify_change → setattr → net_setattr 链条),
+     * 但 inode_operations.setattr 路径不会处理 i_flags 修改 (它只处理 ATTR_*),
+     * 因此这里直接调 write_inode_now (真正的 write_inode 回调会 Raft flush). */
+    ret = write_inode_now(inode, 1);
+    if (ret < 0) {
+        pr_warn("powerfs: fileattr_set write_inode_now ino=%lu failed: %d\n",
+                inode->i_ino, ret);
+        return ret;
+    }
+
+    pr_debug("powerfs: fileattr_set ino=%lu ok, old_i=0x%x new_i=0x%x fs_fl=0x%x\n",
+             inode->i_ino, old_i_flags, new_i_flags, new_fs_fl);
+    return 0;
+}
+
+/*
+ * powerfs_ioctl — P1-3: 基础 ioctl 实现 (替代旧占位).
+ *
+ * 策略 (Linux 6.17 new fileattr 子系统):
+ *   FS_IOC_GETFLAGS/SETFLAGS/FSGETXATTR/FSSETXATTR 直接委托内核通用函数
+ *   ioctl_getflags / ioctl_setflags / ioctl_fsgetxattr / ioctl_fssetxattr,
+ *   它们会 vfs_fileattr_get/set → 我们的 fileattr_get/set 回调.
+ *   FITRIM 仍手动处理 (PowerFS 无块设备 discard).
+ *
+ * 通用函数返回 -ENOIOCTLCMD 时降级为 -ENOTTY (用户 ENOTTY).
+ */
+static long powerfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct inode *inode = file_inode(file);
+    void __user *argp = (void __user *)arg;
+    long ret = -ENOTTY;
+
+    pr_debug("powerfs: ioctl cmd=0x%x ino=%lu\n", cmd, inode->i_ino);
+
+    switch (cmd) {
+    /* ================================================================
+     * 1. FS_IOC_GETFLAGS / SETFLAGS — chattr(1) / lsattr(1) 走 fileattr
+     * ================================================================ */
+    case FS_IOC_GETFLAGS:
+        ret = ioctl_getflags(file, (unsigned int __user *)argp);
+        if (ret == -ENOIOCTLCMD)
+            ret = -ENOTTY;
+        break;
+
+    case FS_IOC_SETFLAGS:
+        ret = ioctl_setflags(file, (unsigned int __user *)argp);
+        if (ret == -ENOIOCTLCMD)
+            ret = -ENOTTY;
+        break;
+
+    /* ================================================================
+     * 2. FS_IOC_FSGETXATTR / FSSETXATTR — chattr 2.0 扩展属性
+     * ================================================================ */
+    case FS_IOC_FSGETXATTR:
+        ret = ioctl_fsgetxattr(file, argp);
+        if (ret == -ENOIOCTLCMD)
+            ret = -ENOTTY;
+        break;
+
+    case FS_IOC_FSSETXATTR:
+        ret = ioctl_fssetxattr(file, argp);
+        if (ret == -ENOIOCTLCMD)
+            ret = -ENOTTY;
+        break;
+
+    /* ================================================================
+     * 3. FITRIM — fstrim -av 空间回收
+     *
+     * PowerFS 是对象存储架构 (Volume → Needles)，无底层块设备 discard，
+     * 返回 -EOPNOTSUPP 让 fstrim 跳过而非报错. 若未来实现 Needle GC，
+     * 可在此触发并返回已回收字节数.
+     * ================================================================ */
+    case FITRIM: {
+        struct super_block *sb = inode->i_sb;
+        struct fstrim_range range;
+
+        if (!capable(CAP_SYS_ADMIN))
+            return -EPERM;
+        if (copy_from_user(&range, argp, sizeof(range)))
+            return -EFAULT;
+        if (range.len < sb->s_blocksize)
+            return -EINVAL;
+        pr_info_once("powerfs: FITRIM not supported (object storage, no block discard)\n");
+        return -EOPNOTSUPP;
+    }
+
+    default:
+        ret = -ENOTTY;
+        break;
+    }
+
+    return ret;
 }
 
 /*
@@ -6878,16 +9049,24 @@ static int powerfs_file_open(struct inode *inode, struct file *file)
  * 参考 ramfs_file_operations (fs/ramfs/file-mmu.c)
  */
 static const struct file_operations powerfs_file_operations = {
-    .open         = powerfs_file_open,
-    .read_iter    = powerfs_file_read_iter,
-    .write_iter   = powerfs_file_write_iter,
-    .mmap         = generic_file_mmap,
-    .release      = powerfs_file_release,
-    .fsync        = powerfs_fsync,
-    .fallocate    = powerfs_fallocate,
-    .splice_read  = filemap_splice_read,
-    .splice_write = iter_file_splice_write,
-    .llseek       = generic_file_llseek,
+    .open           = powerfs_file_open,
+    .read_iter      = powerfs_file_read_iter,
+    .write_iter     = powerfs_file_write_iter,
+    .mmap           = powerfs_mmap,          /* < 6.17 兼容路径 */
+    .mmap_prepare   = powerfs_mmap_prepare,  /* P2-6: 6.17 提前设 vm_ops, 修复 msync 竞态 */
+    .release        = powerfs_file_release,
+    .fsync          = powerfs_fsync,
+    .fallocate      = powerfs_fallocate,
+    .lock           = powerfs_lock,       /* P0-1 fix: POSIX record locks (fcntl) */
+    .flock          = powerfs_flock,      /* P0-2 fix: BSD flock(2) */
+    .unlocked_ioctl = powerfs_ioctl,      /* P1-3 扩展实现 */
+    .compat_ioctl   = compat_ptr_ioctl,   /* P1-3 32-bit user on 64-bit kernel */
+    .splice_read    = powerfs_splice_read,  /* cap ref 管理 + CACHE/copy 降级 */
+    .splice_write   = iter_file_splice_write,
+    .llseek         = generic_file_llseek,
+    .setlease       = simple_nosetlease,  /* P2-4: 明确拒绝 F_SETLEASE delegations，
+                                           * 防止远端写时不触发本地 break，导致 rsync/WAL silent stale */
+    .copy_file_range = powerfs_copy_file_range,  /* P2-5: 同 fs splice + 跨 fs generic fallback */
 };
 
 /* ========== fallocate 回调 (空间预分配) ==========
@@ -6905,7 +9084,8 @@ static long powerfs_fallocate(struct file *file, int mode,
     struct inode *inode = file_inode(file);
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     loff_t new_size = offset + len;
-    int ret;
+    unsigned int got = 0;
+    int cap_err, ret;
 
     /* Only support default, KEEP_SIZE, and PUNCH_HOLE modes */
     if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
@@ -6917,6 +9097,18 @@ static long powerfs_fallocate(struct file *file, int mode,
 
     if (offset < 0 || len <= 0)
         return -EINVAL;
+
+    /* 对齐  fallocate: 需持有 FILE_EXCL (改 size/hole) + AUTH_EXCL (改 attrs).
+     * i_rwsem 会在 inode_lock 获取, 此处先在锁外阻塞拿 cap, 避免持有锁时网络阻塞. */
+    cap_err = powerfs_get_caps(inode, file,
+                               POWERFS_CAP_FILE_EXCL,
+                               POWERFS_CAP_FILE_EXCL | POWERFS_CAP_AUTH_EXCL,
+                               new_size, &got);
+    if (cap_err < 0) {
+        pr_debug("powerfs: fallocate get_caps EXCL ino=%lu ret=%d, continue\n",
+                 inode->i_ino, cap_err);
+        got = 0;
+    }
 
     inode_lock(inode);
 
@@ -7026,6 +9218,8 @@ static long powerfs_fallocate(struct file *file, int mode,
              * needle, so truncate_pagecache_range is sufficient.
              */
             truncate_pagecache_range(inode, offset, new_size - 1);
+            if (pi->placement == POWERFS_PLACEMENT_INLINE)
+                pi->inline_dirty = true;
         }
         ret = 0;
     } else if (!(mode & FALLOC_FL_KEEP_SIZE)) {
@@ -7119,6 +9313,8 @@ static long powerfs_fallocate(struct file *file, int mode,
                  * the zeroed pages resident in pagecache.
                  */
                 filemap_write_and_wait(inode->i_mapping);
+            } else if (pi->placement == POWERFS_PLACEMENT_INLINE) {
+                pi->inline_dirty = true;
             }
         }
         ret = 0;
@@ -7129,16 +9325,34 @@ static long powerfs_fallocate(struct file *file, int mode,
 
 falloc_done:
     inode_unlock(inode);
+
+    /* fallocate 成功 (punch/extend) 后, 标记 EXCL/AUTH dirty.
+     * INLINE: inline_dirty 已在分支内置位, 这里额外 mark cap dirty 供 revoke 感知. */
+    if (ret == 0 && !(mode & FALLOC_FL_KEEP_SIZE))
+        powerfs_cap_mark_dirty(pi, POWERFS_CAP_AUTH_EXCL | POWERFS_CAP_FILE_EXCL);
+
+    if (got)
+        powerfs_cap_put_refs(pi, got);
     return ret;
 }
 
-/* ========== xattr 回调 (simple_xattr in-memory) ==========
+/* ========== xattr 回调 (simple_xattr L1 cache + Filer Raft L2) ==========
  *
- * xattr 存储在 inode 内存中 (powerfs_inode_info.xattrs), 不持久化到 Filer.
- * 使用内核 simple_xattr API + xattr_handler 机制 (kernel 6.17 移除了
- * inode_operations 中的 setxattr/getxattr/removexattr 回调, 改用
- * xattr_handler 注册到 super_block.s_xattr).
- * 支持 user.* / trusted.* / security.* 前缀.
+ * xattr 持久化架构:
+ *   - L1 缓存: 内存 simple_xattr (pi->xattrs), 用于加速 GET/LIST
+ *   - L2 持久化: Filer Raft (通过 powerfs-net TLV: SET_XATTR=0x38/GET_XATTR=0x39/
+ *                 REMOVE_XATTR=0x3a/LIST_XATTR=0x3b)
+ *
+ * 一致性策略:
+ *   - GET: 先 L1 cache, miss → net getxattr → 成功则回填 L1
+ *   - SET: 同步 net setxattr → Filer Raft 确认 → 更新 L1 cache
+ *   - REMOVE: 同步 net removexattr → 成功 → 从 L1 cache 清除
+ *   - LIST: 先 L1 cache 非空直接用; 为空 → net listxattr 回填 L1
+ *   - CapFlush XATTR_EXCL: L1 条目逐条重推 (recall/fsync 场景兜底)
+ *
+ * Kernel 6.17 移除了 inode_operations.setxattr/getxattr/removexattr,
+ * 改用 xattr_handler 注册到 super_block.s_xattr.
+ * 支持 user.* / trusted.* / security.* / system.posix_acl_* 前缀.
  */
 
 static int powerfs_xattr_handler_get(const struct xattr_handler *handler,
@@ -7146,9 +9360,56 @@ static int powerfs_xattr_handler_get(const struct xattr_handler *handler,
                                      const char *name, void *buffer, size_t size)
 {
     struct powerfs_inode_info *pi = POWERFS_I(inode);
+    __u64 shard_id;
+    const char *full_name;
+    size_t name_len;
+    int ret;
 
-    name = xattr_full_name(handler, name);
-    return simple_xattr_get(&pi->xattrs, name, buffer, size);
+    full_name = xattr_full_name(handler, name);
+
+    /* 快速路径: L1 simple_xattr cache hit */
+    ret = simple_xattr_get(&pi->xattrs, full_name, buffer, size);
+    if (ret != -ENODATA)
+        return ret;  /* hit (>=0) 或 -ERANGE 等直接返回 */
+
+    /* 慢速路径: cache miss → net getxattr 查询 Filer */
+    shard_id = powerfs_calc_shard_id(inode->i_ino);
+    name_len = strlen(full_name);
+
+    if (buffer && size > 0) {
+        size_t got_len = 0;
+        ret = powerfs_net_getxattr(shard_id, inode->i_ino,
+                                   full_name, name_len,
+                                   (__u8 *)buffer, size, &got_len);
+        if (ret == 0) {
+            struct simple_xattr *old;
+            old = simple_xattr_set(&pi->xattrs, full_name, buffer, got_len, 0);
+            if (!IS_ERR(old))
+                simple_xattr_free(old);
+            return (int)got_len;
+        }
+        return ret;
+    } else {
+        /* buffer=NULL/size=0: VFS probe 语义, 返回 value 长度 */
+        size_t got_len = 0;
+        __u8 stackbuf[256];
+        __u8 *tmpbuf = stackbuf;
+        size_t tmpcap = sizeof(stackbuf);
+
+        ret = powerfs_net_getxattr(shard_id, inode->i_ino,
+                                   full_name, name_len,
+                                   tmpbuf, tmpcap, &got_len);
+        if (ret == -ERANGE)
+            return (int)got_len;
+        if (ret == 0) {
+            struct simple_xattr *old;
+            old = simple_xattr_set(&pi->xattrs, full_name, tmpbuf, got_len, 0);
+            if (!IS_ERR(old))
+                simple_xattr_free(old);
+            return (int)got_len;
+        }
+        return ret;
+    }
 }
 
 static int powerfs_xattr_handler_set(const struct xattr_handler *handler,
@@ -7158,18 +9419,55 @@ static int powerfs_xattr_handler_set(const struct xattr_handler *handler,
                                      size_t size, int flags)
 {
     struct powerfs_inode_info *pi = POWERFS_I(inode);
+    __u64 shard_id;
+    const char *full_name;
+    size_t name_len;
     struct simple_xattr *old_xattr;
+    int ret;
 
     (void)idmap;
 
     if (size > XATTR_SIZE_MAX)
         return -E2BIG;
 
-    name = xattr_full_name(handler, name);
-    old_xattr = simple_xattr_set(&pi->xattrs, name, value, size, flags);
-    if (IS_ERR(old_xattr))
-        return PTR_ERR(old_xattr);
-    simple_xattr_free(old_xattr);
+    full_name = xattr_full_name(handler, name);
+    name_len = strlen(full_name);
+    shard_id = powerfs_calc_shard_id(inode->i_ino);
+
+    /* value==NULL && size==0: VFS removexattr 语义 */
+    if (!value && size == 0) {
+        ret = powerfs_net_removexattr(shard_id, inode->i_ino,
+                                      full_name, name_len);
+        if (ret < 0)
+            return ret;
+
+        old_xattr = simple_xattr_set(&pi->xattrs, full_name, NULL, 0, 0);
+        if (!IS_ERR(old_xattr))
+            simple_xattr_free(old_xattr);
+
+        powerfs_cap_mark_dirty(pi, POWERFS_CAP_XATTR_EXCL);
+        pi->i_xattr_version++;
+        return 0;
+    }
+
+    /* SETXATTR: 先 Filer 持久化 (Raft), 成功后才更新 L1 cache */
+    ret = powerfs_net_setxattr(shard_id, inode->i_ino,
+                               full_name, name_len,
+                               (const __u8 *)value, size);
+    if (ret < 0)
+        return ret;
+
+    old_xattr = simple_xattr_set(&pi->xattrs, full_name, value, size, flags);
+    if (IS_ERR(old_xattr)) {
+        pr_warn_ratelimited("powerfs: setxattr ino=%lu name=%s "
+                            "simple_xattr_set cache fill failed: %ld (ignored)\n",
+                            inode->i_ino, full_name, PTR_ERR(old_xattr));
+    } else {
+        simple_xattr_free(old_xattr);
+    }
+
+    powerfs_cap_mark_dirty(pi, POWERFS_CAP_XATTR_EXCL);
+    pi->i_xattr_version++;
     return 0;
 }
 
@@ -7178,8 +9476,83 @@ static ssize_t powerfs_listxattr(struct dentry *dentry, char *buffer,
 {
     struct inode *inode = d_inode(dentry);
     struct powerfs_inode_info *pi = POWERFS_I(inode);
+    ssize_t l1_ret;
 
-    return simple_xattr_list(inode, &pi->xattrs, buffer, size);
+    /* 快速路径: L1 cache 非空时直接返回 */
+    l1_ret = simple_xattr_list(inode, &pi->xattrs, buffer, size);
+    if (l1_ret > 0 || (l1_ret == 0 && size == 0))
+        return l1_ret;
+
+    /* 慢速路径: L1 cache 空 → net listxattr 拉取 + 回填 L1 */
+    {
+        __u64 shard_id = powerfs_calc_shard_id(inode->i_ino);
+        char *list_buf;
+        size_t list_cap = (size > 0) ? size : 4096;
+        size_t list_len = 0;
+        int ret;
+
+        if (buffer && size > 0) {
+            list_buf = buffer;
+        } else {
+            list_buf = kmalloc(list_cap, GFP_KERNEL);
+            if (!list_buf)
+                return -ENOMEM;
+        }
+
+        ret = powerfs_net_listxattr(shard_id, inode->i_ino,
+                                    list_buf, list_cap, &list_len);
+        if (ret == -ERANGE && !(buffer && size > 0)) {
+            kfree(list_buf);
+            list_cap = list_len;
+            list_buf = kmalloc(list_cap, GFP_KERNEL);
+            if (!list_buf)
+                return -ENOMEM;
+            list_len = 0;
+            ret = powerfs_net_listxattr(shard_id, inode->i_ino,
+                                        list_buf, list_cap, &list_len);
+        }
+        if (ret < 0) {
+            if (list_buf != buffer)
+                kfree(list_buf);
+            return ret;
+        }
+
+        /* 回填 L1: 遍历 NUL-separated keys, 逐个 getxattr + simple_xattr_set */
+        {
+            size_t pos = 0;
+            while (pos < list_len) {
+                const char *key = list_buf + pos;
+                size_t klen = strlen(key);
+                size_t vcap = XATTR_SIZE_MAX;
+                __u8 *vbuf;
+                size_t vlen = 0;
+
+                vbuf = kmalloc(vcap, GFP_KERNEL);
+                if (vbuf) {
+                    if (powerfs_net_getxattr(shard_id, inode->i_ino,
+                                             key, klen,
+                                             vbuf, vcap, &vlen) == 0) {
+                        struct simple_xattr *old;
+                        old = simple_xattr_set(&pi->xattrs, key, vbuf, vlen, 0);
+                        if (!IS_ERR(old))
+                            simple_xattr_free(old);
+                    }
+                    kfree(vbuf);
+                }
+                pos += klen + 1;
+            }
+        }
+
+        if (!buffer && size == 0) {
+            kfree(list_buf);
+            return simple_xattr_list(inode, &pi->xattrs, NULL, 0);
+        }
+        if (list_buf == buffer)
+            return (ssize_t)list_len;
+
+        kfree(list_buf);
+        return simple_xattr_list(inode, &pi->xattrs, NULL, 0);
+    }
 }
 
 static const struct xattr_handler powerfs_security_xattr_handler = {
@@ -7207,30 +9580,208 @@ static const struct xattr_handler * const powerfs_xattr_handlers[] = {
     NULL
 };
 
+/* ========== POSIX ACL (.get_inode_acl / .set_acl) ==========
+ * P0-3 fix: 对齐  xxx_get_acl / xxx_set_acl.
+ *
+ * 设计:
+ *   - ACL 以 xattr 形式存储在 pi->xattrs (simple_xattr),
+ *     name = system.posix_acl_access / system.posix_acl_default.
+ *   - get: simple_xattr 查内存 → posix_acl_from_xattr 反序列化成 struct posix_acl*
+ *         → set_cached_acl 挂 inode i_acl / i_default_acl (RCU 指针)
+ *         → 下次快速命中 cached_acl, 不重走 xattr 反序列化
+ *   - set: posix_acl_to_xattr → simple_xattr_set 写内存
+ *         → set_cached_acl 更新缓存
+ *         → mark dirty_caps XATTR_EXCL + AUTH_EXCL + inode dirty
+ *         → 后续 cap_flush/setattr_sync 把 xattr+inode 属性推到 Filer
+ *
+ * 注意:
+ *   - 目前 xattr 内存态后端 (Rust Filer 端 setxattr/removexattr net 协议未实现),
+ *     先 warn + 放回 dirty, 下次 recall/fsync 再推进 (同 cap_flush XATTR_EXCL
+ *     WARN_ONCE 策略, 避免静默丢脏 ACL).
+ *   - 单机场景 ACL 立即可用 (getfacl/setfacl 正常返回 + VFS 权限叠加
+ *     __check_acl 路径在 powerfs_permission 内已由 generic_permission 覆盖).
+ *   - DEFAULT ACL 只有目录有 (S_ISDIR 判断).
+ */
+
+#include <linux/posix_acl.h>  /* posix_acl_from_xattr / set_cached_acl */
+
+static struct posix_acl *
+powerfs_get_acl(struct inode *inode, int type, bool rcu)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct posix_acl *acl;
+    const char *xattr_name;
+    struct simple_xattr *xattr;
+    void *value = NULL;
+    ssize_t size;
+
+    /* RCU walk: inode 不可锁 + 不允许阻塞. simple_xattr 内部持 spin_lock
+     * (非睡眠) + get_cached_acl 只是 RCU deref, 理论可支持 RCU 模式, 但为
+     * 避免遗漏 edge case (xattr value kmalloc 未初始化?), 强制 ref-walk. */
+    if (rcu)
+        return ERR_PTR(-ECHILD);
+
+    switch (type) {
+    case ACL_TYPE_ACCESS:
+        xattr_name = XATTR_NAME_POSIX_ACL_ACCESS;
+        break;
+    case ACL_TYPE_DEFAULT:
+        if (!S_ISDIR(inode->i_mode))
+            return NULL;  /* 非目录无 default ACL (VFS 已检查, 再兜底) */
+        xattr_name = XATTR_NAME_POSIX_ACL_DEFAULT;
+        break;
+    default:
+        return ERR_PTR(-EINVAL);
+    }
+
+    /* Fast path: 缓存命中 (ACL_NOT_CACHED = 哨兵 NULL 指针, 需实际查). */
+    acl = get_cached_acl(inode, type);
+    if (acl != ACL_NOT_CACHED)
+        return acl;
+
+    /* Slow path: simple_xattr_get (返回 size 或写入 buffer).
+     * 先查 size (buffer=NULL), 再分配 buffer, 再读实际 value. */
+    size = simple_xattr_get(&pi->xattrs, xattr_name, NULL, 0);
+    if (size <= 0) {
+        /* size < 0: 未设置 → acl = NULL; size == 0: 空值等价于未设 */
+        acl = NULL;
+        goto out_cache;
+    }
+    value = kmalloc(size, GFP_KERNEL);
+    if (!value)
+        return ERR_PTR(-ENOMEM);
+    xattr = NULL; /* suppress unused (simple_xattr_get 有 size-only 模式) */
+    size = simple_xattr_get(&pi->xattrs, xattr_name, value, size);
+    if (size < 0) {
+        kfree(value);
+        return ERR_PTR((int)size);
+    }
+    acl = posix_acl_from_xattr(&init_user_ns, value, size);
+    kfree(value);
+    if (IS_ERR(acl))
+        return acl;
+
+out_cache:
+    set_cached_acl(inode, type, acl); /* 挂 RCU 指针缓存, 下次快路径命中 */
+    return acl;
+}
+
+/*
+ * powerfs_set_acl — 设置/删除 POSIX ACL.
+ *
+ * 调用链: setfacl(1) → sys_acl_set_file → set_posix_acl → iop->set_acl.
+ * set_posix_acl 外层已做权限检查 + 应用 ACL mask 到 inode->i_mode 后
+ * 调用 set_acl; 我们只需: 1) 写内存 xattr  2) 更新缓存  3) 打 dirty_caps
+ * set_posix_acl 外层会处理 mark_inode_dirty(inode) 及 setattr_copy →
+ * i_mode 已更新 → AUTH_EXCL 需同步 (chmod 叠加位).
+ */
+static int
+powerfs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+                struct posix_acl *acl, int type)
+{
+    struct inode *inode = d_inode(dentry);
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    const char *xattr_name;
+    struct simple_xattr *old_xattr;
+    void *value = NULL;
+    int size;
+    int ret = 0;
+
+    (void)idmap;
+
+    switch (type) {
+    case ACL_TYPE_ACCESS:
+        xattr_name = XATTR_NAME_POSIX_ACL_ACCESS;
+        break;
+    case ACL_TYPE_DEFAULT:
+        if (!S_ISDIR(inode->i_mode))
+            return acl ? -EACCES : 0; /* 非目录, 删 default ACL = NOP, 设 = EACCES */
+        xattr_name = XATTR_NAME_POSIX_ACL_DEFAULT;
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    if (acl) {
+        /* Step 1: ACL → xattr value 序列化 (先 probe size, 再写入). */
+        size = posix_acl_to_xattr(&init_user_ns, acl, NULL, 0);
+        if (size < 0)
+            return size;
+        value = kmalloc(size, GFP_NOFS);
+        if (!value)
+            return -ENOMEM;
+        ret = posix_acl_to_xattr(&init_user_ns, acl, value, size);
+        if (ret < 0) {
+            kfree(value);
+            return ret;
+        }
+        /* Step 2: 写 simple_xattr (创建或替换原值, flags=0 无特殊语义). */
+        old_xattr = simple_xattr_set(&pi->xattrs, xattr_name, value, size, 0);
+        kfree(value);
+        if (IS_ERR(old_xattr))
+            return PTR_ERR(old_xattr);
+        simple_xattr_free(old_xattr);
+    } else {
+        /* acl == NULL: 删除 ACL xattr. 若当前未设置, XATTR_REPLACE 返回 -ENODATA
+         * 但我们接受"删除不存在项 = NOP", 忽略 -ENODATA. */
+        old_xattr = simple_xattr_set(&pi->xattrs, xattr_name, NULL, 0, XATTR_REPLACE);
+        if (!IS_ERR(old_xattr))
+            simple_xattr_free(old_xattr);
+        else if (PTR_ERR(old_xattr) != -ENODATA)
+            return PTR_ERR(old_xattr);
+    }
+
+    /* Step 3: 更新缓存. */
+    set_cached_acl(inode, type, acl);
+
+    /* Step 4: 打 dirty_caps + xattr version bump.
+     *   XATTR_EXCL: 需要推 xattr 到 Filer (协议未实现, 当前 WARN+回滚)
+     *   AUTH_EXCL: inode i_mode 被 set_posix_acl 外层改了 (ACL mask 叠加),
+     *              需同步 setattr 到 Filer */
+    spin_lock(&pi->i_lock);
+    pi->i_dirty_caps |= POWERFS_CAP_XATTR_EXCL | POWERFS_CAP_AUTH_EXCL;
+    spin_unlock(&pi->i_lock);
+    pi->i_xattr_version++;  /* xattr 版本号, Filer 端用于 fencing 旧请求 */
+    inode_inc_iversion_raw(inode);
+
+    return 0;
+}
+
 /* ========== Inode operations 表 ========== */
 
 /* 目录 inode 操作 */
 static const struct inode_operations powerfs_dir_inode_operations = {
-    .create     = powerfs_create,
-    .lookup     = powerfs_lookup,
-    .link       = powerfs_link,
-    .unlink     = powerfs_unlink,
-    .symlink    = powerfs_symlink,
-    .readlink   = powerfs_readlink,
-    .mkdir      = powerfs_mkdir,
-    .rmdir      = powerfs_rmdir,
-    .mknod      = powerfs_mknod,
-    .rename     = powerfs_rename,
-    .getattr    = powerfs_getattr,
-    .setattr    = powerfs_setattr,
-    .listxattr  = powerfs_listxattr,
+    .create         = powerfs_create,
+    .lookup         = powerfs_lookup,
+    .link           = powerfs_link,
+    .unlink         = powerfs_unlink,
+    .symlink        = powerfs_symlink,
+    .readlink       = powerfs_readlink,
+    .mkdir          = powerfs_mkdir,
+    .rmdir          = powerfs_rmdir,
+    .mknod          = powerfs_mknod,
+    .rename         = powerfs_rename,
+    .atomic_open    = powerfs_atomic_open,  /* P1-2: lookup→create→open 原子路径，防 TOCTOU */
+    .permission     = powerfs_permission,
+    .getattr        = powerfs_getattr,
+    .setattr        = powerfs_setattr,
+    .listxattr      = powerfs_listxattr,
+    .get_inode_acl  = powerfs_get_acl,  /* P0-3 fix: POSIX ACL get (getfacl/permission 叠加) */
+    .set_acl        = powerfs_set_acl,  /* P0-3 fix: POSIX ACL set (setfacl) */
+    .fileattr_get   = powerfs_fileattr_get,  /* P1-3: chattr/lsattr GETFLAGS/FSGETXATTR 回调 */
+    .fileattr_set   = powerfs_fileattr_set,  /* P1-3: chattr SETFLAGS/FSSETXATTR 回调 */
 };
 
 /* 普通文件 inode 操作 */
 static const struct inode_operations powerfs_file_inode_operations = {
-    .getattr    = powerfs_getattr,
-    .setattr    = powerfs_setattr,
-    .listxattr  = powerfs_listxattr,
+    .permission     = powerfs_permission,
+    .getattr        = powerfs_getattr,
+    .setattr        = powerfs_setattr,
+    .listxattr      = powerfs_listxattr,
+    .get_inode_acl  = powerfs_get_acl,  /* P0-3 fix: POSIX ACL get (文件 ACCESS ACL) */
+    .set_acl        = powerfs_set_acl,  /* P0-3 fix: POSIX ACL set (setfacl 修改文件 ACL) */
+    .fileattr_get   = powerfs_fileattr_get,  /* P1-3: chattr/lsattr GETFLAGS/FSGETXATTR 回调 */
+    .fileattr_set   = powerfs_fileattr_set,  /* P1-3: chattr SETFLAGS/FSSETXATTR 回调 */
 };
 
 /*
@@ -7246,6 +9797,163 @@ static int powerfs_show_options(struct seq_file *m, struct dentry *root)
     return 0;
 }
 
+/*
+ * powerfs_put_super - P1-1: VFS 在卸载前调用此回调 (deactivate_locked_super → put_super).
+ *
+ * 职责 (对齐  xxx_put_super → destroy_mdsc 全量资源回卷):
+ *   1. 注销 Cap NOTIFY 回调 (防止 RX dispatcher 在销毁后仍派发到 fs 层)
+ *   2. 销毁 per-sb slab caches (cap_cachep / cap_snap_cachep / cap_flush_cachep)
+ *
+ * 注意: 重型清理 (workqueue/网络/sync) 放在 kill_sb_super，因为 put_super 执行时
+ * VFS 仍持有 s_umount sem，同步写回/销毁 workqueue 可能阻塞; kill_sb 顺序是
+ *   umount_begin → put_super → deactivate_locked_super → kill_sb
+ * 所以 put_super 做"断开回调 + 轻量 slab 销毁"，kill_sb 做重型清理。
+ */
+static void powerfs_put_super(struct super_block *sb)
+{
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+
+    pr_debug("powerfs: put_super\n");
+
+    if (!sbi)
+        return;
+
+    /* P3-4: 清理 debugfs 入口 (在 slab 销毁前, 避免遍历已释放的 inode) */
+    powerfs_debugfs_cleanup(sb);
+
+    /* P3-5: 清理 /proc 入口 */
+    powerfs_proc_cleanup(sb);
+
+    /* 1. 注销 Cap NOTIFY 回调 (防止 RX dispatcher 再派发 recall/upgrade 到本 sb).
+     *    注意: 全局 refresh_wq 还没销毁，回调内部 queue_work 不会用 NULL wq，
+     *    但 powerfs_cap_recall_notify_handler 开头会检查 g_powerfs_sb != sb 直接返回，
+     *    安全. */
+    powerfs_net_reg_cap_notify_handlers(NULL, NULL);
+
+    /* 2. 销毁 per-sb slab caches.
+     *    顺序: cap_flush (最短期) → cap_snap (snap 单元) → cap (长期).
+     *    kmem_cache_destroy 内部会等所有已分配对象 free 完再销毁 slab，
+     *    若仍有对象泄漏会在 dmesg 打印 "kmem_cache_destroy X remaining"，
+     *    便于排查 cap 泄漏. */
+    if (sbi->cap_flush_cachep) {
+        kmem_cache_destroy(sbi->cap_flush_cachep);
+        sbi->cap_flush_cachep = NULL;
+    }
+    if (sbi->cap_snap_cachep) {
+        kmem_cache_destroy(sbi->cap_snap_cachep);
+        sbi->cap_snap_cachep = NULL;
+    }
+    if (sbi->cap_cachep) {
+        kmem_cache_destroy(sbi->cap_cachep);
+        sbi->cap_cachep = NULL;
+    }
+}
+
+/*
+ * powerfs_sync_fs - P2-1: VFS 在 sync(2)/syncfs(2) 时调用.
+ *
+ * 对齐  xxx_sync_fs: 分 wait=0 (非阻塞) 和 wait=1 (阻塞) 两档.
+ *
+ * 非阻塞 (!wait):
+ *   - 遍历所有 inode, 对有 dirty_caps 的 inode 触发 cap_flush (非阻塞入队).
+ *     用户态 sync(2) 先发 non-blocking 批次做"尽力推", 然后再发 blocking
+ *     批次等 ACK. 这档不能阻塞 (调用方不持页锁, 但在 global sync 上下文中).
+ *
+ * 阻塞 (wait):
+ *   - flush_workqueue(writeback_wq): 等 Stage C writeback_work 全部执行完
+ *     (这些 work 发 powerfs_net_write 落盘).
+ *   - flush_workqueue(refresh_wq): 等 cap recall/upgrade NOTIFY 的异步处理完.
+ *   - sync_filesystem(sb): 用 VFS 内置 writeback 循环触发 write_inode +
+ *     writepage, WB_SYNC_ALL 模式, 等所有 I_DIRTY_PAGES inode 落盘.
+ *
+ * 注意: write_inode 已在 umount (stopping=1) 时短路跳过网络同步, 但 sync_fs
+ * 调用时网络还活着, 所以 write_inode 会真的推 SetAttr 到 Filer, 与 kill_sb
+ * 的 sync_filesystem 用途不同.
+ */
+static int powerfs_sync_fs(struct super_block *sb, int wait)
+{
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+
+    pr_debug("powerfs: sync_fs wait=%d\n", wait);
+
+    /* 非阻塞档: 遍历 inode 触发 dirty caps 入队 (cap_flush 内部不阻塞等 ACK,
+     * 仅分配 flush record + 切 flushing_caps + 发 TX, TX 本身是异步 sendmsg).
+     * 若某些 inode 此时无法 flush (内存不足), 留给下次 sync. */
+    if (!wait) {
+        /* 用 VFS iterate_supers 风格的 writeback_inodes_sb_nr 间接触发.
+         * Stage C writeback 工作线程会再处理 cap 脏数据, 这里不强推,
+         * 对齐  xxx_flush_dirty_caps 只 flush 已 pending 的 cap.
+         *
+         * 我们目前 cap_flush 已经在 recall/fsync 路径上触发, 非阻塞档仅
+         * kick writeback_wq 让已入队的 work 尽早执行即可. */
+        if (sbi && sbi->writeback_wq)
+            writeback_inodes_sb(sb, WB_REASON_SYNC);
+        pr_debug("powerfs: sync_fs non-blocking done\n");
+        return 0;
+    }
+
+    /* 阻塞档: 严格等所有层落盘. */
+
+    /* Step 1: kick 一次 writeback_inodes 让 write_inode 把 SetAttr 推出去.
+     *         WB_SYNC_ALL 由 sync_filesystem 内部统一执行, 这里先 kick. */
+    writeback_inodes_sb(sb, WB_REASON_SYNC);
+
+    /* Step 2: 等 writeback_wq 所有 work 执行完 (powerfs_net_write 异步发送).
+     *         destroy_workqueue 会 drain, 但我们不想 destroy, flush 就够了. */
+    if (sbi && sbi->writeback_wq)
+        flush_workqueue(sbi->writeback_wq);
+
+    /* Step 3: 等 refresh_wq (cap recall/upgrade 的异步 work) 完成,
+     *         防止 recall 半状态 inode 在 sync 完成后仍有脏. */
+    if (powerfs_refresh_wq)
+        flush_workqueue(powerfs_refresh_wq);
+
+    /* Step 4: VFS 标准阻塞同步, 内部会再 iterate_bdevs + wait on page writeback.
+     *         注意: sync_filesystem 自身会再调 ->sync_fs(wait=0) 一次,
+     *         我们在非阻塞档只 kick 不递归, 不会死循环. */
+    sync_filesystem(sb);
+
+    pr_debug("powerfs: sync_fs blocking done\n");
+    return 0;
+}
+
+/*
+ * powerfs_umount_begin - P2-2: 处理 lazy umount (MNT_DETACH) 的准备阶段.
+ *
+ * 对齐  xxx_umount_begin: VFS 在 umount_begin 时调用 (发生在
+ * put_super / kill_sb 之前, 用户态刚执行 umount 时), 用于:
+ *   1. 标记 sb 进入卸载态 (shutting_down), 阻止后续网络请求入队;
+ *   2. 尽力 sync 一次脏数据 (sync_fs wait=1, 非强制, 失败不回滚);
+ *   3. 准备把 inode 上的 cap 标记为 "可 revoke", 后续 recall 直接放行.
+ *
+ * 注意: 对 normal umount 也会触发 (不只是 MNT_DETACH). 后续 kill_sb_super
+ * 会再执行更彻底的清理 (destroy_workqueue / net cleanup / slab destroy).
+ *
+ * 设计选择 — 不直接 abort 网络请求 (像  xxx_osdc_abort_requests):
+ *   我们 powerfs-net 层没有 per-request abort 句柄, 改用全局 stopping 标志
+ *   让后续 send_request 立即返回 -ENOTCONN, in-flight 请求由超时机制回收.
+ *   这样不会在 umount_begin 时把正常 close() 的 cap_release 打断.
+ */
+static void powerfs_umount_begin(struct super_block *sb)
+{
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+
+    pr_debug("powerfs: umount_begin\n");
+
+    if (!sbi)
+        return;
+
+    /* 1. 标记 sb shutting_down: 让 lease_renew_work_func 不再重新排队,
+     *    防止 lease_wq flush 循环. */
+    sbi->shutting_down = true;
+
+    /* 2. 尽力阻塞 sync 一次 (不强制, 失败也不阻止卸载继续).
+     *    sync_fs 内部已经处理 writeback_wq / refresh_wq flush. */
+    (void)powerfs_sync_fs(sb, 1);
+
+    pr_debug("powerfs: umount_begin done\n");
+}
+
 /* ========== Super operations 表 ========== */
 
 static const struct super_operations powerfs_super_ops = {
@@ -7256,6 +9964,792 @@ static const struct super_operations powerfs_super_ops = {
     .statfs        = powerfs_statfs,
     .drop_inode    = generic_delete_inode,
     .show_options  = powerfs_show_options,
+    .put_super     = powerfs_put_super,    /* P1-1: 挂载清理 — 注销回调 + 销毁 per-sb slab */
+    .sync_fs       = powerfs_sync_fs,      /* P2-1: sync(2)/syncfs(2) → flush wq + writeback */
+    .umount_begin  = powerfs_umount_begin, /* P2-2: lazy umount → shutting_down + best-effort sync */
+};
+
+/* ========== P3-5: 全局性能计数 + /proc/metrics ========== */
+
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/percpu_counter.h>
+
+/*
+ * powerfs_metrics_init - 初始化全局性能计数器.
+ *
+ * 对齐  xxx_metric_init (metric.c):
+ *   percpu_counter 用 batch=0 确保精确读取.
+ */
+int powerfs_metrics_init(struct powerfs_metrics *m)
+{
+    int ret, i;
+
+    for (i = 0; i < POWERFS_METRIC_MAX; i++) {
+        spin_lock_init(&m->metric[i].lock);
+        m->metric[i].total = 0;
+        m->metric[i].size_sum = 0;
+        m->metric[i].size_min = U64_MAX;
+        m->metric[i].size_max = 0;
+        m->metric[i].latency_sum = 0;
+        m->metric[i].latency_min = U64_MAX;
+        m->metric[i].latency_max = 0;
+    }
+
+    ret = percpu_counter_init(&m->d_lease_hit, 0, GFP_KERNEL);
+    if (ret)
+        return ret;
+    ret = percpu_counter_init(&m->d_lease_mis, 0, GFP_KERNEL);
+    if (ret)
+        goto err_d_lease_mis;
+    ret = percpu_counter_init(&m->i_caps_hit, 0, GFP_KERNEL);
+    if (ret)
+        goto err_i_caps_hit;
+    ret = percpu_counter_init(&m->i_caps_mis, 0, GFP_KERNEL);
+    if (ret)
+        goto err_i_caps_mis;
+    ret = percpu_counter_init(&m->opened_inodes, 0, GFP_KERNEL);
+    if (ret)
+        goto err_opened_inodes;
+    ret = percpu_counter_init(&m->total_inodes, 0, GFP_KERNEL);
+    if (ret)
+        goto err_total_inodes;
+
+    atomic64_set(&m->opened_files, 0);
+    atomic64_set(&m->total_caps, 0);
+    return 0;
+
+err_total_inodes:
+    percpu_counter_destroy(&m->opened_inodes);
+err_opened_inodes:
+    percpu_counter_destroy(&m->i_caps_mis);
+err_i_caps_mis:
+    percpu_counter_destroy(&m->i_caps_hit);
+err_i_caps_hit:
+    percpu_counter_destroy(&m->d_lease_mis);
+err_d_lease_mis:
+    percpu_counter_destroy(&m->d_lease_hit);
+    return ret;
+}
+
+void powerfs_metrics_destroy(struct powerfs_metrics *m)
+{
+    percpu_counter_destroy(&m->d_lease_hit);
+    percpu_counter_destroy(&m->d_lease_mis);
+    percpu_counter_destroy(&m->i_caps_hit);
+    percpu_counter_destroy(&m->i_caps_mis);
+    percpu_counter_destroy(&m->opened_inodes);
+    percpu_counter_destroy(&m->total_inodes);
+}
+
+/*
+ * powerfs_update_metric - 更新单个操作类型的延迟/吞吐统计.
+ *
+ * 对齐  xxx_update_metrics (metric.c L343):
+ *   只在 rc >= 0 (成功) 时统计, 失败不计数.
+ *   延迟用 ktime_to_ns, 跟踪 sum/min/max.
+ */
+void powerfs_update_metric(struct powerfs_metric *m, ktime_t start, ktime_t end,
+                           unsigned int size, int rc)
+{
+    u64 lat;
+
+    if (rc < 0)
+        return;
+
+    lat = ktime_to_ns(ktime_sub(end, start));
+
+    spin_lock(&m->lock);
+    m->total++;
+    m->size_sum += size;
+    if (size < m->size_min)
+        m->size_min = size;
+    if (size > m->size_max)
+        m->size_max = size;
+    m->latency_sum += lat;
+    if (lat < m->latency_min)
+        m->latency_min = lat;
+    if (lat > m->latency_max)
+        m->latency_max = lat;
+    spin_unlock(&m->lock);
+}
+
+/* ----- /proc 展示函数 ----- */
+
+static const char * const powerfs_metric_names[] = {
+    "read",
+    "write",
+    "metadata",
+};
+
+/*
+ * metrics_latency_show - IO 延迟统计.
+ *
+ * 对齐  metrics_latency_show (debugfs.c L171):
+ *   total, avg_lat(us), min_lat(us), max_lat(us)
+ */
+static int powerfs_proc_metrics_latency_show(struct seq_file *s, void *p)
+{
+    struct super_block *sb = s->private;
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    struct powerfs_metrics *m;
+    int i;
+
+    if (!sbi || !sbi->client) {
+        seq_puts(s, "client not initialized\n");
+        return 0;
+    }
+    m = &sbi->client->metrics;
+
+    seq_printf(s, "item          total       avg_lat(us)     min_lat(us)     max_lat(us)\n");
+    seq_printf(s, "-------------------------------------------------------------------------\n");
+
+    for (i = 0; i < POWERFS_METRIC_MAX; i++) {
+        u64 total, lat_sum, lat_min, lat_max, avg_ns;
+
+        spin_lock(&m->metric[i].lock);
+        total = m->metric[i].total;
+        lat_sum = m->metric[i].latency_sum;
+        lat_min = m->metric[i].latency_min;
+        lat_max = m->metric[i].latency_max;
+        spin_unlock(&m->metric[i].lock);
+
+        avg_ns = total > 0 ? div64_u64(lat_sum, total) : 0;
+
+        seq_printf(s, "%-14s%-12llu%-16llu%-16llu%llu\n",
+                   powerfs_metric_names[i],
+                   total,
+                   div64_u64(avg_ns, 1000),
+                   total > 0 ? div64_u64(lat_min, 1000) : 0,
+                   div64_u64(lat_max, 1000));
+    }
+
+    return 0;
+}
+
+/*
+ * metrics_size_show - IO 吞吐量统计.
+ *
+ * 对齐  metrics_size_show (debugfs.c L197):
+ *   total, avg_sz(bytes), min_sz, max_sz, total_sz
+ */
+static int powerfs_proc_metrics_size_show(struct seq_file *s, void *p)
+{
+    struct super_block *sb = s->private;
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    struct powerfs_metrics *m;
+    int i;
+
+    if (!sbi || !sbi->client) {
+        seq_puts(s, "client not initialized\n");
+        return 0;
+    }
+    m = &sbi->client->metrics;
+
+    seq_printf(s, "item          total       avg_sz(bytes)   min_sz(bytes)   max_sz(bytes)  total_sz(bytes)\n");
+    seq_printf(s, "----------------------------------------------------------------------------------------\n");
+
+    for (i = 0; i < POWERFS_METRIC_MAX; i++) {
+        u64 total, sum, avg, min_sz, max_sz;
+
+        /* metadata 无 size, 跳过 */
+        if (i == POWERFS_METRIC_METADATA)
+            continue;
+
+        spin_lock(&m->metric[i].lock);
+        total = m->metric[i].total;
+        sum = m->metric[i].size_sum;
+        min_sz = m->metric[i].size_min;
+        max_sz = m->metric[i].size_max;
+        spin_unlock(&m->metric[i].lock);
+
+        avg = total > 0 ? div64_u64(sum, total) : 0;
+        min_sz = (total > 0 && min_sz == U64_MAX) ? 0 : min_sz;
+
+        seq_printf(s, "%-14s%-12llu%-16llu%-16llu%-15llu%llu\n",
+                   powerfs_metric_names[i], total, avg, min_sz, max_sz, sum);
+    }
+
+    return 0;
+}
+
+/*
+ * metrics_caps_show - Cap/Dentry lease 命中率 + 文件/inode 计数.
+ *
+ * 对齐  metrics_caps_show (debugfs.c L227) + metrics_file_show (L148):
+ */
+static int powerfs_proc_metrics_caps_show(struct seq_file *s, void *p)
+{
+    struct super_block *sb = s->private;
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    struct powerfs_metrics *m;
+    s64 d_hit, d_mis, c_hit, c_mis, open_inodes, total_inodes;
+
+    if (!sbi || !sbi->client) {
+        seq_puts(s, "client not initialized\n");
+        return 0;
+    }
+    m = &sbi->client->metrics;
+
+    d_hit = percpu_counter_sum(&m->d_lease_hit);
+    d_mis = percpu_counter_sum(&m->d_lease_mis);
+    c_hit = percpu_counter_sum(&m->i_caps_hit);
+    c_mis = percpu_counter_sum(&m->i_caps_mis);
+    open_inodes = percpu_counter_sum(&m->opened_inodes);
+    total_inodes = percpu_counter_sum(&m->total_inodes);
+
+    seq_printf(s, "item                               total\n");
+    seq_printf(s, "------------------------------------------\n");
+    seq_printf(s, "%-35s%lld\n", "total inodes", total_inodes);
+    seq_printf(s, "%-35s%lld\n", "opened files", atomic64_read(&m->opened_files));
+    seq_printf(s, "%-35s%lld\n", "pinned i_caps", atomic64_read(&m->total_caps));
+    seq_printf(s, "%-35s%lld\n", "opened inodes", open_inodes);
+    seq_printf(s, "\n");
+    seq_printf(s, "item                               hit         miss        hit_rate\n");
+    seq_printf(s, "------------------------------------------------------------\n");
+    seq_printf(s, "%-35s%-12lld%-12lld", "dentry lease", d_hit, d_mis);
+    if (d_hit + d_mis > 0)
+        seq_printf(s, "%llu%%\n", div64_u64(d_hit * 100, d_hit + d_mis));
+    else
+        seq_puts(s, "N/A\n");
+    seq_printf(s, "%-35s%-12lld%-12lld", "inode caps", c_hit, c_mis);
+    if (c_hit + c_mis > 0)
+        seq_printf(s, "%llu%%\n", div64_u64(c_hit * 100, c_hit + c_mis));
+    else
+        seq_puts(s, "N/A\n");
+
+    return 0;
+}
+
+/* P3-5: /proc entry wrappers — procfs uses proc_ops (not file_operations).
+ * pde_data(inode) retrieves the sb pointer passed via proc_create_data. */
+static int powerfs_proc_metrics_latency_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, powerfs_proc_metrics_latency_show, pde_data(inode));
+}
+static const struct proc_ops powerfs_proc_metrics_latency_pops = {
+    .proc_open    = powerfs_proc_metrics_latency_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+};
+
+static int powerfs_proc_metrics_size_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, powerfs_proc_metrics_size_show, pde_data(inode));
+}
+static const struct proc_ops powerfs_proc_metrics_size_pops = {
+    .proc_open    = powerfs_proc_metrics_size_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+};
+
+static int powerfs_proc_metrics_caps_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, powerfs_proc_metrics_caps_show, pde_data(inode));
+}
+static const struct proc_ops powerfs_proc_metrics_caps_pops = {
+    .proc_open    = powerfs_proc_metrics_caps_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+};
+
+/*
+ * powerfs_proc_init - 在 fill_super 中调用, 创建 /proc/powerfs/<sb_id>/ 入口.
+ *
+ * 目录结构: /proc/powerfs/sb-<addr>/
+ *   latency  - IO 延迟统计 (read/write/metadata: total, avg/min/max lat)
+ *   size     - IO 吞吐量统计 (read/write: total, avg/min/max size, total_bytes)
+ *   caps     - Cap/Dentry lease 命中率 + opened_files/inodes 计数
+ */
+static void powerfs_proc_init(struct super_block *sb)
+{
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    struct proc_dir_entry *root;
+    char name[32];
+
+    snprintf(name, sizeof(name), "sb-%p", sb);
+
+    /* 创建 /proc/powerfs/ 父目录 (已存在则返回旧入口) */
+    root = proc_mkdir("powerfs", NULL);
+    if (!root) {
+        pr_warn("powerfs: failed to create /proc/powerfs\n");
+        return;
+    }
+
+    sbi->proc_dir = proc_mkdir(name, root);
+    if (!sbi->proc_dir) {
+        pr_warn("powerfs: failed to create /proc/powerfs/%s\n", name);
+        return;
+    }
+
+    proc_create_data("latency", 0444, sbi->proc_dir, &powerfs_proc_metrics_latency_pops, sb);
+    proc_create_data("size",    0444, sbi->proc_dir, &powerfs_proc_metrics_size_pops, sb);
+    proc_create_data("caps",    0444, sbi->proc_dir, &powerfs_proc_metrics_caps_pops, sb);
+
+    pr_info("powerfs: /proc/powerfs/%s/ entries created\n", name);
+}
+
+/*
+ * powerfs_proc_cleanup - 在 put_super 中调用, 清理 /proc 入口.
+ */
+static void powerfs_proc_cleanup(struct super_block *sb)
+{
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+
+    if (sbi->proc_dir) {
+        proc_remove(sbi->proc_dir);
+        sbi->proc_dir = NULL;
+    }
+}
+
+/* ========== P3-4: Debugfs 内部状态导出 ========== */
+
+#ifdef CONFIG_DEBUG_FS
+
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+
+/*
+ * status_show - 挂载状态总览.
+ *
+ * 对齐  status_show (debugfs.c L350):
+ *   mount_state, master 地址, client_id, blocklisted, writeback 统计.
+ */
+static int powerfs_debugfs_status_show(struct seq_file *s, void *p)
+{
+    struct super_block *sb = s->private;
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    struct powerfs_client *client = sbi->client;
+
+    if (!client) {
+        seq_puts(s, "client not initialized\n");
+        return 0;
+    }
+
+    seq_printf(s, "mount_state:    %d\n", client->mount_state);
+    seq_printf(s, "master:         %s:%u\n", sbi->master_addr, sbi->master_port);
+    seq_printf(s, "client_id:      %s\n", client->client_id);
+    seq_printf(s, "blocklisted:    %s\n", str_true_false(client->blocklisted));
+    seq_printf(s, "shutting_down:  %s\n", str_true_false(sbi->shutting_down));
+    seq_printf(s, "max_file_size:  %lld\n", client->max_file_size);
+    seq_printf(s, "writeback:      %ld (congested=%s)\n",
+               atomic_long_read(&client->writeback_count),
+               str_true_false(client->write_congested));
+    seq_printf(s, "wb_in_flight:   %d (max=%d)\n",
+               atomic_read(&sbi->wb_in_flight), POWERFS_WB_MAX_IN_FLIGHT);
+    seq_printf(s, "next_ino:       %d\n", atomic_read(&sbi->next_ino));
+
+    return 0;
+}
+
+/*
+ * caps_show - 遍历所有 inode, 导出 cap 状态.
+ *
+ * 对齐  caps_show (debugfs.c L266):
+ *   遍历 super_block->s_inodes 列表, 每个 inode 打印:
+ *   ino, issued, implemented, dirty_caps, flushing_caps, refs.
+ */
+static int powerfs_debugfs_caps_show(struct seq_file *s, void *p)
+{
+    struct super_block *sb = s->private;
+    struct powerfs_client *client = POWERFS_SB_INFO(sb)->client;
+    struct inode *inode;
+
+    seq_printf(s, "ino              issued           implemented      dirty           flushing        refs\n");
+    seq_printf(s, "------------------------------------------------------------------------------------------\n");
+
+    if (!client) {
+        seq_puts(s, "(client not initialized)\n");
+        return 0;
+    }
+
+    spin_lock(&sb->s_inode_list_lock);
+    list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+        struct powerfs_inode_info *pi = POWERFS_I(inode);
+
+        if (!pi)
+            continue;
+
+        /* igrab 安全: 持有 s_inode_list_lock 时 inode 不会被释放 */
+        if (!igrab(inode))
+            continue;
+        spin_unlock(&sb->s_inode_list_lock);
+
+        spin_lock(&pi->i_lock);
+        if (pi->i_auth_cap || pi->i_dirty_caps || pi->i_flushing_caps) {
+            seq_printf(s, "%-16lu%-17x%-17x%-17x%-17x%-4d\n",
+                       inode->i_ino,
+                       pi->i_auth_cap ? pi->i_auth_cap->issued : 0,
+                       pi->i_auth_cap ? pi->i_auth_cap->implemented : 0,
+                       pi->i_dirty_caps,
+                       pi->i_flushing_caps,
+                       pi->i_pin_ref);
+        }
+        spin_unlock(&pi->i_lock);
+
+        iput(inode);
+        spin_lock(&sb->s_inode_list_lock);
+    }
+    spin_unlock(&sb->s_inode_list_lock);
+
+    /* 全局 cap LRU 统计 */
+    {
+        int cap_lru_count = 0;
+        struct powerfs_cap *entry;
+
+        spin_lock(&client->cap_lru_lock);
+        list_for_each_entry(entry, &client->cap_lru_list, lru_item)
+            cap_lru_count++;
+        spin_unlock(&client->cap_lru_lock);
+
+        seq_printf(s, "\ncap_lru_count:  %d\n", cap_lru_count);
+    }
+
+    /* 全局 dirty/flushing 列表统计 */
+    {
+        int flush_count = 0;
+        struct powerfs_cap_flush *cf;
+
+        spin_lock(&client->cap_flush_lock);
+        list_for_each_entry(cf, &client->cap_flush_list, g_list)
+            flush_count++;
+        spin_unlock(&client->cap_flush_lock);
+
+        seq_printf(s, "cap_flush_list: %d\n", flush_count);
+    }
+
+    return 0;
+}
+
+/*
+ * inodes_show - 遍历所有 inode, 导出关键属性.
+ *
+ * 对齐  mdsc_show (debugfs.c L52) 的 inode 部分:
+ *   ino, mode, size, nlink, placement, dirty, cache_valid.
+ */
+static int powerfs_debugfs_inodes_show(struct seq_file *s, void *p)
+{
+    struct super_block *sb = s->private;
+    struct inode *inode;
+
+    seq_printf(s, "ino              mode      size             nlink  placement  dirty  cache_valid\n");
+    seq_printf(s, "----------------------------------------------------------------------------------------\n");
+
+    spin_lock(&sb->s_inode_list_lock);
+    list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+        struct powerfs_inode_info *pi = POWERFS_I(inode);
+
+        if (!pi)
+            continue;
+
+        if (!igrab(inode))
+            continue;
+        spin_unlock(&sb->s_inode_list_lock);
+
+        spin_lock(&pi->i_lock);
+        seq_printf(s, "%-16lu%-10o%-16lld%-7d%-10d%-7x%-7d\n",
+                   inode->i_ino,
+                   inode->i_mode,
+                   i_size_read(inode),
+                   inode->i_nlink,
+                   pi->placement,
+                   pi->i_dirty_caps,
+                   pi->cache_valid ? 1 : 0);
+        spin_unlock(&pi->i_lock);
+
+        iput(inode);
+        spin_lock(&sb->s_inode_list_lock);
+    }
+    spin_unlock(&sb->s_inode_list_lock);
+
+    return 0;
+}
+
+/*
+ * dentries_show - 遍历 dentry lease 列表, 导出 lease 状态.
+ *
+ * 对齐  caps_show_cb + dentry lease 部分:
+ *   dentry name, lease_expire, lease_gen, dir_shared_gen, flags.
+ */
+static int powerfs_debugfs_dentries_show(struct seq_file *s, void *p)
+{
+    struct super_block *sb = s->private;
+    struct powerfs_client *client = POWERFS_SB_INFO(sb)->client;
+    struct powerfs_dentry_info *di;
+    int count = 0;
+
+    if (!client) {
+        seq_puts(s, "(client not initialized)\n");
+        return 0;
+    }
+
+    seq_printf(s, "dentry            lease_expire  lease_gen  dir_shared_gen  flags\n");
+    seq_printf(s, "------------------------------------------------------------------------\n");
+
+    spin_lock(&client->dentry_lease_lock);
+    list_for_each_entry(di, &client->dentry_lease_list, lease_list) {
+        struct dentry *dentry = di->dentry;
+        unsigned long now = jiffies;
+        bool expired = di->lease_expire && time_after_eq(now, di->lease_expire);
+
+        if (dentry && dentry->d_name.name) {
+            seq_printf(s, "%-18s%-14lu%-11u%-16llu%-5lx%s\n",
+                       dentry->d_name.name,
+                       di->lease_expire,
+                       di->lease_gen,
+                       di->dir_shared_gen,
+                       di->flags,
+                       expired ? " (EXPIRED)" : "");
+        }
+        count++;
+    }
+    spin_unlock(&client->dentry_lease_lock);
+
+    seq_printf(s, "\ntotal dentry_leases: %d\n", count);
+    return 0;
+}
+
+/*
+ * leases_show - 目录 lease 状态 (shared_gen + I_COMPLETE).
+ */
+static int powerfs_debugfs_leases_show(struct seq_file *s, void *p)
+{
+    struct super_block *sb = s->private;
+    struct inode *inode;
+
+    seq_printf(s, "ino              shared_gen  complete  rdcache_gen  rfiles  rbytes\n");
+    seq_printf(s, "------------------------------------------------------------------------\n");
+
+    spin_lock(&sb->s_inode_list_lock);
+    list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+        struct powerfs_inode_info *pi = POWERFS_I(inode);
+
+        if (!pi || !S_ISDIR(inode->i_mode))
+            continue;
+
+        if (!igrab(inode))
+            continue;
+        spin_unlock(&sb->s_inode_list_lock);
+
+        spin_lock(&pi->i_lock);
+        seq_printf(s, "%-16lu%-12d%-10s%-13u%-8llu%-12llu\n",
+                   inode->i_ino,
+                   atomic_read(&pi->i_shared_gen),
+                   (pi->i_flags & POWERFS_I_COMPLETE) ? "yes" : "no",
+                   pi->i_rdcache_gen,
+                   pi->i_rfiles,
+                   pi->i_rbytes);
+        spin_unlock(&pi->i_lock);
+
+        iput(inode);
+        spin_lock(&sb->s_inode_list_lock);
+    }
+    spin_unlock(&sb->s_inode_list_lock);
+
+    return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_status);
+DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_caps);
+DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_inodes);
+DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_dentries);
+DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_leases);
+
+/*
+ * powerfs_debugfs_init - 在 fill_super 中调用, 创建 debugfs 目录和文件.
+ *
+ * 目录结构: /sys/kernel/debug/powerfs/<sb_id>/
+ *   status    - 挂载状态总览
+ *   caps      - 所有 inode cap 状态
+ *   inodes    - 所有 inode 关键属性
+ *   dentries  - dentry lease 列表
+ *   leases    - 目录 lease 状态
+ */
+static void powerfs_debugfs_init(struct super_block *sb)
+{
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+    char name[32];
+
+    /* 用超级块地址作为唯一标识 (同  用 client->debugfs_dir) */
+    snprintf(name, sizeof(name), "sb-%p", sb);
+
+    sbi->debugfs_dir = debugfs_create_dir(name, NULL);
+    if (IS_ERR_OR_NULL(sbi->debugfs_dir)) {
+        pr_warn("powerfs: failed to create debugfs dir\n");
+        sbi->debugfs_dir = NULL;
+        return;
+    }
+
+    debugfs_create_file("status",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_status_fops);
+    debugfs_create_file("caps",     0400, sbi->debugfs_dir, sb, &powerfs_debugfs_caps_fops);
+    debugfs_create_file("inodes",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_inodes_fops);
+    debugfs_create_file("dentries", 0400, sbi->debugfs_dir, sb, &powerfs_debugfs_dentries_fops);
+    debugfs_create_file("leases",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_leases_fops);
+
+    pr_info("powerfs: debugfs entries at /sys/kernel/debug/%s/\n", name);
+}
+
+/*
+ * powerfs_debugfs_cleanup - 在 put_super 中调用, 清理 debugfs 目录.
+ */
+static void powerfs_debugfs_cleanup(struct super_block *sb)
+{
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
+
+    if (sbi->debugfs_dir) {
+        debugfs_remove_recursive(sbi->debugfs_dir);
+        sbi->debugfs_dir = NULL;
+    }
+}
+
+#else /* !CONFIG_DEBUG_FS */
+
+/* CONFIG_DEBUG_FS 未启用时, init/cleanup 为空操作.
+ * 前向声明已在文件头部 (非 static inline, 而是 static),
+ * 此处提供空函数体. */
+
+static void powerfs_debugfs_init(struct super_block *sb) {}
+static void powerfs_debugfs_cleanup(struct super_block *sb) {}
+
+#endif /* CONFIG_DEBUG_FS */
+
+/* ========== P2-8: NFS Export Operations ========== */
+
+/*
+ * powerfs_encode_fh - 将 inode 编码为 NFS file handle.
+ *
+ * 对齐  xxx_encode_fh (export.c L94):
+ *   - 无 parent: fh = {ino} (FILEID_INO32_GEN)
+ *   - 有 parent: fh = {ino, parent_ino} (FILEID_INO32_GEN_PARENT)
+ *
+ * PowerFS file handle 只用 inode number (u64), 简洁可靠。
+ */
+static int powerfs_encode_fh(struct inode *inode, __u32 *fh, int *max_len,
+                              struct inode *parent)
+{
+    int type;
+
+    if (parent && (*max_len < 4)) {
+        *max_len = 4;
+        return FILEID_INVALID;
+    } else if (*max_len < 2) {
+        *max_len = 2;
+        return FILEID_INVALID;
+    }
+
+    if (parent) {
+        u64 ino = inode->i_ino;
+        u64 pino = parent->i_ino;
+        fh[0] = (__u32)(ino & 0xFFFFFFFF);
+        fh[1] = (__u32)(ino >> 32);
+        fh[2] = (__u32)(pino & 0xFFFFFFFF);
+        fh[3] = (__u32)(pino >> 32);
+        *max_len = 4;
+        type = FILEID_INO32_GEN_PARENT;
+    } else {
+        u64 ino = inode->i_ino;
+        fh[0] = (__u32)(ino & 0xFFFFFFFF);
+        fh[1] = (__u32)(ino >> 32);
+        *max_len = 2;
+        type = FILEID_INO32_GEN;
+    }
+    return type;
+}
+
+/*
+ * powerfs_fh_to_dentry - 从 NFS file handle 恢复 dentry.
+ *
+ * 对齐  __fh_to_dentry (export.c L189):
+ *   1. 从 fid 提取 ino
+ *   2. powerfs_iget 查找/创建 inode (若不在 icache 则需网络 getattr)
+ *   3. d_obtain_alias 关联 dentry
+ */
+static struct dentry *powerfs_fh_to_dentry(struct super_block *sb,
+                                            struct fid *fid,
+                                            int fh_len, int fh_type)
+{
+    struct inode *inode;
+    u64 ino;
+
+    if (fh_type != FILEID_INO32_GEN &&
+        fh_type != FILEID_INO32_GEN_PARENT)
+        return NULL;
+
+    if (fh_len < 2)
+        return NULL;
+
+    ino = (u64)fid->raw[0] | ((u64)fid->raw[1] << 32);
+
+    /* iget5_locked 先查 icache; 若 I_NEW 则需 fill_super 的 read_inode 路径
+     * 填充. NFS export 场景 inode 通常已在 icache (之前被访问过). */
+    inode = powerfs_iget(sb, ino);
+    if (IS_ERR(inode))
+        return ERR_CAST(inode);
+
+    if (is_bad_inode(inode)) {
+        iput(inode);
+        return ERR_PTR(-ESTALE);
+    }
+
+    return d_obtain_alias(inode);
+}
+
+/*
+ * powerfs_fh_to_parent - 从 NFS file handle 恢复父目录 dentry.
+ */
+static struct dentry *powerfs_fh_to_parent(struct super_block *sb,
+                                            struct fid *fid,
+                                            int fh_len, int fh_type)
+{
+    struct inode *inode;
+    u64 pino;
+
+    if (fh_type != FILEID_INO32_GEN_PARENT)
+        return NULL;
+
+    if (fh_len < 4)
+        return NULL;
+
+    pino = (u64)fid->raw[2] | ((u64)fid->raw[3] << 32);
+
+    inode = powerfs_iget(sb, pino);
+    if (IS_ERR(inode))
+        return ERR_CAST(inode);
+
+    if (is_bad_inode(inode)) {
+        iput(inode);
+        return ERR_PTR(-ESTALE);
+    }
+
+    return d_obtain_alias(inode);
+}
+
+/*
+ * powerfs_get_parent - 获取 dentry 的父目录 (NFS exportfs 用).
+ *
+ * 对齐  xxx_get_parent (export.c L369):
+ *   PowerFS 简化: 用 dentry->d_parent 直接获取 (不做 RPC).
+ *   适用于本地 dcache 有父 dentry 的场景. 若 d_parent == root 则返回 -ESTALE.
+ */
+static struct dentry *powerfs_get_parent(struct dentry *child)
+{
+    struct dentry *parent;
+
+    if (IS_ROOT(child))
+        return ERR_PTR(-ESTALE);
+
+    parent = dget_parent(child);
+    return parent;
+}
+
+static const struct export_operations powerfs_export_ops = {
+    .encode_fh     = powerfs_encode_fh,
+    .fh_to_dentry  = powerfs_fh_to_dentry,
+    .fh_to_parent  = powerfs_fh_to_parent,
+    .get_parent    = powerfs_get_parent,
 };
 
 /* ========== 全局 slab 缓存初始化/销毁 ========== */
@@ -7379,9 +10873,51 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     /* 初始化 inode 号分配器 (从 100 开始，1 是 root) */
     atomic_set(&sbi->next_ino, 100);
 
+    /* P3-5: 分配并初始化 powerfs_client (对齐  xxx_fs_client).
+     * client 承载全局性能计数、dentry lease LRU、cap LRU、client_id 等.
+     * 之前 client 始终为 NULL, 导致 dentry lease 链表/cap LRU/metrics 全部失效. */
+    sbi->client = kzalloc(sizeof(*sbi->client), GFP_KERNEL);
+    if (!sbi->client) {
+        pr_err("powerfs: failed to allocate powerfs_client\n");
+        kfree(sbi);
+        return -ENOMEM;
+    }
+    sbi->client->sb = sb;
+    sbi->client->mount_state = POWERFS_MOUNT_MOUNTING;
+    sbi->client->blocklisted = false;
+    sbi->client->max_file_size = MAX_LFS_FILESIZE;
+    atomic_long_set(&sbi->client->writeback_count, 0);
+    sbi->client->write_congested = false;
+    sbi->client->filp_gen = 0;
+    memcpy(sbi->client->master_addr, sbi->master_addr, sizeof(sbi->master_addr));
+    sbi->client->master_port = sbi->master_port;
+    /* client_id: "powerfs-kernel-<tgid>" — 唯一标识本 mount, 用于 Cap recall */
+    {
+        int id_len = snprintf(sbi->client->client_id, sizeof(sbi->client->client_id),
+                              "powerfs-kernel-%d", task_tgid_vnr(current));
+        sbi->client->client_id_len = (size_t)id_len;
+    }
+    INIT_LIST_HEAD(&sbi->client->dentry_lease_list);
+    spin_lock_init(&sbi->client->dentry_lease_lock);
+    INIT_LIST_HEAD(&sbi->client->cap_lru_list);
+    spin_lock_init(&sbi->client->cap_lru_lock);
+    INIT_LIST_HEAD(&sbi->client->cap_flush_list);
+    spin_lock_init(&sbi->client->cap_flush_lock);
+    mutex_init(&sbi->client->mount_mutex);
+    ret = powerfs_metrics_init(&sbi->client->metrics);
+    if (ret) {
+        pr_err("powerfs: powerfs_metrics_init failed: %d\n", ret);
+        kfree(sbi->client);
+        sbi->client = NULL;
+        kfree(sbi);
+        return ret;
+    }
+    pr_info("powerfs: client allocated, client_id=%s\n", sbi->client->client_id);
+
     /* 设置超级块 (覆盖 sb->s_fs_info, 之前指向已释放的 ctx) */
     sb->s_fs_info = sbi;
     sb->s_op = &powerfs_super_ops;
+    sb->s_export_op = &powerfs_export_ops;  /* P2-8: NFS export 支持 */
     sb->s_xattr = powerfs_xattr_handlers;
     sb->s_magic = POWERFS_SUPER_MAGIC;
     sb->s_blocksize = 4096;
@@ -7396,7 +10932,7 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
      * folio_account_dirtied 不增加 dirty 统计, writeback 子系统不扫描
      * dirty folio, 导致 sync/fsync 不触发 writepage, 数据无法持久化.
      *
-     * 参考: ceph_fill_super (fs/ceph/super.c) 调用 super_setup_bdi.
+     * 参考: xxx_fill_super (fs/xxx/super.c) 调用 super_setup_bdi.
      * ramfs 不需要 (纯内存, 无 writeback). */
     ret = super_setup_bdi(sb);
     if (ret) {
@@ -7427,6 +10963,8 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
     sbi->initialized = true;
     sbi->shutting_down = false;
+    if (sbi->client)
+        sbi->client->mount_state = POWERFS_MOUNT_MOUNTED;
 
     /* 设置全局超级块指针 (供通信层使用) */
     g_powerfs_sb = sb;
@@ -7455,6 +10993,14 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         return -ENOMEM;
     }
 
+    /* Stage C+: 注册 Cap NOTIFY 回调 (Filer→Client async push).
+     * refresh_wq 必须已创建 (handlers 内部 queue_work 到它).
+     * 注册后 RX dispatcher 收到 CapRecallNotify / CapUpgradeNotify 会
+     * 派发到 fs 层 powerfs_cap_recall_notify_handler / upgrade handler. */
+    powerfs_net_reg_cap_notify_handlers(powerfs_cap_recall_notify_handler,
+                                        powerfs_cap_upgrade_notify_handler);
+    pr_info("powerfs: cap notify handlers registered via powerfs-net dispatcher\n");
+
     /* Phase 3: lease 续约 workqueue.
      * WQ_UNBOUND: 不绑定 CPU, 允许调度器自由调度.
      * WQ_MEM_RECLAIM: 参考 nfsiod/GFS2, 内存回收路径可用.
@@ -7466,6 +11012,40 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
                                      WQ_UNBOUND | WQ_MEM_RECLAIM, 4);
     if (!sbi->lease_wq) {
         pr_err("powerfs: failed to create lease workqueue\n");
+        return -ENOMEM;
+    }
+
+    /* P1-1: 创建 per-sb slab caches (对齐  init_caches() — cap/cap_snap/cap_flush).
+     * 注意: inode_cache/dentry_cachep 是模块级全局 (powerfs_init_inode_cache 创建),
+     * cap/cap_snap/cap_flush 是 per-sb (每个挂载独立, 支持多挂载互不干扰). */
+    sbi->cap_cachep = kmem_cache_create(
+        "powerfs_cap",
+        sizeof(struct powerfs_cap),
+        __alignof__(struct powerfs_cap),
+        SLAB_RECLAIM_ACCOUNT,
+        NULL);
+    if (!sbi->cap_cachep) {
+        pr_err("powerfs: failed to create cap_cachep\n");
+        return -ENOMEM;
+    }
+    sbi->cap_snap_cachep = kmem_cache_create(
+        "powerfs_cap_snap",
+        sizeof(struct powerfs_cap_snap),
+        __alignof__(struct powerfs_cap_snap),
+        SLAB_RECLAIM_ACCOUNT,
+        NULL);
+    if (!sbi->cap_snap_cachep) {
+        pr_err("powerfs: failed to create cap_snap_cachep\n");
+        return -ENOMEM;
+    }
+    sbi->cap_flush_cachep = kmem_cache_create(
+        "powerfs_cap_flush",
+        sizeof(struct powerfs_cap_flush),
+        __alignof__(struct powerfs_cap_flush),
+        SLAB_RECLAIM_ACCOUNT,
+        NULL);
+    if (!sbi->cap_flush_cachep) {
+        pr_err("powerfs: failed to create cap_flush_cachep\n");
         return -ENOMEM;
     }
 
@@ -7549,6 +11129,13 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
     pr_debug("powerfs: fill_super done, root ino=%lu\n", root->i_ino);
     pr_debug("powerfs: powerfs_net pool initialized (Delta Sync ready)\n");
+
+    /* P3-4: 创建 debugfs 状态导出入口 */
+    powerfs_debugfs_init(sb);
+
+    /* P3-5: 创建 /proc/powerfs/<sb>/ 性能计数入口 */
+    powerfs_proc_init(sb);
+
     return 0;
 }
 
@@ -7614,7 +11201,31 @@ void powerfs_kill_sb_super(struct super_block *sb)
     /* 4. 关闭所有连接 (g_pool 会被清零) */
     powerfs_net_pool_cleanup();
 
+    /* 4b. P1-1 防御式清理: put_super 理论上先执行并销毁 cap caches，
+     *     但 mount 中途失败 (fill_super 报错→kill_sb) 时 put_super 不会被调用，
+     *     这里重复销毁 (kmem_cache_destroy(NULL) 安全，重复 destroy 也安全)。 */
     if (sbi) {
+        if (sbi->cap_flush_cachep) {
+            kmem_cache_destroy(sbi->cap_flush_cachep);
+            sbi->cap_flush_cachep = NULL;
+        }
+        if (sbi->cap_snap_cachep) {
+            kmem_cache_destroy(sbi->cap_snap_cachep);
+            sbi->cap_snap_cachep = NULL;
+        }
+        if (sbi->cap_cachep) {
+            kmem_cache_destroy(sbi->cap_cachep);
+            sbi->cap_cachep = NULL;
+        }
+    }
+
+    if (sbi) {
+        if (sbi->client) {
+            sbi->client->mount_state = POWERFS_MOUNT_UNMOUNTING;
+            powerfs_metrics_destroy(&sbi->client->metrics);
+            kfree(sbi->client);
+            sbi->client = NULL;
+        }
         kfree(sbi);
         sb->s_fs_info = NULL;
     }

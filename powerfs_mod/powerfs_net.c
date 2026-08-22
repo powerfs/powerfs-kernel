@@ -2,7 +2,7 @@
  * PowerFS 内核态 powerfs-net 协议实现
  *
  * 直接在内核中实现 powerfs-net 二进制协议，通过 TCP 连接与 Filer 通信。
- * 参考 Ceph 内核客户端的 socket 使用模式。
+ * 参考 内核客户端的 socket 使用模式。
  *
  * 通信流程:
  *   1. 建立 TCP 连接 (sock_create_kern + kernel_connect)
@@ -2125,6 +2125,24 @@ static int pfs_conn_flow_idx(struct powerfs_net_server_conn *conn)
     return -1;
 }
 
+/* --- §13 Cap NOTIFY forward declarations ---
+ * 定义位于文件末尾 §13 (cap dispatcher + decode_cap_*_body).
+ * pfs_rx_dispatch 需要提前引用 decode 函数 + g_cap_*_notify_fn 变量. */
+static int decode_cap_recall_body(const __u8 *body, size_t body_len,
+                                  u64 *ino_out,
+                                  char *token_out, size_t token_cap, size_t *token_len_out,
+                                  __u8 *recall_mask_out, __u8 *retain_mask_out,
+                                  __u64 *epoch_out);
+static int decode_cap_upgrade_body(const __u8 *body, size_t body_len,
+                                   u64 *ino_out,
+                                   char *token_out, size_t token_cap, size_t *token_len_out,
+                                   __u8 *new_granted_out,
+                                   __u64 *epoch_out, __u64 *sn_out);
+/* cap NOTIFY 回调 (fs 层通过 powerfs_net_reg_cap_notify_handlers 注册).
+ * __read_mostly: 注册一次后只读, 减少 cache line ping-pong. */
+static powerfs_cap_recall_notify_fn  g_cap_recall_notify_fn  __read_mostly;
+static powerfs_cap_upgrade_notify_fn g_cap_upgrade_notify_fn __read_mostly;
+
 /* 一帧完整后处理: NOTIFY 异步帧 或 按 seq 匹配 pending req + complete.
  * 锁外 memcpy 大块 READ 响应 (持 req_lock 会阻塞 do_send 入队). */
 static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
@@ -2136,31 +2154,90 @@ static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
     size_t data_len = conn->rx_data_got;
     struct powerfs_request *req = NULL;
 
-    /* 异步通知帧 (seq=0 或 NOTIFY flag): invalidate 主动推送.
-     * Filer 元数据变更后推 Invalidate(inode, version) 到所有订阅客户端. */
+    /* 异步通知帧 (seq=0 或 NOTIFY flag): invalidate 主动推送 / Cap recall / Cap upgrade.
+     * Filer 元数据变更后推 Invalidate(inode, version) 到所有订阅客户端;
+     * Cap manager 推 CapRecallNotify(撤销) / CapUpgradeNotify(升级) 到持有 cap 的客户端. */
     if ((hdr->flags & POWERFS_NET_FLAG_NOTIFY) || hdr->seq == 0) {
-        __u64 ino = 0;
-        __u64 version = 0;
+        pr_debug("powerfs: RX %s:%u: async notify msg=0x%04x seq=%u flags=0x%02x body_len=%zu\n",
+                 conn->addr, conn->port, hdr->msg_type, hdr->seq, hdr->flags, body_len);
 
-        pr_debug("powerfs: RX %s:%u: async notify seq=%u flags=0x%02x\n",
-                 conn->addr, conn->port, hdr->seq, hdr->flags);
+        /* --- Cap recall notify (0x0094): 服务端撤销本客户端 cap 位 --- */
+        if (hdr->msg_type == POWERFS_NET_MSG_CAP_RECALL_NOTIFY) {
+            powerfs_cap_recall_notify_fn fn;
+            u64 ino = 0;
+            char token_buf[64];
+            size_t token_len = 0;
+            __u8 recall_mask = 0, retain_mask = 0;
+            __u64 epoch = 0;
+            int rc;
 
-        if (body && body_len > 0) {
-            struct powerfs_tlv_dec dec;
-            powerfs_tlv_dec_init(&dec, body, body_len);
-            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_INO, &ino);
-            powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_VERSION, &version);
+            rc = decode_cap_recall_body(body, body_len, &ino,
+                                        token_buf, sizeof(token_buf), &token_len,
+                                        &recall_mask, &retain_mask, &epoch);
+            if (rc < 0) {
+                pr_warn("powerfs: CapRecallNotify decode failed rc=%d\n", rc);
+                return;
+            }
+            fn = smp_load_acquire(&g_cap_recall_notify_fn);
+            if (fn) {
+                fn(ino, token_buf, token_len, recall_mask, retain_mask, epoch);
+            } else {
+                pr_warn("powerfs: CapRecallNotify for ino=%llu but no handler registered\n",
+                        ino);
+            }
+            return;
         }
 
-        if (ino != 0) {
-            pr_debug("powerfs: invalidate ino=%llu version=%llu\n",
-                    ino, version);
-            /* powerfs_invalidate_one() now defers all work (inode lookup +
-             * getattr + page cache invalidation) to powerfs_refresh_wq.
-             * This is non-blocking and safe to call from the RX dispatcher. */
-            powerfs_invalidate_one(ino);
-        } else {
-            pr_warn("powerfs: notify frame missing Ino field\n");
+        /* --- Cap upgrade notify (0x0095): 存活 writer 被升级回 EXCLUSIVE_WRITE --- */
+        if (hdr->msg_type == POWERFS_NET_MSG_CAP_UPGRADE_NOTIFY) {
+            powerfs_cap_upgrade_notify_fn fn;
+            u64 ino = 0;
+            char token_buf[64];
+            size_t token_len = 0;
+            __u8 new_granted = 0;
+            __u64 epoch = 0, sn = 0;
+            int rc;
+
+            rc = decode_cap_upgrade_body(body, body_len, &ino,
+                                         token_buf, sizeof(token_buf), &token_len,
+                                         &new_granted, &epoch, &sn);
+            if (rc < 0) {
+                pr_warn("powerfs: CapUpgradeNotify decode failed rc=%d\n", rc);
+                return;
+            }
+            fn = smp_load_acquire(&g_cap_upgrade_notify_fn);
+            if (fn) {
+                fn(ino, token_buf, token_len, new_granted, epoch, sn);
+            } else {
+                pr_warn("powerfs: CapUpgradeNotify for ino=%llu but no handler registered\n",
+                        ino);
+            }
+            return;
+        }
+
+        /* --- 通用 Invalidate notify: 元数据变更推 Invalidate(inode, version) --- */
+        {
+            __u64 ino = 0;
+            __u64 version = 0;
+
+            if (body && body_len > 0) {
+                struct powerfs_tlv_dec dec;
+                powerfs_tlv_dec_init(&dec, body, body_len);
+                powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_INO, &ino);
+                powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_VERSION, &version);
+            }
+
+            if (ino != 0) {
+                pr_debug("powerfs: invalidate ino=%llu version=%llu\n",
+                        ino, version);
+                /* powerfs_invalidate_one() now defers all work (inode lookup +
+                 * getattr + page cache invalidation) to powerfs_refresh_wq.
+                 * This is non-blocking and safe to call from the RX dispatcher. */
+                powerfs_invalidate_one(ino);
+            } else {
+                pr_warn("powerfs: notify frame missing Ino field (msg=0x%04x)\n",
+                        hdr->msg_type);
+            }
         }
         return;
     }
@@ -2689,7 +2766,7 @@ static void powerfs_conn_reconnect_work_fn(struct work_struct *work)
         pr_debug("powerfs: %s %s:%u reconnected\n", ctype, conn->addr, conn->port);
     } else {
         /* 指数退避: BASE_DELAY * 2^(attempt-1), 上限 MAX_DELAY
-         * (参照 Ceph con->delay). 成功连接时在 connect_one 中归零. */
+         * (参照  con->delay). 成功连接时在 connect_one 中归零. */
         if (conn->reconnect_delay == 0)
             conn->reconnect_delay = msecs_to_jiffies(POWERFS_NET_BASE_DELAY);
         else
@@ -3083,7 +3160,7 @@ struct powerfs_request *powerfs_request_alloc(__u16 msg_type, gfp_t gfp)
 }
 EXPORT_SYMBOL_GPL(powerfs_request_alloc);
 
-/* kref 释放回调: 引用计数归零时释放请求 (参照 Ceph ceph_osdc_release_request) */
+/* kref 释放回调: 引用计数归零时释放请求 */
 void powerfs_request_release(struct kref *kref)
 {
     struct powerfs_request *req = container_of(kref, struct powerfs_request, kref);
@@ -3124,7 +3201,7 @@ void powerfs_request_free(struct powerfs_request *req)
 }
 EXPORT_SYMBOL_GPL(powerfs_request_free);
 
-/* === 红黑树辅助函数 (参照 Ceph: 按 seq 组织请求, O(log n) 查找) ===
+/* === 红黑树辅助函数 (按 seq 组织请求, O(log n) 查找) ===
  *
  * req_tree 按 seq 排序, 用于 reply 匹配: 收到响应时按 seq 快速定位请求.
  * 与 pending_reqs (链表, 按发送顺序) 互补.
@@ -4421,7 +4498,9 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
                          __u64 *size, __u32 *nlink,
                          __u64 *mtime, __u64 *atime, __u64 *ctime,
                          __u64 *volume_id, __u64 *file_key,
-                         struct powerfs_file_layout *layout)
+                         struct powerfs_file_layout *layout,
+                         __u64 *rbytes_out, __u64 *rfiles_out, __u64 *rsubdirs_out,
+                         __u64 *rctime_sec_out, __u32 *rctime_nsec_out)
 {
     __u8 body[64];
     struct powerfs_tlv_enc enc;
@@ -4476,6 +4555,21 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
 
         /* K1: 解析 FileLayout (placement/reliability/chunk_size) */
         parse_file_layout(&dec, layout);
+
+        /* P1-5: 解析目录递归 rstat 聚合 (RBytes/RFiles/RSubdirs/RCtime).
+         * 仅目录 inode 在 GETATTR/LOOKUP 响应中携带这些字段;
+         * 文件 inode 缺省时保持 *out 不变 (不写入). find_* 失败 = 0,
+         * 所以若不需要时传 NULL 直接跳过; 否则即使缺省也写 0 是 OK 的. */
+        if (rbytes_out)
+            (void)powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_RBYTES, rbytes_out);
+        if (rfiles_out)
+            (void)powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_RFILES, rfiles_out);
+        if (rsubdirs_out)
+            (void)powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_RSUBDIRS, rsubdirs_out);
+        if (rctime_sec_out)
+            (void)powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_RCTIME_SEC, rctime_sec_out);
+        if (rctime_nsec_out)
+            (void)powerfs_tlv_dec_find_u32(&dec, POWERFS_NET_FLD_RCTIME_NSEC, rctime_nsec_out);
     }
 
     ret = 0;
@@ -5827,6 +5921,289 @@ int powerfs_net_link(__u64 ino, __u64 dir_ino, const char *name, size_t name_len
 
     return 0;
 }
+
+/* ===== Xattr TX: SetXattr / GetXattr / RemoveXattr / ListXattr =====
+ *
+ * 消息/字段值必须与 Rust powerfs-net MsgType/FieldId 枚举严格一致:
+ *   MsgType::SetXattr    = 0x0038,
+ *   MsgType::GetXattr    = 0x0039,
+ *   MsgType::RemoveXattr = 0x003a,
+ *   MsgType::ListXattr   = 0x003b.
+ *   FieldId::ShardId     = 0x70, Ino = 0x07,
+ *   FieldId::XattrKey    = 0xB3 (string), XattrValue = 0xB4 (bytes),
+ *   FieldId::XattrKeys   = 0xBC (NUL-separated bytes list).
+ *
+ * 所有请求需要 ShardId + Ino: Filer 路由层通过 ShardId 哈希到 shard leader,
+ * 忽略 Ino 本身 (xattr 与 inode 属同一 shard). Ino 传 0 也能工作, 但为了
+ * 日志/调试和将来 Filer 端按 inode 聚合缓存, 这里总是显式传. */
+
+/**
+ * powerfs_net_setxattr - 设置/覆盖单个 xattr (Raft 持久化).
+ *
+ * Request TLV:  ShardId + Ino + XattrKey(string) + XattrValue(bytes)
+ * Response TLV: Status only
+ */
+int powerfs_net_setxattr(__u64 shard_id, __u64 ino,
+                         const char *name, size_t name_len,
+                         const __u8 *value, size_t value_len)
+{
+    /* 编码请求 body: ShardId(8+8=16hdr+val) + Ino(16) +
+     *                XattrKey(5hdr+name) + XattrValue(5hdr+value).
+     * 留 1KB 安全裕量, xattr value 通常 <=64KB. */
+    size_t body_cap = 64 + name_len + value_len;
+    __u8 *body;
+    struct powerfs_tlv_enc enc;
+    int ret;
+
+    if (!name || name_len == 0 || name_len > 255)
+        return -EINVAL;
+    if (value_len > 0 && !value)
+        return -EINVAL;
+
+    body = kmalloc(body_cap, GFP_KERNEL);
+    if (!body)
+        return -ENOMEM;
+
+    powerfs_tlv_enc_init(&enc, body, body_cap);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SHARD_ID, shard_id);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_XATTR_KEY, name, name_len);
+    if (value_len > 0)
+        powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_XATTR_VALUE, value, value_len);
+    else {
+        /* 空值仍然要编码字段 (区分 "未设置" 和 "设置为空字符串").
+         * tlv_enc_bytes(NULL, 0) 编码为 field(1) + len(4) = 5 字节头, data=0. */
+        powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_XATTR_VALUE, value ? value : (const __u8 *)"", 0);
+    }
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_SET_XATTR, ino,
+                                    body, powerfs_tlv_enc_len(&enc),
+                                    NULL, 0, NULL, 0, NULL, 0,
+                                    POWERFS_META_TIMEOUT_MS, NULL, NULL);
+    kfree(body);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return net_status_to_errno((__u16)ret);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_setxattr);
+
+/**
+ * powerfs_net_getxattr - 查询单个 xattr 值.
+ *
+ * Request TLV:  ShardId + Ino + XattrKey(string)
+ * Response TLV: XattrValue(bytes) 或 Status=NOT_FOUND
+ *
+ * 若 xattr 未设置 → 返回 -ENODATA (VFS xattr 标准语义).
+ * 若 value_cap < 实际 value_len → *value_len_out = 实际 len, 返回 -ERANGE.
+ */
+int powerfs_net_getxattr(__u64 shard_id, __u64 ino,
+                         const char *name, size_t name_len,
+                         __u8 *value_out, size_t value_cap,
+                         size_t *value_len_out)
+{
+    size_t body_cap = 64 + name_len;
+    __u8 *body;
+    struct powerfs_tlv_enc enc;
+    /* 响应 body 期望一个 XattrValue bytes 字段, xattr value 通常 <=64KB. */
+    __u8 resp_stack[4096];
+    __u8 *resp_body = resp_stack;
+    size_t resp_body_cap = sizeof(resp_stack);
+    size_t resp_body_len = 0;
+    struct powerfs_tlv_dec dec;
+    const __u8 *raw_val = NULL;
+    size_t raw_len = 0;
+    int ret;
+
+    if (!name || name_len == 0 || name_len > 255 || !value_len_out)
+        return -EINVAL;
+
+    *value_len_out = 0;
+
+    body = kmalloc(body_cap, GFP_KERNEL);
+    if (!body)
+        return -ENOMEM;
+
+    powerfs_tlv_enc_init(&enc, body, body_cap);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SHARD_ID, shard_id);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_XATTR_KEY, name, name_len);
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_GET_XATTR, ino,
+                                    body, powerfs_tlv_enc_len(&enc),
+                                    NULL, 0,
+                                    resp_body, resp_body_cap,
+                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
+                                    &resp_body_len, NULL);
+    kfree(body);
+    if (ret < 0)
+        return ret;
+    if (ret > 0) {
+        /* STATUS_ERR_NOT_FOUND → -ENODATA (VFS xattr 语义, 区别于 lookup 的 ENOENT).
+         * net_status_to_errno 默认把 NOT_FOUND → -ENOENT, 这里覆盖. */
+        if ((__u16)ret == POWERFS_NET_STATUS_ERR_NOT_FOUND)
+            return -ENODATA;
+        return net_status_to_errno((__u16)ret);
+    }
+
+    /* 成功响应: 解析 XattrValue bytes. */
+    powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+    if (powerfs_tlv_dec_find_raw(&dec, POWERFS_NET_FLD_XATTR_VALUE,
+                                 &raw_val, &raw_len) != 0) {
+        /* 无 XattrValue 字段: Filer 端可能为空值但漏编码, 视为 0 长度. */
+        raw_len = 0;
+    }
+
+    *value_len_out = raw_len;
+    if (raw_len == 0)
+        return 0;
+    if (raw_len > value_cap)
+        return -ERANGE;
+    if (value_out)
+        memcpy(value_out, raw_val, raw_len);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_getxattr);
+
+/**
+ * powerfs_net_removexattr - 删除单个 xattr (Raft 持久化).
+ *
+ * Request TLV:  ShardId + Ino + XattrKey(string)
+ * Response TLV: Status only
+ * 未设置 → 返回 -ENODATA.
+ */
+int powerfs_net_removexattr(__u64 shard_id, __u64 ino,
+                            const char *name, size_t name_len)
+{
+    size_t body_cap = 64 + name_len;
+    __u8 *body;
+    struct powerfs_tlv_enc enc;
+    int ret;
+
+    if (!name || name_len == 0 || name_len > 255)
+        return -EINVAL;
+
+    body = kmalloc(body_cap, GFP_KERNEL);
+    if (!body)
+        return -ENOMEM;
+
+    powerfs_tlv_enc_init(&enc, body, body_cap);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SHARD_ID, shard_id);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_XATTR_KEY, name, name_len);
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_REMOVE_XATTR, ino,
+                                    body, powerfs_tlv_enc_len(&enc),
+                                    NULL, 0, NULL, 0, NULL, 0,
+                                    POWERFS_META_TIMEOUT_MS, NULL, NULL);
+    kfree(body);
+    if (ret < 0)
+        return ret;
+    if (ret > 0) {
+        if ((__u16)ret == POWERFS_NET_STATUS_ERR_NOT_FOUND)
+            return -ENODATA;
+        return net_status_to_errno((__u16)ret);
+    }
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_removexattr);
+
+/**
+ * powerfs_net_listxattr - 枚举 inode 上所有 xattr 键名.
+ *
+ * Request TLV:  ShardId + Ino
+ * Response TLV: XattrKeys (NUL-separated bytes) 或 empty body = 无 xattr.
+ *
+ * 若缓冲区不足 → *list_len_out = 实际字节数, 返回 -ERANGE (VFS listxattr
+ * 语义: listxattr(fd, NULL, 0) probe 时传入 list_buf=NULL/list_cap=0,
+ * 成功返回所需长度).
+ */
+int powerfs_net_listxattr(__u64 shard_id, __u64 ino,
+                          char *list_buf, size_t list_cap,
+                          size_t *list_len_out)
+{
+    __u8 body[64];
+    struct powerfs_tlv_enc enc;
+    __u8 resp_stack[512];    /* 小响应走栈 (典型场景 < 10 个 xattr 键 < 512B) */
+    __u8 *resp_body = resp_stack;
+    size_t resp_body_cap = sizeof(resp_stack);
+    size_t resp_body_len = 0;
+    __u8 *resp_heap = NULL;
+    struct powerfs_tlv_dec dec;
+    const __u8 *raw_keys = NULL;
+    size_t raw_len = 0;
+    int ret;
+
+    if (!list_len_out)
+        return -EINVAL;
+    *list_len_out = 0;
+
+    powerfs_tlv_enc_init(&enc, body, sizeof(body));
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SHARD_ID, shard_id);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_LIST_XATTR, ino,
+                                    body, powerfs_tlv_enc_len(&enc),
+                                    NULL, 0,
+                                    resp_body, resp_body_cap,
+                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
+                                    &resp_body_len, NULL);
+    /* -ERANGE: 栈缓冲 512 不够, 响应实际长度 > 512 → 切换到堆缓冲重试 */
+    if (ret == -ERANGE) {
+        resp_body_cap = resp_body_len ? resp_body_len : 8192;
+        if (resp_body_cap > 65536)  /* 上限 64KB (xattr 键不可能这么多) */
+            resp_body_cap = 65536;
+        resp_heap = kmalloc(resp_body_cap, GFP_KERNEL);
+        if (!resp_heap)
+            return -ENOMEM;
+        resp_body = resp_heap;
+        resp_body_len = 0;
+        ret = powerfs_net_send_request(POWERFS_NET_MSG_LIST_XATTR, ino,
+                                        body, powerfs_tlv_enc_len(&enc),
+                                        NULL, 0,
+                                        resp_body, resp_body_cap,
+                                        NULL, 0, POWERFS_META_TIMEOUT_MS,
+                                        &resp_body_len, NULL);
+    }
+    if (ret < 0) {
+        kfree(resp_heap);
+        return ret;
+    }
+    if (ret > 0) {
+        kfree(resp_heap);
+        return net_status_to_errno((__u16)ret);
+    }
+
+    if (resp_body_len == 0) {
+        kfree(resp_heap);
+        *list_len_out = 0;  /* 无 xattr */
+        return 0;
+    }
+
+    powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+    if (powerfs_tlv_dec_find_raw(&dec, POWERFS_NET_FLD_XATTR_KEYS,
+                                 &raw_keys, &raw_len) != 0 || raw_len == 0) {
+        kfree(resp_heap);
+        *list_len_out = 0;  /* 字段缺失或空 → 无 xattr */
+        return 0;
+    }
+
+    *list_len_out = raw_len;
+    /* probe 语义: list_buf == NULL 或容量不足 → 返回 -ERANGE 让 VFS 重分配. */
+    if (list_buf == NULL || list_cap == 0) {
+        kfree(resp_heap);
+        return -ERANGE;
+    }
+    if (raw_len > list_cap) {
+        kfree(resp_heap);
+        return -ERANGE;
+    }
+    memcpy(list_buf, raw_keys, raw_len);
+    kfree(resp_heap);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_listxattr);
 
 /**
  * powerfs_net_ping - 连接健康检查
@@ -7252,6 +7629,403 @@ int powerfs_net_release_lease(__u64 volume_id, __u64 ino,
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_net_release_lease);
+
+/* ========================================================================
+ * §13 Capability (Cap) model: 三条同步 RPC 实现
+ * ========================================================================
+ *
+ * 消息值对齐 Rust MsgType 枚举 (powerfs-net/src/protocol.rs L685):
+ *   CapOpenGrant  = 0x0091 (open() 时申请)
+ *   CapRecallAck  = 0x0092 (flush 后 ACK)
+ *   CapRelease    = 0x0093 (close 时释放)
+ *
+ * 路由: 全部走 powerfs_calc_shard_id(ino) → shard_leader_map → filer leader,
+ * 非 leader 重定向由 send_request 内部自动处理 (REDIRECT → shard_route_update → 重试).
+ *
+ * ClientId 字符串: 内核态固定用 "powerfs-kernel-<pid>" 还是模块级常量?
+ * 这里取调用方传入的 client_id 字符串 (与 FUSE 端一致, 模块级可在 sb_info
+ * 内生成唯一 client_id 并由上层传入, 保持灵活).
+ */
+
+/* 内核内部分派 TLV 字符串解码: 安全版本.
+ * 直接复用 decoder 提供的 dec_string / find_raw, 这里实现一个对 dec 顺序解析
+ * token/capset/epoch/sn/duration 的小助手, 用于 CapOpenGrant 响应及
+ * CapRelease HasUpgrade 分支. */
+static int decode_cap_grant_fields(struct powerfs_tlv_dec *dec,
+                                    char *token_out, size_t *token_len_out,
+                                    __u8 *cap_set_out, __u64 *epoch_out,
+                                    __u64 *sn_out, __u64 *duration_ms_out)
+{
+    /* 字段按 Filer 服务端编码顺序:
+     *   LeaseToken → CapSet → CapEpoch → CapSn → LeaseDuration(可选) */
+    if (token_out) {
+        /* decoder: 在 max_len-1 处填 '\0' (dec_string 实现保证) */
+        size_t tlen = 0;
+        const __u8 *raw = NULL;
+        int rc = powerfs_tlv_dec_find_raw(dec, POWERFS_NET_FLD_LEASE_TOKEN,
+                                          &raw, &tlen);
+        if (rc == 0 && raw) {
+            size_t cp = tlen;
+            if (token_len_out && *token_len_out > 0)
+                cp = min(tlen, *token_len_out - 1);
+            if (cp > 0)
+                memcpy(token_out, raw, cp);
+            token_out[cp] = '\0';
+            if (token_len_out)
+                *token_len_out = tlen;
+        } else if (token_len_out) {
+            token_out[0] = '\0';
+            *token_len_out = 0;
+        }
+    }
+    if (cap_set_out)
+        powerfs_tlv_dec_find_u8(dec, POWERFS_NET_FLD_CAP_SET, cap_set_out);
+    if (epoch_out)
+        powerfs_tlv_dec_find_u64(dec, POWERFS_NET_FLD_CAP_EPOCH, epoch_out);
+    if (sn_out)
+        powerfs_tlv_dec_find_u64(dec, POWERFS_NET_FLD_CAP_SN, sn_out);
+    if (duration_ms_out)
+        powerfs_tlv_dec_find_u64(dec, POWERFS_NET_FLD_LEASE_DURATION, duration_ms_out);
+    return 0;
+}
+
+/*
+ * powerfs_net_cap_open_grant - §13.3 open() 初始 cap 申请 (同步, 永不阻塞).
+ *
+ * 对齐 Filer handle_cap_open_grant (net_handler.rs L3146):
+ *   - 请求 TLV: Ino + ClientId(string) + IsWriteOpen(u8)
+ *   - 响应 TLV: LeaseToken + CapSet + CapEpoch + CapSn + LeaseDuration(ms)
+ *
+ * 返回: 0 成功, <0 错误. 网络层 STATUS_OK 以外的状态码转 errno.
+ */
+int powerfs_net_cap_open_grant(__u64 ino,
+                               const char *client_id,
+                               bool is_write_open,
+                               char *lease_token_out, size_t *token_len_out,
+                               __u8 *cap_set_out, __u64 *epoch_out,
+                               __u64 *sn_out, __u64 *duration_ms_out)
+{
+    __u8 body[512];
+    struct powerfs_tlv_enc enc;
+    __u8 *resp_body;
+    size_t resp_body_len = 0;
+    size_t cid_len;
+    struct powerfs_tlv_dec dec;
+    int ret;
+
+    if (!client_id)
+        return -EINVAL;
+    cid_len = strlen(client_id);
+    if (cid_len == 0 || cid_len > 255)
+        return -EINVAL;
+    if (ino == 0)
+        return -EINVAL;
+
+    /* 输出可选, 但先初始化 (便于调用方判断失败时也有默认值) */
+    if (lease_token_out)
+        lease_token_out[0] = '\0';
+    if (token_len_out)
+        *token_len_out = 0;
+    if (cap_set_out)
+        *cap_set_out = 0;
+    if (epoch_out)
+        *epoch_out = 0;
+    if (sn_out)
+        *sn_out = 0;
+    if (duration_ms_out)
+        *duration_ms_out = 0;
+
+    resp_body = kvmalloc(POWERFS_NET_MAX_BODY, GFP_NOFS);
+    if (!resp_body)
+        return -ENOMEM;
+
+    /* 编码请求: Ino + ClientId + IsWriteOpen */
+    powerfs_tlv_enc_init(&enc, body, sizeof(body));
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID, client_id, cid_len);
+    powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_IS_WRITE_OPEN,
+                       is_write_open ? 1 : 0);
+
+    /* cap_open_grant 属于元数据一致性类 RPC, 走 POWERFS_META_TIMEOUT_MS (5s),
+     * 足够覆盖 Raft 选举 + 重连 + 3 次重试 (回忆 check_caps 不应 hung task). */
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_CAP_OPEN_GRANT, ino,
+                                   body, powerfs_tlv_enc_len(&enc),
+                                   NULL, 0,
+                                   resp_body, POWERFS_NET_MAX_BODY,
+                                   NULL, 0,
+                                   POWERFS_META_TIMEOUT_MS,
+                                   &resp_body_len, NULL);
+    if (ret < 0)
+        goto out;
+    if (ret > 0) {
+        /* 协议状态码: 按约定 open_grant 总是 STATUS_OK, 但防御式转 errno */
+        ret = net_status_to_errno((__u16)ret);
+        goto out;
+    }
+
+    /* 解码响应: TLV 字段顺序随意 (按 FieldId find). */
+    if (resp_body_len > 0) {
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        decode_cap_grant_fields(&dec,
+                                lease_token_out, token_len_out,
+                                cap_set_out, epoch_out,
+                                sn_out, duration_ms_out);
+    }
+
+    ret = 0;
+out:
+    kvfree(resp_body);
+    return ret;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_cap_open_grant);
+
+/*
+ * powerfs_net_cap_recall_ack - §13.4 向 Filer ACK: 已 flush 脏数据并降级.
+ *
+ * Request TLV:  Ino + ClientId(string) + LeaseToken(string)
+ * Response TLV: 仅状态码 (STATUS_OK / ERR_SERVER / ERR_BAD_REQUEST).
+ */
+int powerfs_net_cap_recall_ack(__u64 ino,
+                               const char *client_id,
+                               const char *token, size_t token_len)
+{
+    __u8 body[512];
+    struct powerfs_tlv_enc enc;
+    size_t cid_len;
+    int ret;
+
+    if (!client_id || !token)
+        return -EINVAL;
+    cid_len = strlen(client_id);
+    if (cid_len == 0 || cid_len > 255)
+        return -EINVAL;
+    if (token_len == 0 || token_len > 255)
+        return -EINVAL;
+    if (ino == 0)
+        return -EINVAL;
+
+    /* 编码请求: Ino + ClientId + LeaseToken */
+    powerfs_tlv_enc_init(&enc, body, sizeof(body));
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID, client_id, cid_len);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_LEASE_TOKEN, token, token_len);
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_CAP_RECALL_ACK, ino,
+                                   body, powerfs_tlv_enc_len(&enc),
+                                   NULL, 0,
+                                   NULL, 0, NULL, 0,
+                                   POWERFS_META_TIMEOUT_MS,
+                                   NULL, NULL);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return net_status_to_errno((__u16)ret);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_cap_recall_ack);
+
+/*
+ * powerfs_net_cap_release - §13.4 close 时主动释放 cap, 触发 upgrade 判定.
+ *
+ * Request TLV:  Ino + ClientId(string) + LeaseToken(string)
+ * Response TLV:
+ *   HasUpgrade(u8: 0/1)
+ *   [if 1]: LeaseToken + CapSet + CapEpoch + CapSn (升级后的值)
+ *
+ * 注意: HasUpgrade=1 表示"本次 release 触发了一次 upgrade", 对应的 survivor
+ * 客户端会额外收到 CapUpgradeNotify NOTIFY 推送 (异步通道).
+ * 响应体内嵌升级信息是为了便于 release 请求的调用方 (survivor 自己) 立即
+ * 拿到升级结果, 无需等到 NOTIFY 推送到达.
+ */
+int powerfs_net_cap_release(__u64 ino,
+                            const char *client_id,
+                            const char *token, size_t token_len,
+                            __u8 *has_upgrade_out,
+                            char *upgrade_token_out, size_t *upgrade_token_len_out,
+                            __u8 *upgrade_cap_set_out,
+                            __u64 *upgrade_epoch_out, __u64 *upgrade_sn_out)
+{
+    __u8 body[512];
+    struct powerfs_tlv_enc enc;
+    __u8 *resp_body;
+    size_t resp_body_len = 0;
+    size_t cid_len;
+    struct powerfs_tlv_dec dec;
+    __u8 has_upg = 0;
+    int ret;
+
+    if (!client_id || !token)
+        return -EINVAL;
+    cid_len = strlen(client_id);
+    if (cid_len == 0 || cid_len > 255)
+        return -EINVAL;
+    if (token_len == 0 || token_len > 255)
+        return -EINVAL;
+    if (ino == 0)
+        return -EINVAL;
+
+    /* 初始化输出 */
+    if (has_upgrade_out)
+        *has_upgrade_out = 0;
+    if (upgrade_token_out)
+        upgrade_token_out[0] = '\0';
+    if (upgrade_token_len_out)
+        *upgrade_token_len_out = 0;
+    if (upgrade_cap_set_out)
+        *upgrade_cap_set_out = 0;
+    if (upgrade_epoch_out)
+        *upgrade_epoch_out = 0;
+    if (upgrade_sn_out)
+        *upgrade_sn_out = 0;
+
+    resp_body = kvmalloc(POWERFS_NET_MAX_BODY, GFP_NOFS);
+    if (!resp_body)
+        return -ENOMEM;
+
+    /* 编码请求: Ino + ClientId + LeaseToken */
+    powerfs_tlv_enc_init(&enc, body, sizeof(body));
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID, client_id, cid_len);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_LEASE_TOKEN, token, token_len);
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_CAP_RELEASE, ino,
+                                   body, powerfs_tlv_enc_len(&enc),
+                                   NULL, 0,
+                                   resp_body, POWERFS_NET_MAX_BODY,
+                                   NULL, 0,
+                                   POWERFS_META_TIMEOUT_MS,
+                                   &resp_body_len, NULL);
+    if (ret < 0)
+        goto out;
+    if (ret > 0) {
+        ret = net_status_to_errno((__u16)ret);
+        goto out;
+    }
+
+    if (resp_body_len > 0) {
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        /* HasUpgrade 是响应首个必字段 (服务端 always encode HasUpgrade
+         * 即使为 0, 见 net_handler.rs L3348/L3362). */
+        powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_HAS_UPGRADE, &has_upg);
+        if (has_upgrade_out)
+            *has_upgrade_out = has_upg;
+
+        if (has_upg) {
+            /* 升级字段: LeaseToken + CapSet + CapEpoch + CapSn */
+            decode_cap_grant_fields(&dec,
+                                    upgrade_token_out, upgrade_token_len_out,
+                                    upgrade_cap_set_out, upgrade_epoch_out,
+                                    upgrade_sn_out, NULL);
+        }
+    }
+
+    ret = 0;
+out:
+    kvfree(resp_body);
+    return ret;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_cap_release);
+
+/* ========== §13 Cap NOTIFY dispatch (Filer→Client async push) ==========
+ *
+ * 回调注册点: 模块 init 时 fs 层注册 recall / upgrade handler.
+ * 未注册时 NOTIFY 只打印 warning, 不 panic (防止模块早期阶段 crash).
+ * 变量 g_cap_*_notify_fn 定义在 pfs_rx_dispatch 前 (文件 2128 行附近) 以便
+ * RX dispatch 引用; 此处提供注册函数 (EXPORTed 供 fs 层调用). */
+
+void powerfs_net_reg_cap_notify_handlers(
+        powerfs_cap_recall_notify_fn recall_fn,
+        powerfs_cap_upgrade_notify_fn upgrade_fn)
+{
+    /* smp 内存屏障: 注册后 RX 线程立即可见.
+     * 典型调用时机: fill_super() (单线程, 但 barrier 安全无副作用). */
+    smp_store_release(&g_cap_recall_notify_fn, recall_fn);
+    smp_store_release(&g_cap_upgrade_notify_fn, upgrade_fn);
+    pr_info("powerfs: cap notify handlers registered (%p/%p)\n",
+            (void *)recall_fn, (void *)upgrade_fn);
+}
+EXPORT_SYMBOL_GPL(powerfs_net_reg_cap_notify_handlers);
+
+/* 解析 CapRecallNotify body (服务端 net_handler.rs build_cap_recall_notify 编码).
+ *
+ * 对齐 Rust net_handler.rs cap push (L92-L113):
+ *   FieldId::Ino             → ino (u64)
+ *   FieldId::LeaseToken      → lease_token (string)
+ *   FieldId::CapSet          → recall_mask (u8, 第一个 CapSet 字段)
+ *   FieldId::IsWriteOpen (0xC6) → packed 第二个 CapSet 作为 retain_mask (u8, 复用 IsWriteOpen tag)
+ *   FieldId::CapEpoch (0xC5) → epoch (u64)
+ *
+ * NOTE: 服务端临时复用 IsWriteOpen 作为 retain_mask 的 tag (TLV 允许
+ * 重复 FieldId 但 decoder 用 next_*, 用不同 tag 更简单; 这里严格按 Rust 端解码). */
+static int decode_cap_recall_body(const __u8 *body, size_t body_len,
+                                  u64 *ino_out,
+                                  char *token_out, size_t token_cap, size_t *token_len_out,
+                                  __u8 *recall_mask_out, __u8 *retain_mask_out,
+                                  __u64 *epoch_out)
+{
+    struct powerfs_tlv_dec dec;
+    const __u8 *raw;
+    size_t tlen;
+    int rc;
+
+    if (!body || body_len == 0)
+        return -EINVAL;
+
+    powerfs_tlv_dec_init(&dec, body, body_len);
+    powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_INO, ino_out);
+
+    token_out[0] = '\0';
+    if (token_len_out) *token_len_out = 0;
+    rc = powerfs_tlv_dec_find_raw(&dec, POWERFS_NET_FLD_LEASE_TOKEN, &raw, &tlen);
+    if (rc == 0 && raw && token_cap > 0) {
+        size_t cp = min(tlen, token_cap - 1);
+        memcpy(token_out, raw, cp);
+        token_out[cp] = '\0';
+        if (token_len_out) *token_len_out = tlen;
+    }
+
+    powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_CAP_SET, recall_mask_out);
+    /* retain_mask = IsWriteOpen field (Rust 端 repurpose 此 tag 传输). */
+    powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_IS_WRITE_OPEN, retain_mask_out);
+    powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_CAP_EPOCH, epoch_out);
+
+    return 0;
+}
+
+/* 解析 CapUpgradeNotify body (服务端 net_handler.rs L3326-L3331:
+ * Ino + LeaseToken + CapSet + CapEpoch + CapSn). */
+static int decode_cap_upgrade_body(const __u8 *body, size_t body_len,
+                                   u64 *ino_out,
+                                   char *token_out, size_t token_cap, size_t *token_len_out,
+                                   __u8 *new_granted_out,
+                                   __u64 *epoch_out, __u64 *sn_out)
+{
+    struct powerfs_tlv_dec dec;
+    const __u8 *raw;
+    size_t tlen;
+    int rc;
+
+    if (!body || body_len == 0)
+        return -EINVAL;
+
+    powerfs_tlv_dec_init(&dec, body, body_len);
+    powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_INO, ino_out);
+
+    token_out[0] = '\0';
+    if (token_len_out) *token_len_out = 0;
+    rc = powerfs_tlv_dec_find_raw(&dec, POWERFS_NET_FLD_LEASE_TOKEN, &raw, &tlen);
+    if (rc == 0 && raw && token_cap > 0) {
+        size_t cp = min(tlen, token_cap - 1);
+        memcpy(token_out, raw, cp);
+        token_out[cp] = '\0';
+        if (token_len_out) *token_len_out = tlen;
+    }
+
+    powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_CAP_SET, new_granted_out);
+    powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_CAP_EPOCH, epoch_out);
+    powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_CAP_SN, sn_out);
+    return 0;
+}
 
 /*
  * powerfs_net_discover_volumes - 从 Master GetTopology 获取 volume 路由表
