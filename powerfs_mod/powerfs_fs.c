@@ -3062,33 +3062,100 @@ xattr_flush_done:
     }
 
     /* --- Step 4: INLINE placement inline_data dirty flush ---
-     *   inline_data 是 CREATE PhaseA 时在 CreateInode body 里携带的
-     *   payload. 后续 (open_write+write_end) 更新了 inline_data
-     *   + 置 inline_dirty, 但是没有独立的 UpdateInline RPC.
+     *   inline_data is set during CreateInode (Phase A) and updated by
+     *   write_begin/write_end. There is no standalone UpdateInline RPC;
+     *   we reuse powerfs_net_update_inode_size_chunks with inline_data
+     *   payload — same approach as the release() path (see L9784+).
      *
-     *   走 powerfs_net_setattr 无法携带 inline_data buffer payload.
-     *   临时做法: 先放警告 + 保持 inline_dirty 放回 XATTR_EXCL or AUTH_EXCL
-     *   脏位? 不, inline_dirty 是独立于 i_dirty_caps 的 bool 状态.
-     *   重新置位 inline_dirty = true, 下次 recall/fsync 再尝试.
-     *
-     *   正确解法: 在 net 层新增 UPDATE_INLINE_DATA (0x0097) 消息帧,
-     *   body 带 Ino + InlineData TLV. */
+     *   Without this, a CapRecallNotify on an inline file flushes page
+     *   cache (Step 1) and sends ACK (cap_send_recall_ack), but the
+     *   inline_data payload stays stale on the Filer. The server then
+     *   promotes a waiting client that reads the stale inline_data,
+     *   causing silent data loss — identical to the FUSE L4.21 bug. */
     if (need_inline_flush) {
-        WARN_ONCE(1, "powerfs: cap_flush INLINE inline_dirty ino=%lu "
-                     "but UPDATE_INLINE_DATA protocol not implemented; rollback\n",
-                  inode->i_ino);
-        /* 回滚: inline_dirty 仍保持 true, fsync/close/re-recall 时再尝试 */
+        __u8 *snap_data = NULL;
+        __u32 snap_len;
+        __u64 shard_id;
+        int attempt;
+        bool inline_synced = false;
+
+        /* Snapshot inline_data under lock (network I/O cannot hold spinlock) */
         spin_lock(&pi->i_lock);
-        pi->inline_dirty = true;
-        /* WR_DATA 脏位若之前 Step1 成功已被清: 为了保证下次 recall 再进来,
-         * 把 WR_DATA 重新置位 (recall mask 通常含 WR_DATA). */
-        if (need_data_flush && ret == 0) {
-            pi->i_dirty_caps    |= need_data_flush;
-            pi->i_flushing_caps &= ~need_data_flush;
+        if (!pi->inline_data || pi->inline_len == 0) {
+            pi->inline_dirty = false;
+            spin_unlock(&pi->i_lock);
+            pr_warn_ratelimited("powerfs: cap_flush INLINE ino=%lu dirty but no data\n",
+                                inode->i_ino);
+            goto inline_flush_done;
+        }
+        snap_len = pi->inline_len;
+        spin_unlock(&pi->i_lock);
+
+        snap_data = kmalloc(snap_len, GFP_NOFS);
+        if (!snap_data) {
+            pr_warn_ratelimited("powerfs: cap_flush INLINE ino=%lu kmalloc %u failed\n",
+                                inode->i_ino, snap_len);
+            /* Keep inline_dirty; next recall/fsync will retry */
+            spin_lock(&pi->i_lock);
+            pi->inline_dirty = true;
+            spin_unlock(&pi->i_lock);
+            ret = ret ?: -ENOMEM;
+            goto inline_flush_done;
+        }
+
+        spin_lock(&pi->i_lock);
+        if (pi->inline_data && pi->inline_len == snap_len) {
+            memcpy(snap_data, pi->inline_data, snap_len);
+        } else {
+            /* Concurrent modification — abandon this snapshot */
+            spin_unlock(&pi->i_lock);
+            pr_warn_ratelimited("powerfs: cap_flush INLINE ino=%lu data changed during snapshot\n",
+                                inode->i_ino);
+            kfree(snap_data);
+            spin_lock(&pi->i_lock);
+            pi->inline_dirty = true;
+            spin_unlock(&pi->i_lock);
+            ret = ret ?: -EAGAIN;
+            goto inline_flush_done;
         }
         spin_unlock(&pi->i_lock);
-        ret = ret ?: -EOPNOTSUPP;
+
+        shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : inode->i_ino);
+
+        /* Retry loop: 5 attempts, 500ms×attempt backoff (covers Raft election) */
+        for (attempt = 1; attempt <= 5; attempt++) {
+            int r = powerfs_net_update_inode_size_chunks(shard_id, inode->i_ino,
+                                                         (__u64)snap_len,
+                                                         "kernel",
+                                                         NULL, 0,
+                                                         snap_data, snap_len);
+            if (r == 0) {
+                inline_synced = true;
+                pr_debug("powerfs: cap_flush INLINE ino=%lu synced size=%u (attempt %d)\n",
+                        inode->i_ino, snap_len, attempt);
+                break;
+            }
+            pr_warn_ratelimited("powerfs: cap_flush INLINE ino=%lu attempt %d failed: %d\n",
+                                inode->i_ino, attempt, r);
+            if (attempt < 5)
+                msleep(500 * attempt);
+        }
+
+        kfree(snap_data);
+
+        if (inline_synced) {
+            spin_lock(&pi->i_lock);
+            pi->inline_dirty = false;
+            spin_unlock(&pi->i_lock);
+        } else {
+            /* Keep inline_dirty for next recall/fsync/close retry */
+            spin_lock(&pi->i_lock);
+            pi->inline_dirty = true;
+            spin_unlock(&pi->i_lock);
+            ret = ret ?: -EIO;
+        }
     }
+inline_flush_done:
 
     /* =====================================================================
      * 清理: 回到 i_lock, 把成功的 flushing 位移出 i_flushing_caps.
