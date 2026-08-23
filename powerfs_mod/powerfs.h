@@ -14,6 +14,12 @@
 #include <linux/fs_context.h>
 #include <linux/netfs.h>
 #include <linux/xattr.h>
+#if 0 /* DEAD_CODE — powerfs_lock.h: entire header body inside #if 0 DEAD_CODE (audit 2026-08-23).
+     * All MDLock/lock_client/tlk_codec content in that header is disabled; keeping
+     * the #include here would only pull in the include-guard macro and ~60 lines of
+     * detailed block comments explaining WHY it's dead — nothing functional. */
+#include "powerfs_lock.h"  /* MDLock 独立锁对象 */
+#endif /* DEAD_CODE */
 
 /* ========== 常量定义 ========== */
 
@@ -48,6 +54,7 @@
  * 需容纳 8KB inline + ~512B 元数据开销. 栈上分配不安全, 用 kvmalloc. */
 #define POWERFS_NET_RESP_INLINE_CAP  (POWERFS_INLINE_MAX_SIZE + 512)
 #define POWERFS_LEASE_DURATION  (30 * HZ)
+#define POWERFS_LEASE_DURATION_MS  30000   /* 30s in ms, for mdlock use */
 /* Phase 3: lease 续约阈值. 当 lease 剩余有效期 < 阈值时触发续约.
  * 设为 DURATION/3 (10s): 在过期前 10s 续约, 留足网络往返 + 重试时间.
  * 参考  cap renew 在 expiry 前主动续约. */
@@ -647,6 +654,39 @@ struct powerfs_inode_info {
      * 支持 user.* / trusted.* / security.* 前缀.
      * 由 i_lock 间接保护 (simple_xattr 内部有自旋锁). */
     struct simple_xattrs xattrs;
+
+#if 0 /* DEAD_CODE — removed per architecture alignment (2026-08-23, audit s6-audit-scope).
+     *
+     * Original comment: "Phase 1 inode-level per-lock-type MDLock array +
+     * GATHER waitqueue, one independent lock per POWERFS_NUM_LOCK_TYPES
+     * (AUTH / LINK / DIR / Xattr / FileLock / ...)."
+     *
+     * Why this is dead code:
+     *  1. `powerfs_mdlock_rdlock/wrlock/xlock/unlock` were defined in
+     *     powerfs_fs.c but NEVER called from any VFS entry (lookup / open /
+     *     create / unlink / setattr / setxattr / readdir / …) — grep
+     *     returned zero invocations outside of function bodies.
+     *  2. The actual FILE-lock cap negotiation goes through
+     *     cap_open_grant_and_issue() → powerfs_net_cap_open_grant()
+     *     (MsgType 0x91) talking to the real lock_arbiter.rs that runs
+     *     EXCLUSIVELY on the Filer leader — this per-inode C state machine
+     *     was a duplicate attempt to replicate the MDS Locker on the
+     *     client, which violates the Ceph architecture invariant: lock
+     *     arbitration lives only on the server; clients only cache
+     *     issued cap bits and react to CapRecallNotify.
+     *  3. Leaving these fields multiplied `sizeof(struct powerfs_mdlock)`
+     *     (8 locks × large struct with holders/gather/waiting lists)
+     *     onto *every* inode in memory — significant wasted memory for
+     *     code that never ran.
+     *
+     * The header `#include "powerfs_lock.h"` above is also being wrapped
+     * out. If the MDLock design is ever revisited, note it must live on
+     * the Filer side (lock_arbiter.rs) not the client; the client-only
+     * equivalent is ClientCap (powerfs-fuse/src/client_cap.rs) which
+     * simply tracks {issued_mask, wanted_mask, epoch, token, sn}. */
+    struct powerfs_mdlock i_locks[POWERFS_NUM_LOCK_TYPES];
+    wait_queue_head_t i_mdlock_wq;   /* GATHER 全局等待队列 (跨锁类型) */
+#endif /* DEAD_CODE */
 };
 
 /* 获取 inode 扩展结构 */
@@ -801,6 +841,15 @@ struct powerfs_client {
      * 内核态填: "powerfs-kernel-<tgid>" (mount 时生成, 单 mount 唯一). */
     char client_id[64];
     size_t client_id_len;
+
+    /* Master RegisterClient/DeregisterClient: 本 mount 持久字符串 UUID
+     * (发送给 Master, 用于黑名单/心跳注册表键). 格式: "pwfs-k-<pid>-<jiffies>"
+     * 或类似, 单 mount 唯一, 不需要 crash 持久化. */
+    char client_uuid[64];
+
+    /* Master RegisterClient 响应中返回的统一分配 numeric client_id (u64).
+     * 0 = 尚未完成注册 (默认). 用于心跳/路由等需要 numeric id 的场景. */
+    u64 assigned_client_id;
 
     /* 通信层 */
     struct powerfs_comm *comm;

@@ -62,8 +62,10 @@
 /* Phase 2: 元数据操作短超时 (ms).
  * create/unlink/rename/symlink/link 等在 VFS 持有 i_rwsem 写锁时调用,
  * 必须快速完成或失败, 避免长时间阻塞目录操作.
- * 5s 足够覆盖正常 LAN RPC (<10ms) + 重连 (3s) + 重试. */
-#define POWERFS_META_TIMEOUT_MS         5000    /* metadata ops: 5s */
+ * 15s: 覆盖正常 LAN RPC (<10ms) + Raft 选举 (~3s) + 多轮 redirect
+ * 回退重试 (4 轮 x 1.6s = 6.4s) + 安全余量. 之前 5s 在 3-Filer Raft
+ * 选举抖动 + self-redirect 黑名单 TTL 回退下频繁 deadline exceed. */
+#define POWERFS_META_TIMEOUT_MS         15000   /* metadata ops: 15s */
 
 /* 断连窗口: 断连后 5s 内视为 "最近断连", lookup/readdir 用短超时 */
 #define POWERFS_RECENT_DISCONNECT_MS    5000
@@ -157,6 +159,15 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_GET_XATTR    = 0x0039,
     POWERFS_NET_MSG_REMOVE_XATTR = 0x003a,
     POWERFS_NET_MSG_LIST_XATTR   = 0x003b,
+    /* Two-phase mkdir (client-routed, no server forwarding):
+     *   AllocInodeBatch (0x0033) + MkdirPhaseA (0x003c, target_shard) +
+     *   MkdirPhaseB (0x003d, parent_shard).  Required when
+     *   target_shard != parent_shard so the server does NOT have to
+     *   cross-propose to a different Raft group leader.  Value MUST match
+     *   powerfs-net/src/protocol.rs MsgType enum. */
+    POWERFS_NET_MSG_ALLOC_INODE_BATCH = 0x0033,
+    POWERFS_NET_MSG_MKDIR_PHASE_A     = 0x003c,
+    POWERFS_NET_MSG_MKDIR_PHASE_B     = 0x003d,
 
     /* 状态 */
     POWERFS_NET_MSG_STATFS = 0x0040,
@@ -166,10 +177,39 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_HEARTBEAT = 0x0052,
     POWERFS_NET_MSG_KEEP_CONNECTED = 0x0053,
     POWERFS_NET_MSG_VOLUME_LIST = 0x0054,
+    /* RegisterClient (0x0055): FUSE/kernel → Master 注册 client_uuid,
+     * 获取 master 统一分配的 assigned_client_id(u64).
+     * 同时 Master 检查 client_uuid 黑名单:
+     *   STATUS_OK(0) = 挂载允许, assigned_id 回传在 FieldId::ClientId
+     *   STATUS_ERR_PERMISSION_DENIED(3) = 黑名单拒绝挂载
+     *   STATUS_ERR_REDIRECT(11) = 非 leader 重定向
+     * Req: ClientUuid + Backend(type) + Name(mount) + Collection + Replication
+     *      + Owner(host) + Limit(pid)
+     * Resp: ClientId(assigned u64) + Owner(leader) + MountAllowed(u8) */
+    POWERFS_NET_MSG_REGISTER_CLIENT = 0x0055,
+    /* DeregisterClient (0x0056): 客户端 umount 时向 master 优雅下线,
+     * 提前移除心跳注册表项 (不用等到 heartbeat age 超时).
+     * Req: ClientUuid + ClientId(assigned)
+     * Resp: Owner(leader) */
+    POWERFS_NET_MSG_DEREGISTER_CLIENT = 0x0056,
 
-    /* Master topology & discovery */
+    /* Master topology & discovery
+     * 与 Rust powerfs-net/protocol.rs MsgType 枚举完全对齐:
+     *   GetTopology(0x70) / WatchTopology(0x71) / TopologyChanged(0x72) /
+     *   AssignVolumeV2(0x73) / ListFilers(0x74) / ShardLeaderUpdate(0x75) */
     POWERFS_NET_MSG_GET_TOPOLOGY = 0x0070,
+    POWERFS_NET_MSG_WATCH_TOPOLOGY = 0x0071,
+    /* Master → Client NOTIFY frame (seq=0, NOTIFY flag, empty body).
+     * Triggers after the Master receives a ShardLeaderUpdate from a filer
+     * whose shard_leader table actually changed. On receipt, clients
+     * asynchronously re-GET_TOPOLOGY to pick up the new per-shard leader
+     * map (zero-redirect fast path) instead of waiting for a lazy
+     * STATUS_ERR_REDIRECT from a stale follower. */
+    POWERFS_NET_MSG_TOPOLOGY_CHANGED = 0x0072,
     POWERFS_NET_MSG_LIST_FILERS = 0x0074,
+    /* Filer → Master, MsgType=0x0075; kernel client doesn't originate but
+     * keeps the constant for protocol audit/trace consistency. */
+    POWERFS_NET_MSG_SHARD_LEADER_UPDATE = 0x0075,
 
     /* Volume 操作 */
     POWERFS_NET_MSG_CREATE_VOLUME = 0x0060,
@@ -272,6 +312,9 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_ENTRIES = 0x23,
     POWERFS_NET_FLD_COUNT = 0x24,
     POWERFS_NET_FLD_ENTRY = 0x25,
+    /* Message (0x26): RegisterClient 拒绝理由 (字符串),
+     * 以及通用 human-readable 错误信息. 对齐 Rust FieldId::Message = 0x26. */
+    POWERFS_NET_FLD_MESSAGE = 0x26,
     POWERFS_NET_FLD_VERSION = 0x19,  /* matches Rust FieldId::Version */
 
     /* Delta 同步字段 */
@@ -279,6 +322,14 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_SEQ = 0x31,
     POWERFS_NET_FLD_VCLOCK_ENTRIES = 0x32,
     POWERFS_NET_FLD_DELTA_OPS = 0x33,
+
+    /* 请求追踪字段 (Exactly-Once 语义), 对齐 Rust FieldId:
+     *   RequestId = 0x60, ClientUuid = 0x61, ChannelId = 0x62, ShardHash = 0x63.
+     * ClientUuid 是 RegisterClient/DeregisterClient 的主键. */
+    POWERFS_NET_FLD_REQUEST_ID = 0x60,
+    POWERFS_NET_FLD_CLIENT_UUID = 0x61,
+    POWERFS_NET_FLD_CHANNEL_ID = 0x62,
+    POWERFS_NET_FLD_SHARD_HASH = 0x63,
 
     /* K1-6: ShardId (u64), 对齐 powerfs-net FieldId::ShardId (0x70).
      * 用于 UpdateInodeSizeChunks 等需 shard 路由的消息. */
@@ -296,6 +347,12 @@ enum powerfs_net_field_id {
     /* Lease Token (Volume Server lease validation, matches Rust FieldId::LeaseToken) */
     POWERFS_NET_FLD_LEASE_TOKEN = 0x80,
 
+    /* AssignVolume / RegisterClient 字段 (对齐 Rust FieldId):
+     *   Collection = 0x90, Replication = 0x91.
+     * Collection 是存储池名称, Replication 是冗余策略字符串. */
+    POWERFS_NET_FLD_COLLECTION = 0x90,
+    POWERFS_NET_FLD_REPLICATION = 0x91,
+
     /* Volume / Needle 字段 (数据直连 Volume Server) */
     POWERFS_NET_FLD_VOLUME_ID = 0x92,   /* volume_id (u64), needle 操作中复用 Ino 字段 */
     POWERFS_NET_FLD_FILE_KEY = 0x94,    /* needle_id / file_key (u64) */
@@ -303,6 +360,20 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_INODE_V2 = 0x97,    /* inode (u64), needle 操作中与 FileKey 并存 */
     POWERFS_NET_FLD_USED_SPACE = 0x98,  /* used space (u64), matches Rust FieldId::UsedSpace */
     POWERFS_NET_FLD_FILE_COUNT = 0x99,  /* file count (u64), matches Rust FieldId::FileCount */
+
+    /* ===== Master topology / filer discovery fields (0x9A-0x9F)
+     * 值必须与 Rust powerfs-net/protocol.rs FieldId 枚举完全一致,
+     * 同步更新于 protocol.rs ZoneId (0x9A) ~ ShardLeaderEntries (0x9F). */
+    POWERFS_NET_FLD_ZONE_ID = 0x9A,      /* Zone ID (u64), matches FieldId::ZoneId */
+    POWERFS_NET_FLD_SHARD_ID_LIST = 0x9B,/* Packed u64 LE array of shard ids (bytes), FieldId::ShardIdList */
+    POWERFS_NET_FLD_FILER_ADDRESS = 0x9C,/* Filer advertise address (string "ip:net_port"), FieldId::FilerAddress */
+    POWERFS_NET_FLD_NET_PORT = 0x9D,     /* Volume server TLV net port (u16?), matches FieldId::NetPort */
+    POWERFS_NET_FLD_RAFT_PAYLOAD = 0x9E, /* Serialized eraftpb::Message bytes, FieldId::RaftPayload */
+    /* Count of per-shard leader entries in GetTopology response (u64 LE).
+     * Followed by N × (ShardId=0x70 + FilerAddress=0x9C) pairs. Populated by
+     * the Master from ShardLeaderUpdate (0x0075) broadcasts so clients route
+     * RPCs directly to the shard leader (zero-redirect fast path). */
+    POWERFS_NET_FLD_SHARD_LEADER_ENTRIES = 0x9F,
 
     /* ===== FileLayout fields (0xA0-0xAF) — powerfs-layout crate ===== */
     POWERFS_NET_FLD_PLACEMENT = 0xA0,       /* Placement 编码 (u8 tag + 后续) */
@@ -378,6 +449,9 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_RCTIME_SEC = 0xD0,
     /* RCtimeNsec (u32 LE): rctime 纳秒部分 (0-999999999). */
     POWERFS_NET_FLD_RCTIME_NSEC = 0xD1,
+    /* MountAllowed (u8): RegisterClient 响应标志位, 1=允许挂载 0=拒绝.
+     * 拒绝理由通常在 Message(0x26) 字段给出. */
+    POWERFS_NET_FLD_MOUNT_ALLOWED = 0xD2,
 };
 
 /* ========== 帧头结构 (28 字节, packed) ========== */
@@ -1076,6 +1150,19 @@ int powerfs_net_send_request(__u16 msg_type, u64 route_inode,
                              size_t *resp_body_len_out,
                              size_t *resp_data_len_out);
 
+/* Direct-shard variant: routes to `explicit_shard_id` instead of
+ * calculating via calc_shard_id(route_inode). Used for two-phase mkdir,
+ * AllocInodeBatch, etc., where the request must go to a specific shard
+ * unrelated to any particular inode number. */
+int powerfs_net_send_request_shard(__u16 msg_type, __u64 explicit_shard_id,
+                                   const __u8 *body, size_t body_len,
+                                   const __u8 *data, size_t data_len,
+                                   __u8 *resp_body, size_t resp_body_cap,
+                                   __u8 *resp_data, size_t resp_data_cap,
+                                   int timeout_ms,
+                                   size_t *resp_body_len_out,
+                                   size_t *resp_data_len_out);
+
 u64 powerfs_calc_shard_id(u64 inode);
 
 /* ========== 便捷方法 ========== */
@@ -1392,6 +1479,44 @@ int net_status_to_errno(__u16 status);
 /* 从 Master GetTopology 获取 volume 路由表 (volume_id → addr).
  * 在 pool_init 后调用, 填充 vol_routes[] 用于 ReadNeedle 路由. */
 int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port);
+
+/* RegisterClient: 内核/FUSE 客户端在 mount 时向 Master 注册,
+ * 获取 master 统一分配的 assigned_client_id(u64).
+ * 同时 Master 检查 client_uuid 黑名单:
+ *   STATUS_OK = 挂载允许, assigned_id 回传在 Fld_CLIENT_ID
+ *   STATUS_ERR_PERMISSION = 黑名单拒绝挂载 (mount_allowed=false)
+ *   STATUS_ERR_REDIRECT = 非 leader 重定向 (内部自动跟随一次)
+ *
+ * 参数:
+ *   master_addr/master_port: Master 地址 (逗号分隔多地址 + port)
+ *   client_uuid: 本 mount 唯一字符串 UUID (见 powerfs_client.client_uuid)
+ *   client_type: 客户端类型字符串, 内核传 "kernel"
+ *   mount_point: 挂载点路径字符串 (用于审计/调试)
+ *   collection: 存储池名称, 未配置传 "default"
+ *   replication: 冗余策略字符串, 未配置传 "none"
+ *   host: 主机名/标识, 用于审计
+ *   pid: 客户端进程/挂载发起者 PID, 0 表示无
+ *   out_assigned_id: [输出] Master 分配的 numeric client_id (u64)
+ *   out_mount_allowed: [输出] true=允许挂载, false=黑名单拒绝
+ *   out_reason: [输出] 拒绝理由 (可显示给用户)
+ *   reason_cap: out_reason 缓冲区容量
+ *
+ * 返回: 0=成功收到响应 (无论 mount_allowed 与否), <0=-errno 网络/协议错误. */
+int powerfs_net_register_client(const char *master_addr, __u16 master_port,
+                                const char *client_uuid, const char *client_type,
+                                const char *mount_point, const char *collection,
+                                const char *replication, const char *host,
+                                __u64 pid,
+                                __u64 *out_assigned_id, bool *out_mount_allowed,
+                                char *out_reason, size_t reason_cap);
+
+/* DeregisterClient: umount 时向 Master 优雅下线, 提前移除心跳注册表项.
+ * 参数:
+ *   client_uuid: 与 RegisterClient 一致的 UUID 字符串
+ *   assigned_id: RegisterClient 返回的 numeric client_id
+ * 返回: 0 成功 STATUS_OK, <0 错误 (调用方通常忽略, 最佳努力) */
+int powerfs_net_deregister_client(const char *master_addr, __u16 master_port,
+                                  const char *client_uuid, __u64 assigned_id);
 
 /* Phase 3: RangeLease 续约 (直连 volume server).
  * volume_id: 目标 volume (路由查找)

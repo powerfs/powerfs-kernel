@@ -2143,6 +2143,28 @@ static int decode_cap_upgrade_body(const __u8 *body, size_t body_len,
 static powerfs_cap_recall_notify_fn  g_cap_recall_notify_fn  __read_mostly;
 static powerfs_cap_upgrade_notify_fn g_cap_upgrade_notify_fn __read_mostly;
 
+/* --- §13b TopologyChanged NOTIFY (Master → Client) ---
+ *
+ * When the Master's `shard_leaders` table changes (after receiving a
+ * ShardLeaderUpdate from a filer whose shard leadership actually flipped),
+ * it broadcasts MsgType::TopologyChanged (0x0072, NOTIFY flag, empty body)
+ * to all connected TLV clients. On receipt we queue an asynchronous worker
+ * on `g_pool.reconn_wq` (WQ_UNBOUND, safe for blocking socket I/O) that
+ * re-issues GET_TOPOLOGY → parses ShardLeaderEntries → pre-fills every
+ * shard's route to the new leader VALID. This keeps the zero-redirect fast
+ * path live across elections instead of waiting for a follower redirect on
+ * the next RPC.
+ *
+ * Debounce: `g_topology_refresh_pending` (test_and_set_bit) guarantees at
+ * most one in-flight refresh, since the Master may broadcast
+ * TopologyChanged multiple times in quick succession when many shards
+ * fail over together (e.g. filer restart → 256 shards elect new leaders
+ * in a burst, triggering 256× ShardLeaderUpdate → 256× broadcasts). */
+static void topology_refresh_worker(struct work_struct *work);
+static DECLARE_WORK(g_topology_refresh_work, topology_refresh_worker);
+static unsigned long g_topology_refresh_flags;  /* 0 = pending bit */
+#define TOPOLOGY_REFRESH_PENDING_BIT  0UL
+
 /* 一帧完整后处理: NOTIFY 异步帧 或 按 seq 匹配 pending req + complete.
  * 锁外 memcpy 大块 READ 响应 (持 req_lock 会阻塞 do_send 入队). */
 static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
@@ -2211,6 +2233,47 @@ static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
             } else {
                 pr_warn("powerfs: CapUpgradeNotify for ino=%llu but no handler registered\n",
                         ino);
+            }
+            return;
+        }
+
+        /* --- TopologyChanged notify (0x0072): Master shard leader table
+         * was updated → re-fetch topology and refresh shard_route VALID.
+         *
+         * This RX-thread callback is NON-BLOCKING: all blocking socket I/O
+         * (connect master / send GET_TOPOLOGY / parse response) is queued
+         * onto g_pool.reconn_wq — an UNBOUND workqueue specifically for
+         * operations that may block on kernel_connect() / recv(). A
+         * test_and_set debounce flag collapses the common "many shards
+         * failed over together → N broadcasts" burst into a single
+         * refresh. */
+        if (hdr->msg_type == POWERFS_NET_MSG_TOPOLOGY_CHANGED) {
+            if (powerfs_net_is_stopping()) {
+                pr_debug("powerfs: TopologyChanged dropped (stopping=1)\n");
+                return;
+            }
+            if (!test_and_set_bit(TOPOLOGY_REFRESH_PENDING_BIT,
+                                   &g_topology_refresh_flags)) {
+                bool queued = false;
+                if (g_pool.reconn_wq) {
+                    queued = queue_work(g_pool.reconn_wq,
+                                         &g_topology_refresh_work);
+                }
+                pr_info("powerfs: TopologyChanged NOTIFY received (from %s:%u)%s — debounce-pending=%d queue_work=%d\n",
+                        conn->addr, conn->port,
+                        (hdr->flags & POWERFS_NET_FLAG_NOTIFY) ? "" : " (seq=0 legacy)",
+                        1, queued ? 1 : 0);
+                if (!queued && g_pool.reconn_wq == NULL) {
+                    /* race: reconn_wq not yet allocated. Pending bit
+                     * stays set → dropped; next broadcast retries.
+                     * (This window only exists during mount before
+                     * discover_volumes, which runs before any RPC.) */
+                    clear_bit(TOPOLOGY_REFRESH_PENDING_BIT,
+                              &g_topology_refresh_flags);
+                    pr_warn("powerfs: TopologyChanged dropped (reconn_wq NULL); will retry next broadcast\n");
+                }
+            } else {
+                pr_debug("powerfs: TopologyChanged debounced — refresh already pending\n");
             }
             return;
         }
@@ -3551,6 +3614,74 @@ int powerfs_request_submit(struct powerfs_request *req)
     enum powerfs_shard_route_state route_state;
     struct powerfs_net_server_conn *conn;
     struct powerfs_net_server_conn *last_tried_conn = NULL;
+
+    /* FIX (align with FUSE send_coherence_msg):
+     *
+     * PROBLEM with only last_tried_conn:
+     *   After a self-redirect on node S3 (S3 says leader is S3 → fail),
+     *   we rotate to S2 (Follower). S2 returns REDIRECT "leader is S3".
+     *   At that point last_tried_conn == S2 (the current node, just set on
+     *   entry to do_send). The cross-filer loop check
+     *     "leader_addr == last_tried_conn" fails because leader=S3 != S2.
+     *   So we happily update shard_router to VALID→S3, next iteration
+     *   immediately returns to S3, self-redirect again → ping-pong
+     *   S3→S2→S3→S2→deadline exceeded.
+     *
+     * SOLUTION (FUSE MetaShardClient model, ported to C):
+     *   Maintain a per-request blacklist of nodes that have *already*
+     *   responded with self-redirect during this request. Two new fields:
+     *     bad_self_addr / bad_self_port
+     *   Then three rules:
+     *     (A) ROUTE_CHECKING picker skips BOTH last_tried_conn AND
+     *         any filer matching (bad_self_addr, bad_self_port) so we
+     *         never waste a round-trip probing a node proven stale.
+     *     (B) When a non-self REDIRECT arrives whose target == the
+     *         blacklisted self-redirect node, treat it as a "stale
+     *         redirect" — do NOT poke shard_router at that node, just
+     *         apply x2 backoff and keep rotating. In FUSE this is the
+     *         `if new_addr == target_addr { rotate, don't update router }`
+     *         branch, generalised to catch redirects THROUGH a follower.
+     *     (C) Cross-filer A↔B loop detection still applies when neither
+     *         endpoint is a known self-redirect target.
+     */
+    /* ================================================================
+     * FIX V6: Multi-node self-redirect BLACKLIST ARRAY (was single node).
+     *
+     * Previous single-node bug proven by dmesg:
+     *   Attempt 0: S32 self-redirect  →  bad_self = S32  (covers old)
+     *   Attempt 1: S31 self-redirect  →  bad_self = S31  (OVERWRITES S32!)
+     *   Attempt 2: picker skips S31,  picks S32 again  →  self-redirect
+     *               →  bad_self = S32  (overwrites S31 again)
+     *   Result: S32 ↔ S31 infinite ping-pong, S33 (real leader) never
+     *           probed, 15s deadline exceeded despite live leader present.
+     *
+     * New design: fixed array of up to POWERFS_MAX_FILERS distinct
+     * blacklisted self-redirect targets.  Duplicate add is no-op.  The
+     * ROUTE_CHECKING picker walks the entire list for every candidate,
+     * so once a filer self-redirects it is skipped for the rest of the
+     * request until the global TTL expiry below clears all entries.
+     * With 3 filers this guarantees we rotate through ALL of them —
+     * worst case 3 attempts, we WILL reach the real leader.  */
+    #define POWERFS_MAX_BLACKLISTED_SELF  8
+    char  bad_self_addrs[POWERFS_MAX_BLACKLISTED_SELF][64];
+    __u16 bad_self_ports[POWERFS_MAX_BLACKLISTED_SELF];
+    int   bad_self_cnt = 0;
+
+    /* FIX V3 (kept, applied to the whole blacklist array):
+     * TTL counter: N subsequent STALE-redirects pointing at any
+     * blacklisted node → clear the whole blacklist.  Self-redirect
+     * state is TRANSIENT (lasts ~100 ms during Raft election settle),
+     * so after enough follower-consensus STALE hits we must retry all
+     * nodes — otherwise we permanently blacklist the real leader.
+     *
+     * Threshold = 2: in a 3-Filer cluster, 2 independent DIFFERENT
+     * follower confirmations that X is leader is sufficient proof
+     * (Raft quorum = 2).  Previously 4 was overly conservative and
+     * caused deadline exceed during otherwise-normal redirect chains.
+     */
+    int   bad_self_stale_count = 0;
+    #define BAD_SELF_MAX_STALE_ROUNDS  2
+
     int filer_idx;
     int attempt;
     int ret;
@@ -3608,31 +3739,83 @@ int powerfs_request_submit(struct powerfs_request *req)
                     powerfs_shard_route_on_filer_disconnect(filer_idx);
                 conn = NULL;
             }
+            /* FIX V2+V6 extension: ROUTE_VALID must ALSO honour
+             * the per-request multi-node bad_self blacklist ARRAY.
+             * Otherwise:
+             *   S3 self-redirect → blacklist S3, state=CHECKING
+             *   S2 REDIRECT → powerfs_shard_route_update sets VALID→S3
+             *   Next iteration ROUTE_VALID returns S3 again, bypassing
+             *   the CHECKING picker's blacklist filter → ping-pong loop.
+             *
+             * V6: iterate the full blacklist array, not single node. */
+            if (conn && bad_self_cnt > 0) {
+                int k;
+                bool bl_hit = false;
+                for (k = 0; k < bad_self_cnt; k++) {
+                    if (strcmp(conn->addr, bad_self_addrs[k]) == 0 &&
+                        conn->port == bad_self_ports[k]) {
+                        bl_hit = true;
+                        break;
+                    }
+                }
+                if (bl_hit) {
+                    pr_warn("powerfs: ROUTE_VALID conn %s:%u is in "
+                            "bad_self blacklist (cnt=%d); downgrading to "
+                            "CHECKING (attempt %d, shard=%llu)\n",
+                            conn->addr, conn->port, bad_self_cnt,
+                            attempt,
+                            (unsigned long long)req->shard_id);
+                    if (req->shard_id < POWERFS_MAX_SHARDS) {
+                        struct powerfs_shard_route_entry *entry;
+                        entry = &g_pool.shard_route.entries[req->shard_id];
+                        spin_lock(&g_pool.shard_route.lock);
+                        if (entry->state == ROUTE_VALID)
+                            entry->state = ROUTE_CHECKING;
+                        spin_unlock(&g_pool.shard_route.lock);
+                    }
+                    conn = NULL;
+                }
+            }
             break;
 
         case ROUTE_CHECKING:
         case ROUTE_UNKNOWN:
             /*
-             * 寻找可用 filer, 优先跳过上次尝试的 (避免 self-redirect 循环).
+             * 寻找可用 filer, 优先跳过 last_tried_conn 和 self-redirect 黑名单数组.
              *
              * ROUTE_CHECKING: leader 可能已变, round-robin 尝试.
              * ROUTE_UNKNOWN: 无 leader 信息, 尝试任意已连接 filer.
              *
-             * 两者的 filer 选择策略相同: 先跳过 last_tried_conn,
-             * 若无其他选择则允许重试同一个.
+             * 两者的 filer 选择策略相同:
+             *   第一轮: 跳过 last_tried_conn + 全量黑名单数组 (V6 multi-node)
+             *           避免在 proven-stale 节点上浪费 RTT.
+             *   第二轮: 若无其他选择, 允许重试同一个 (避免 livelock 当
+             *           3 个 filer 中有 3 个已列入黑名单 → TTL will clear).
              */
             if (g_pool.filer_count > 0) {
                 int i;
-                /* 第一轮: 跳过 last_tried_conn (避免 self-redirect 循环) */
+                /* 第一轮: 跳过 last_tried_conn + 多节点黑名单数组 */
                 for (i = 0; i < g_pool.filer_count; i++) {
-                    if (g_pool.filers[i].in_use &&
-                        g_pool.filers[i].state == CONN_CONNECTED &&
-                        &g_pool.filers[i] != last_tried_conn) {
+                    bool skip = false;
+                    int k;
+                    if (!g_pool.filers[i].in_use ||
+                        g_pool.filers[i].state != CONN_CONNECTED)
+                        continue;
+                    if (&g_pool.filers[i] == last_tried_conn)
+                        skip = true;
+                    /* V6: linear scan of blacklist array */
+                    for (k = 0; k < bad_self_cnt && !skip; k++) {
+                        if (strcmp(g_pool.filers[i].addr,
+                                   bad_self_addrs[k]) == 0 &&
+                            g_pool.filers[i].port == bad_self_ports[k])
+                            skip = true;
+                    }
+                    if (!skip) {
                         conn = &g_pool.filers[i];
                         break;
                     }
                 }
-                /* 第二轮: 若无其他选择, 允许重试同一个 */
+                /* 第二轮: 若无其他选择, 允许任何已连接 filer */
                 if (!conn) {
                     for (i = 0; i < g_pool.filer_count; i++) {
                         if (g_pool.filers[i].in_use &&
@@ -3774,15 +3957,261 @@ int powerfs_request_submit(struct powerfs_request *req)
             if (powerfs_net_parse_redirect(req->resp_body, req->resp_body_len,
                                             leader_addr, sizeof(leader_addr),
                                             &leader_port) == 0) {
-                /*
-                 * Cross-filer redirect loop detection:
-                 * If the new leader is the same filer we redirected FROM
-                 * in the previous attempt, we have a loop (A→B→A→B…).
-                 * This happens when two filers' Raft state is inconsistent
-                 * (each thinks the other is leader for the same shard).
-                 * Break the loop with -EAGAIN so VFS retries the whole
-                 * operation, giving Raft time to converge.
-                 */
+                /* FIX (T1.6 alignment): 检测 self-redirect 必须 FIRST.
+                 *
+                 * 之前的代码先做 cross-filer loop 检测, 后做 self-redirect
+                 * 检测. 当 last_tried_conn == conn == leader 三者同为 S1
+                 * 时 (例如 S1 选举进行中返回 self-redirect), 错误地先命中
+                 * "last_tried_conn == leader" 条件, 误报 "redirect loop"
+                 * 并立即 EAGAIN, 而不走 self-redirect 的指数退避重试路径.
+                 *
+                 * Self-redirect (leader == conn) 是正常的选举中间态,
+                 * 必须用退避重试处理; 只有 leader != conn 但又绕回
+                 * last_tried_conn 时才是真正的 A↔B cross-filer loop. */
+                if (strcmp(leader_addr, conn->addr) == 0 &&
+                    leader_port == conn->port) {
+                    self_redirect = true;
+                    pr_debug("powerfs: self-redirect detected on filer %s:%u (election in progress), attempt=%d\n",
+                            conn->addr, conn->port, attempt);
+                }
+
+                if (self_redirect) {
+                    unsigned long backoff;
+                    int dup_idx;
+                    bool already_blacklisted = false;
+                    /* FIX V7: After Filer FINAL FIX V2, *every* non-leader
+                     * returns SELF-redirect (never cross-filer redirect
+                     * to another node).  This means Rule B (stale-redirect
+                     * hit → TTL clear) is NEVER reached because the else
+                     * branch below (strcmp leader != conn) requires a
+                     * CROSS-filer redirect.  Result: once all 3 filers are
+                     * blacklisted (attempt 2), the picker's 2nd fallthrough
+                     * round keeps picking the same filer forever, and
+                     * bad_self_stale_count never increments → deadline.
+                     *
+                     * V7 fix: track duplicate self-redirect rounds via the
+                     * SAME bad_self_stale_count counter.  After N dup
+                     * rounds → TTL-clear entire blacklist.  Same quorum
+                     * logic as Rule B (2 rounds = election settled). */
+                    bool v7_ttl_cleared = false;
+
+                    /* ========= Rule (3) V6: multi-node blacklist ADD (dedup) ====
+                     * Record (conn->addr, port) into per-request BAD_SELF
+                     * ARRAY if not already present.  Unlike the old single-
+                     * node code we NEVER overwrite entries — two followers
+                     * self-redirecting in sequence must BOTH stay skipped
+                     * so the picker can reach filer #3 (real leader). */
+                    for (dup_idx = 0; dup_idx < bad_self_cnt; dup_idx++) {
+                        if (strcmp(bad_self_addrs[dup_idx],
+                                   conn->addr) == 0 &&
+                            bad_self_ports[dup_idx] == conn->port) {
+                            already_blacklisted = true;
+                            break;
+                        }
+                    }
+                    if (!already_blacklisted &&
+                        bad_self_cnt < POWERFS_MAX_BLACKLISTED_SELF) {
+                        strncpy(bad_self_addrs[bad_self_cnt], conn->addr,
+                                sizeof(bad_self_addrs[0]) - 1);
+                        bad_self_addrs[bad_self_cnt]
+                                     [sizeof(bad_self_addrs[0]) - 1] = '\0';
+                        bad_self_ports[bad_self_cnt] = conn->port;
+                        bad_self_cnt++;
+                    }
+
+                    /* ==== V7: dup self-redirect triggers TTL (same
+                     * threshold as Rule B, 2 rounds).  This replaces
+                     * Rule B's trigger which is now unreachable under
+                     * Filer FINAL FIX V2 (all-SELF redirect model). */
+                    if (already_blacklisted) {
+                        bad_self_stale_count++;
+                        if (bad_self_stale_count >= BAD_SELF_MAX_STALE_ROUNDS) {
+                            pr_warn("powerfs: V7 SELF-redirect TTL after "
+                                    "%d dup-rounds: all filers returned "
+                                    "self-redirect (cnt=%d); CLEARING "
+                                    "entire blacklist to retry leader "
+                                    "(attempt %d, shard=%llu)\n",
+                                    bad_self_stale_count,
+                                    bad_self_cnt,
+                                    attempt,
+                                    (unsigned long long)req->shard_id);
+                            bad_self_cnt = 0;
+                            bad_self_stale_count = 0;
+                            v7_ttl_cleared = true;
+                        }
+                    }
+
+                    /* Force CHECKING state so picker rotates *past*
+                     * this filer (without disconnecting it). */
+                    if (req->shard_id < POWERFS_MAX_SHARDS) {
+                        struct powerfs_shard_route_entry *entry;
+                        entry = &g_pool.shard_route.entries[req->shard_id];
+                        spin_lock(&g_pool.shard_route.lock);
+                        if (entry->state == ROUTE_VALID)
+                            entry->state = ROUTE_CHECKING;
+                        spin_unlock(&g_pool.shard_route.lock);
+                    }
+
+                    /* PERF OPT: After Filer FINAL FIX V2, followers
+                     * *stably* return self-redirect (not transient election
+                     * state).  Old 400/800ms backoff was for Raft election
+                     * settle (~100-500 ms).  Current case: 2 followers
+                     * always return self, 1 leader always accepts.  So
+                     * minimise wait: 20/40ms, cap 50ms.  Worst-case 3-node
+                     * probe = 70 ms TOTAL overhead per fresh request, vs
+                     * 1200 ms before. */
+                    if (v7_ttl_cleared) {
+                        backoff = 0;
+                    } else {
+                        backoff = min(20ul * (1UL << min(attempt, 1)),
+                                      50ul);
+                    }
+
+                    pr_warn("powerfs: self-redirect on filer %s:%u, "
+                            "x2 backoff=%lu ms, +blacklist (cnt=%d%s), "
+                            "rotating next (attempt %d, shard=%llu)\n",
+                            conn->addr, conn->port, backoff, bad_self_cnt,
+                            already_blacklisted ? " (dup)" : "",
+                            attempt,
+                            (unsigned long long)req->shard_id);
+
+                    reinit_completion(&req->done);
+                    req->error = 0;
+                    if (backoff > 0)
+                        msleep(backoff);
+                    continue;
+                }
+
+                /* ======= Stale-redirect guard (Rule B V6: multi-node array) =====
+                 * Follower redirects us to a node we ALREADY know is a stale
+                 * self-redirect target (present in blacklist array). Don't
+                 * update shard_router; keep rotating with x2 backoff.
+                 *
+                 * FIX V3: TTL the whole blacklist.  Self-redirect is a
+                 * TRANSIENT election-in-progress state (~100 ms).  After N
+                 * stale-rounds where followers independently confirm X is
+                 * leader, the election must have settled — clear ALL nodes
+                 * and retry, otherwise we permanently blacklist the real
+                 * leader and spin through followers until deadline. */
+                {
+                    int bl_hit_idx = -1;
+                    int k;
+                    for (k = 0; k < bad_self_cnt; k++) {
+                        if (strcmp(leader_addr, bad_self_addrs[k]) == 0 &&
+                            leader_port == bad_self_ports[k]) {
+                            bl_hit_idx = k;
+                            break;
+                        }
+                    }
+                    if (bl_hit_idx >= 0) {
+                        unsigned long backoff;
+                        bool skip_sleep_v4 = false;
+
+                        bad_self_stale_count++;
+                        if (bad_self_stale_count >= BAD_SELF_MAX_STALE_ROUNDS) {
+                            pr_warn("powerfs: BAD_SELF TTL expired after %d "
+                                    "stale-rounds: all followers point to "
+                                    "%s:%u, CLEARING ENTIRE blacklist array "
+                                    "(was %d nodes) to retry proven leader "
+                                    "(attempt %d, shard=%llu)\n",
+                                    bad_self_stale_count,
+                                    leader_addr, leader_port,
+                                    bad_self_cnt,
+                                    attempt,
+                                    (unsigned long long)req->shard_id);
+                            bad_self_cnt = 0;       /* V6: clear entire array */
+                            bad_self_stale_count = 0;
+                            /* FIX V4: Skip the ~1.6s stall after TTL since
+                             * follower consensus already means election is
+                             * settled.  Also force VALID route to the
+                             * consensus leader — otherwise picker still
+                             * round-robins through followers. */
+                            skip_sleep_v4 = true;
+                            {
+                                struct powerfs_net_server_conn *consensus_ldr;
+                                consensus_ldr = powerfs_conn_find_filer(
+                                                    leader_addr, leader_port);
+                                if (consensus_ldr) {
+                                    int cidx = powerfs_conn_get_filer_idx(
+                                                          consensus_ldr);
+                                    if (cidx >= 0 &&
+                                        req->shard_id < POWERFS_MAX_SHARDS) {
+                                        powerfs_shard_route_update(
+                                                           req->shard_id, cidx);
+                                        pr_warn("powerfs: post-TTL force "
+                                                "route VALID to consensus "
+                                                "leader %s:%u (idx=%d)\n",
+                                                consensus_ldr->addr,
+                                                consensus_ldr->port, cidx);
+                                    }
+                                }
+                            }
+                        }
+
+                    if (req->shard_id < POWERFS_MAX_SHARDS && !skip_sleep_v4) {
+                        struct powerfs_shard_route_entry *entry;
+                        entry = &g_pool.shard_route.entries[req->shard_id];
+                        spin_lock(&g_pool.shard_route.lock);
+                        if (entry->state == ROUTE_VALID)
+                            entry->state = ROUTE_CHECKING;
+                        spin_unlock(&g_pool.shard_route.lock);
+                    }
+
+                    /* PERF OPT: same rationale as self-redirect branch —
+                     * stable redirect pattern, not transient election.
+                     * 20/40ms cap 50ms instead of 400/800/1600ms. */
+                    backoff = min(20ul * (1UL << min(attempt, 1)),
+                                  50ul);
+
+                    if (!skip_sleep_v4) {
+                        pr_warn("powerfs: STALE-redirect: follower %s:%u "
+                                "-> blacklisted self-target %s:%u; keeping "
+                                "CHECKING, x2 backoff=%lu ms, rotate next "
+                                "(attempt %d, shard=%llu, stale_cnt=%d/%d)\n",
+                                conn->addr, conn->port,
+                                leader_addr, leader_port,
+                                backoff, attempt,
+                                (unsigned long long)req->shard_id,
+                                bad_self_stale_count,
+                                BAD_SELF_MAX_STALE_ROUNDS);
+                    } else {
+                        pr_warn("powerfs: STALE-redirect (TTL-cleared): "
+                                "SKIP backoff=%lu ms, go retry "
+                                "consensus-leader immediately "
+                                "(attempt %d, shard=%llu)\n",
+                                backoff, attempt,
+                                (unsigned long long)req->shard_id);
+                    }
+
+                    reinit_completion(&req->done);
+                    req->error = 0;
+                    if (!skip_sleep_v4)
+                        msleep(backoff);
+                    continue;
+                    }
+                }
+
+                /* FIX V2-V6: Diagnostics when bad_self array non-empty.
+                 * Log all blacklisted nodes to help diagnose why Rule B
+                 * strcmp didn't match any of them for the target leader. */
+                if (bad_self_cnt > 0) {
+                    int dk;
+                    for (dk = 0; dk < bad_self_cnt; dk++) {
+                        pr_warn("powerfs: REDIRECT diag[%d/%d]: "
+                                "leader='%s':%u blacklist='%s':%u "
+                                "strcmp_addr=%d port_eq=%d "
+                                "(attempt %d, shard=%llu)\n",
+                                dk, bad_self_cnt,
+                                leader_addr, leader_port,
+                                bad_self_addrs[dk], bad_self_ports[dk],
+                                strcmp(leader_addr, bad_self_addrs[dk]),
+                                leader_port == bad_self_ports[dk] ? 1 : 0,
+                                attempt,
+                                (unsigned long long)req->shard_id);
+                    }
+                }
+
+                /* Cross-filer A<->B loop detection. */
                 if (last_tried_conn &&
                     strcmp(leader_addr, last_tried_conn->addr) == 0 &&
                     leader_port == last_tried_conn->port) {
@@ -3801,55 +4230,69 @@ int powerfs_request_submit(struct powerfs_request *req)
                         leader_addr, leader_port, conn->addr, conn->port,
                         g_pool.filer_count);
 
-                /* 检测 self-redirect (filer 选举中, 返回自身地址) */
-                if (strcmp(leader_addr, conn->addr) == 0 &&
-                    leader_port == conn->port) {
-                    self_redirect = true;
-                    pr_debug("powerfs: self-redirect detected on filer %s:%u (election in progress), switching to ROUTE_CHECKING\n",
-                            conn->addr, conn->port);
-                }
-
-                if (!self_redirect) {
-                    /* 查找或更新 filer 路由 */
-                    leader_conn = powerfs_conn_find_filer(leader_addr, leader_port);
-                    if (leader_conn) {
-                        int new_idx = powerfs_conn_get_filer_idx(leader_conn);
-                        if (new_idx >= 0) {
-                            /* 记录当前 filer 为上次尝试的 filer,
-                             * 用于下一轮的 cross-filer redirect loop 检测 */
-                            last_tried_conn = conn;
-                            /* 更新 shard 路由到新 leader */
-                            powerfs_shard_route_update(req->shard_id, new_idx);
-                            /* 重试请求 (走新 leader) */
-                            reinit_completion(&req->done);
-                            req->error = 0;
-                            continue;
+                /* 查找或更新 filer 路由 */
+                leader_conn = powerfs_conn_find_filer(leader_addr, leader_port);
+                if (leader_conn) {
+                    int new_idx = powerfs_conn_get_filer_idx(leader_conn);
+                    if (new_idx >= 0) {
+                        /* FIX V2+V6: Defence-in-depth before route update.
+                         * Even if Rule B stale-redirect guard somehow missed
+                         * (e.g. formatting edge case vs leader_addr string),
+                         * check the RESOLVED leader_conn pointer against the
+                         * ENTIRE bad_self blacklist array.  On any match:
+                         * treat as stale-redirect — don't VALID→blacklisted,
+                         * stay CHECKING, backoff + rotate. */
+                        {
+                            int v6k;
+                            bool v6_hit = false;
+                            for (v6k = 0; v6k < bad_self_cnt; v6k++) {
+                                if (strcmp(leader_conn->addr,
+                                           bad_self_addrs[v6k]) == 0 &&
+                                    leader_conn->port ==
+                                        bad_self_ports[v6k]) {
+                                    v6_hit = true;
+                                    break;
+                                }
+                            }
+                            if (v6_hit) {
+                                unsigned long backoff_v2;
+                                pr_warn("powerfs: stale-redirect (defence): "
+                                        "resolved leader %s:%u matches "
+                                        "blacklist[%d] (cnt=%d); SKIP route "
+                                        "update, stay CHECKING + rotate "
+                                        "(attempt %d, shard=%llu)\n",
+                                        leader_conn->addr, leader_conn->port,
+                                        v6k, bad_self_cnt,
+                                        attempt,
+                                        (unsigned long long)req->shard_id);
+                                if (req->shard_id < POWERFS_MAX_SHARDS) {
+                                    struct powerfs_shard_route_entry *entry_v2;
+                                    entry_v2 = &g_pool.shard_route.entries[req->shard_id];
+                                    spin_lock(&g_pool.shard_route.lock);
+                                    if (entry_v2->state == ROUTE_VALID)
+                                        entry_v2->state = ROUTE_CHECKING;
+                                    spin_unlock(&g_pool.shard_route.lock);
+                                }
+                                last_tried_conn = conn;
+                                /* PERF OPT: stable redirect pattern. */
+                                backoff_v2 = min(20ul * (1UL << min(attempt, 1)),
+                                                 50ul);
+                                reinit_completion(&req->done);
+                                req->error = 0;
+                                msleep(backoff_v2);
+                                continue;
+                            }
                         }
+                        /* 记录当前 filer 为上次尝试的 filer,
+                         * 用于下一轮的 cross-filer redirect loop 检测 */
+                        last_tried_conn = conn;
+                        /* 更新 shard 路由到新 leader */
+                        powerfs_shard_route_update(req->shard_id, new_idx);
+                        /* 重试请求 (走新 leader) */
+                        reinit_completion(&req->done);
+                        req->error = 0;
+                        continue;
                     }
-                } else {
-                    /*
-                     * Self-redirect: filer 选举中, 不知道 leader.
-                     * 使用指数退避重试, 避免快速循环 (22ms 一次会消耗大量 CPU).
-                     * 退避时间: 200ms, 400ms, 800ms, 1600ms, 上限 2000ms.
-                     * 每次重试会重新查路由, 若选举已完成则请求成功或收到
-                     * 指向真正 leader 的 REDIRECT.
-                     */
-                    unsigned long backoff;
-
-                    filer_idx = powerfs_conn_get_filer_idx(conn);
-                    if (filer_idx >= 0)
-                        powerfs_shard_route_on_filer_disconnect(filer_idx);
-
-                    /* 指数退避: 200ms * 2^min(attempt, 4), 上限 2000ms */
-                    backoff = min(200ul * (1UL << min(attempt, 4)),
-                                  2000ul);
-                    pr_debug("powerfs: self-redirect on filer %s:%u, backing off %lu ms (attempt %d)\n",
-                            conn->addr, conn->port, backoff, attempt);
-
-                    reinit_completion(&req->done);
-                    req->error = 0;
-                    msleep(backoff);
-                    continue;
                 }
             }
             /* redirect 解析失败或 filer 未找到 */
@@ -3869,6 +4312,30 @@ int powerfs_request_submit(struct powerfs_request *req)
         }
 
         /* 非 REDIRECT: 正常完成 (do_send 已 complete) */
+
+        /* ==== PERF OPT v1: ROLLOUT SAFELY ====
+         * The leader-caching optimization (setting VALID route on success)
+         * is TEMPORARILY DISABLED because it correlates with soft lockup /
+         * invalid opcode panics.  Investigate separately.  For now we still
+         * get the 20ms backoff improvement (was 400-800ms), which reduces
+         * per-request overhead from 1.2s → ~70ms. */
+#if 0
+        if (req->error == 0 &&
+            req->resp_status != POWERFS_NET_STATUS_ERR_REDIRECT &&
+            conn != NULL &&
+            req->shard_id < POWERFS_MAX_SHARDS) {
+            int ok_idx = powerfs_conn_get_filer_idx(conn);
+            if (ok_idx >= 0) {
+                struct powerfs_shard_route_entry *ok_entry;
+                ok_entry = &g_pool.shard_route.entries[req->shard_id];
+                spin_lock(&g_pool.shard_route.lock);
+                ok_entry->leader_filer_idx = ok_idx;
+                ok_entry->state = ROUTE_VALID;
+                spin_unlock(&g_pool.shard_route.lock);
+            }
+        }
+#endif
+
         return req->error;
     }
 
@@ -3986,6 +4453,66 @@ int powerfs_net_send_request(__u16 msg_type, u64 route_inode,
     powerfs_request_free(req);
     return ret;
 }
+
+/**
+ * powerfs_net_send_request_shard - 发送请求, 直接路由到 explicit_shard_id.
+ *
+ * 与 powerfs_net_send_request 的唯一区别:
+ *   req->shard_id = explicit_shard_id (绕过 calc_shard_id).
+ *
+ * 用于 AllocInodeBatch / MkdirPhaseA(target_shard) 等场景: 请求需要
+ * 发往指定 shard (非 inode-derived). 在 powerfs_request_submit 中
+ * ROUTE_VALID/CHECKING/UNKNOWN 全部使用 req->shard_id, 所以只需要在
+ * 分配 req 时替换 shard_id 赋值即可.
+ */
+int powerfs_net_send_request_shard(__u16 msg_type, __u64 explicit_shard_id,
+                                   const __u8 *body, size_t body_len,
+                                   const __u8 *data, size_t data_len,
+                                   __u8 *resp_body, size_t resp_body_cap,
+                                   __u8 *resp_data, size_t resp_data_cap,
+                                   int timeout_ms,
+                                   size_t *resp_body_len_out,
+                                   size_t *resp_data_len_out)
+{
+    struct powerfs_request *req;
+    int ret;
+
+    if (g_pool.filer_count == 0 || atomic_read(&g_pool.stopping))
+        return -ENOTCONN;
+
+    req = powerfs_request_alloc(msg_type, GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+
+    req->req_body = body;
+    req->req_body_len = body_len;
+    req->req_data = data;
+    req->req_data_len = data_len;
+    req->resp_body = resp_body;
+    req->resp_body_cap = resp_body_cap;
+    req->resp_data = resp_data;
+    req->resp_data_cap = resp_data_cap;
+    req->shard_id = explicit_shard_id;          /* direct shard routing */
+    if (timeout_ms > 0)
+        req->deadline = jiffies + msecs_to_jiffies(timeout_ms);
+
+    ret = powerfs_request_submit(req);
+
+    if (resp_body_len_out)
+        *resp_body_len_out = req->resp_body_len;
+    if (resp_data_len_out)
+        *resp_data_len_out = req->resp_data_len;
+
+    if (ret < 0) {
+        powerfs_request_free(req);
+        return ret;
+    }
+
+    ret = req->resp_status;
+    powerfs_request_free(req);
+    return ret;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_send_request_shard);
 
 /* ========== 状态码转换 ========== */
 
@@ -4608,6 +5135,171 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
     resp_body = kvmalloc(POWERFS_NET_RESP_INLINE_CAP, GFP_NOFS);
     if (!resp_body)
         return -ENOMEM;
+
+    /* ================================================================
+     * Two-phase mkdir (align with FUSE MetaShardClient::mkdir):
+     *
+     * MKDIR legacy single-RPC (handle_mkdir on Filer) only works when
+     * shard_ino == shard_dir (both CreateInode + AddDirEntry batched
+     * on the same Raft group). Cross-shard mkdir (child_dir placed on
+     * a DIFFERENT shard from parent, default for multi-shard clusters)
+     * has the parent_shard leader propose CreateInode to the *other*
+     * shard's Raft group → "not_leader" → proposal fails.
+     *
+     * Fix: same algorithm as FUSE meta_shard_client.rs L2276-2395:
+     *   shard_count <= 1 OR parent_shard == target_shard → legacy Mkdir
+     *   else →
+     *     (0) AllocInodeBatch(count=1) → target_shard leader
+     *     (1) MkdirPhaseA → target_shard leader (CreateInode only)
+     *     (2) MkdirPhaseB → parent_shard leader (AddDirEntry only)
+     * Phase A attr response carries Ino/Mode/Uid/Gid/Size/Nlink/mtime.
+     * If Phase B fails we orphan the inode (GC will clean it later).
+     * ================================================================ */
+    if (is_dir) {
+        __u64 parent_shard;
+        __u64 shard_count;
+        __u64 target_shard;
+
+        parent_shard = powerfs_calc_shard_id(dir_ino);
+        shard_count = g_pool.shard_route.shard_count;
+        if (shard_count < 1) shard_count = 1;
+        target_shard = (shard_count <= 1)
+                           ? parent_shard
+                           : (parent_shard + 1) % shard_count;
+
+        if (target_shard != parent_shard) {
+            /* ============ Slow path: Two-phase mkdir ============ */
+            __u64 ino_alloc = 0;
+            __u8 ab_body[128];
+            __u8 ab_resp[128];
+            size_t ab_resp_len;
+            struct powerfs_tlv_enc ab_enc;
+
+            /* ---- Phase 0: AllocInodeBatch on target_shard.
+             * Request: ShardId + Count + ClientId
+             * Response: StartInode + EndInode (OK) / Name=error (fail) */
+            powerfs_tlv_enc_init(&ab_enc, ab_body, sizeof(ab_body));
+            powerfs_tlv_enc_u64(&ab_enc, POWERFS_NET_FLD_SHARD_ID, target_shard);
+            powerfs_tlv_enc_u32(&ab_enc, POWERFS_NET_FLD_COUNT, 1);
+            powerfs_tlv_enc_string(&ab_enc, POWERFS_NET_FLD_CLIENT_ID,
+                                   "powerfs-kernel", 15);
+
+            ab_resp_len = 0;
+            ret = powerfs_net_send_request_shard(
+                        POWERFS_NET_MSG_ALLOC_INODE_BATCH, target_shard,
+                        ab_body, powerfs_tlv_enc_len(&ab_enc),
+                        NULL, 0,
+                        ab_resp, sizeof(ab_resp),
+                        NULL, 0, POWERFS_META_TIMEOUT_MS,
+                        &ab_resp_len, NULL);
+            if (ret < 0) goto out;
+            if (ret > 0) { ret = net_status_to_errno((__u16)ret); goto out; }
+
+            if (ab_resp_len > 0) {
+                struct powerfs_tlv_dec ab_dec;
+                powerfs_tlv_dec_init(&ab_dec, ab_resp, ab_resp_len);
+                if (powerfs_tlv_dec_find_u64(&ab_dec,
+                        POWERFS_NET_FLD_START_INODE, &ino_alloc) != 0 ||
+                    ino_alloc == 0) {
+                    pr_warn("powerfs: two-phase mkdir AllocInodeBatch "
+                            "invalid: no StartInode (target_shard=%llu)\n",
+                            (unsigned long long)target_shard);
+                    ret = -EREMOTEIO;
+                    goto out;
+                }
+            } else {
+                ret = -EREMOTEIO;
+                goto out;
+            }
+
+            /* ---- Phase A: MkdirPhaseA CreateInode → target_shard.
+             * Enc: ShardId + Ino + ParentIno + Name + Mode(u64) + Uid(u64) + Gid(u64)
+             * Decode same attr format as legacy Mkdir. */
+            {
+                __u8 pa_body[512];
+                struct powerfs_tlv_enc pa_enc;
+
+                powerfs_tlv_enc_init(&pa_enc, pa_body, sizeof(pa_body));
+                powerfs_tlv_enc_u64(&pa_enc, POWERFS_NET_FLD_SHARD_ID, target_shard);
+                powerfs_tlv_enc_u64(&pa_enc, POWERFS_NET_FLD_INO, ino_alloc);
+                powerfs_tlv_enc_u64(&pa_enc, POWERFS_NET_FLD_PARENT_INO, dir_ino);
+                powerfs_tlv_enc_string(&pa_enc, POWERFS_NET_FLD_NAME, name, name_len);
+                powerfs_tlv_enc_u64(&pa_enc, POWERFS_NET_FLD_MODE, (__u64)mode);
+                powerfs_tlv_enc_u64(&pa_enc, POWERFS_NET_FLD_UID, (__u64)uid);
+                powerfs_tlv_enc_u64(&pa_enc, POWERFS_NET_FLD_GID, (__u64)gid);
+
+                resp_body_len = 0;
+                ret = powerfs_net_send_request_shard(
+                            POWERFS_NET_MSG_MKDIR_PHASE_A, target_shard,
+                            pa_body, powerfs_tlv_enc_len(&pa_enc),
+                            NULL, 0,
+                            resp_body, POWERFS_NET_RESP_INLINE_CAP,
+                            NULL, 0, POWERFS_META_TIMEOUT_MS,
+                            &resp_body_len, NULL);
+                if (ret < 0) goto out;
+                if (ret > 0) { ret = net_status_to_errno((__u16)ret); goto out; }
+
+                /* Phase A already returns full inode attrs.
+                 * Parse into output vars now so Phase B failure doesn't
+                 * lose the inode number (informational only). */
+                if (resp_body_len > 0) {
+                    powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+                    if (ino_ret) (void)powerfs_tlv_dec_find_u64(
+                                        &dec, POWERFS_NET_FLD_INO, ino_ret);
+                }
+            }
+
+            /* ---- Phase B: MkdirPhaseB AddDirEntry → parent_shard (dir_ino shard).
+             * Enc: ShardId + ParentIno + Name + Ino + Mode(u64) + Uid(u64) + Gid(u64)
+             * Response: status only, body may contain Ino. */
+            {
+                __u8 pb_body[512];
+                struct powerfs_tlv_enc pb_enc;
+                __u8 pb_resp[128];
+                size_t pb_resp_len;
+
+                powerfs_tlv_enc_init(&pb_enc, pb_body, sizeof(pb_body));
+                powerfs_tlv_enc_u64(&pb_enc, POWERFS_NET_FLD_SHARD_ID, parent_shard);
+                powerfs_tlv_enc_u64(&pb_enc, POWERFS_NET_FLD_PARENT_INO, dir_ino);
+                powerfs_tlv_enc_string(&pb_enc, POWERFS_NET_FLD_NAME, name, name_len);
+                powerfs_tlv_enc_u64(&pb_enc, POWERFS_NET_FLD_INO, ino_alloc);
+                powerfs_tlv_enc_u64(&pb_enc, POWERFS_NET_FLD_MODE, (__u64)mode);
+                powerfs_tlv_enc_u64(&pb_enc, POWERFS_NET_FLD_UID, (__u64)uid);
+                powerfs_tlv_enc_u64(&pb_enc, POWERFS_NET_FLD_GID, (__u64)gid);
+
+                pb_resp_len = 0;
+                ret = powerfs_net_send_request_shard(
+                            POWERFS_NET_MSG_MKDIR_PHASE_B, parent_shard,
+                            pb_body, powerfs_tlv_enc_len(&pb_enc),
+                            NULL, 0,
+                            pb_resp, sizeof(pb_resp),
+                            NULL, 0, POWERFS_META_TIMEOUT_MS,
+                            &pb_resp_len, NULL);
+                if (ret < 0) goto out;
+                if (ret > 0) {
+                    ret = net_status_to_errno((__u16)ret);
+                    /* Phase B failed: orphan inode on target_shard.
+                     * GC will clean it later; still propagate error to caller. */
+                    pr_warn("powerfs: two-phase mkdir PhaseB failed: ino=%llu "
+                            "parent=%llu err=%d (orphan inode left on shard=%llu)\n",
+                            (unsigned long long)ino_alloc,
+                            (unsigned long long)dir_ino, ret,
+                            (unsigned long long)target_shard);
+                    goto out;
+                }
+            }
+
+            /* ---- Two-phase mkdir done.
+             * If Phase A already populated ino_ret we're good; Layout for
+             * directories is not meaningful so we leave layout untouched
+             * (same as legacy single-RPC mkdir path below which never sets
+             * volume_id/file_key/layout). */
+            ret = 0;
+            goto out;
+        }
+        /* else: target_shard == parent_shard → fall through to legacy
+         * single-RPC Mkdir path below. */
+    }
 
     msg_type = is_dir ? POWERFS_NET_MSG_MKDIR : POWERFS_NET_MSG_CREATE;
 
@@ -7946,17 +8638,28 @@ void powerfs_net_reg_cap_notify_handlers(
 }
 EXPORT_SYMBOL_GPL(powerfs_net_reg_cap_notify_handlers);
 
-/* 解析 CapRecallNotify body (服务端 net_handler.rs build_cap_recall_notify 编码).
+/* 解析 CapRecallNotify body (服务端 net_handler.rs NetCapRevoker::recall 编码).
  *
- * 对齐 Rust net_handler.rs cap push (L92-L113):
+ * 对齐 Rust net_handler.rs recall() 推送 (net_handler.rs ~L92-L118):
  *   FieldId::Ino             → ino (u64)
  *   FieldId::LeaseToken      → lease_token (string)
- *   FieldId::CapSet          → recall_mask (u8, 第一个 CapSet 字段)
- *   FieldId::IsWriteOpen (0xC6) → packed 第二个 CapSet 作为 retain_mask (u8, 复用 IsWriteOpen tag)
+ *   FieldId::CapSet          → recall_mask (u8, 完整 8-bit recall capset)
+ *   FieldId::IsWriteOpen(0xC6) → packed u8:
+ *                                 bits[0:3] = recall_mask & 0x0F (冗余副本)
+ *                                 bits[4:7] = retained_caps & 0x0F  ← 真正的 retain_mask
  *   FieldId::CapEpoch (0xC5) → epoch (u64)
  *
- * NOTE: 服务端临时复用 IsWriteOpen 作为 retain_mask 的 tag (TLV 允许
- * 重复 FieldId 但 decoder 用 next_*, 用不同 tag 更简单; 这里严格按 Rust 端解码). */
+ * === BUG FIX (audit 2026-08-23, P1-S5a) ===
+ * Previous decoder read FieldId::IsWriteOpen directly into retain_mask_out
+ * without nibble-unpacking: for a recall=0x06 (W+X), retain=0x01 (R),
+ * Rust encodes IsWriteOpen=0x16 = (recall_lo4=0x6)|(retain_lo4<<4=0x10).
+ * Reading 0x16 directly into retain_mask gave wire_capset_to_kernel_bits(0x16)
+ * = W+X (low 3 bits = 0x06) — exactly the bits being *recalled*, not retained.
+ * The kernel then computed k_recall = issued & ~k_retain and revoked R instead
+ * of W+X → client kept dirty WR_DATA/AUTH_EXCL, server never got recall_ack
+ * for those bits → GATHER timeout → force-reclaim penalty applied.
+ * Fix: mask packed byte, extract high nibble as retain_mask.
+ */
 static int decode_cap_recall_body(const __u8 *body, size_t body_len,
                                   u64 *ino_out,
                                   char *token_out, size_t token_cap, size_t *token_len_out,
@@ -7966,7 +8669,7 @@ static int decode_cap_recall_body(const __u8 *body, size_t body_len,
     struct powerfs_tlv_dec dec;
     const __u8 *raw;
     size_t tlen;
-    int rc;
+    __u8 packed;
 
     if (!body || body_len == 0)
         return -EINVAL;
@@ -7976,17 +8679,23 @@ static int decode_cap_recall_body(const __u8 *body, size_t body_len,
 
     token_out[0] = '\0';
     if (token_len_out) *token_len_out = 0;
-    rc = powerfs_tlv_dec_find_raw(&dec, POWERFS_NET_FLD_LEASE_TOKEN, &raw, &tlen);
-    if (rc == 0 && raw && token_cap > 0) {
+    if (powerfs_tlv_dec_find_raw(&dec, POWERFS_NET_FLD_LEASE_TOKEN, &raw, &tlen) == 0 &&
+        raw && token_cap > 0) {
         size_t cp = min(tlen, token_cap - 1);
         memcpy(token_out, raw, cp);
         token_out[cp] = '\0';
         if (token_len_out) *token_len_out = tlen;
     }
 
+    /* Recall mask: full 8-bit value from the first CapSet field. */
     powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_CAP_SET, recall_mask_out);
-    /* retain_mask = IsWriteOpen field (Rust 端 repurpose 此 tag 传输). */
-    powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_IS_WRITE_OPEN, retain_mask_out);
+
+    /* Retain mask: Rust packs (recall_lo4 | retain_lo4 << 4) into
+     * FieldId::IsWriteOpen. We only care about the high nibble. */
+    packed = 0;
+    powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_IS_WRITE_OPEN, &packed);
+    *retain_mask_out = (packed >> 4) & 0x0F;
+
     powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_CAP_EPOCH, epoch_out);
 
     return 0;
@@ -8325,6 +9034,142 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
             }
         }
 
+        /* Parse ShardLeaderEntries (0x9F) to pre-fill shard→leader routing.
+         *
+         * Encoding (matches Master net_handler.rs + powerfs-master-net client.rs):
+         *   ShardLeaderEntries = u64(count)
+         *   followed by N × (ShardId=0x70 (u64) + FilerAddress=0x9C (string "ip:port"))
+         *
+         * When present, every shard_id's first RPC to the pool hits the true
+         * leader directly (zero-redirect fast path) instead of waiting for a
+         * STATUS_ERR_REDIRECT from a follower. */
+        {
+            u64 leader_count = 0;
+            int sl_parsed = 0, sl_applied = 0;
+
+            if (powerfs_tlv_dec_find_u64(&dec,
+                                          POWERFS_NET_FLD_SHARD_LEADER_ENTRIES,
+                                          &leader_count) == 0 && leader_count > 0) {
+                u64 idx;
+                pr_info("powerfs: Master topology has %llu ShardLeaderEntries, applying pre-route\n",
+                        (unsigned long long)leader_count);
+
+                for (idx = 0; idx < leader_count; idx++) {
+                    u64 sid = 0;
+                    char leader_addr[64] = {0};
+                    char *colon;
+                    char ip[64] = {0};
+                    __u16 port = 0;
+                    int filer_idx = -1;
+                    int j;
+
+                    /* NOTE: sequential next_u64 / next_string within the
+                     * ShardLeaderEntries group — the Master encoder emits
+                     * N × (ShardId + FilerAddress) back-to-back, and the
+                     * TLV decoder's linear scan matches emission order.
+                     * (Same logic as Rust master-net client.rs L361-L368.) */
+                    if (powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_SHARD_ID, &sid) < 0) {
+                        pr_warn("powerfs: ShardLeaderEntries[%llu]: missing ShardId, stop\n",
+                                (unsigned long long)idx);
+                        break;
+                    }
+                    if (powerfs_tlv_dec_string(&dec, POWERFS_NET_FLD_FILER_ADDRESS,
+                                                leader_addr, sizeof(leader_addr) - 1) < 0) {
+                        pr_warn("powerfs: ShardLeaderEntries[%llu]: missing FilerAddress, stop\n",
+                                (unsigned long long)idx);
+                        break;
+                    }
+                    sl_parsed++;
+                    leader_addr[sizeof(leader_addr) - 1] = '\0';
+
+                    if (leader_addr[0] == '\0') {
+                        pr_debug("powerfs: ShardLeaderEntries[%llu] sid=%llu empty addr, skip\n",
+                                (unsigned long long)idx, (unsigned long long)sid);
+                        continue;
+                    }
+                    if (sid >= POWERFS_MAX_SHARDS) {
+                        pr_warn("powerfs: ShardLeaderEntries[%llu] sid=%llu >= MAX(%u), skip\n",
+                                (unsigned long long)idx, (unsigned long long)sid,
+                                POWERFS_MAX_SHARDS);
+                        continue;
+                    }
+
+                    /* parse "ip:net_port" */
+                    colon = strrchr(leader_addr, ':');
+                    if (!colon) {
+                        pr_warn("powerfs: ShardLeaderEntries[%llu] addr=%s invalid (no port), skip\n",
+                                (unsigned long long)idx, leader_addr);
+                        continue;
+                    }
+                    {
+                        int ip_len = min_t(int, (int)(colon - leader_addr), (int)(sizeof(ip) - 1));
+                        memcpy(ip, leader_addr, ip_len);
+                        ip[ip_len] = '\0';
+                    }
+                    port = (__u16)simple_strtoul(colon + 1, NULL, 10);
+                    if (port == 0) {
+                        pr_warn("powerfs: ShardLeaderEntries[%llu] addr=%s invalid port, skip\n",
+                                (unsigned long long)idx, leader_addr);
+                        continue;
+                    }
+
+                    /* exact-match in g_pool.servers[] (must have been
+                     * populated by a prior powerfs_net_discover_filers()
+                     * call — or we auto-add a new filer entry here). */
+                    mutex_lock(&g_pool.pool_lock);
+                    for (j = 0; j < g_pool.server_count; j++) {
+                        if (g_pool.servers[j].type != POWERFS_NET_SERVER_FILER)
+                            continue;
+                        if (strcmp(g_pool.servers[j].addr, ip) == 0 &&
+                            g_pool.servers[j].port == port) {
+                            filer_idx = j;
+                            break;
+                        }
+                    }
+                    if (filer_idx < 0) {
+                        /* not yet in pool → add as a new filer metadata entry
+                         * (struct powerfs_net_server_entry compatible slot).
+                         * Actual socket/connection creation is deferred to the
+                         * first RPC submission via powerfs_net_submit, which
+                         * calls into the v2 filers[] conn pool — so here we
+                         * only populate the lightweight server_entry metadata
+                         * so addr/port lookups find a match on subsequent
+                         * discover cycles. */
+                        if (g_pool.server_count < POWERFS_NET_MAX_SERVERS) {
+                            filer_idx = g_pool.server_count;
+                            strncpy(g_pool.servers[filer_idx].addr, ip,
+                                    sizeof(g_pool.servers[filer_idx].addr) - 1);
+                            g_pool.servers[filer_idx].addr[sizeof(g_pool.servers[filer_idx].addr) - 1] = '\0';
+                            g_pool.servers[filer_idx].port = port;
+                            g_pool.servers[filer_idx].type = POWERFS_NET_SERVER_FILER;
+                            g_pool.servers[filer_idx].is_leader = false;
+                            g_pool.servers[filer_idx].last_ping_ms = -1;
+                            g_pool.servers[filer_idx].last_check_time = jiffies;
+                            g_pool.server_count++;
+                            g_pool.filer_count++;
+                            pr_info("powerfs: ShardLeaderEntries: added filer[%d] %s:%u (metadata, conn deferred)\n",
+                                    filer_idx, ip, port);
+                        }
+                    }
+                    mutex_unlock(&g_pool.pool_lock);
+
+                    if (filer_idx >= 0) {
+                        powerfs_shard_route_update(sid, filer_idx);
+                        sl_applied++;
+                        pr_debug("powerfs: shard_route prefill sid=%llu → filer[%d] %s:%u VALID\n",
+                                (unsigned long long)sid, filer_idx, ip, port);
+                    } else {
+                        pr_warn("powerfs: ShardLeaderEntries[%llu] sid=%llu addr=%s: pool full, skip\n",
+                                (unsigned long long)idx, (unsigned long long)sid, leader_addr);
+                    }
+                }
+                pr_info("powerfs: ShardLeaderEntries: parsed=%d, applied VALID route=%d (zero-redirect fast path)\n",
+                        sl_parsed, sl_applied);
+            } else {
+                pr_info("powerfs: Master topology has no ShardLeaderEntries (0x9F); shard routes will be discovered lazily via redirect\n");
+            }
+        }
+
         pr_info("powerfs: discover_volumes complete, %d routes added (vol_route_count=%d)\n",
                 routes_added, g_pool.vol_route_count);
         kfree(resp_body);
@@ -8342,6 +9187,475 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
 int powerfs_net_set_volume(const char *addr, __u16 port)
 {
     return powerfs_net_add_server(addr, port, POWERFS_NET_SERVER_VOLUME);
+}
+
+/* topology_refresh_worker — asynchronous handler for TopologyChanged(0x0072).
+ *
+ * Runs on g_pool.reconn_wq (WQ_UNBOUND) so blocking socket I/O is allowed.
+ * Re-issues GET_TOPOLOGY via powerfs_net_discover_volumes() which walks all
+ * configured master addresses (for failover), parses TotalShards/ShardMap
+ * plus the newly added ShardLeaderEntries(0x9F), and updates every shard's
+ * shard_route to the new leader VALID — keeping the zero-redirect fast
+ * path live across leader elections.
+ *
+ * After completion the pending bit is cleared so the next TopologyChanged
+ * broadcast can trigger a fresh refresh. If discover_volumes fails (all
+ * masters unreachable, REDIRECT storms, etc.) we leave it to subsequent
+ * notifications (or the lazy redirect fallback on the next RPC) to heal. */
+static void topology_refresh_worker(struct work_struct *work)
+{
+    int rc;
+    unsigned int old_failover;
+
+    (void)work;
+
+    if (powerfs_net_is_stopping()) {
+        pr_info("powerfs: topology-refresh worker skipped (stopping=1)\n");
+        goto out_clear;
+    }
+    if (!g_pool.master_set) {
+        pr_warn("powerfs: topology-refresh worker: master address not set; skip\n");
+        goto out_clear;
+    }
+
+    pr_info("powerfs: topology-refresh worker START — re-GET_TOPOLOGY from master %s:%u to refresh shard leader routes\n",
+            g_pool.master_addr, (unsigned)g_pool.master_port);
+
+    old_failover = atomic_read(&g_pool.failover_count);
+
+    /* powerfs_net_discover_volumes() does the full work:
+     *   1. for each master_addr (failover) connect → GET_TOPOLOGY;
+     *   2. parse TotalShards + ShardMap (volume route update);
+     *   3. parse ShardLeaderEntries(0x9F) → powerfs_shard_route_update
+     *      per shard → route_state=VALID;
+     *   4. returns filer_count (>0) on success, negative errno otherwise.
+     *
+     * Even when volume routes didn't change (common case: only per-shard
+     * leaders flipped), step (3) refreshes shard_route for every shard,
+     * so the zero-redirect fast path stays hot. */
+    rc = powerfs_net_discover_volumes(g_pool.master_addr, g_pool.master_port);
+
+    pr_info("powerfs: topology-refresh worker DONE rc=%d failover_delta=%u — zero-redirect shard leader routes now REFRESHED\n",
+            rc,
+            (unsigned)(atomic_read(&g_pool.failover_count) - old_failover));
+
+out_clear:
+    smp_mb__before_atomic();
+    clear_bit(TOPOLOGY_REFRESH_PENDING_BIT, &g_topology_refresh_flags);
+    smp_mb__after_atomic();
+}
+
+/*
+ * powerfs_net_register_client - 向 Master 注册本 mount 的 client_uuid,
+ * 获取 master 统一分配的 assigned_client_id(u64), 同时检查黑名单.
+ *
+ * 请求 TLV: ClientUuid + Backend(type) + Name(mount) + Collection + Replication
+ *           + Owner(host) + Limit(pid)
+ * 响应 TLV: ClientId(assigned u64) + Owner(leader) + MountAllowed(u8)
+ *           + [Message(deny reason)]
+ *
+ * 状态:
+ *   STATUS_OK = 允许挂载
+ *   STATUS_ERR_PERMISSION = 黑名单拒绝 (仍解码输出参数)
+ *   STATUS_ERR_REDIRECT = 非 leader, 内部自动跟随重定向重试一次
+ *
+ * 返回: 0 = 成功收到响应 (无论 mount_allowed 与否), <0 = -errno 网络错误
+ */
+int powerfs_net_register_client(const char *master_addrs, __u16 master_port,
+                                const char *client_uuid, const char *client_type,
+                                const char *mount_point, const char *collection,
+                                const char *replication, const char *host,
+                                __u64 pid,
+                                __u64 *out_assigned_id, bool *out_mount_allowed,
+                                char *out_reason, size_t reason_cap)
+{
+    char addr_buf[256];
+    char *mp, *mtok;
+    __u8 *req_body;
+    __u8 *resp_body;
+    __u8 resp_data[64];
+    size_t req_body_len = 0, body_len = 0, data_len = 0;
+    struct powerfs_net_frame_hdr hdr;
+    __u32 seq;
+    int ret, ri;
+    bool handled = false;
+
+    if (!master_addrs || !master_addrs[0] || !client_uuid || !out_assigned_id ||
+        !out_mount_allowed)
+        return -EINVAL;
+
+    *out_assigned_id = 0;
+    *out_mount_allowed = false;
+    if (out_reason && reason_cap > 0)
+        out_reason[0] = '\0';
+
+    req_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
+    resp_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
+    if (!req_body || !resp_body) {
+        kfree(req_body);
+        kfree(resp_body);
+        pr_err("powerfs: register_client: kmalloc failed\n");
+        return -ENOMEM;
+    }
+
+    /* 编码请求 TLV body (一次编码, 主请求和 REDIRECT 重试都复用) */
+    {
+        struct powerfs_tlv_enc enc;
+        powerfs_tlv_enc_init(&enc, req_body, POWERFS_NET_MAX_BODY);
+        if (client_uuid)
+            powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_UUID,
+                                   client_uuid, strlen(client_uuid));
+        if (client_type)
+            powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_BACKEND,
+                                   client_type, strlen(client_type));
+        if (mount_point)
+            powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_NAME,
+                                   mount_point, strlen(mount_point));
+        if (collection)
+            powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_COLLECTION,
+                                   collection, strlen(collection));
+        if (replication)
+            powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_REPLICATION,
+                                   replication, strlen(replication));
+        if (host)
+            powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_OWNER,
+                                   host, strlen(host));
+        powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_LIMIT, pid);
+        req_body_len = powerfs_tlv_enc_len(&enc);
+    }
+
+    strncpy(addr_buf, master_addrs, sizeof(addr_buf) - 1);
+    addr_buf[sizeof(addr_buf) - 1] = '\0';
+
+    mp = addr_buf;
+    while ((mtok = strsep(&mp, ",")) != NULL) {
+        struct socket *sock = NULL;
+
+        while (*mtok == ' ')
+            mtok++;
+        if (mtok[0] == '\0')
+            continue;
+
+        pr_debug("powerfs: register_client: trying master %s:%u\n",
+                 mtok, master_port);
+
+        sock = powerfs_net_create_tcp_socket();
+        if (!sock)
+            continue;
+
+        ret = powerfs_net_tcp_connect(sock, mtok, master_port);
+        if (ret < 0) {
+            powerfs_net_close_socket(sock);
+            continue;
+        }
+
+        ret = powerfs_net_do_handshake(sock);
+        if (ret < 0) {
+            powerfs_net_close_socket(sock);
+            continue;
+        }
+
+        seq = atomic_inc_return(&g_discover_seq);
+        powerfs_net_frame_hdr_encode(&hdr,
+                                      POWERFS_NET_MSG_REGISTER_CLIENT,
+                                      POWERFS_NET_FLAG_REQUEST,
+                                      seq, 0, (__u32)req_body_len, 0, 0);
+
+        ret = powerfs_net_frame_send(sock, &hdr, req_body, req_body_len, NULL, 0);
+        if (ret < 0) {
+            pr_warn("powerfs: register_client send failed: %d\n", ret);
+            powerfs_net_close_socket(sock);
+            continue;
+        }
+
+        for (ri = 0; ri < 5; ri++) {
+            ret = powerfs_net_frame_recv(sock, &hdr,
+                                          resp_body, POWERFS_NET_MAX_BODY, &body_len,
+                                          resp_data, sizeof(resp_data), &data_len,
+                                          POWERFS_NET_RECV_TIMEOUT);
+            if (ret < 0)
+                break;
+            if (hdr.flags & POWERFS_NET_FLAG_NOTIFY)
+                continue;
+            break;
+        }
+
+        powerfs_net_close_socket(sock);
+
+        if (ret < 0) {
+            pr_warn("powerfs: register_client recv failed: %d\n", ret);
+            continue;
+        }
+
+        /* 处理 REDIRECT: 跟随一次 */
+        if (hdr.status == POWERFS_NET_STATUS_ERR_REDIRECT) {
+            struct powerfs_tlv_dec rdec;
+            char redirect_addr[64];
+
+            powerfs_tlv_dec_init(&rdec, resp_body, body_len);
+            if (powerfs_tlv_dec_string(&rdec, POWERFS_NET_FLD_OWNER,
+                                        redirect_addr,
+                                        sizeof(redirect_addr) - 1) == 0) {
+                redirect_addr[sizeof(redirect_addr) - 1] = '\0';
+                if (redirect_addr[0] == '\0') {
+                    pr_warn("powerfs: register_client redirect empty (election?)\n");
+                    continue;
+                }
+                pr_debug("powerfs: register_client redirect to %s\n",
+                         redirect_addr);
+
+                sock = powerfs_net_create_tcp_socket();
+                if (!sock)
+                    continue;
+                ret = powerfs_net_tcp_connect(sock, redirect_addr, master_port);
+                if (ret < 0) {
+                    powerfs_net_close_socket(sock);
+                    continue;
+                }
+                ret = powerfs_net_do_handshake(sock);
+                if (ret < 0) {
+                    powerfs_net_close_socket(sock);
+                    continue;
+                }
+                seq = atomic_inc_return(&g_discover_seq);
+                powerfs_net_frame_hdr_encode(&hdr,
+                                              POWERFS_NET_MSG_REGISTER_CLIENT,
+                                              POWERFS_NET_FLAG_REQUEST,
+                                              seq, 0, (__u32)req_body_len, 0, 0);
+
+                ret = powerfs_net_frame_send(sock, &hdr, req_body,
+                                             req_body_len, NULL, 0);
+                if (ret < 0) {
+                    powerfs_net_close_socket(sock);
+                    continue;
+                }
+                for (ri = 0; ri < 5; ri++) {
+                    ret = powerfs_net_frame_recv(sock, &hdr,
+                                                  resp_body, POWERFS_NET_MAX_BODY,
+                                                  &body_len, resp_data, sizeof(resp_data),
+                                                  &data_len, POWERFS_NET_RECV_TIMEOUT);
+                    if (ret < 0)
+                        break;
+                    if (hdr.flags & POWERFS_NET_FLAG_NOTIFY)
+                        continue;
+                    break;
+                }
+                powerfs_net_close_socket(sock);
+                if (ret < 0) {
+                    pr_warn("powerfs: register_client redirect recv failed: %d\n", ret);
+                    continue;
+                }
+            }
+        }
+
+        /* 无论 STATUS_OK 还是 STATUS_ERR_PERMISSION, 都解码响应 */
+        if (hdr.status == POWERFS_NET_STATUS_OK ||
+            hdr.status == POWERFS_NET_STATUS_ERR_PERMISSION) {
+            struct powerfs_tlv_dec dec;
+            __u8 mount_allowed_u8 = 0;
+
+            powerfs_tlv_dec_init(&dec, resp_body, body_len);
+
+            (void)powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_CLIENT_ID,
+                                            out_assigned_id);
+
+            if (powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_MOUNT_ALLOWED,
+                                         &mount_allowed_u8) == 0)
+                *out_mount_allowed = (mount_allowed_u8 != 0);
+            else
+                *out_mount_allowed = (hdr.status == POWERFS_NET_STATUS_OK);
+
+            /* Message: 拒绝理由 / 提示信息 (可选) */
+            if (out_reason && reason_cap > 0) {
+                const __u8 *msg_raw = NULL;
+                size_t msg_len = 0;
+                if (powerfs_tlv_dec_find_raw(&dec, POWERFS_NET_FLD_MESSAGE,
+                                             &msg_raw, &msg_len) == 0 && msg_len > 0) {
+                    size_t cpy = msg_len < (reason_cap - 1) ?
+                                 msg_len : (reason_cap - 1);
+                    memcpy(out_reason, msg_raw, cpy);
+                    out_reason[cpy] = '\0';
+                } else if (!*out_mount_allowed &&
+                           reason_cap >= sizeof("client blacklisted by master")) {
+                    strcpy(out_reason, "client blacklisted by master");
+                }
+            }
+
+            handled = true;
+            break;
+        }
+
+        pr_warn("powerfs: register_client unexpected status=%u\n", hdr.status);
+        continue;
+    }
+
+    kfree(req_body);
+    kfree(resp_body);
+
+    if (!handled) {
+        pr_err("powerfs: register_client: no master responded\n");
+        return -ENOLINK;
+    }
+    return 0;
+}
+
+/*
+ * powerfs_net_deregister_client - umount 时向 Master 优雅下线,
+ * 提前移除 client_uuid 的心跳注册表项 (不用等到心跳超时).
+ *
+ * 请求 TLV: ClientUuid + ClientId(assigned u64)
+ * 响应: STATUS_OK 即可
+ */
+int powerfs_net_deregister_client(const char *master_addrs, __u16 master_port,
+                                  const char *client_uuid, __u64 assigned_id)
+{
+    char addr_buf[256];
+    char *p, *tok;
+    __u8 *req_body;
+    __u8 *resp_body;
+    __u8 resp_data[64];
+    size_t body_len = 0, data_len = 0;
+    struct powerfs_net_frame_hdr hdr;
+    __u32 seq;
+    int ret, i;
+    int rc = -ENOLINK;
+
+    if (!master_addrs || !master_addrs[0] || !client_uuid)
+        return -EINVAL;
+
+    req_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
+    resp_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
+    if (!req_body || !resp_body) {
+        kfree(req_body);
+        kfree(resp_body);
+        return -ENOMEM;
+    }
+
+    {
+        struct powerfs_tlv_enc enc;
+        powerfs_tlv_enc_init(&enc, req_body, POWERFS_NET_MAX_BODY);
+        powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_UUID,
+                               client_uuid, strlen(client_uuid));
+        powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_CLIENT_ID, assigned_id);
+        body_len = powerfs_tlv_enc_len(&enc);
+    }
+
+    strncpy(addr_buf, master_addrs, sizeof(addr_buf) - 1);
+    addr_buf[sizeof(addr_buf) - 1] = '\0';
+
+    p = addr_buf;
+    while ((tok = strsep(&p, ",")) != NULL) {
+        struct socket *sock = NULL;
+
+        while (*tok == ' ')
+            tok++;
+        if (tok[0] == '\0')
+            continue;
+
+        sock = powerfs_net_create_tcp_socket();
+        if (!sock)
+            continue;
+
+        ret = powerfs_net_tcp_connect(sock, tok, master_port);
+        if (ret < 0) {
+            powerfs_net_close_socket(sock);
+            continue;
+        }
+
+        ret = powerfs_net_do_handshake(sock);
+        if (ret < 0) {
+            powerfs_net_close_socket(sock);
+            continue;
+        }
+
+        seq = atomic_inc_return(&g_discover_seq);
+        powerfs_net_frame_hdr_encode(&hdr,
+                                      POWERFS_NET_MSG_DEREGISTER_CLIENT,
+                                      POWERFS_NET_FLAG_REQUEST,
+                                      seq, 0, (__u32)body_len, 0, 0);
+
+        ret = powerfs_net_frame_send(sock, &hdr, req_body, body_len, NULL, 0);
+        if (ret < 0) {
+            powerfs_net_close_socket(sock);
+            continue;
+        }
+
+        for (i = 0; i < 5; i++) {
+            ret = powerfs_net_frame_recv(sock, &hdr,
+                                          resp_body, POWERFS_NET_MAX_BODY, &body_len,
+                                          resp_data, sizeof(resp_data), &data_len,
+                                          POWERFS_NET_RECV_TIMEOUT);
+            if (ret < 0)
+                break;
+            if (hdr.flags & POWERFS_NET_FLAG_NOTIFY)
+                continue;
+            break;
+        }
+        powerfs_net_close_socket(sock);
+
+        if (ret < 0)
+            continue;
+
+        if (hdr.status == POWERFS_NET_STATUS_ERR_REDIRECT) {
+            struct powerfs_tlv_dec rdec;
+            char redirect_addr[64];
+
+            powerfs_tlv_dec_init(&rdec, resp_body, body_len);
+            if (powerfs_tlv_dec_string(&rdec, POWERFS_NET_FLD_OWNER,
+                                        redirect_addr,
+                                        sizeof(redirect_addr) - 1) != 0 ||
+                redirect_addr[0] == '\0')
+                continue;
+            pr_debug("powerfs: deregister_client redirect to %s\n", redirect_addr);
+
+            sock = powerfs_net_create_tcp_socket();
+            if (!sock)
+                continue;
+            ret = powerfs_net_tcp_connect(sock, redirect_addr, master_port);
+            if (ret < 0) {
+                powerfs_net_close_socket(sock);
+                continue;
+            }
+            ret = powerfs_net_do_handshake(sock);
+            if (ret < 0) {
+                powerfs_net_close_socket(sock);
+                continue;
+            }
+            seq = atomic_inc_return(&g_discover_seq);
+            powerfs_net_frame_hdr_encode(&hdr,
+                                          POWERFS_NET_MSG_DEREGISTER_CLIENT,
+                                          POWERFS_NET_FLAG_REQUEST,
+                                          seq, 0, (__u32)body_len, 0, 0);
+            ret = powerfs_net_frame_send(sock, &hdr, req_body, body_len, NULL, 0);
+            if (ret < 0) {
+                powerfs_net_close_socket(sock);
+                continue;
+            }
+            for (i = 0; i < 5; i++) {
+                ret = powerfs_net_frame_recv(sock, &hdr,
+                                              resp_body, POWERFS_NET_MAX_BODY,
+                                              &body_len, resp_data, sizeof(resp_data),
+                                              &data_len, POWERFS_NET_RECV_TIMEOUT);
+                if (ret < 0)
+                    break;
+                if (hdr.flags & POWERFS_NET_FLAG_NOTIFY)
+                    continue;
+                break;
+            }
+            powerfs_net_close_socket(sock);
+            if (ret < 0)
+                continue;
+        }
+
+        if (hdr.status == POWERFS_NET_STATUS_OK) {
+            rc = 0;
+            break;
+        }
+    }
+
+    kfree(req_body);
+    kfree(resp_body);
+    return rc;
 }
 
 /* ========== 导出新符号 ========== */
@@ -8364,3 +9678,5 @@ EXPORT_SYMBOL_GPL(powerfs_net_write_needle);
 EXPORT_SYMBOL_GPL(powerfs_net_read_needle);
 EXPORT_SYMBOL_GPL(powerfs_net_discover_volumes);
 EXPORT_SYMBOL_GPL(powerfs_net_renew_lease);
+EXPORT_SYMBOL_GPL(powerfs_net_register_client);
+EXPORT_SYMBOL_GPL(powerfs_net_deregister_client);

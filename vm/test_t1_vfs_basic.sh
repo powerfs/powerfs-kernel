@@ -38,6 +38,11 @@ SKIP=0
 SLAB_INIT=""
 MEM_INIT=""
 
+# qemu.log boot 段基线 (T1 记录当前行数, 之后只扫增量, 避免误报历史 panic)
+# qemu.log 是 append 模式, 每次 VM 重启 (panic=-1) 会追加新 boot 段,
+# 历史 panic 记录永远残留在文件前部, 不过滤会导致永久误报.
+QEMU_LOG_BASE=0
+
 # 颜色输出
 if [ -t 1 ]; then
     C_RED='\033[0;31m'
@@ -146,10 +151,27 @@ check_kernel_state() {
     fi
 
     # 3. serial 日志 lockup 检查 (补充 dmesg, VM 卡死时也能查)
+    # 只扫描 T1 记录的 QEMU_LOG_BASE 之后的行 (当前 boot 段),
+    # 避免误报历史 panic (qemu.log 是 append 模式, panic=-1 重启后
+    # 旧 panic 记录残留在文件前部).
     local qemu_log="${SCRIPT_DIR}/output/qemu.log"
     if [ -f "${qemu_log}" ]; then
         local serial_errors
-        serial_errors=$(grep -E 'soft lockup|hard lockup|NMI watchdog|Kernel panic|BUG:|Oops:|RCU stall|workqueue lockup|hung task' "${qemu_log}" 2>/dev/null | tail -5 || true)
+        if [ "${QEMU_LOG_BASE}" -gt 0 ] 2>/dev/null; then
+            # 只扫当前 boot 段 (tail -n +BASE 从第 BASE 行开始)
+            serial_errors=$(tail -n +"${QEMU_LOG_BASE}" "${qemu_log}" 2>/dev/null | grep -E 'soft lockup|hard lockup|NMI watchdog|Kernel panic|BUG:|Oops:|RCU stall|workqueue lockup|hung task' | tail -5 || true)
+        else
+            # 惰性初始化: 跳过 T1 时 (QEMU_LOG_BASE=0) 首次调用,
+            # 记录当前 qemu.log 行数作为基线, 只扫之后新增的行.
+            # 这样即使选择性运行 T2/T3... 也不会误报历史 panic.
+            QEMU_LOG_BASE=$(wc -l < "${qemu_log}" 2>/dev/null || echo 0)
+            case "$QEMU_LOG_BASE" in
+                ''|*[!0-9]*) QEMU_LOG_BASE=1 ;;
+            esac
+            QEMU_LOG_BASE=$((QEMU_LOG_BASE + 1))
+            # 基线刚记录, 当前 boot 段 (基线之后) 应该还没有新 panic
+            serial_errors=$(tail -n +"${QEMU_LOG_BASE}" "${qemu_log}" 2>/dev/null | grep -E 'soft lockup|hard lockup|NMI watchdog|Kernel panic|BUG:|Oops:|RCU stall|workqueue lockup|hung task' | tail -5 || true)
+        fi
         if [ -z "$serial_errors" ]; then
             ok "serial log clean (no lockup/panic)"
         else
@@ -249,6 +271,22 @@ test_t1_mount() {
     else
         ng "QEMU boot failed"
         return 1
+    fi
+
+    # 记录 qemu.log 当前行数作为 boot 段基线.
+    # qemu.log 是 append 模式, 每次 VM 重启 (panic=-1) 会追加新 boot 段,
+    # 历史 panic 记录残留在文件前部.  之后 check_kernel_state 只扫
+    # 此基线之后的行, 避免误报历史 panic.
+    local qemu_log="${SCRIPT_DIR}/output/qemu.log"
+    if [ -f "${qemu_log}" ]; then
+        QEMU_LOG_BASE=$(wc -l < "${qemu_log}" 2>/dev/null || echo 0)
+        # 确保是数字
+        case "$QEMU_LOG_BASE" in
+            ''|*[!0-9]*) QEMU_LOG_BASE=1 ;;
+        esac
+        # +1: wc 给的是总行数, tail -n +N 从第 N 行开始, 需要 +1 跳过已存在的行
+        QEMU_LOG_BASE=$((QEMU_LOG_BASE + 1))
+        echo "  -> qemu.log boot baseline: line ${QEMU_LOG_BASE} (scanning only current boot segment)"
     fi
 
     # T1-3: SSH 可达
