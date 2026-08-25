@@ -452,6 +452,19 @@ enum powerfs_net_field_id {
     /* MountAllowed (u8): RegisterClient 响应标志位, 1=允许挂载 0=拒绝.
      * 拒绝理由通常在 Message(0x26) 字段给出. */
     POWERFS_NET_FLD_MOUNT_ALLOWED = 0xD2,
+    /* RegistrationToken (string, TLV 0xD3): Filer/Volume 节点注册时携带的
+     * 注册令牌. 与 Rust 端 FieldId::RegistrationToken=0xD3 对齐. 当前内核
+     * 客户端 RegisterClient 不发此字段, 保留宏位避免 0xD3 空洞. */
+    POWERFS_NET_FLD_REGISTRATION_TOKEN = 0xD3,
+    /* ClientCert (string PEM, TLV 0xD4): 客户端证书 PEM 原文.
+     * Master 做 4 级校验: fingerprint∈registry ∧ 未吊销 ∧ now 在
+     * [issued_at,expires_at] ∧ peer_ip∈san_ips ∧ mount_point∈mount_dirs.
+     * 由 mount -o client_crt=<path> 读取文件 PEM 内容后嵌入此处,
+     * 与 Rust FieldId::ClientCert=0xD4 严格对齐. */
+    POWERFS_NET_FLD_CLIENT_CERT = 0xD4,
+    /* ClientCertSignature (bytes, TLV 0xD5, reserved): 客户端证书对请求体
+     * 的 HMAC/签名, 留作未来重放保护; 当前未使用, 预留字段位. */
+    POWERFS_NET_FLD_CLIENT_CERT_SIGNATURE = 0xD5,
 };
 
 /* ========== 帧头结构 (28 字节, packed) ========== */
@@ -900,7 +913,7 @@ static inline const char *powerfs_conn_state_str(enum powerfs_conn_state s)
 /* ========== 连接池 API (新架构) ========== */
 
 /* 初始化连接池 (从 Master 发现 filer/volume 列表) */
-int powerfs_conn_pool_init(const char *master_addr, __u16 master_port);
+int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count);
 
 /* 连接池清理 */
 void powerfs_conn_pool_exit(void);
@@ -1066,6 +1079,27 @@ struct powerfs_net_pool {
     atomic_t last_failover_time;
     struct mutex pool_lock;
     struct delayed_work leader_check_work;
+
+    /* === KeepConnected 心跳 (对齐 FUSE MasterStatsReporter 30s 周期) ===
+     * 向 Master 周期发送 MsgType::KeepConnected(0x0053), 刷新 client 注册
+     * last_heartbeat 并维持 Admin/Client 通道活跃 (防止 ~55s 后断链/EAGAIN).
+     * 所有字符串字段来自 fill_super register_client 路径，存一份副本到 g_pool
+     * 避免回调依赖 powerfs_sb / sbi->client 生命周期 (kill_sb 清理顺序有交叉).
+     * WQ: g_pool.reconn_wq (UNBOUND, 适配 blocking socket I/O). */
+    struct delayed_work heartbeat_work;
+    bool              heartbeat_started;
+#define POWERFS_HB_INTERVAL_SECS 30
+    char              hb_client_uuid[64];
+    char              hb_client_type[16];  /* "kernel" */
+    char              hb_mount_point[256];
+    char              hb_collection[64];
+    char              hb_replication[32];
+    char              hb_host[64];
+    __u64             hb_pid;
+    u64               hb_assigned_client_id;  /* 0 = 未注册 */
+    /* client_crt 路径: 心跳不长期持 PEM, 每次心跳按需读堆 (和 register_client
+     * 一致). 路径空 = dev mode, 跳过 0xD4 嵌入. */
+    char              hb_client_crt[256];
 };
 
 /* ========== 连接管理 API (增强版) ========== */
@@ -1496,6 +1530,10 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port);
  *   replication: 冗余策略字符串, 未配置传 "none"
  *   host: 主机名/标识, 用于审计
  *   pid: 客户端进程/挂载发起者 PID, 0 表示无
+ *   client_crt_path: 客户端证书 PEM 文件路径 (mount -o client_crt=...).
+ *       非空时, 内部用 filp_open+kernel_read 读取内容并编码到
+ *       POWERFS_NET_FLD_CLIENT_CERT(0xD4) 传给 Master 校验.
+ *       空字符串表示无证书 (Master 强制模式会拒绝挂载).
  *   out_assigned_id: [输出] Master 分配的 numeric client_id (u64)
  *   out_mount_allowed: [输出] true=允许挂载, false=黑名单拒绝
  *   out_reason: [输出] 拒绝理由 (可显示给用户)
@@ -1507,6 +1545,7 @@ int powerfs_net_register_client(const char *master_addr, __u16 master_port,
                                 const char *mount_point, const char *collection,
                                 const char *replication, const char *host,
                                 __u64 pid,
+                                const char *client_crt_path,
                                 __u64 *out_assigned_id, bool *out_mount_allowed,
                                 char *out_reason, size_t reason_cap);
 
@@ -1514,9 +1553,18 @@ int powerfs_net_register_client(const char *master_addr, __u16 master_port,
  * 参数:
  *   client_uuid: 与 RegisterClient 一致的 UUID 字符串
  *   assigned_id: RegisterClient 返回的 numeric client_id
+ *   client_crt_path: 同 RegisterClient 解释; DeregisterClient 同样需携带
+ *       证书做认证 (防止任意主机伪造下线请求吊销合法 client).
  * 返回: 0 成功 STATUS_OK, <0 错误 (调用方通常忽略, 最佳努力) */
 int powerfs_net_deregister_client(const char *master_addr, __u16 master_port,
-                                  const char *client_uuid, __u64 assigned_id);
+                                  const char *client_uuid, __u64 assigned_id,
+                                  const char *client_crt_path);
+
+/* 读 PEM 文件的小工具: GFP_NOFS 分配缓冲区返回 heap 指针 + 可选 *out_len,
+ * 失败返回 NULL. 调用方需 kfree() 返回指针.
+ * 内部通过 filp_open(path, O_RDONLY, 0) + kernel_read, 兼容内核 6.17
+ * (kernel_read 直接取 file->f_pos, 无需 set_fs/KERNEL_DS). */
+char *powerfs_read_pem_file(const char *path, gfp_t gfp, size_t *out_len);
 
 /* Phase 3: RangeLease 续约 (直连 volume server).
  * volume_id: 目标 volume (路由查找)
@@ -1702,6 +1750,30 @@ void powerfs_net_reg_cap_notify_handlers(
         powerfs_cap_recall_notify_fn recall_fn,
         powerfs_cap_upgrade_notify_fn upgrade_fn);
 
+/* === KeepConnected 心跳 (B1: kernel 补齐与 FUSE 对齐的能力) ===
+ * 对齐 powerfs-fuse MasterStatsReporter 30s 周期, 向 Master 发送
+ * MsgType::KeepConnected(0x0053) 刷新 client 注册 last_heartbeat.
+ * 缺了这个 kernel 可能在 ~55s 窗口后出现 Filer EAGAIN/连接失活.
+ *
+ * start:  在 fill_sber(register_client 成功 assigned_client_id 后) 调用,
+ *         把参数存副本到 g_pool, 启动 delayed_work 到 reconn_wq.
+ * update: KeepConnected 心跳发送前用 assigned_client_id 最新值刷新
+ *         (register_client 完成前 start 可能被调但 assigned=0, 通知 kernel
+ *          侧 update 即可; 或 fill_super 后再 start).
+ * stop:   在 kill_sb_super DeregisterClient 之后 cancel_delayed_work_sync,
+ *         确保卸载时 work 不再调度. */
+int powerfs_net_start_heartbeat(const char *client_uuid,
+                                const char *client_type,
+                                const char *mount_point,
+                                const char *collection,
+                                const char *replication,
+                                const char *host,
+                                __u64 pid,
+                                u64 assigned_client_id,
+                                const char *client_crt_path);
+void powerfs_net_update_heartbeat_id(u64 assigned_client_id);
+void powerfs_net_stop_heartbeat(void);
+
 /* ========== 初始化/清理 ========== */
 
 int  powerfs_net_init(void);
@@ -1709,8 +1781,16 @@ void powerfs_net_exit(void);
 
 /* ========== 内部工具 ========== */
 
-/* CRC32C 计算 */
+/* CRC32C 计算
+ *   powerfs_crc32c        - RFC3720 standard one-shot (init ~0, out ~x), 用于数据块校验.
+ *   powerfs_crc32c_append - 对齐 Rust crc32c crate (0.6.8) crc32c::crc32c_append:
+ *                          输入反转 (~crc) + 输出反转 (~state), 即 RFC3720 one-shot
+ *                          风格的流式接口. crc32c_append(0, data) ≡ powerfs_crc32c(data).
+ *                          专门用于 FrameHeader::calc_header_crc / verify_crc.
+ *                          (RC-4 修复前误以为 Rust 是流式无取反, 导致 master 端
+ *                          verify_crc 失败 drop 连接; 现已对齐.) */
 __u32 powerfs_crc32c(const __u8 *data, size_t len);
+__u32 powerfs_crc32c_append(__u32 crc, const __u8 *data, size_t len);
 
 /* 帧头编解码 */
 void powerfs_net_frame_hdr_encode(struct powerfs_net_frame_hdr *hdr,

@@ -1381,11 +1381,10 @@ out_free:
  *   after 60s. By deferring to a workqueue, only the workqueue thread
  *   blocks, not the RX thread.
  *
- * We intentionally do NOT d_drop() here: the Fuser-side Invalidate
- * only carries (inode, version), so we don't know if the inode was
- * deleted or merely modified.  The next lookup/getattr will fetch
- * fresh metadata; if the inode no longer exists on the Filer, the
- * lookup returns negative and VFS evicts the dentry naturally.
+ * NOTE: If the NOTIFY also carries ParentIno + Name fields, we prefer the
+ * dentry-level path powerfs_invalidate_dentry() which knows (parent,name)
+ * and can explicitly d_drop() the stale alias plus remove it from the
+ * parent's dir_entries list.
  */
 int powerfs_invalidate_one(u64 ino)
 {
@@ -1413,6 +1412,317 @@ int powerfs_invalidate_one(u64 ino)
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_invalidate_one);
+
+/* ── §8b Dentry-level (parent,name,version) invalidate dispatch ──
+ *
+ * MC-401: 对齐 FUSE 侧 Invalidate Handler 的 dentry-level 失效能力.
+ *
+ * 之前 powerfs_invalidate_one 只做 inode-level (ino,version), 缺失
+ * VFS dcache 的子 dentry 哈希链清理 —— 即使 inode 在 Filer 上已被
+ * unlink/rename 覆盖, VFS __d_lookup 仍可能找到已缓存的旧 dentry
+ * alias, 指向 stale inode 映射 (ar rcs 的 8 字节 magic-only 文件就是
+ * 这种场景: 旧 libtest.a 被 rename 覆盖后, dir_entries 中还挂着
+ * active entry, VFS dcache 也可能存着指向 old inode 的 hashed dentry).
+ *
+ * 这里新增 powerfs_invalidate_dentry(parent_ino, name, name_len, version):
+ *   1. 先做 (parent,name,version) dedup: Filer 可能因网络重传 / 多副本
+ *      广播同一个 notify N 次, 或 Filer 因 exclude_client_id + fallback
+ *      dedup 推送重复. 仅当 version > last_seen_version 时才处理.
+ *   2. 所有阻塞操作 (ilookup5 / d_find_any_alias / d_invalidate) 都放到
+ *      workqueue 上 —— 与 inode-level invalidate 共享 powerfs_refresh_wq.
+ *   3. workqueue 内:
+ *        a) ilookup5 parent inode (可阻塞)
+ *        b) 从 parent dir_entries 移除该 name 的 active entry (soft-delete
+ *           标记 deleted=true, 对齐 powerfs_remove_dir_entry 语义).
+ *        c) d_find_any_alias(parent) 找到父目录 dentry,
+ *           从 d_subdirs/d_children 中找匹配 name 的子 dentry, 对它做
+ *           d_invalidate(截断 alias inode page cache + unhash) + d_drop.
+ *        d) 若找到子 inode, 异步 schedule 一次 refresh_work (通过
+ *           powerfs_invalidate_one), 让其 getattr + pagecache inval.
+ *   4. 失败都为 best-effort: 下次 dir lease expire / d_revalidate
+ *      会再触发 Filer refetch.
+ */
+
+/* Recent processed dentry notify ring-buffer.
+ * 环形哈希去重: 最多 POWERFS_DENTRY_DEDUP_ENTRIES 条,
+ * 新来的 notify 若 (parent,name) 命中且 version <= recorded, 直接 drop. */
+#define POWERFS_DENTRY_DEDUP_ENTRIES 256
+
+struct powerfs_dentry_dedup_entry {
+    u64 parent_ino;
+    u64 version;
+    size_t name_hash;     /* full_name_len 的 fast hash (pre-compute) */
+    u32 name_len;
+    char *name;           /* kstrdup'd name, GFP_NOIO/KERNEL */
+    unsigned long jiffies_last;  /* 超长时间未命中可回收 (LRU-ish) */
+};
+
+static DEFINE_SPINLOCK(g_dentry_dedup_lock);
+static struct powerfs_dentry_dedup_entry g_dentry_dedup[POWERFS_DENTRY_DEDUP_ENTRIES];
+static u32 g_dentry_dedup_cursor; /* 环形 buffer cursor, 超过时覆盖最旧 */
+
+/* Simple full_name hash (same as FUSE's processed_dentry_versions uses
+ * (parent,name) key).  Use jhash: 但 Linux kernel 里 jhash 需
+ * linux/jhash.h, 这里用简单的 FNV-1a 64-bit, 无依赖. */
+static u64 fnv1a_hash(const u8 *buf, size_t len)
+{
+    u64 hash = 1469598103934665603ULL; /* FNV offset basis 64-bit */
+    size_t i;
+    for (i = 0; i < len; ++i) {
+        hash ^= (u64)buf[i];
+        hash *= 1099511628211ULL; /* FNV prime 64-bit */
+    }
+    return hash;
+}
+
+/*
+ * dentry_dedup_check_and_record - 返回 true 表示去重命中 (应跳过)
+ *
+ * Caller MUST hold g_dentry_dedup_lock. 此函数可能进行 GFP_ATOMIC
+ * 名称分配 (失败则放弃 dedup 直接放行, 是 best-effort). */
+static bool dentry_dedup_check_and_record_locked(u64 parent_ino,
+                                                  const char *name, u32 name_len,
+                                                  u64 version)
+{
+    u64 nhash = fnv1a_hash((const u8 *)name, name_len);
+    struct powerfs_dentry_dedup_entry *e;
+    u32 i, free_slot = POWERFS_DENTRY_DEDUP_ENTRIES;
+    unsigned long now = jiffies;
+
+    for (i = 0; i < POWERFS_DENTRY_DEDUP_ENTRIES; ++i) {
+        e = &g_dentry_dedup[i];
+        if (!e->name) {
+            if (free_slot == POWERFS_DENTRY_DEDUP_ENTRIES)
+                free_slot = i;
+            continue;
+        }
+        if (e->parent_ino == parent_ino &&
+            e->name_len == name_len &&
+            e->name_hash == nhash &&
+            memcmp(e->name, name, name_len) == 0) {
+            /* 命中: version <= 已记录 → 去重 */
+            if (version <= e->version) {
+                pr_debug("powerfs: dedup dentry_notify parent=%llu name=%.*s ver=%llu <= rec=%llu, skip\n",
+                        parent_ino, name_len, name, version, e->version);
+                return true;
+            }
+            /* version 更新: 覆盖记录, 不释放 name (相同) */
+            e->version = version;
+            e->jiffies_last = now;
+            pr_debug("powerfs: accept newer dentry_notify parent=%llu name=%.*s ver=%llu (prev=%llu)\n",
+                    parent_ino, name_len, name, version, version);
+            return false;
+        }
+    }
+
+    /* 未命中: 插入新条目 */
+    if (free_slot == POWERFS_DENTRY_DEDUP_ENTRIES) {
+        free_slot = g_dentry_dedup_cursor;
+        g_dentry_dedup_cursor = (g_dentry_dedup_cursor + 1) % POWERFS_DENTRY_DEDUP_ENTRIES;
+    }
+    e = &g_dentry_dedup[free_slot];
+    kfree(e->name);
+    e->name = kstrndup(name, name_len, GFP_ATOMIC);
+    if (!e->name) {
+        /* 分配失败: 放弃 dedup, 放行 notify. */
+        pr_warn_ratelimited("powerfs: dentry_dedup kstrndup failed (%u bytes), dedup skipped\n",
+                            name_len);
+        e->name_len = 0;
+        e->parent_ino = 0;
+        e->version = 0;
+        e->name_hash = 0;
+        return false;
+    }
+    e->parent_ino = parent_ino;
+    e->name_len = name_len;
+    e->name_hash = nhash;
+    e->version = version;
+    e->jiffies_last = now;
+    return false;
+}
+
+void powerfs_dentry_dedup_destroy_all(void)
+{
+    u32 i;
+    spin_lock(&g_dentry_dedup_lock);
+    for (i = 0; i < POWERFS_DENTRY_DEDUP_ENTRIES; ++i) {
+        kfree(g_dentry_dedup[i].name);
+        g_dentry_dedup[i].name = NULL;
+    }
+    spin_unlock(&g_dentry_dedup_lock);
+}
+
+/* Work payload for async dentry-level invalidate.
+ *
+ * RX thread 中可以 GFP_ATOMIC 分配, 但不能阻塞等 inode.
+ * workqueue 中可阻塞, 所以把 parent_ino/name/version 全带过去. */
+struct powerfs_dentry_inval_work {
+    struct work_struct work;
+    struct rcu_head rcu;
+    u64 parent_ino;
+    u64 version;
+    u32 name_len;
+    char name[];   /* flexible array */
+};
+
+static void dentry_inval_work_free_rcu(struct rcu_head *head)
+{
+    struct powerfs_dentry_inval_work *w =
+        container_of(head, struct powerfs_dentry_inval_work, rcu);
+    kfree(w);
+}
+
+static void powerfs_dentry_inval_work_fn(struct work_struct *work)
+{
+    struct powerfs_dentry_inval_work *w =
+        container_of(work, struct powerfs_dentry_inval_work, work);
+    struct super_block *sb;
+    struct inode *parent_inode;
+    struct dentry *parent_dentry = NULL;
+
+    sb = powerfs_get_sb();
+    if (!sb)
+        goto out_free;
+
+    /* Workqueue 上下文, 可阻塞: ilookup5 parent */
+    parent_inode = powerfs_find_inode(sb, w->parent_ino);
+    if (!parent_inode) {
+        pr_debug("powerfs: dentry_inval parent=%llu not in icache, skip\n",
+                w->parent_ino);
+        goto out_free;
+    }
+    if (parent_inode->i_state & (I_FREEING | I_CLEAR | I_WILL_FREE)) {
+        pr_debug("powerfs: dentry_inval parent=%llu inode evicting, skip\n",
+                w->parent_ino);
+        goto out_iput_parent;
+    }
+
+    /* ── P1: 父目录 dir_entries 中清掉该 name (soft-delete) ──
+     *
+     * 与 rename 修复保持一致: 即使 VFS dcache 中没有对应子 dentry,
+     * 我们自己的 dir_entries 链表也可能保留 active entry,
+     * readdir 返回 stale 条目, lookup 先命中 dir_entries
+     * 返回旧 inode. */
+    {
+        /* powerfs_remove_dir_entry 按 strcmp + !deleted 查找,
+         * 无论 dcache 状态都能找到 active entry. */
+        char name_nul[POWERFS_MAX_NAME_LEN + 1];
+        u32 copy_len = w->name_len;
+        if (copy_len > POWERFS_MAX_NAME_LEN)
+            copy_len = POWERFS_MAX_NAME_LEN;
+        memcpy(name_nul, w->name, copy_len);
+        name_nul[copy_len] = '\0';
+        pr_debug("powerfs: dentry_inval remove_dir_entry parent=%llu name=%s\n",
+                w->parent_ino, name_nul);
+        powerfs_remove_dir_entry(parent_inode, name_nul);
+    }
+
+    /* 父目录 dentry lease expire —— 下次 readdir 会 re-fetch */
+    powerfs_invalidate_dir_lease(parent_inode);
+
+    /* ── P2: 在 VFS dcache 中找子 dentry → d_invalidate + d_drop ──
+     *
+     * 需要先通过 d_find_any_alias 拿到父目录 dentry. 多 alias
+     * (同一 dir inode 被多个 mount 挂载) 情形下, 我们遍历所有 alias
+     * dentry, 在各 alias 的 d_children (hlist) 中查找匹配 name 的
+     * child dentry.
+     *
+     * Linux 6.17 dcache: parent->d_children 是 hlist_head,
+     * child->d_sib 是 hlist_node. 用 d_first_child/d_next_sibling
+     * 遍历 (见 linux/dcache.h). */
+    parent_dentry = d_find_any_alias(parent_inode);
+    if (parent_dentry) {
+        struct dentry *child;
+        /* Loop over all child dentries using d_first_child/d_next_sibling.
+         *
+         * Locking: walk 需持 parent->d_lock (RCU-free version), 但
+         * d_invalidate/drop 需 release lock. 所以:
+         *   - 持 d_lock 读 name + dget(child);
+         *   - unlock 后操作;
+         *   - re-lock 再 break (单次). */
+        child = d_first_child(parent_dentry);
+        while (child) {
+            if (child->d_name.len == w->name_len &&
+                memcmp(child->d_name.name, w->name, w->name_len) == 0) {
+                struct dentry *child_ref;
+                struct inode *child_inode;
+
+                child_ref = dget(child);
+                child_inode = d_inode(child_ref);
+                pr_debug("powerfs: dentry_inval: found child=%pd d_inode=%p ino=%lu\n",
+                        child_ref, child_inode,
+                        child_inode ? child_inode->i_ino : 0LU);
+
+                /* d_invalidate: 若 child 是 positive, 这会 truncate
+                 * alias inode page cache 并 unhash; 否则只 unhash. */
+                d_invalidate(child_ref);
+                d_drop(child_ref);
+                dput(child_ref);
+                break;  /* name 唯一 */
+            }
+            child = d_next_sibling(child);
+        }
+        dput(parent_dentry);
+    }
+
+    /* ── P3: (best-effort) 如果目标 inode 存在, 异步 refresh its meta
+     *       + pagecache inval. 若目标 inode 不存在 (unlink/rename-over case),
+     *       没什么可做的: d_drop 已发生. */
+    {
+        /* 没法用 inode-level notify 信息直接关联 (INO 字段可能带也可能
+         * 不带). 退而求其次: 用 ilookup5 查 parent dir_entries 里被
+         * soft-deleted 的 entry 关联的 ino 并 inval. 但那太绕;
+         * 多数情况下 inode-level notify 也会一起推 (Filer 同时发).
+         * 所以这里只打印 debug, 不强做. */
+    }
+
+out_iput_parent:
+    iput(parent_inode);
+out_free:
+    call_rcu(&w->rcu, dentry_inval_work_free_rcu);
+}
+
+/*
+ * powerfs_invalidate_dentry - 入口, RX 线程调用
+ *
+ * 1) 在 RX-thread 上下文做 (parent,name,version) dedup (spin_lock, GFP_ATOMIC).
+ * 2) 如 dedup 未命中, 分配 + 入队 dentry_inval_work_fn.
+ */
+int powerfs_invalidate_dentry(u64 parent_ino, const char *name, size_t name_len, u64 version)
+{
+    struct powerfs_dentry_inval_work *w;
+    bool skip;
+
+    if (!name || name_len == 0 || name_len > POWERFS_MAX_NAME_LEN)
+        return -EINVAL;
+
+    /* Step 1: dedup */
+    spin_lock(&g_dentry_dedup_lock);
+    skip = dentry_dedup_check_and_record_locked(parent_ino, name, (u32)name_len, version);
+    spin_unlock(&g_dentry_dedup_lock);
+    if (skip)
+        return 0;
+
+    /* Step 2: async workqueue dispatch */
+    w = kmalloc(sizeof(*w) + name_len + 1, GFP_ATOMIC);
+    if (!w) {
+        pr_warn_ratelimited("powerfs: invalidate_dentry kmalloc %zu failed, skip\n",
+                            sizeof(*w) + name_len + 1);
+        return -ENOMEM;
+    }
+    INIT_WORK(&w->work, powerfs_dentry_inval_work_fn);
+    w->parent_ino = parent_ino;
+    w->version = version;
+    w->name_len = (u32)name_len;
+    memcpy(w->name, name, name_len);
+    w->name[name_len] = '\0';
+
+    queue_work(powerfs_refresh_wq, &w->work);
+    pr_debug("powerfs: invalidate_dentry parent=%llu name=%.*s ver=%llu queued\n",
+            parent_ino, (int)name_len, name, version);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_invalidate_dentry);
 
 /* ========== §13 Cap NOTIFY async work (Filer→Client push) ==========
  *
@@ -1972,15 +2282,24 @@ void powerfs_evict_inode(struct inode *inode)
     }
 
     /* 5b. 清理 i_caps rbtree (对齐 xxx_evict_inode: remove caps)
-     *    evict 时所有 cap 应已被 revoke/release, 但安全起见遍历释放. */
+     *    evict 时所有 cap 应已被 revoke/release, 但安全起见遍历释放.
+     *    必须先从 cap_lru_list 移除再释放, 否则 slab 复用内存后
+     *    INIT_LIST_HEAD 会造成 cap_lru_list 链表腐败 (list_add corruption).
+     *    同时修正分配器: cap 由 kmem_cache_zalloc(cap_cachep) 分配,
+     *    必须用 kmem_cache_free 释放 (不能用 kfree). */
     while (!RB_EMPTY_ROOT(&pi->i_caps)) {
         struct rb_node *n = rb_first(&pi->i_caps);
         struct powerfs_cap *cap = rb_entry(n, struct powerfs_cap, ci_node);
         rb_erase(n, &pi->i_caps);
-        /* P3-5: 统计 total_caps (与 add_cap_for_inode_locked 对称) */
-        if (sbi && sbi->client)
+        /* 从全局 cap_lru_list 移除 (与 add_cap_for_inode_locked 对称) */
+        if (sbi && sbi->client) {
+            spin_lock(&sbi->client->cap_lru_lock);
+            list_del_init(&cap->lru_item);
+            spin_unlock(&sbi->client->cap_lru_lock);
+            /* P3-5: 统计 total_caps (与 add_cap_for_inode_locked 对称) */
             atomic64_dec(&sbi->client->metrics.total_caps);
-        kfree(cap);
+        }
+        kmem_cache_free(sbi->cap_cachep, cap);
     }
     pi->i_auth_cap = NULL;
 
@@ -6900,9 +7219,18 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  *
  * 参考 xxx_rename (fs/xxx/dir.c)
  *
- * 策略:
- *   - 纯本地操作: 在 VFS dcache 中直接进行重命名
- *   - 异步通知: 操作完成后异步通知代理更新后端
+ * 策略 (与 FUSE 侧对齐, POSIX-safe 同步模型):
+ *   - 先通过 powerfs_net_rename 同步等 Filer Raft 提交 (POSIX 要求 rename
+ *     成功返回后其他客户端立即可见, 所以必须等持久化).
+ *   - Filer rename 成功后:
+ *       1. 无条件从本地 dir_entries 移除 old_name 和 new_name
+ *          (即使 new_dentry 不是 really positive, Filer 已 commit rename-over-replace,
+ *           旧 target entry 必须被清掉; 否则后续 lookup/readdir 可能返回
+ *           stale 8 字节 inode, 直到 dir_lease 过期).
+ *       2. 对 target inode 做 pagecache invalidate + d_drop(new_dentry).
+ *       3. 对 source inode 做 pagecache invalidate + d_drop(old_dentry).
+ *          (VFS rename 成功返回后会调用 d_move, 但我们本地 dir_entries
+ *           自己管理, 所以还要先 drop 掉).
  *
  * 处理情况:
  *   - 同一目录内重命名
@@ -6941,25 +7269,27 @@ int powerfs_rename(struct mnt_idmap *idmap,
         char old_name_buf[POWERFS_MAX_NAME_LEN + 1];
         char new_name_buf[POWERFS_MAX_NAME_LEN + 1];
         int nret;
+        struct inode *target_inode = NULL;
 
         strncpy(old_name_buf, old_dentry->d_name.name, POWERFS_MAX_NAME_LEN);
         old_name_buf[POWERFS_MAX_NAME_LEN] = '\0';
         strncpy(new_name_buf, new_dentry->d_name.name, POWERFS_MAX_NAME_LEN);
         new_name_buf[POWERFS_MAX_NAME_LEN] = '\0';
 
-        /* 检查目标已存在的情况 (但不修改 nlink, 等 net_rename 成功后再改) */
+        /* 保存替换目标 inode (用于后续 pagecache invalidate),
+         * 需要在 d_move/d_drop 之前从 new_dentry 读出. */
         if (d_really_is_positive(new_dentry)) {
-            struct inode *target = d_inode(new_dentry);
+            target_inode = d_inode(new_dentry);
 
             /* 不支持 RENAME_EXCHANGE */
             if (flags & RENAME_EXCHANGE)
                 return -EINVAL;
 
-            if (!target)
+            if (!target_inode)
                 return -ENOENT;
 
             /* 检查是否可以删除目标 */
-            if (S_ISDIR(target->i_mode)) {
+            if (S_ISDIR(target_inode->i_mode)) {
                 /* 目录必须为空 */
                 if (!simple_empty(new_dentry))
                     return -ENOTEMPTY;
@@ -6984,15 +7314,61 @@ int powerfs_rename(struct mnt_idmap *idmap,
 
         /* === 以下操作仅在 filer rename 成功后执行 === */
 
+        /* ── Phase A: 本地 dir_entries 清理 (对齐 fuse 侧 cache.rename 修复) ──
+         *
+         * 关键: 无条件从本地 dir_entries 移除 new_name.
+         * d_really_is_positive(new_dentry) 仅反映 VFS dcache, 不反映
+         * 我们自己的 dir_entries. Filer 已经 commit rename-over-replace,
+         * 旧 target entry 必须被清掉, 否则:
+         *   - readdir 通过 dir_entries 返回旧 8 字节条目 (例如 ar 的
+         *     !<arch>\n magic-only libtest.a).
+         *   - lookup 先查 dir_entries -> 返回旧 inode.
+         *
+         * 必须在 add_dir_entry 之前调用 remove_dir_entry, 否则
+         * add_dir_entry 中的同名复用会保留旧 target inode. */
+        powerfs_remove_dir_entry(new_dir, new_name_buf);
+        powerfs_remove_dir_entry(old_dir, old_name_buf);
+
+        /* ── Phase B: VFS dcache + pagecache 失效 (对齐 FUSE 侧的
+         * FUSE_NOTIFY_INVAL_ENTRY + FUSE_NOTIFY_INVAL_INODE) ──
+         *
+         * Target inode (被替换的旧文件):
+         *   - drop_nlink 已做在下方, 但还需清理 pagecache:
+         *     内核可能还缓存着旧文件内容 (8 字节 magic),
+         *     不清掉的话, 后续 read 可能通过 old alias 访问到 stale 数据.
+         *   - d_drop(new_dentry) 强制下次 lookup 重新进入 powerfs_lookup.
+         *
+         * Source inode (被移动的文件):
+         *   - 其在旧路径下的任何 dcache alias 都已无效.
+         *   - d_drop(old_dentry) 后 VFS 会 d_move 它 (重命名回正常 dentry
+         *     位置), 但 d_drop 保证旧 alias 不再被 DCACHE 哈希链命中. */
+        if (target_inode) {
+            pr_debug("powerfs: rename-over-replace: inval pages target ino=%lu\n",
+                     target_inode->i_ino);
+            /* 非阻塞丢弃 clean page, 跳过 dirty/locked page.
+             * (rename 的目标通常是已 close 过的文件, page 应为 clean.) */
+            invalidate_mapping_pages(target_inode->i_mapping, 0, (pgoff_t)-1);
+            /* 从 DCACHE 哈希链摘掉 new_dentry (如果 still hashed),
+             * 避免后续 path walk 命中 stale alias. */
+            d_drop(new_dentry);
+        }
+        /* Source inode pagecache invalidate: 它被移到了新路径,
+         * 旧路径下的任何 read/write/mmap alias 都应失效.
+         * 内核 rename_succeeded 会处理 inode alias list, 但我们主动做
+         * invalidate_mapping_pages 以防 VFS 跳过某些情况下 (例如 noopen). */
+        invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
+        d_drop(old_dentry);
+
+        /* ── Phase C: nlink / 时间戳 / dir_entries 更新 ── */
+
         /*
          * 目标已存在: 减少目标 inode 的 nlink
          * 参考 ramfs_rename (fs/ramfs/inode.c)
          */
-        if (d_really_is_positive(new_dentry)) {
-            struct inode *target = d_inode(new_dentry);
-            if (S_ISDIR(target->i_mode))
+        if (target_inode) {
+            if (S_ISDIR(target_inode->i_mode))
                 drop_nlink(new_dir);
-            drop_nlink(target);
+            drop_nlink(target_inode);
         }
 
         /*
@@ -7020,23 +7396,11 @@ int powerfs_rename(struct mnt_idmap *idmap,
         if (old_dir != new_dir)
             mark_inode_dirty(new_dir);
 
-        /* 更新本地目录项链表 */
-        /* 从旧目录移除旧名称 */
-        powerfs_remove_dir_entry(old_dir, old_name_buf);
-
         /* 在新目录添加新名称 (或在同一目录更新) */
         {
             unsigned int entry_type = inode->i_mode & S_IFMT;
             powerfs_add_dir_entry(new_dir, inode->i_ino,
                                   entry_type, new_name_buf);
-        }
-
-        /* 如果目标已存在，移除目标目录项 */
-        if (d_really_is_positive(new_dentry)) {
-            struct inode *target = d_inode(new_dentry);
-            if (target) {
-                powerfs_remove_dir_entry(new_dir, new_name_buf);
-            }
         }
 
         /* Phase 1: 本地 mutation 清两个父目录的 lease + epoch++.
@@ -11492,10 +11856,19 @@ static int powerfs_sync_fs(struct super_block *sb, int wait)
     if (powerfs_refresh_wq)
         flush_workqueue(powerfs_refresh_wq);
 
-    /* Step 4: VFS 标准阻塞同步, 内部会再 iterate_bdevs + wait on page writeback.
-     *         注意: sync_filesystem 自身会再调 ->sync_fs(wait=0) 一次,
-     *         我们在非阻塞档只 kick 不递归, 不会死循环. */
-    sync_filesystem(sb);
+    /* Step 4: inode/page cache 阻塞等待 writeback 完成.
+     *
+     * 注意: 严禁调用 sync_filesystem(sb). Linux 6.17 sync_filesystem()
+     * 内部 fs/sync.c L66 会回调 ->sync_fs(sb, wait=1), 而我们正是在
+     * sync_fs(wait=1) 上下文中执行, 会形成 sync_filesystem ↔ powerfs_sync_fs
+     * 无限递归 → 内核栈溢出 → TASK stack guard page was hit → panic.
+     *
+     * PowerFS 是 nodev fs (sb->s_bdev == NULL), 块设备路径完全不生效;
+     * 我们也没有 export sync_blockdev_nowait/sync_blockdev. 直接使用
+     * sync_inodes_sb(sb): 内部 writeback_inodes_sb 触发 writepage/write_inode,
+     * 然后等待 I_DIRTY_PAGES 全部落盘 — 已经覆盖了 sync_filesystem 对
+     * nodev fs 的实际有用的路径, 并且不会再次回调 ->sync_fs. */
+    sync_inodes_sb(sb);
 
     pr_debug("powerfs: sync_fs blocking done\n");
     return 0;
@@ -12397,7 +12770,11 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     struct powerfs_ctx_simple {
         char master_addr[64];
         u16  master_port;
+        u16  shard_count;
         u32  write_batch_kb;
+        char ca_crt[512];
+        char client_crt[512];
+        char client_key[512];
     };
     /* 注意: sget_fc() 会将 fc->s_fs_info 转移到 sb->s_fs_info, 然后将
      * fc->s_fs_info 置 NULL. 因此必须从 sb->s_fs_info 获取 ctx, 而不是
@@ -12408,9 +12785,6 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     struct inode *root;
     u32 batch_kb = POWERFS_WRITE_BATCH_DEFAULT_KB;
     int ret;
-
-    pr_debug("powerfs: fill_super (sb->s_fs_info=%px, master_addr='%s')\n",
-            ctx, ctx ? ctx->master_addr : "(null)");
 
     /* 创建超级块私有信息 */
     sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
@@ -12423,12 +12797,42 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     if (ctx) {
         strncpy(sbi->master_addr, ctx->master_addr, sizeof(sbi->master_addr) - 1);
         sbi->master_port = ctx->master_port;
+        sbi->shard_count  = ctx->shard_count;
         batch_kb = ctx->write_batch_kb;
+        /* 证书路径先保存到 sbi, 下方 powerfs_client 初始化时再从 sbi
+         * 拷贝到 client->ca_crt/client_crt/client_key. 必须在 kfree(ctx)
+         * 之前完成拷贝, 否则路径字符串丢失. */
+        strncpy(sbi->ca_crt,     ctx->ca_crt,     sizeof(sbi->ca_crt) - 1);
+        strncpy(sbi->client_crt, ctx->client_crt, sizeof(sbi->client_crt) - 1);
+        strncpy(sbi->client_key, ctx->client_key, sizeof(sbi->client_key) - 1);
+        sbi->ca_crt[sizeof(sbi->ca_crt) - 1]             = '\0';
+        sbi->client_crt[sizeof(sbi->client_crt) - 1]     = '\0';
+        sbi->client_key[sizeof(sbi->client_key) - 1]     = '\0';
         /* 释放 init_fs_context 分配的 ctx, 释放后 sb->s_fs_info 仍指向已释放内存,
          * 必须在下方设置 sb->s_fs_info = sbi 之前完成 */
         kfree(ctx);
         ctx = NULL;
     }
+
+    /* 挂载时必须传 master_addr. 不能再从 module_param 全局默认值回退:
+     * 多个 mount point 会冲突, 也不允许静默连到 "默认集群" 造成跨租户事故. */
+    if (sbi->master_addr[0] == '\0') {
+        pr_err("powerfs: missing required mount option 'master_addr='. "
+               "Usage: mount -t powerfs none /mnt -o master_addr=h1,h2,h3[,master_port=P,shard_count=N]\n");
+        kfree(sbi);
+        return -EINVAL;
+    }
+    if (sbi->shard_count == 0) {
+        pr_err("powerfs: shard_count=0 invalid, must be >=1\n");
+        kfree(sbi);
+        return -EINVAL;
+    }
+    if (sbi->master_port == 0)
+        sbi->master_port = 9334;
+
+    pr_debug("powerfs: fill_super master_addr='%s' master_port=%u shard_count=%u\n",
+             sbi->master_addr, (unsigned)sbi->master_port,
+             (unsigned)sbi->shard_count);
 
     /* 验证并转换 write_batch_kb → write_batch_pages.
      * 范围: 4KB (1 page) ~ 64MB (stripe size, 16384 pages).
@@ -12475,6 +12879,11 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     sbi->client->filp_gen = 0;
     memcpy(sbi->client->master_addr, sbi->master_addr, sizeof(sbi->master_addr));
     sbi->client->master_port = sbi->master_port;
+    /* 证书路径: fill_super 阶段暂存在 sbi 上, 这里复制到 client.
+     * RegisterClient/DeregisterClient 都以 client 指针为入口读取路径. */
+    memcpy(sbi->client->ca_crt,     sbi->ca_crt,     sizeof(sbi->ca_crt));
+    memcpy(sbi->client->client_crt, sbi->client_crt, sizeof(sbi->client_crt));
+    memcpy(sbi->client->client_key, sbi->client_key, sizeof(sbi->client_key));
     /* client_id: "powerfs-kernel-<tgid>" — 唯一标识本 mount, 用于 Cap recall */
     {
         int id_len = snprintf(sbi->client->client_id, sizeof(sbi->client->client_id),
@@ -12721,6 +13130,8 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
                                              "none",
                                              host_str,
                                              (__u64)task_tgid_vnr(current),
+                                             sbi->client->client_crt[0] ?
+                                                 sbi->client->client_crt : NULL,
                                              &assigned_id,
                                              &mount_allowed,
                                              reason_buf,
@@ -12782,16 +13193,52 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     /* 初始化新连接池.
      *
      * 新架构 (per-conn 状态机 + shard 路由 + 事件驱动) 为唯一路径.
-     * 断连检测由 sk_state_change 回调 + TCP keepalive 取代, 无需健康监控线程. */
+     * 断连检测由 sk_state_change 回调 + TCP keepalive 取代, 无需健康监控线程.
+     *
+     * 参数全来自 per-mount sbi (由 mount -o 选项决定). */
     {
         const char *maddr = sbi->master_addr[0] ? sbi->master_addr : NULL;
         __u16 mport = sbi->master_port ? sbi->master_port : 9334;
-        int pool_ret = powerfs_conn_pool_init(maddr, mport);
+        __u16 scount = sbi->shard_count ? sbi->shard_count : 3;
+        int pool_ret = powerfs_conn_pool_init(maddr, mport, scount);
         if (pool_ret != 0) {
             pr_err("powerfs: connection pool init failed (%d)\n", pool_ret);
             return pool_ret;
         }
-        pr_debug("powerfs: new connection pool initialized (sk callback + keepalive)\n");
+        pr_info("powerfs: connection pool init success (master=%s:%u shard_count=%u)\n",
+                maddr ? maddr : "(null)", (unsigned)mport, (unsigned)scount);
+
+        /* === B1: 启动 KeepConnected 周期心跳 (对齐 FUSE 30s) ===
+         * 必须在 conn_pool_init (创建 reconn_wq) + register_client (拿到
+         * assigned_client_id + client_uuid) 都完成后启动. 参数严格对齐
+         * 上面 register_client 调用参数, 保证 heartbeat 和注册信息一致. */
+        {
+            const char *hb_host_str = "kernel";
+            char hb_host_buf[65];
+            struct new_utsname *uts = init_utsname();
+            int hb_rc;
+            if (uts && uts->nodename[0]) {
+                size_t nn_len = strlen(uts->nodename);
+                if (nn_len > sizeof(hb_host_buf) - 1)
+                    nn_len = sizeof(hb_host_buf) - 1;
+                memcpy(hb_host_buf, uts->nodename, nn_len);
+                hb_host_buf[nn_len] = '\0';
+                hb_host_str = hb_host_buf;
+            }
+            hb_rc = powerfs_net_start_heartbeat(
+                        sbi->client->client_uuid,
+                        "kernel",
+                        "/mnt/powerfs",
+                        "default",
+                        "none",
+                        hb_host_str,
+                        (__u64)task_tgid_vnr(current),
+                        sbi->client->assigned_client_id,
+                        sbi->client->client_crt[0] ? sbi->client->client_crt : NULL);
+            if (hb_rc < 0)
+                pr_warn("powerfs: start_heartbeat failed (%d), "
+                        "heartbeat skipped (may cause 55s filer EAGAIN)\n", hb_rc);
+        }
 
         /* 从 Master GetTopology 发现 volume 路由表 (volume_id → conn_idx).
          * 失败不挂载失败: filer 元数据仍可用, 数据读写等 volume 上线后恢复. */
@@ -12847,7 +13294,9 @@ void powerfs_kill_sb_super(struct super_block *sb)
         int dr = powerfs_net_deregister_client(sbi->client->master_addr,
                                                sbi->client->master_port,
                                                sbi->client->client_uuid,
-                                               sbi->client->assigned_client_id);
+                                               sbi->client->assigned_client_id,
+                                               sbi->client->client_crt[0] ?
+                                                   sbi->client->client_crt : NULL);
         if (dr == 0)
             pr_info("powerfs: umount deregistered client "
                     "(assigned_id=%llu, uuid=%s)\n",
@@ -12857,6 +13306,10 @@ void powerfs_kill_sb_super(struct super_block *sb)
             pr_warn("powerfs: umount deregister_client failed (%d); "
                     "master will evict entry on heartbeat timeout\n", dr);
     }
+
+    /* 1a-2. B1: 停止 KeepConnected 周期心跳.
+     *         在 deregister_client 之后、pool_exit(reconn_wq 销毁) 之前. */
+    powerfs_net_stop_heartbeat();
 
     /* 1b. Phase 3: 设置 shutting_down 标志.
      *    lease_renew_work_func 检查此标志, 避免在 destroy_workqueue(lease_wq)

@@ -335,14 +335,13 @@ if [ -n "$POWERFS_KO" ]; then
     echo "加载 PowerFS 内核模块 (powerfs-net 模式)..."
     echo "  Master:            ${POWERFS_MASTER_ADDR}:${POWERFS_MASTER_PORT}"
     echo "  Filer/Volume:      通过 Master 动态发现"
+    echo "  Shard count:       ${POWERFS_SHARD_COUNT:-3}"
     echo "  模块路径:          ${POWERFS_KO}"
+    echo "  参数传递:          mount -o master_addr=... (NOT insmod param, per-mount)"
 
-    # 加载模块, 只传递 master_addr/master_port
-    # Filer 和 Volume 地址在 fill_super 时通过 Master 动态发现
-    insmod "${POWERFS_KO}" \
-        master_addr="${POWERFS_MASTER_ADDR}" \
-        master_port="${POWERFS_MASTER_PORT}" \
-        shard_count="${POWERFS_SHARD_COUNT:-2}"
+    # 加载模块 (所有 master/shard 参数都在 mount -o 时传递,
+    # 不再走 module_param 全局共享, 支持多 mount point 独立配置)
+    insmod "${POWERFS_KO}"
 
     if [ $? -eq 0 ]; then
         echo "[OK] PowerFS 模块加载成功 (Master 动态发现 filer/volume)"
@@ -426,9 +425,12 @@ echo "常用命令:"
 echo "  lsmod                           - 查看已加载模块"
 echo "  dmesg | tail -50                - 查看内核日志"
 echo "  cat /proc/filesystems | grep powerfs  - 检查 powerfs 文件系统"
-echo "  mount -t powerfs none /mnt/pfs  - 挂载 PowerFS"
+echo "  mount_powerfs none /mnt/pfs     - 挂载 PowerFS (mount -o master_addr=...,master_port=N,shard_count=N)"
 echo "  echo 'hello' > /mnt/pfs/test.txt - 写入测试"
 echo "  cat /mnt/pfs/test.txt            - 读取测试"
+echo ""
+echo "完整 mount 示例 (per-mount opts):"
+echo "  mount -t powerfs -o \"master_addr=172.30.0.11,172.30.0.12,172.30.0.13,master_port=9334,shard_count=3\" none /mnt/pfs"
 echo ""
 
 # 启动交互式 shell
@@ -600,23 +602,43 @@ fi
 cat > bin/mount_powerfs << 'MEOF'
 #!/bin/sh
 # PowerFS 快捷挂载脚本
+# 参数全通过 mount -o 传递 (master_addr/master_port/shard_count 不再是
+# 全局 module_param), 避免多个 mount point 之间互相污染.
+
+POWERFS_MOUNT_OPTS="${POWERFS_MOUNT_OPTS:-master_addr=${POWERFS_MASTER_ADDR:-172.30.0.11,172.30.0.12,172.30.0.13},master_port=${POWERFS_MASTER_PORT:-9334},shard_count=${POWERFS_SHARD_COUNT:-3}}"
+
+# 证书 opts: 如果环境变量指定了证书路径, 追加到 mount opts。
+# master 有 CA manager 时必填, 否则 RegisterClient 会被 PERMISSION_DENIED 拒绝。
+if [ -n "${POWERFS_CA_CRT:-}" ]; then
+    POWERFS_MOUNT_OPTS="${POWERFS_MOUNT_OPTS},ca_crt=${POWERFS_CA_CRT}"
+fi
+if [ -n "${POWERFS_CLIENT_CRT:-}" ]; then
+    POWERFS_MOUNT_OPTS="${POWERFS_MOUNT_OPTS},client_crt=${POWERFS_CLIENT_CRT}"
+fi
+if [ -n "${POWERFS_CLIENT_KEY:-}" ]; then
+    POWERFS_MOUNT_OPTS="${POWERFS_MOUNT_OPTS},client_key=${POWERFS_CLIENT_KEY}"
+fi
+
 if [ $# -lt 1 ]; then
     echo "用法: mount_powerfs <device> [mountpoint]"
-    echo "示例: mount_powerfs /dev/sda1 /mnt"
+    echo "示例: mount_powerfs none /mnt/pfs"
+    echo "  mount_opts (env POWERFS_MOUNT_OPTS): $POWERFS_MOUNT_OPTS"
     exit 1
 fi
 
 DEVICE=$1
-MOUNTPOINT=${2:-/mnt}
+MOUNTPOINT=${2:-/mnt/pfs}
 
-echo "挂载 PowerFS: ${DEVICE} -> ${MOUNTPOINT}"
+echo "挂载 PowerFS: ${DEVICE} -> ${MOUNTPOINT} (opts=${POWERFS_MOUNT_OPTS})"
 mkdir -p "${MOUNTPOINT}"
-mount -t powerfs "${DEVICE}" "${MOUNTPOINT}"
-if [ $? -eq 0 ]; then
+mount -t powerfs -o "${POWERFS_MOUNT_OPTS}" "${DEVICE}" "${MOUNTPOINT}"
+RC=$?
+if [ $RC -eq 0 ]; then
     echo "挂载成功!"
 else
-    echo "挂载失败!"
+    echo "挂载失败! (rc=$RC) 检查 dmesg | tail -30"
 fi
+exit $RC
 MEOF
 chmod +x bin/mount_powerfs
 

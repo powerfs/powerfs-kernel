@@ -43,6 +43,9 @@
 #include <linux/kref.h>
 #include <linux/unaligned.h>
 #include <linux/crc32.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/mm.h>
 #include "powerfs_ec.h"
 
 #include <net/sock.h>
@@ -175,9 +178,6 @@ int shard_map_from_entries(const __u8 *blob, size_t len)
 }
 EXPORT_SYMBOL_GPL(shard_map_from_entries);
 
-/* 从模块参数获取 (定义在 powerfs_mod.c) */
-extern ushort shard_count;
-
 /* discover_filers 用的序列号计数器 (旧 g_conn.seq_counter 的替代,
  * 仅用于 master 发现阶段的裸 socket 请求, 不涉及 per-filer 连接) */
 static atomic_t g_discover_seq = ATOMIC_INIT(0);
@@ -249,7 +249,8 @@ static void powerfs_crc32c_init_table(void)
 }
 
 /**
- * powerfs_crc32c - 计算 CRC32C 校验值
+ * powerfs_crc32c - 计算标准 RFC3720 CRC32C (Castagnoli).
+ * 初始 0xFFFFFFFF, 输出 ~crc. 用于数据块完整性校验等场景.
  */
 __u32 powerfs_crc32c(const __u8 *data, size_t len)
 {
@@ -265,6 +266,40 @@ __u32 powerfs_crc32c(const __u8 *data, size_t len)
     return crc ^ 0xFFFFFFFF;
 }
 EXPORT_SYMBOL_GPL(powerfs_crc32c);
+
+/**
+ * powerfs_crc32c_append - 与 Rust crc32c crate (0.6.8) crc32c::crc32c_append 严格对齐.
+ *
+ * Rust crate 内部语义 (sw.rs): state = ~crc; for_each_byte:
+ *   state = table[..] ^ (state>>8); return ~state;
+ * 即输入反转 (~crc 作内部 state)、输出反转 (~state 返回), 与 RFC3720 one-shot
+ * 一致: crc32c_append(0, data) ≡ crc32c(data) ≡ ~internal(0xFFFFFFFF, data).
+ *
+ * 因此 Rust 侧 FrameHeader::calc_header_crc() 对 9 个字段链式调用 crc32c_append
+ * 等价于对整段 24B header 调一次 crc32c_append(0, hdr, 24), 即 RFC3720 one-shot
+ * 对 24 字节的结果. 这里直接对整段 24B 调一次 powerfs_crc32c_append(0, hdr, 24)
+ * 即可完全对齐.
+ *
+ * 历史 bug (RC-4): 之前误以为 Rust crc32c_append 是流式无取反 (init=crc 直累,
+ *   无反转), 导致 kernel 算出的 header_crc 与 master 端 FrameHeader::verify_crc()
+ *   不一致, master 直接 drop 连接, dmesg 报 "recv header truncated 0 < 28
+ *   (peer closed)", master 日志 "invalid frame header: header CRC mismatch".
+ *   该 bug 与证书机制无关, 现已修复.
+ */
+__u32 powerfs_crc32c_append(__u32 crc, const __u8 *data, size_t len)
+{
+    __u32 state = ~crc;
+    size_t i;
+
+    if (!crc32c_table_init)
+        powerfs_crc32c_init_table();
+
+    for (i = 0; i < len; i++)
+        state = crc32c_table[(state ^ data[i]) & 0xFF] ^ (state >> 8);
+
+    return ~state;
+}
+EXPORT_SYMBOL_GPL(powerfs_crc32c_append);
 
 /* ========== 帧头编解码 ========== */
 
@@ -323,9 +358,29 @@ void powerfs_net_frame_hdr_encode(struct powerfs_net_frame_hdr *hdr,
     /* protocol_ver: 协议版本 (版本升级一致性检查) */
     hdr->protocol_ver = POWERFS_NET_PROTOCOL_VER;
 
-    /* 计算 header_crc (前 24 字节的 CRC32C) */
-    crc = powerfs_crc32c((const __u8 *)hdr, 24);
+    /* 计算 header_crc: powerfs_crc32c_append(0, hdr, 24) 等价于
+     * Rust crc32c::crc32c_append(0, hdr, 24), 后者由 9 个字段链式调用
+     * 等价于 RFC3720 one-shot crc32c(hdr, 24). 与 Rust FrameHeader::
+     * calc_header_crc() 完全一致. (RC-4 修复前实现错误导致 master
+     * verify_crc 失败 drop 连接, 现已对齐.) */
+    crc = powerfs_crc32c_append(0, (const __u8 *)hdr, 24);
     hdr->header_crc = cpu_to_le32(crc);
+
+    /* DEBUG RC-4: 打印发送的 24 字节十六进制和计算出的 CRC, 便于与 Rust 端对比 */
+    {
+        const __u8 *p = (const __u8 *)hdr;
+        char hexbuf[24*3+1];
+        size_t i;
+        for (i = 0; i < 24; i++)
+            snprintf(hexbuf + i*3, 4, "%02x ", p[i]);
+        hexbuf[24*3] = '\0';
+        pr_err("powerfs: CRC_DEBUG bytes=[%s] crc=0x%08x crc_le=%02x%02x%02x%02x magic=0x%08x seq=0x%08x msg_type=0x%04x status=0x%04x data_len=0x%08x body_len=0x%08x route_hash=0x%02x proto_ver=0x%02x\n",
+               hexbuf, crc, p[24], p[25], p[26], p[27],
+               be32_to_cpu(hdr->magic), le32_to_cpu(hdr->seq),
+               le16_to_cpu(hdr->msg_type), le16_to_cpu(hdr->status),
+               le32_to_cpu(hdr->data_len), le32_to_cpu(hdr->body_len),
+               hdr->route_hash, hdr->protocol_ver);
+    }
 }
 EXPORT_SYMBOL_GPL(powerfs_net_frame_hdr_encode);
 
@@ -350,8 +405,9 @@ bool powerfs_net_frame_hdr_decode(const __u8 *buf, size_t len,
     if (hdr->version != POWERFS_NET_VERSION)
         return false;
 
-    /* 验证 CRC */
-    calc_crc = powerfs_crc32c(buf, 24);
+    /* 验证 CRC: powerfs_crc32c_append(0, buf, 24) ≡ Rust crc32c_append(0, hdr, 24)
+     * ≡ FrameHeader::calc_header_crc(). 与 Rust FrameHeader::verify_crc() 对齐. */
+    calc_crc = powerfs_crc32c_append(0, buf, 24);
     if (le32_to_cpu(hdr->header_crc) != calc_crc)
         return false;
 
@@ -427,11 +483,14 @@ static int powerfs_net_tcp_connect(struct socket *sock, const char *addr,
     sin.sin_family = AF_INET;
     sin.sin_port = cpu_to_be16(port);
 
-    /* 解析 IP 地址 (使用 in4_pton 兼容内核 6.2+) */
+    /* 解析 IP 地址 (使用 in4_pton 兼容内核 6.2+).
+     * 注意: in4_pton 返回 1=成功, 0=失败 (不是 <0).
+     *       必须用 !ret 判断, 否则非法 IP 静默通过 → sin_addr=0.0.0.0
+     *       → connect 无意义, 且 register_client 走 -ENOLINK/-67. */
     ret = in4_pton(addr, -1, (void *)&sin.sin_addr, '\0', NULL);
-    if (ret < 0) {
-        pr_err("powerfs: invalid server address: %s\n", addr);
-        return ret;
+    if (!ret) {
+        pr_err("powerfs: invalid server address: %s (in4_pton returned 0)\n", addr);
+        return -EINVAL;
     }
 
     /* 内核态 connect */
@@ -2278,27 +2337,82 @@ static void pfs_rx_dispatch(struct powerfs_net_server_conn *conn)
             return;
         }
 
-        /* --- 通用 Invalidate notify: 元数据变更推 Invalidate(inode, version) --- */
+        /* --- 通用 Invalidate notify: 元数据变更推 Invalidate ---
+         *
+         * 支持两种载荷 (兼容旧的 inode-only, 对齐 FUSE 侧新增 dentry-level):
+         *   (A) Ino + Version (旧协议, 向后兼容):
+         *        → powerfs_invalidate_one(ino) 做 inode-level refresh.
+         *   (B) ParentIno + Name + Ino(可选) + Version (新协议, dentry-level):
+         *        → powerfs_invalidate_dentry(parent_ino, name, version)
+         *          同时清理 VFS dcache 子 dentry (d_drop/d_invalidate)
+         *          和父目录 dir_entries 中的 stale active entry,
+         *          解决 ar rcs rename-over-replace 遗留 8 字节 stale inode 的 bug.
+         *
+         * Filer 在 net_handler.rs 中编码 notify 时会同时设置 (ParentIno, Name,
+         * Ino, Version) 四个字段; 旧版 Filer 只推 Ino+Version, 这里分支兼容.
+         */
         {
             __u64 ino = 0;
             __u64 version = 0;
+            __u64 parent_ino = 0;
+            char name_buf[POWERFS_MAX_NAME_LEN + 1];
+            int name_rc = -ENOENT;
 
             if (body && body_len > 0) {
                 struct powerfs_tlv_dec dec;
                 powerfs_tlv_dec_init(&dec, body, body_len);
-                powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_INO, &ino);
-                powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_VERSION, &version);
+                /* 顺序不敏感: find 遍历. */
+                powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_INO, &ino);
+                powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_VERSION, &version);
+                powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_PARENT_INO, &parent_ino);
+                /* name 解码: 可能缺省 (旧 inode-only notify, 或 Filer
+                 * 广播 inode-level-only event 如 truncate).
+                 * powerfs_tlv_dec_find_raw 已 NULL-safe, 单次调用即可
+                 * 同时探测存在性并取值, 无需二次扫描. */
+                name_buf[0] = '\0';
+                {
+                    const __u8 *name_ptr = NULL;
+                    size_t name_len = 0;
+                    name_rc = powerfs_tlv_dec_find_raw(&dec,
+                                POWERFS_NET_FLD_NAME, &name_ptr, &name_len);
+                    if (name_rc >= 0 && name_ptr && name_len > 0) {
+                        size_t copy = name_len;
+                        if (copy > POWERFS_MAX_NAME_LEN)
+                            copy = POWERFS_MAX_NAME_LEN;
+                        memcpy(name_buf, name_ptr, copy);
+                        name_buf[copy] = '\0';
+                        name_rc = (int)copy;
+                    } else {
+                        name_rc = -ENOENT;
+                    }
+                }
+            }
+
+            /* ── 派发优先级:
+             *   1. ParentIno + Name 存在 → 先 DENTRY-level (MC-401 对齐 FUSE),
+             *      这一步已经 remove_dir_entry + d_invalidate/d_drop.
+             *   2. Ino != 0 → 再走 inode-level getattr+pagecache inval.
+             *      (即使做了 dentry-level, inode-level 仍需:
+             *      比如被 rename-over-replace 的目标 inode 仍可能在别处
+             *      被打开, pagecache 需要被 inval;
+             *      另外 rename 源文件的 source inode 也需要 inode-level
+             *      pagecache inval.) */
+            if (parent_ino != 0 && name_rc > 0) {
+                pr_debug("powerfs: dentry-level inval parent=%llu name=%s ino=%llu ver=%llu\n",
+                        parent_ino, name_buf, ino, version);
+                powerfs_invalidate_dentry(parent_ino, name_buf,
+                                          (size_t)name_rc, version);
             }
 
             if (ino != 0) {
-                pr_debug("powerfs: invalidate ino=%llu version=%llu\n",
+                pr_debug("powerfs: inode-level inval ino=%llu ver=%llu\n",
                         ino, version);
                 /* powerfs_invalidate_one() now defers all work (inode lookup +
                  * getattr + page cache invalidation) to powerfs_refresh_wq.
                  * This is non-blocking and safe to call from the RX dispatcher. */
                 powerfs_invalidate_one(ino);
-            } else {
-                pr_warn("powerfs: notify frame missing Ino field (msg=0x%04x)\n",
+            } else if (parent_ino == 0) {
+                pr_warn("powerfs: notify frame missing Ino and ParentIno (msg=0x%04x)\n",
                         hdr->msg_type);
             }
         }
@@ -2842,11 +2956,308 @@ static void powerfs_conn_reconnect_work_fn(struct work_struct *work)
     }
 }
 
+/* === 5b. KeepConnected 心跳 (B1: 对齐 FUSE MasterStatsReporter 30s 周期) === */
+
+/* 独立 raw socket 发送一次 KeepConnected 请求到指定 master addr/port.
+ * 与 register_client (9550+) 的网络模式完全一致: 短连接 raw-socket +
+ * handshake → 1次请求/响应 → close. 不介入 g_pool filer 连接池, 网络
+ * 失败不影响 VFS 请求 (best-effort, 下轮重试).
+ *
+ * 返回: 0=成功收到 STATUS_OK/STATUS_OK_REDIRECT 处理完, <0=-errno */
+static int powerfs_heartbeat_send_one(const char *master_addr, __u16 master_port,
+                                      const __u8 *req_body, size_t req_body_len)
+{
+    struct socket *sock;
+    struct powerfs_net_frame_hdr hdr;
+    __u8 *resp_body;
+    __u8 resp_data[64];
+    __u32 seq;
+    size_t body_len = 0, data_len = 0;
+    int ret, ri;
+
+    resp_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
+    if (!resp_body)
+        return -ENOMEM;
+
+    sock = powerfs_net_create_tcp_socket();
+    if (!sock) {
+        kfree(resp_body);
+        return -ENOMEM;
+    }
+
+    ret = powerfs_net_tcp_connect(sock, master_addr, master_port);
+    if (ret < 0)
+        goto out_close;
+
+    ret = powerfs_net_do_handshake(sock);
+    if (ret < 0)
+        goto out_close;
+
+    seq = atomic_inc_return(&g_discover_seq);
+    powerfs_net_frame_hdr_encode(&hdr,
+                                  POWERFS_NET_MSG_KEEP_CONNECTED,
+                                  POWERFS_NET_FLAG_REQUEST,
+                                  seq, 0, (__u32)req_body_len,
+                                  (__u32)req_body_len, 0);
+
+    ret = powerfs_net_frame_send(sock, &hdr, req_body, req_body_len, NULL, 0);
+    if (ret < 0)
+        goto out_close;
+
+    for (ri = 0; ri < 5; ri++) {
+        ret = powerfs_net_frame_recv(sock, &hdr,
+                                      resp_body, POWERFS_NET_MAX_BODY, &body_len,
+                                      resp_data, sizeof(resp_data), &data_len,
+                                      POWERFS_NET_RECV_TIMEOUT);
+        if (ret < 0)
+            break;
+        if (hdr.flags & POWERFS_NET_FLAG_NOTIFY)
+            continue;
+        break;
+    }
+    if (ret < 0)
+        goto out_close;
+
+    /* REDIRECT: 跟随一次 (和 discover_filers/discover_volumes 一致). */
+    if (hdr.status == POWERFS_NET_STATUS_ERR_REDIRECT) {
+        struct powerfs_tlv_dec rdec;
+        char redirect_addr[64];
+
+        powerfs_net_close_socket(sock);
+        sock = NULL;
+
+        powerfs_tlv_dec_init(&rdec, resp_body, body_len);
+        if (powerfs_tlv_dec_string(&rdec, POWERFS_NET_FLD_OWNER,
+                                    redirect_addr,
+                                    sizeof(redirect_addr) - 1) != 0 ||
+            redirect_addr[0] == '\0') {
+            ret = -EREMOTEIO;
+            goto out_close;
+        }
+
+        sock = powerfs_net_create_tcp_socket();
+        if (!sock) {
+            ret = -ENOMEM;
+            goto out_close;
+        }
+        ret = powerfs_net_tcp_connect(sock, redirect_addr, master_port);
+        if (ret < 0)
+            goto out_close;
+        ret = powerfs_net_do_handshake(sock);
+        if (ret < 0)
+            goto out_close;
+        seq = atomic_inc_return(&g_discover_seq);
+        powerfs_net_frame_hdr_encode(&hdr,
+                                      POWERFS_NET_MSG_KEEP_CONNECTED,
+                                      POWERFS_NET_FLAG_REQUEST,
+                                      seq, 0, (__u32)req_body_len,
+                                      (__u32)req_body_len, 0);
+        ret = powerfs_net_frame_send(sock, &hdr, req_body, req_body_len, NULL, 0);
+        if (ret < 0)
+            goto out_close;
+        for (ri = 0; ri < 5; ri++) {
+            ret = powerfs_net_frame_recv(sock, &hdr,
+                                          resp_body, POWERFS_NET_MAX_BODY, &body_len,
+                                          resp_data, sizeof(resp_data), &data_len,
+                                          POWERFS_NET_RECV_TIMEOUT);
+            if (ret < 0)
+                break;
+            if (hdr.flags & POWERFS_NET_FLAG_NOTIFY)
+                continue;
+            break;
+        }
+        if (ret < 0)
+            goto out_close;
+    }
+
+    ret = (hdr.status == POWERFS_NET_STATUS_OK) ? 0 : -EREMOTEIO;
+
+out_close:
+    if (sock)
+        powerfs_net_close_socket(sock);
+    kfree(resp_body);
+    return ret;
+}
+
+static void powerfs_heartbeat_work_fn(struct work_struct *work)
+{
+    struct delayed_work *dw = to_delayed_work(work);
+    struct powerfs_net_pool *pool = container_of(dw, struct powerfs_net_pool,
+                                                  heartbeat_work);
+    __u8 *req_body;
+    size_t req_body_len;
+    int ret = -ENODEV;
+    char *cert_pem = NULL;
+    size_t cert_len = 0;
+    struct powerfs_tlv_enc enc;
+    /* Multi-master comma-list 轮询 (对齐 register_client / discover_volumes).
+     * master_addr 字段保存逗号列表 "ip1,ip2,ip3", 逐个 endpoint 尝试.
+     * kmalloc 本地副本避免 strsep 修改 g_pool.master_addr. */
+    char *addr_copy = NULL;
+    char *ap, *tok;
+
+    if (atomic_read(&pool->stopping))
+        return;
+
+    if (!pool->master_set || !pool->hb_client_uuid[0])
+        goto requeue;
+
+    req_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
+    if (!req_body)
+        goto requeue;
+
+    /* 编码 KeepConnected TLV (与 FUSE topology.rs:589-600 完全对齐).
+     * assigned_client_id=0 时不嵌入 ClientId 字段 (和 FUSE Option 一致). */
+    powerfs_tlv_enc_init(&enc, req_body, POWERFS_NET_MAX_BODY);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_UUID,
+                           pool->hb_client_uuid, strlen(pool->hb_client_uuid));
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_BACKEND,
+                           pool->hb_client_type, strlen(pool->hb_client_type));
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_NAME,
+                           pool->hb_mount_point, strlen(pool->hb_mount_point));
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_COLLECTION,
+                           pool->hb_collection, strlen(pool->hb_collection));
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_REPLICATION,
+                           pool->hb_replication, strlen(pool->hb_replication));
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_OWNER,
+                           pool->hb_host, strlen(pool->hb_host));
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_LIMIT, pool->hb_pid);
+    if (pool->hb_assigned_client_id > 0)
+        powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                            pool->hb_assigned_client_id);
+    /* ClientCert PEM (生产模式强制校验; 和 register_client 9536-9539 一致).
+     * 失败 / 路径空 → 不嵌入 0xD4, master dev mode 允许, enforce mode 拒. */
+    if (pool->hb_client_crt[0]) {
+        cert_pem = powerfs_read_pem_file(pool->hb_client_crt, GFP_KERNEL,
+                                          &cert_len);
+        if (cert_pem && cert_len > 0)
+            powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_CERT,
+                                    cert_pem, cert_len);
+    }
+    req_body_len = powerfs_tlv_enc_len(&enc);
+
+    /* === Multi-master 轮询: master_addr = "ip1,ip2,...,ipN" === */
+    addr_copy = kstrdup(pool->master_addr, GFP_KERNEL);
+    if (!addr_copy)
+        goto out_req;
+
+    ap = addr_copy;
+    while ((tok = strsep(&ap, ",")) != NULL) {
+        while (*tok == ' ') tok++;
+        if (tok[0] == '\0') continue;
+
+        ret = powerfs_heartbeat_send_one(tok, pool->master_port,
+                                          req_body, req_body_len);
+        if (ret == 0) {
+            /* 成功: 顺便把 leader 记到 g_pool.master_addr 首个字段,
+             * 优化下次轮询顺序 (但永久原列表保留在 fill_super context,
+             * 这里保持逗号列表不变, 仅记录 endpoint 命中是 best-effort). */
+            break;
+        }
+    }
+
+    if (ret < 0) {
+        pr_warn_ratelimited(
+            "powerfs: KeepConnected heartbeat (all %u master endpoints tried) "
+            "last_ret=%d; will retry in %us (uuid=%s assigned=%llu masters=%s)\n",
+            (unsigned)0 /* endpoint_count 简化占位 */,
+            ret, POWERFS_HB_INTERVAL_SECS, pool->hb_client_uuid,
+            (unsigned long long)pool->hb_assigned_client_id,
+            pool->master_addr);
+    } else {
+        pr_info_ratelimited(
+            "powerfs: KeepConnected heartbeat OK (uuid=%s assigned=%llu)\n",
+            pool->hb_client_uuid,
+            (unsigned long long)pool->hb_assigned_client_id);
+    }
+
+    kfree(addr_copy);
+out_req:
+    kfree(cert_pem);
+    kfree(req_body);
+
+requeue:
+    if (!atomic_read(&pool->stopping) && pool->heartbeat_started &&
+        pool->reconn_wq)
+        queue_delayed_work(pool->reconn_wq, &pool->heartbeat_work,
+                            POWERFS_HB_INTERVAL_SECS * HZ);
+}
+
+/**
+ * powerfs_net_start_heartbeat - 启动 KeepConnected 周期心跳.
+ * 在 fill_super register_client 成功后调用. 参数存副本到 g_pool. */
+int powerfs_net_start_heartbeat(const char *client_uuid,
+                                const char *client_type,
+                                const char *mount_point,
+                                const char *collection,
+                                const char *replication,
+                                const char *host,
+                                __u64 pid,
+                                u64 assigned_client_id,
+                                const char *client_crt_path)
+{
+    if (atomic_read(&g_pool.stopping))
+        return -ESHUTDOWN;
+    if (!g_pool.reconn_wq)
+        return -ENODEV;
+    if (!client_uuid || !client_uuid[0] || !mount_point)
+        return -EINVAL;
+
+    strncpy(g_pool.hb_client_uuid,    client_uuid,    sizeof(g_pool.hb_client_uuid)    - 1);
+    strncpy(g_pool.hb_client_type,    client_type ? client_type : "kernel",
+            sizeof(g_pool.hb_client_type) - 1);
+    strncpy(g_pool.hb_mount_point,   mount_point,    sizeof(g_pool.hb_mount_point)   - 1);
+    strncpy(g_pool.hb_collection,    collection  ? collection  : "",  sizeof(g_pool.hb_collection)  - 1);
+    strncpy(g_pool.hb_replication,   replication ? replication : "",  sizeof(g_pool.hb_replication) - 1);
+    strncpy(g_pool.hb_host,          host        ? host        : "",  sizeof(g_pool.hb_host)        - 1);
+    if (client_crt_path)
+        strncpy(g_pool.hb_client_crt, client_crt_path, sizeof(g_pool.hb_client_crt) - 1);
+    g_pool.hb_pid                 = pid;
+    g_pool.hb_assigned_client_id  = assigned_client_id;
+
+    INIT_DELAYED_WORK(&g_pool.heartbeat_work, powerfs_heartbeat_work_fn);
+    g_pool.heartbeat_started = true;
+    /* 立即排队首次心跳 (delay=0), 之后每 POWERFS_HB_INTERVAL_SECS 重排.
+     * 对齐 FUSE MasterStatsReporter.start 立刻发一次 KeepConnected,
+     * 避免 ~30s 空窗口内 master last_heartbeat 判定过期. */
+    queue_delayed_work(g_pool.reconn_wq, &g_pool.heartbeat_work, 0);
+    pr_info("powerfs: KeepConnected heartbeat started (interval=%us uuid=%s assigned=%llu)\n",
+            POWERFS_HB_INTERVAL_SECS, g_pool.hb_client_uuid,
+            (unsigned long long)g_pool.hb_assigned_client_id);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_start_heartbeat);
+
+/**
+ * powerfs_net_update_heartbeat_id - 刷新 assigned_client_id.
+ * 若 start 被调时 assigned=0 (register_client 还没回来), 赋值完成后调本函数. */
+void powerfs_net_update_heartbeat_id(u64 assigned_client_id)
+{
+    g_pool.hb_assigned_client_id = assigned_client_id;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_update_heartbeat_id);
+
+/**
+ * powerfs_net_stop_heartbeat - 停止心跳 (umount kill_sb 调用). */
+void powerfs_net_stop_heartbeat(void)
+{
+    if (g_pool.heartbeat_started) {
+        g_pool.heartbeat_started = false;
+        cancel_delayed_work_sync(&g_pool.heartbeat_work);
+        pr_info("powerfs: KeepConnected heartbeat stopped\n");
+    }
+}
+EXPORT_SYMBOL_GPL(powerfs_net_stop_heartbeat);
+
 /* === 6. 连接池 init/exit === */
 
-int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
+int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count)
 {
     int i, ret;
+
+    /* 防御: shard_count 必须 >= 1, 否则 % shard_count 会除 0. */
+    if (shard_count == 0)
+        shard_count = 1;
 
     /* 1. 存储 master 地址 (可选, 用于后续动态发现) */
     if (master_addr) {
@@ -2855,6 +3266,7 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         g_pool.master_set = true;
     }
     atomic_set(&g_pool.stopping, 0);
+    g_pool.heartbeat_started = false;
 
     /* v2: 创建独立重连/断连 workqueue.
      * WQ_UNBOUND: work 在不同 CPU 并行, 避免多 filer 重连串行阻塞.
@@ -2876,7 +3288,14 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         return ret;
     }
 
-    /* 2. 初始化 shard 路由表 */
+    /* 2. 初始化 shard 路由表.
+     *
+     * shard_count 来自 per-mount ctx → sbi->shard_count (mount -o shard_count=N),
+     * 不再从全局 module_param 读取: 同一个 ko 多个 mount 到不同集群
+     * 时, 各集群可配置独立分片. 目前连接池为单例 g_pool (不支持多集群并发),
+     * 二次 mount 若 master_addr 不同会在 fill_super 中检查冲突并拒绝;
+     * 但 shard_count 即便不同, 新 mount 的参数也会覆盖 pool 中的值,
+     * 这是 per-sb 参数在单例 pool 中的预期传播行为. */
     spin_lock_init(&g_pool.shard_route.lock);
     for (i = 0; i < POWERFS_MAX_SHARDS; i++) {
         g_pool.shard_route.entries[i].leader_filer_idx = -1;
@@ -2884,9 +3303,9 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port)
         INIT_LIST_HEAD(&g_pool.shard_route.entries[i].pending_reqs);
         spin_lock_init(&g_pool.shard_route.entries[i].req_lock);
     }
-    g_pool.shard_route.shard_count = shard_count;  /* 从模块参数获取 */
+    g_pool.shard_route.shard_count = shard_count;
 
-    /* Initialize global ShardMap from module param as fallback.
+    /* Initialize global ShardMap from per-mount mount-option fallback.
      * Overridden by Master topology (0xBD) in discover_volumes when
      * the Master advertises ShardMapEntries. Equivalent to Rust's
      * ShardMap::from_shard_count — equal 1M ranges per shard. */
@@ -3051,6 +3470,8 @@ void powerfs_conn_pool_exit(void)
     int i;
 
     atomic_set(&g_pool.stopping, 1);
+    /* B1: 停止心跳, 保证 cancel_delayed_work_sync 在 reconn_wq 释放前执行. */
+    powerfs_net_stop_heartbeat();
 
     /* 断开并清理所有 filer 连接.
      * disconnect_one 是幂等入口: reset_callbacks → 摘 sched 队列 →
@@ -9029,8 +9450,8 @@ int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port)
                 pr_info("powerfs: ShardMap updated from TotalShards (0xB8=%llu)\n",
                         (u64)total_shards);
             } else {
-                pr_info("powerfs: Master topology has no ShardMap fields, keeping module-param fallback (shard_count=%u)\n",
-                        shard_count);
+                pr_info("powerfs: Master topology has no ShardMap fields, keeping conn-pool-init fallback (shard_count=%llu)\n",
+                        (unsigned long long)g_pool.shard_route.shard_count);
             }
         }
 
@@ -9246,6 +9667,74 @@ out_clear:
 }
 
 /*
+ * powerfs_read_pem_file - 内核态读取 PEM 文本文件 (证书/密钥).
+ *
+ * 使用 filp_open + kernel_read (6.17 不再需要 set_fs), 缓冲区采用
+ * 调用方指定 gfp 标记, VFS 回调场景传 GFP_NOFS 避免递归回收.
+ *
+ * 返回: kmalloc 缓冲区, NUL-terminated (可直接 strlen / TLV 编码).
+ *   若 out_len 非 NULL, 写入实际字节数 (不含 trailing NUL).
+ *   失败 (路径不存在/IO错误/空文件/alloc 失败) 返回 NULL.
+ *   调用方必须 kfree() 返回指针.
+ */
+char *powerfs_read_pem_file(const char *path, gfp_t gfp, size_t *out_len)
+{
+    struct file *filp = NULL;
+    struct kstat st;
+    loff_t pos = 0;
+    char *buf = NULL;
+    ssize_t nread;
+    int rc;
+
+    if (!path || !*path)
+        return NULL;
+
+    filp = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(filp)) {
+        pr_warn("powerfs: pem_open: cannot open %s (ld=%ld)\n",
+                path, PTR_ERR(filp));
+        return NULL;
+    }
+
+    rc = vfs_getattr_nosec(&filp->f_path, &st,
+                            STATX_SIZE, AT_STATX_SYNC_AS_STAT);
+    if (rc != 0) {
+        pr_warn("powerfs: pem_open: vfs_getattr %s failed (%d)\n", path, rc);
+        goto out_fput;
+    }
+    if (st.size == 0 || st.size > 4 * 1024 * 1024) {
+        pr_warn("powerfs: pem_open: %s size=%llu invalid (want (0,4MB])\n",
+                path, (unsigned long long)st.size);
+        goto out_fput;
+    }
+
+    /* +1 trailing NUL so caller can use as C string. */
+    buf = kmalloc((size_t)st.size + 1, gfp);
+    if (!buf) {
+        pr_warn("powerfs: pem_open: kmalloc %llu+1 failed\n",
+                (unsigned long long)st.size);
+        goto out_fput;
+    }
+
+    nread = kernel_read(filp, buf, (size_t)st.size, &pos);
+    if (nread < 0 || (size_t)nread != (size_t)st.size) {
+        pr_warn("powerfs: pem_open: kernel_read %s failed (%zd want %llu)\n",
+                path, nread, (unsigned long long)st.size);
+        kfree(buf);
+        buf = NULL;
+        goto out_fput;
+    }
+    buf[nread] = '\0';
+    if (out_len)
+        *out_len = (size_t)nread;
+
+out_fput:
+    filp_close(filp, NULL);
+    return buf;
+}
+EXPORT_SYMBOL_GPL(powerfs_read_pem_file);
+
+/*
  * powerfs_net_register_client - 向 Master 注册本 mount 的 client_uuid,
  * 获取 master 统一分配的 assigned_client_id(u64), 同时检查黑名单.
  *
@@ -9266,6 +9755,7 @@ int powerfs_net_register_client(const char *master_addrs, __u16 master_port,
                                 const char *mount_point, const char *collection,
                                 const char *replication, const char *host,
                                 __u64 pid,
+                                const char *client_crt_path,
                                 __u64 *out_assigned_id, bool *out_mount_allowed,
                                 char *out_reason, size_t reason_cap)
 {
@@ -9278,7 +9768,11 @@ int powerfs_net_register_client(const char *master_addrs, __u16 master_port,
     struct powerfs_net_frame_hdr hdr;
     __u32 seq;
     int ret, ri;
+    pr_err("powerfs: CRC_TRACE ENTER register_client master_addrs=%s port=%u\n",
+           master_addrs ? master_addrs : "(null)", master_port);
     bool handled = false;
+    char *cert_pem = NULL;
+    size_t cert_len = 0;
 
     if (!master_addrs || !master_addrs[0] || !client_uuid || !out_assigned_id ||
         !out_mount_allowed)
@@ -9289,11 +9783,25 @@ int powerfs_net_register_client(const char *master_addrs, __u16 master_port,
     if (out_reason && reason_cap > 0)
         out_reason[0] = '\0';
 
+    /* 尽早把证书 PEM 读到内核堆, 路径空/读失败仅 warn, master 强制模式
+     * 会因缺少 0xD4 字段直接 PERMISSION_DENIED 返回, 不在这里 abort. */
+    if (client_crt_path && client_crt_path[0]) {
+        cert_pem = powerfs_read_pem_file(client_crt_path, GFP_NOFS, &cert_len);
+        if (!cert_pem)
+            pr_warn("powerfs: register_client: client_crt not readable %s "
+                    "(mount will fail if master enforces cert)\n",
+                    client_crt_path);
+        else
+            pr_info("powerfs: register_client: loaded client_crt '%s' (%zuB)\n",
+                    client_crt_path, cert_len);
+    }
+
     req_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
     resp_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
     if (!req_body || !resp_body) {
         kfree(req_body);
         kfree(resp_body);
+        kfree(cert_pem);
         pr_err("powerfs: register_client: kmalloc failed\n");
         return -ENOMEM;
     }
@@ -9321,8 +9829,15 @@ int powerfs_net_register_client(const char *master_addrs, __u16 master_port,
             powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_OWNER,
                                    host, strlen(host));
         powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_LIMIT, pid);
+        /* ClientCert 0xD4: 若成功读到 PEM, 嵌入 TLV, 长度 = strlen(PEM). */
+        if (cert_pem && cert_len > 0)
+            powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_CERT,
+                                   cert_pem, cert_len);
         req_body_len = powerfs_tlv_enc_len(&enc);
     }
+    /* PEM 编码完成即可释放, 避免后续网络循环期间长期占用堆. */
+    kfree(cert_pem);
+    cert_pem = NULL;
 
     strncpy(addr_buf, master_addrs, sizeof(addr_buf) - 1);
     addr_buf[sizeof(addr_buf) - 1] = '\0';
@@ -9338,28 +9853,37 @@ int powerfs_net_register_client(const char *master_addrs, __u16 master_port,
 
         pr_debug("powerfs: register_client: trying master %s:%u\n",
                  mtok, master_port);
+        pr_err("powerfs: CRC_TRACE trying master %s:%u\n", mtok, master_port);
 
         sock = powerfs_net_create_tcp_socket();
-        if (!sock)
+        if (!sock) {
+            pr_err("powerfs: CRC_TRACE create_tcp_socket failed\n");
             continue;
+        }
+        pr_err("powerfs: CRC_TRACE tcp_socket ok\n");
 
         ret = powerfs_net_tcp_connect(sock, mtok, master_port);
         if (ret < 0) {
+            pr_err("powerfs: CRC_TRACE tcp_connect failed ret=%d\n", ret);
             powerfs_net_close_socket(sock);
             continue;
         }
+        pr_err("powerfs: CRC_TRACE tcp_connect ok\n");
 
         ret = powerfs_net_do_handshake(sock);
         if (ret < 0) {
+            pr_err("powerfs: CRC_TRACE do_handshake failed ret=%d\n", ret);
             powerfs_net_close_socket(sock);
             continue;
         }
+        pr_err("powerfs: CRC_TRACE do_handshake ok\n");
 
         seq = atomic_inc_return(&g_discover_seq);
+        pr_err("powerfs: CRC_TRACE before encode, seq=0x%08x req_body_len=%zu\n", seq, req_body_len);
         powerfs_net_frame_hdr_encode(&hdr,
                                       POWERFS_NET_MSG_REGISTER_CLIENT,
                                       POWERFS_NET_FLAG_REQUEST,
-                                      seq, 0, (__u32)req_body_len, 0, 0);
+                                      seq, 0, (__u32)req_body_len, (__u32)req_body_len, 0);
 
         ret = powerfs_net_frame_send(sock, &hdr, req_body, req_body_len, NULL, 0);
         if (ret < 0) {
@@ -9421,7 +9945,7 @@ int powerfs_net_register_client(const char *master_addrs, __u16 master_port,
                 powerfs_net_frame_hdr_encode(&hdr,
                                               POWERFS_NET_MSG_REGISTER_CLIENT,
                                               POWERFS_NET_FLAG_REQUEST,
-                                              seq, 0, (__u32)req_body_len, 0, 0);
+                                              seq, 0, (__u32)req_body_len, (__u32)req_body_len, 0);
 
                 ret = powerfs_net_frame_send(sock, &hdr, req_body,
                                              req_body_len, NULL, 0);
@@ -9507,7 +10031,8 @@ int powerfs_net_register_client(const char *master_addrs, __u16 master_port,
  * 响应: STATUS_OK 即可
  */
 int powerfs_net_deregister_client(const char *master_addrs, __u16 master_port,
-                                  const char *client_uuid, __u64 assigned_id)
+                                  const char *client_uuid, __u64 assigned_id,
+                                  const char *client_crt_path)
 {
     char addr_buf[256];
     char *p, *tok;
@@ -9519,15 +10044,27 @@ int powerfs_net_deregister_client(const char *master_addrs, __u16 master_port,
     __u32 seq;
     int ret, i;
     int rc = -ENOLINK;
+    char *cert_pem = NULL;
+    size_t cert_len = 0;
 
     if (!master_addrs || !master_addrs[0] || !client_uuid)
         return -EINVAL;
+
+    /* Deregister 同样校验证书: 防止任意主机伪造下线请求. 读失败仅 warn. */
+    if (client_crt_path && client_crt_path[0]) {
+        cert_pem = powerfs_read_pem_file(client_crt_path, GFP_NOFS, &cert_len);
+        if (!cert_pem)
+            pr_warn("powerfs: deregister_client: client_crt unreadable '%s' "
+                    "(best-effort deregister will proceed; master may reject)\n",
+                    client_crt_path);
+    }
 
     req_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
     resp_body = kmalloc(POWERFS_NET_MAX_BODY, GFP_KERNEL);
     if (!req_body || !resp_body) {
         kfree(req_body);
         kfree(resp_body);
+        kfree(cert_pem);
         return -ENOMEM;
     }
 
@@ -9537,8 +10074,13 @@ int powerfs_net_deregister_client(const char *master_addrs, __u16 master_port,
         powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_UUID,
                                client_uuid, strlen(client_uuid));
         powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_CLIENT_ID, assigned_id);
+        if (cert_pem && cert_len > 0)
+            powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_CERT,
+                                   cert_pem, cert_len);
         body_len = powerfs_tlv_enc_len(&enc);
     }
+    kfree(cert_pem);
+    cert_pem = NULL;
 
     strncpy(addr_buf, master_addrs, sizeof(addr_buf) - 1);
     addr_buf[sizeof(addr_buf) - 1] = '\0';
@@ -9572,7 +10114,7 @@ int powerfs_net_deregister_client(const char *master_addrs, __u16 master_port,
         powerfs_net_frame_hdr_encode(&hdr,
                                       POWERFS_NET_MSG_DEREGISTER_CLIENT,
                                       POWERFS_NET_FLAG_REQUEST,
-                                      seq, 0, (__u32)body_len, 0, 0);
+                                      seq, 0, (__u32)body_len, (__u32)body_len, 0);
 
         ret = powerfs_net_frame_send(sock, &hdr, req_body, body_len, NULL, 0);
         if (ret < 0) {
@@ -9625,7 +10167,7 @@ int powerfs_net_deregister_client(const char *master_addrs, __u16 master_port,
             powerfs_net_frame_hdr_encode(&hdr,
                                           POWERFS_NET_MSG_DEREGISTER_CLIENT,
                                           POWERFS_NET_FLAG_REQUEST,
-                                          seq, 0, (__u32)body_len, 0, 0);
+                                          seq, 0, (__u32)body_len, (__u32)body_len, 0);
             ret = powerfs_net_frame_send(sock, &hdr, req_body, body_len, NULL, 0);
             if (ret < 0) {
                 powerfs_net_close_socket(sock);

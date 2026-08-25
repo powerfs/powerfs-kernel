@@ -835,6 +835,15 @@ struct powerfs_client {
     char master_addr[64];
     u16 master_port;
 
+    /* 证书路径: 来源 mount -o ca_crt/client_crt/client_key.
+     * deregister_client 在 kill_sb_super 中通过 client 指针取此路径,
+     * 故保存在 client 上而非仅 sbi 上. 空字符串表示未提供, 由 Master
+     * 强制模式在 net_handler 层拒绝挂载 (不强制内核层 return EINVAL,
+     * 兼容 dev mode 无 CA 的开发环境). */
+    char ca_crt[512];
+    char client_crt[512];
+    char client_key[512];
+
     /* §13 Cap model: 客户端唯一字符串标识 (ClientId string, TLV FieldId::ClientId = 0x30).
      * 对齐 FUSE MetaShardClient::cap_open_grant 入参 client_id, 服务端 cap_manager
      * 用此键维护 per-client 状态并在 recall 时推送 NOTIFY 到对应 net 连接.
@@ -897,6 +906,13 @@ struct powerfs_sb_info {
     /* Master 服务地址 (唯一配置项, Filer/Volume 通过 Master 动态发现) */
     char master_addr[64];
     u16  master_port;
+    u16  shard_count;   /* Filer 总分片数, 用于元数据路由 (inode/1M) % shard_count */
+
+    /* 证书路径: fill_super 阶段从 ctx 暂存到此, 后续 powerfs_client 初始化
+     * 时再拷贝到 client->ca_crt/client_crt/client_key. 长度 511B + NUL. */
+    char ca_crt[512];
+    char client_crt[512];
+    char client_key[512];
 
     /* 多组 kmem_cache: 对齐  init_caches() (powerfs_cap_snap_cachep / inode / dentry) */
     struct kmem_cache *inode_cache;       /* powerfs_inode_info (内含 netfs_inode) */
@@ -1036,6 +1052,20 @@ struct inode *powerfs_find_inode(struct super_block *sb, u64 ino);
  * Called from powerfs_net.c when a NOTIFY frame is received from Filer.
  * Returns 0 on success, -ENOENT if inode not in cache, negative on error. */
 int powerfs_invalidate_one(u64 ino);
+
+/* Dentry-level invalidation: drop the dentry identified by (parent_ino, name)
+ * from the VFS dcache and optionally refresh its inode metadata. Also updates
+ * the dir_entries of the parent directory to remove stale entries.
+ * Called from powerfs_net.c RX dispatcher when a NOTIFY frame carries
+ * the ParentIno + Name TLV fields in addition to (or instead of) Ino.
+ *
+ * (parent,name,version) dedup is performed inside: replays/network retransmits
+ * with the same (or older) version are ignored. */
+int powerfs_invalidate_dentry(u64 parent_ino, const char *name, size_t name_len, u64 version);
+
+/* Destroy (free) all entries in the dentry notify dedup ring. Called from
+ * module_exit to leak all name strings. */
+void powerfs_dentry_dedup_destroy_all(void);
 
 /* invalidate 通知处理 (powerfs_transport.c) */
 struct powerfs_invalidate_req;  /* 前向声明 */
