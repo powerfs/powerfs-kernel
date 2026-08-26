@@ -12,8 +12,27 @@ MODULE_NAME := powerfs
 obj-m += $(MODULE_NAME).o
 $(MODULE_NAME)-objs := \
     powerfs_mod.o \
-    powerfs_fs.o \
+    powerfs_super.o \
+    powerfs_inode.o \
+    powerfs_file.o \
+    powerfs_dir.o \
+    powerfs_addr.o \
+    powerfs_dentry.o \
+    powerfs_caps.o \
+    powerfs_locks.o \
+    powerfs_lease.o \
+    powerfs_xattr.o \
     powerfs_net.o \
+    powerfs_net_shard.o \
+    powerfs_net_sock.o \
+    powerfs_net_conn.o \
+    powerfs_net_req.o \
+    powerfs_net_inode.o \
+    powerfs_net_data.o \
+    powerfs_net_xattr.o \
+    powerfs_net_pool.o \
+    powerfs_net_discover.o \
+    powerfs_net_lease.o \
     powerfs_tlv.o \
     powerfs_transport.o \
     powerfs_serializer.o \

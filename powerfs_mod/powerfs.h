@@ -236,8 +236,15 @@ struct powerfs_dir_entry {
     struct list_head list;          /* 链表节点 */
     u64 ino;                        /* inode 号 */
     unsigned int type;              /* 文件类型 (DT_REG, DT_DIR, 等) */
-    char name[POWERFS_MAX_NAME_LEN]; /* 文件名 */
+    char name[POWERFS_MAX_NAME_LEN + 1]; /* 文件名 (255 chars + null) */
     bool deleted;                   /* 标记删除: 保持链表位置稳定, readdir 跳过 */
+    /* fetch_epoch: 上次从 Filer 拉取到该 name 时的 dir_fetch_epoch 值.
+     * readdir refetch 完成后, active 条目中 fetch_epoch != 当前 dir_fetch_epoch
+     * 的 (即本次 refetch 未被 Filer 返回) 标记为 deleted, 清理 stale active 条目.
+     * 解决 root cause: 之前 refetch 只追加/undelete, 从不清理本地 stale active,
+     * 导致历史测试遗留的已删除文件名无限堆积 (实测 dir_ino=1 累积 1862 active
+     * 而 Filer 实际仅 109 个文件). */
+    u64 fetch_epoch;
 };
 
 /* ========== Inode 扩展结构 (参考 powerfs_inode_info) ========== */
@@ -248,6 +255,7 @@ struct powerfs_chunk_map {
     u64 needle_id;
     u64 volume_id;
     u32 crc32;
+    u64 size;   /* chunk 有效数据大小 (字节), 用于 Filer 元数据同步 */
 };
 
 /* ==============================================================
@@ -433,7 +441,7 @@ struct powerfs_inode_info {
     struct netfs_inode netfs;          /* 内含 struct inode，必须第一个字段 */
 
     u64 parent_ino;
-    char name[POWERFS_MAX_NAME_LEN];
+    char name[POWERFS_MAX_NAME_LEN + 1];
 
     spinlock_t i_lock;
 
@@ -620,6 +628,11 @@ struct powerfs_inode_info {
      * Note: dir_lease_epoch 现在直接对齐父目录 inode 的 atomic i_shared_gen. */
     unsigned long dir_lease_expire;
     u64 dir_lease_epoch;
+    /* dir_fetch_epoch: 单调递增, 每次 readdir refetch 开始时 ++.
+     * 用于清理 stale active dir_entries: refetch 拉取过程中遇到的同名条目
+     * 更新 fetch_epoch = dir_fetch_epoch; refetch 结束后所有 fetch_epoch
+     * 落后于 dir_fetch_epoch 的 active 条目说明 Filer 不再返回, 标记 deleted. */
+    u64 dir_fetch_epoch;
 
     /* === 对齐 : 未 commit 的 async dirop / iop 链表 (Async DIROPS 核心) === */
     struct list_head i_unsafe_dirops;    /* uncommitted mds dir op 链表 */

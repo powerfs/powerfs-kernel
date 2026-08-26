@@ -34,13 +34,21 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/fault_injection.sh"
 
-MNT=/mnt/pfs
+# 与 FUSE 容器 fuse.toml mount_point="/mnt/powerfs" 对齐。
+MNT=${MNT:-/mnt/powerfs}
+# 实际挂载点 (T1 mount / T8 umount 使用); MNT 可以是挂载点下的子目录,
+# 用于在干净子目录中运行测试, 避免根目录历史 stale dentry 干扰.
+MOUNT_POINT=${MOUNT_POINT:-/mnt/powerfs}
 POWERFS_MOD_DIR="/home/portion/powerfs/kernel/powerfs_mod"
 
 PASS=0
 FAIL=0
 WARN=0
 SKIP=0
+
+# qemu.log boot 段基线 (惰性初始化: 首次 check_kernel_state 时记录,
+# 之后只扫增量, 避免误报历史 panic)
+QEMU_LOG_BASE=0
 
 # 颜色输出
 if [ -t 1 ]; then
@@ -150,10 +158,24 @@ check_kernel_state() {
     fi
 
     # 3. serial 日志 lockup 检查 (补充 dmesg, VM 卡死时也能查)
+    # 只扫描 T1 记录的 QEMU_LOG_BASE 之后的行 (当前 boot 段),
+    # 避免误报历史 panic (qemu.log 是 append 模式, panic=-1 重启后
+    # 旧 panic 记录残留在文件前部).
     local qemu_log="${SCRIPT_DIR}/output/qemu.log"
     if [ -f "${qemu_log}" ]; then
         local serial_errors
-        serial_errors=$(grep -E 'soft lockup|hard lockup|NMI watchdog|Kernel panic|BUG:|Oops:|RCU stall|workqueue lockup|hung task' "${qemu_log}" 2>/dev/null | tail -5 || true)
+        if [ "${QEMU_LOG_BASE}" -gt 0 ] 2>/dev/null; then
+            serial_errors=$(tail -n +"${QEMU_LOG_BASE}" "${qemu_log}" 2>/dev/null | grep -E 'soft lockup|hard lockup|NMI watchdog|Kernel panic|BUG:|Oops:|RCU stall|workqueue lockup|hung task' | tail -5 || true)
+        else
+            # 惰性初始化: 首次调用记录当前 qemu.log 行数作为基线,
+            # 只扫之后新增的行, 避免误报历史 panic.
+            QEMU_LOG_BASE=$(wc -l < "${qemu_log}" 2>/dev/null || echo 0)
+            case "$QEMU_LOG_BASE" in
+                ''|*[!0-9]*) QEMU_LOG_BASE=1 ;;
+            esac
+            QEMU_LOG_BASE=$((QEMU_LOG_BASE + 1))
+            serial_errors=$(tail -n +"${QEMU_LOG_BASE}" "${qemu_log}" 2>/dev/null | grep -E 'soft lockup|hard lockup|NMI watchdog|Kernel panic|BUG:|Oops:|RCU stall|workqueue lockup|hung task' | tail -5 || true)
+        fi
         if [ -z "$serial_errors" ]; then
             ok "serial log clean (no lockup/panic)"
         else
@@ -967,7 +989,7 @@ test_t8_unmount() {
     # T8-1: umount
     echo "  [T8-1] umount powerfs..."
     local umount_ret
-    umount_ret=$(vm "timeout 30 umount ${MNT} 2>&1" 2>/dev/null)
+    umount_ret=$(vm "timeout 30 umount ${MOUNT_POINT} 2>&1" 2>/dev/null)
     local ret=$?
     if [ $ret -eq 0 ]; then
         ok "umount succeeded"
@@ -1040,7 +1062,7 @@ test_t8_unmount() {
     # 重新挂载以便后续使用
     echo ""
     echo "  [T8] remount powerfs (for subsequent tests)..."
-    vm "mount -t powerfs none ${MNT}" 2>/dev/null
+    vm "mount -t powerfs none ${MOUNT_POINT}" 2>/dev/null
     sleep 2
 
     return 0

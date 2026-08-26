@@ -687,6 +687,8 @@ struct powerfs_request {
     int error;                  /* 最终错误码 (0=成功, <0=错误) */
     unsigned long deadline;     /* 超时 jiffies (0=使用默认) */
     u64 ts_submit;              /* 调试: do_send 入队时间 (ktime_get_ns, 0=未启用) */
+    u64 ts_sent;                /* 调试: TX 线程发送完成时间 (pfs_process_transmit) */
+    u64 ts_recv;                /* 调试: RX dispatch 入口时间 (帧收完, 匹配前) */
 
     /* === 异步超时 (仅 callback != NULL 时启用) ===
      * 同步请求用 do_send 内 wait_for_completion_killable_timeout 兜底;

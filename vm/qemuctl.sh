@@ -45,7 +45,7 @@
 #   ./qemuctl.sh ssh
 #   ./qemuctl.sh log powerfs
 #   ./qemuctl.sh monitor powerfs
-#   ./qemuctl.sh exec "ls -la /mnt/pfs/"
+#   ./qemuctl.sh exec "ls -la /mnt/powerfs/"
 #   ./qemuctl.sh service log filer-1
 
 set -u
@@ -206,23 +206,28 @@ cmd_hotdeploy() {
     info "已复制到 ${SHARE_DIR}/powerfs.ko"
 
     step "3/4 SSH 热加载 (umount → rmmod → insmod → mount)..."
-    local cmdline master_addr master_port shard_count
+    local cmdline master_addr master_port shard_count cert_ca cert_crt cert_key
     cmdline=$(ssh_vm "cat /proc/cmdline" 2>/dev/null)
     master_addr=$(echo "$cmdline" | grep -o 'powerfs_master_addr=[^ ]*' | head -1 | cut -d= -f2)
     master_port=$(echo "$cmdline" | grep -o 'powerfs_master_port=[^ ]*' | head -1 | cut -d= -f2)
     shard_count=$(echo "$cmdline" | grep -o 'shard_count=[^ ]*' | head -1 | cut -d= -f2)
-    master_addr=${master_addr:-172.30.0.11,172.30.0.12,172.30.0.13}
-    master_port=${master_port:-9334}
-    shard_count=${shard_count:-2}
+    master_addr=${master_addr:-${POWERFS_MASTER_ADDR}}
+    master_port=${master_port:-${POWERFS_MASTER_PORT}}
+    shard_count=${shard_count:-3}
+    # 首选 initramfs 打包的 /etc/powerfs/ (VM 重启后仍存在), 兼容 /tmp/
+    cert_ca="${POWERFS_CA_CRT:-/etc/powerfs/ca.crt}"
+    cert_crt="${POWERFS_CLIENT_CRT:-/etc/powerfs/kernel-client-1.crt}"
+    cert_key="${POWERFS_CLIENT_KEY:-/etc/powerfs/kernel-client-1.key}"
 
     # 执行热加载 (在 VM 内部完成 umount/rmmod/insmod/mount)
     info "执行: umount → rmmod → insmod → mount"
-    local hotload_script
-    hotload_script=$(cat <<'HOTLOAD'
-set -e
+    local hotload_script mount_opts
+    mount_opts="master_addr=${master_addr},master_port=${master_port},shard_count=${shard_count},ca_crt=${cert_ca},client_crt=${cert_crt},client_key=${cert_key}"
+    hotload_script=$(cat <<HOTLOAD
+set +e
 # 1. umount powerfs (如果已挂载)
-if mount | grep -q 'on /mnt/pfs type powerfs'; then
-    umount /mnt/pfs 2>/dev/null || umount -l /mnt/pfs 2>/dev/null
+if mount | grep -q 'on /mnt/powerfs type powerfs'; then
+    umount /mnt/powerfs 2>/dev/null || umount -l /mnt/powerfs 2>/dev/null
     sleep 1
 fi
 # 2. rmmod (如果已加载)
@@ -230,26 +235,30 @@ if lsmod | grep -q powerfs; then
     rmmod powerfs
     sleep 1
 fi
-# 3. insmod from 9p share
-insmod /mnt/host/powerfs.ko master_addr=__MASTER_ADDR__ master_port=__MASTER_PORT__ shard_count=__SHARD_COUNT__
+# 3. insmod from 9p share (module_param 已移除, 所有参数通过 mount -o 传递)
+insmod /mnt/host/powerfs.ko
+insmod_ret=\$?
+if [ \$insmod_ret -ne 0 ] && [ \$insmod_ret -ne 17 ]; then
+    echo "HOTDEPLOY_FAIL: insmod failed ret=\$insmod_ret"
+    dmesg | tail -10
+    exit \$insmod_ret
+fi
 sleep 1
-# 4. mount
-mkdir -p /mnt/pfs
-mount -t powerfs none /mnt/pfs
+# 4. mount (所有参数通过 -o 传递: master/证书/shard_count)
+mkdir -p /mnt/powerfs
+mount -t powerfs -o "${mount_opts}" none /mnt/powerfs
+mount_ret=\$?
 sleep 2
 # 5. verify
-if mount | grep -q 'on /mnt/pfs type powerfs'; then
+if mount | grep -q 'on /mnt/powerfs type powerfs'; then
     echo "HOTDEPLOY_OK"
 else
-    echo "HOTDEPLOY_FAIL: mount failed"
-    dmesg | tail -10
+    echo "HOTDEPLOY_FAIL: mount failed ret=\$mount_ret"
+    echo "opts: ${mount_opts}"
+    dmesg | tail -20
 fi
 HOTLOAD
 )
-    # 替换占位符
-    hotload_script=$(echo "$hotload_script" | sed "s|__MASTER_ADDR__|${master_addr}|g")
-    hotload_script=$(echo "$hotload_script" | sed "s|__MASTER_PORT__|${master_port}|g")
-    hotload_script=$(echo "$hotload_script" | sed "s|__SHARD_COUNT__|${shard_count}|g")
 
     local result
     result=$(ssh_vm "$hotload_script" 2>&1)
@@ -787,14 +796,48 @@ cmd_mount() {
         error "QEMU 未运行"
         exit 1
     fi
-    ssh_vm "mkdir -p /mnt/pfs && mount -t powerfs none /mnt/pfs 2>&1"
-    local ret=$?
-    if [ ${ret} -eq 0 ]; then
-        info "PowerFS 已挂载到 /mnt/pfs"
-        ssh_vm "mount | grep powerfs"
-    else
-        error "挂载失败"
+    # 证书路径 (VM 内路径, 支持环境变量覆盖)
+    # Master 强制证书认证: 必须提供 ca_crt/client_crt/client_key
+    # 首选 initramfs 预打包的 /etc/powerfs/ (VM 重启后仍存在), 兼容 /tmp/
+    local cert_ca="${POWERFS_CA_CRT:-/etc/powerfs/ca.crt}"
+    local cert_crt="${POWERFS_CLIENT_CRT:-/etc/powerfs/kernel-client-1.crt}"
+    local cert_key="${POWERFS_CLIENT_KEY:-/etc/powerfs/kernel-client-1.key}"
+    local mount_opts="master_addr=${POWERFS_MASTER_ADDR},master_port=${POWERFS_MASTER_PORT},shard_count=3,ca_crt=${cert_ca},client_crt=${cert_crt},client_key=${cert_key}"
+
+    # 如果 ko 未加载 (重启后 lsmod 没 powerfs), 先从 9p share insmod。
+    # 注: powerfs.ko 通过 -virtfs 共享到 VM 的 /mnt/host/powerfs.ko。
+    local load_script
+    load_script=$(cat <<INSERTSCRIPT
+set +e
+mount -t 9p -o trans=virtio,version=9p2000.L,access=client ${SHARE_TAG} /mnt/host 2>/dev/null
+if ! lsmod | grep -q powerfs; then
+    insmod /mnt/host/powerfs.ko
+    ir=\$?
+    if [ \$ir -ne 0 ] && [ \$ir -ne 17 ]; then
+        echo "INSMOD_FAIL rc=\$ir"
+        dmesg | tail -10
+        exit \$ir
     fi
+    sleep 1
+fi
+mkdir -p /mnt/powerfs
+mount -t powerfs -o "${mount_opts}" none /mnt/powerfs 2>&1
+mr=\$?
+if [ \$mr -ne 0 ]; then
+    echo "MOUNT_FAIL rc=\$mr"
+    dmesg | tail -20
+fi
+INSERTSCRIPT
+)
+    local result
+    result=$(ssh_vm "$load_script" 2>&1)
+    echo "$result" | grep -v "^$"
+    if echo "$result" | grep -q "MOUNT_FAIL\|INSMOD_FAIL"; then
+        error "挂载失败"
+        return 1
+    fi
+    info "PowerFS 已挂载到 /mnt/powerfs (opts: ${mount_opts})"
+    ssh_vm "mount | grep powerfs"
 }
 
 # ============================================================
@@ -806,7 +849,7 @@ cmd_umount() {
         error "QEMU 未运行"
         exit 1
     fi
-    ssh_vm "umount /mnt/pfs 2>&1 || echo '未挂载或卸载失败'"
+    ssh_vm "umount /mnt/powerfs 2>&1 || echo '未挂载或卸载失败'"
     info "卸载完成"
 }
 
@@ -907,7 +950,7 @@ cmd_exec() {
     local cmd="${1:-}"
     if [ -z "${cmd}" ]; then
         error "请提供要执行的命令"
-        echo "  用法: ./qemuctl.sh exec \"ls -la /mnt/pfs/\""
+        echo "  用法: ./qemuctl.sh exec \"ls -la /mnt/powerfs/\""
         exit 1
     fi
     if ! is_qemu_running; then
@@ -1140,7 +1183,7 @@ PowerFS QEMU 统一管理脚本
   ./qemuctl.sh monitor powerfs
   ./qemuctl.sh serial "BUG\|Oops\|stall\|lockup" 200  # VM 卡死时查 lockup 日志
   ./qemuctl.sh serial-tail "powerfs\|stall"            # 实时监控 serial 日志
-  ./qemuctl.sh exec "cat /mnt/pfs/test.txt"
+  ./qemuctl.sh exec "cat /mnt/powerfs/test.txt"
   ./qemuctl.sh service log filer-1
 EOF
 }
