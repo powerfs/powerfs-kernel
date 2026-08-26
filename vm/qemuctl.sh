@@ -327,6 +327,19 @@ cmd_start() {
         qemu-img create -f qcow2 "${QEMU_DISK}" 1G >/dev/null
     fi
 
+    # Rotate qemu.log: 保留上一份 .1, 清空当前日志, 防止 append 模式无限增长.
+    # panic=-1 自动重启会追加新 boot 段, 多次压力测试后文件可达 GB 级.
+    if [ -f "${QEMU_LOG}" ]; then
+        local log_size=$(stat -c%s "${QEMU_LOG}" 2>/dev/null || echo 0)
+        if [ "${log_size}" -gt 10485760 ]; then  # >10MB
+            mv "${QEMU_LOG}" "${QEMU_LOG}.1"
+            info "qemu.log rotated (was $((log_size/1024/1024))MB -> .1 backup)"
+        else
+            : > "${QEMU_LOG}"
+            info "qemu.log truncated (was $((log_size/1024))KB)"
+        fi
+    fi
+
     # 检查 KVM 支持
     local kvm_flag=""
     if [ -e /dev/kvm ] && sudo test -r /dev/kvm && sudo test -w /dev/kvm; then
@@ -489,6 +502,19 @@ cmd_debug() {
     if [ ! -f "${QEMU_DISK}" ]; then
         info "创建虚拟磁盘 (1GB)..."
         qemu-img create -f qcow2 "${QEMU_DISK}" 1G >/dev/null
+    fi
+
+    # Rotate qemu.log: 保留上一份 .1, 清空当前日志, 防止 append 模式无限增长.
+    # panic=-1 自动重启会追加新 boot 段, 多次压力测试后文件可达 GB 级.
+    if [ -f "${QEMU_LOG}" ]; then
+        local log_size=$(stat -c%s "${QEMU_LOG}" 2>/dev/null || echo 0)
+        if [ "${log_size}" -gt 10485760 ]; then  # >10MB
+            mv "${QEMU_LOG}" "${QEMU_LOG}.1"
+            info "qemu.log rotated (was $((log_size/1024/1024))MB -> .1 backup)"
+        else
+            : > "${QEMU_LOG}"
+            info "qemu.log truncated (was $((log_size/1024))KB)"
+        fi
     fi
 
     # 检查 KVM 支持
