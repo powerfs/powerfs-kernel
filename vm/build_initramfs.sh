@@ -426,6 +426,11 @@ mkdir -p /mnt/host
 mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/host 2>/dev/null
 if [ $? -eq 0 ]; then
     echo "[OK] Host 共享目录已挂载: /mnt/host"
+    # fio 动态库在 9p 共享目录, 设置 LD_LIBRARY_PATH 使 fio 可用
+    if [ -d /mnt/host/fio-libs ]; then
+        export LD_LIBRARY_PATH=/mnt/host/fio-libs
+        echo "[OK] LD_LIBRARY_PATH=/mnt/host/fio-libs (fio 动态库)"
+    fi
 else
     echo "[INFO] 9p 挂载失败 (可忽略, 不影响基本功能)"
 fi
@@ -562,6 +567,9 @@ if mount -t powerfs -o "${AUTO_MOUNT_OPTS}" none /mnt/powerfs 2>/dev/null; then
 else
     echo "[INFO] PowerFS 自动挂载失败，稍后请手动执行 mount_powerfs none /mnt/powerfs"
 fi
+
+# 创建 /mnt/pfs -> /mnt/powerfs 符号链接，兼容使用 MNT=/mnt/pfs 的测试脚本
+ln -sf /mnt/powerfs /mnt/pfs 2>/dev/null
 
 echo ""
 echo "常用命令:"
@@ -731,11 +739,20 @@ for fio_path in /tmp/fio-build/fio /tmp/fio_bundle/fio "${OUTPUT_DIR}/fio"; do
     fi
 done
 if [ -n "${FIO_BIN}" ]; then
-    cp "${FIO_BIN}" bin/fio
+    cp "${FIO_BIN}" bin/fio.real
+    chmod +x bin/fio.real
+    # 创建 wrapper 脚本设置 LD_LIBRARY_PATH (fio 是动态链接, 依赖 9p 共享的 fio-libs)
+    cat > bin/fio << 'FIOEOF'
+#!/bin/sh
+if [ -d /mnt/host/fio-libs ]; then
+    export LD_LIBRARY_PATH=/mnt/host/fio-libs
+fi
+exec /bin/fio.real "$@"
+FIOEOF
     chmod +x bin/fio
     # 同步到 output 目录缓存
     cp "${FIO_BIN}" "${OUTPUT_DIR}/fio" 2>/dev/null || true
-    echo "  已添加 fio 到 initramfs ($(ls -la bin/fio | awk '{print $5}') bytes)"
+    echo "  已添加 fio 到 initramfs ($(ls -la bin/fio.real | awk '{print $5}') bytes)"
 else
     echo "  [WARN] 未找到 fio 二进制, T5 性能测试将需要手动安装"
     echo "  预期路径: /tmp/fio-build/fio (静态构建)"

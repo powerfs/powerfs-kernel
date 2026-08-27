@@ -311,6 +311,18 @@ cmd_start() {
             echo "  请手动运行: sudo ./setup_network.sh"
             exit 1
         fi
+    else
+        # TAP 已存在, 验证是否仍在正确的 bridge 上
+        # (docker compose down/up 后旧 bridge 可能已消失)
+        local _br
+        _br=$(ip link show ${TAP_DEVICE} 2>/dev/null | grep -oE 'master [^ ]+' | awk '{print $2}')
+        if [ -n "${_br}" ] && ! ip link show "${_br}" &>/dev/null 2>&1; then
+            warn "TAP 设备 ${TAP_DEVICE} 连接的网桥 ${_br} 已消失，重新配置..."
+            sudo bash "${SCRIPT_DIR}/setup_network.sh" 2>&1 || true
+        elif [ -z "${_br}" ]; then
+            warn "TAP 设备 ${TAP_DEVICE} 未连接到任何网桥，重新配置..."
+            sudo bash "${SCRIPT_DIR}/setup_network.sh" 2>&1 || true
+        fi
     fi
 
     # 检查 Docker 服务状态 (QEMU 需要 master/volume/filer 可达)
@@ -487,6 +499,18 @@ cmd_debug() {
             error "TAP 设备创建失败"
             echo "  请手动运行: sudo ./setup_network.sh"
             exit 1
+        fi
+    else
+        # TAP 已存在, 验证是否仍在正确的 bridge 上
+        # (docker compose down/up 后旧 bridge 可能已消失)
+        local _br
+        _br=$(ip link show ${TAP_DEVICE} 2>/dev/null | grep -oE 'master [^ ]+' | awk '{print $2}')
+        if [ -n "${_br}" ] && ! ip link show "${_br}" &>/dev/null 2>&1; then
+            warn "TAP 设备 ${TAP_DEVICE} 连接的网桥 ${_br} 已消失，重新配置..."
+            sudo bash "${SCRIPT_DIR}/setup_network.sh" 2>&1 || true
+        elif [ -z "${_br}" ]; then
+            warn "TAP 设备 ${TAP_DEVICE} 未连接到任何网桥，重新配置..."
+            sudo bash "${SCRIPT_DIR}/setup_network.sh" 2>&1 || true
         fi
     fi
 
