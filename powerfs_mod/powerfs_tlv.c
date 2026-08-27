@@ -544,8 +544,15 @@ int powerfs_tlv_dec_find_raw(struct powerfs_tlv_dec *dec, __u8 field,
             break;
 
         if (cur_field == field) {
-            *val = &dec->buf[dec->pos];
-            *len = cur_len;
+            /* NULL-safe output: callers may pass NULL val/len to probe
+             * field existence (e.g. pfs_rx_dispatch dentry-level notify
+             * NAME probe). Without these guards the probe would write
+             * through a NULL pointer and panic — observed oops:
+             * powerfs_tlv_dec_find_raw+0xa4 NULL deref (write access). */
+            if (val)
+                *val = &dec->buf[dec->pos];
+            if (len)
+                *len = cur_len;
             dec->pos += cur_len;
             return 0;
         }

@@ -276,23 +276,23 @@ mount_filesystem() {
     log_info "  Volume:    $VOLUME"
     log_info "  Mount:     $MOUNT_POINT"
     
-    # Build mount options
-    local mount_opts="filer=${filer_host}:${filer_port},master=${master_host}:${master_port},volume=${volume_host}:${volume_port}"
-    
-    # For multi-filer, pass as comma-separated
-    local filer_opt=""
-    local first=1
-    for addr in $(echo "$FILERS" | tr ',' ' '); do
-        if [ "$first" -eq 1 ]; then
-            filer_opt="$addr"
-            first=0
-        else
-            filer_opt="${filer_opt},${addr}"
-        fi
-    done
-    
-    mount_opts="filer=${filer_opt},master=${MASTER},volume=${VOLUME}"
-    
+    # Build mount options.
+    #
+    # IMPORTANT: PowerFS no longer reads master_addr/shard_count via
+    # module_param (global shared state). ALL per-mount parameters must
+    # be passed via -o key=val on the mount command line.  Accepted keys:
+    #   master_addr=host1,host2,host3  (required)
+    #   master_port=N                  (default 9334)
+    #   shard_count=N                  (default 3)
+    #   write_batch_kb=N               (default 64KB)
+    # Legacy "filer=" / "volume=" keys are silently ignored (they were
+    # never actually parsed; topology is discovered via Master).
+    local master_host master_port
+    master_host="${MASTER%:*}"
+    master_port="${MASTER#*:}"
+
+    local mount_opts="master_addr=${master_host},master_port=${master_port},shard_count=${POWERFS_SHARD_COUNT:-3}"
+
     log_info "  mount -t powerfs -o $mount_opts none $MOUNT_POINT"
     
     # Check if filer is reachable

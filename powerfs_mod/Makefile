@@ -12,13 +12,54 @@ MODULE_NAME := powerfs
 obj-m += $(MODULE_NAME).o
 $(MODULE_NAME)-objs := \
     powerfs_mod.o \
-    powerfs_fs.o \
+    powerfs_super.o \
+    powerfs_inode.o \
+    powerfs_file.o \
+    powerfs_dir.o \
+    powerfs_addr.o \
+    powerfs_dentry.o \
+    powerfs_caps.o \
+    powerfs_locks.o \
+    powerfs_lease.o \
+    powerfs_xattr.o \
     powerfs_net.o \
+    powerfs_net_shard.o \
+    powerfs_net_sock.o \
+    powerfs_net_conn.o \
+    powerfs_net_req.o \
+    powerfs_net_inode.o \
+    powerfs_net_data.o \
+    powerfs_net_xattr.o \
+    powerfs_net_pool.o \
+    powerfs_net_discover.o \
+    powerfs_net_lease.o \
     powerfs_tlv.o \
     powerfs_transport.o \
     powerfs_serializer.o \
     powerfs_flow.o \
-    powerfs_ec.o
+    powerfs_ec.o \
+    page_cache.o
+
+# NOTE: tlk_codec.o / lock_client.o have been REMOVED from the kernel link.
+#
+# Both modules were dead code (grep confirms zero FS/NET callers):
+#   - tlk_codec.c/h defined an independent wire protocol (msg_type + length
+#     LE + TLK_FIELD_*) that was never plugged into the powerfs-net TLV
+#     transport layer; the actual cap negotiation uses MsgType 0x91~0x95
+#     in powerfs_net_cap_* (powerfs_net.c + powerfs_fs.c cap_open_grant).
+#   - lock_client.c's acquire/release/renew/revoke_ack all returned
+#     -ENOSYS when transport == NULL, and the transport was never wired
+#     up; the per-inode MDLock state machine (powerfs_mdlock_rdlock etc.)
+#     was declared but never called from any VFS path.
+#
+# Architecture alignment (Ceph MDS Locker model): lock arbitration / state
+# machines live *exclusively* on the Filer leader (lock_arbiter.rs).
+# Kernel/FUSE clients only cache cap tokens + issued bits and respond to
+# recall by flushing dirty pages + sending CapRecallAck (0x92).
+#
+# The files remain in-tree for source history / future audit; the
+# independent userspace round-trip target (make test_codec) still works
+# via the explicit tlk_codec.c file list below.
 
 # 编译选项
 ccflags-y += -Wall -Wextra -Wno-unused-parameter
@@ -58,6 +99,7 @@ all:
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
 	@rm -f *.o *.ko *.mod *.mod.c *.mod.o .*.o.cmd .*.cmd
+	@rm -f test_tlk_codec
 
 install:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules_install
@@ -82,6 +124,23 @@ test:
 	@echo "  lsmod | grep powerfs"
 	@echo "  dmesg | tail -20"
 	@echo "  mount -t powerfs /dev/null /mnt/powerfs"
+
+# Userspace codec round-trip test (phase 4-6 §6e).
+# Compiles tlk_codec.c with -U__KERNEL__ to validate the dual-environment
+# codec against test_tlk_codec.c. The kernel build picks the same .c
+# file up via $(MODULE_NAME)-objs above; this target is independent so
+# the codec can be regression-tested without a kernel tree.
+TLK_CODEC_CFLAGS := -Wall -Wextra -Werror -U__KERNEL__ -I$(PWD)
+
+test_codec: test_tlk_codec.c tlk_codec.c tlk_codec.h
+	$(CC) $(TLK_CODEC_CFLAGS) -o test_tlk_codec \
+		test_tlk_codec.c tlk_codec.c
+	@echo "=== running tlk_codec round-trip tests ==="
+	./test_tlk_codec
+	@echo "=== all tests passed ==="
+
+clean_codec:
+	@rm -f test_tlk_codec
 
 # 开发辅助命令
 help:

@@ -20,53 +20,63 @@
 
 #include "powerfs.h"
 
-/* ========== 模块参数 ==========
+/* ========== fs_context 参数解析 ==========
  *
- * 架构: 只需配置 Master 地址 (3 个), Filer/Volume 地址全部通过
- * Master 动态发现 (GetTopology / ListFilers).
- * 不再需要手动配置 filer_addr / volume_addr.
+ * 设计原则: ALL 挂载相关参数 (master_addr/master_port/shard_count
+ * /write_batch_kb) 必须通过 mount -o key=value 传递, 不能用
+ * module_param 全局共享. 否则同一 ko 被多次 mount 到不同集群时,
+ * 全局 module_param 会互相污染.
  *
- * 注意: master_port 必须是 net_port (9334), 不是 grpc_port (9333),
- * 因为内核通过 powerfs-net (TLV) 协议与 Master 通信.
+ * 需要 master_addr: 形如 "172.30.0.11,172.30.0.12,172.30.0.13" (Raft 3 节点).
+ * master_port: net_port (9334), 不是 gRPC_port (9333).
+ * shard_count: Filer shard 总数, 默认 3 (对齐 3 Filer × 3 shard).
  */
-
-static char *master_addr = "172.30.0.11,172.30.0.12,172.30.0.13";
-module_param(master_addr, charp, 0644);
-MODULE_PARM_DESC(master_addr, "Master server addresses (comma-separated, 3 nodes for Raft)");
-
-static ushort master_port = 9334;
-module_param(master_port, ushort, 0644);
-MODULE_PARM_DESC(master_port, "Master powerfs-net port (default 9334, not gRPC 9333)");
-
-ushort shard_count = 3;  /* 默认 3, 对齐 Filer 配置 (3 Filer × 3 shard) */
-module_param(shard_count, ushort, 0644);
-MODULE_PARM_DESC(shard_count, "Filer shard count for metadata routing (default 3)");
-
-/* ========== fs_context 参数解析 ========== */
 
 enum powerfs_param {
     Opt_master_addr,
     Opt_master_port,
+    Opt_shard_count,
     Opt_write_batch_kb,
+    Opt_ca_crt,
+    Opt_client_crt,
+    Opt_client_key,
 };
 
 static const struct fs_parameter_spec powerfs_fs_parameters[] = {
     fsparam_string("master_addr",  Opt_master_addr),
     fsparam_u32("master_port",     Opt_master_port),
+    fsparam_u32("shard_count",     Opt_shard_count),
     fsparam_u32("write_batch_kb",  Opt_write_batch_kb),
+    fsparam_string("ca_crt",       Opt_ca_crt),
+    fsparam_string("client_crt",   Opt_client_crt),
+    fsparam_string("client_key",   Opt_client_key),
     {}
 };
+
+/* Defaults — 按内核常见最佳实践, 网络地址不硬编码为外网可路由默认值,
+ * 只给端口/数量等非安全敏感字段合理默认.
+ * master_addr 默认留空 → fill_super 检测为空返回 -EINVAL. */
+#define POWERFS_DEFAULT_MASTER_PORT  9334
+#define POWERFS_DEFAULT_SHARD_COUNT  3
 
 struct powerfs_ctx {
     char master_addr[64];
     u16  master_port;
+    u16  shard_count;
     u32  write_batch_kb;
+    /* 证书路径: 由 mount -o ca_crt=/... client_crt=/... client_key=/... 传入.
+     * 空字符串代表未提供, 由 Master net_handler 在强制模式下拒绝挂载.
+     * 路径长度上限 511B (兼容大多数绝对路径场景). */
+    char ca_crt[512];
+    char client_crt[512];
+    char client_key[512];
 };
 
 /* ========== 外部函数声明 (在 powerfs_fs.c 中定义) ========== */
 
 extern int  powerfs_init_inode_cache(void);
 extern void powerfs_destroy_inode_cache(void);
+extern void powerfs_dentry_dedup_destroy_all(void);
 
 /* Phase 2: 流控模块 */
 extern int  powerfs_flow_init(void);
@@ -75,6 +85,71 @@ extern int  powerfs_fill_super(struct super_block *sb, struct fs_context *fc);
 extern void powerfs_kill_sb_super(struct super_block *sb);
 
 /* ========== parse_param: 解析挂载参数 ========== */
+
+/* 辅助: 判断字符串是否像 IPv4 地址 "x.x.x.x" (每段 0-255, 4 段).
+ * 注意: 只做启发式判定 (digit+dot 组成且有 3 个 dot),
+ * 不严格校验范围, 后续 powerfs_net_tcp_connect 内 in4_pton 会严格校验. */
+static inline bool powerfs_looks_like_ipv4(const char *s)
+{
+    int dots = 0;
+    const char *p;
+    if (!s || !*s)
+        return false;
+    for (p = s; *p; p++) {
+        if (*p == '.')
+            dots++;
+        else if (*p < '0' || *p > '9')
+            return false;
+    }
+    return (dots == 3);
+}
+
+/* 辅助: 把 "master_addr 值" 和后续 "IP 形 stray options" 用逗号
+ * 连接到 ctx->master_addr (cap at sizeof-1). 处理两种常见写法:
+ *   A) mount -o master_addr=172.30.0.11,172.30.0.12,172.30.0.13,...
+ *        → util-linux/VFS 按逗号拆成多个 param:
+ *            {key="master_addr", string="172.30.0.11"}
+ *            {key="172.30.0.12"}  (无 value, -ENOPARAM 路径)
+ *            {key="172.30.0.13"}
+ *        → 我们用 L86 -ENOPARAM 分支抓取 stray IP keys 并 append.
+ *   B) mount -o master_addr=172.30.0.11:172.30.0.12:172.30.0.13
+ *        → 单个 string param, 内部用 ':' 分隔.
+ * 我们先把所有 ',' (内部拼接) 和 ':' (B 写法) 统一成 ',' 存 ctx,
+ * 后续 discover_filers 里 strsep(&p, ",") 就能正确拆分. */
+static int powerfs_ctx_append_master(struct powerfs_ctx *ctx, const char *more)
+{
+    size_t cur, left, need;
+    char *dst;
+
+    if (!ctx || !more || !*more)
+        return 0;
+
+    /* B 写法: 把 more 里的 ':' 统一成 ','. */
+    /* 先计算 needed 长度: more 原长度 + 可能的 leading ','. */
+    cur = strlen(ctx->master_addr);
+    need = strlen(more);
+    if (cur > 0)
+        need += 1;  /* leading comma */
+
+    if (cur + need >= sizeof(ctx->master_addr))
+        return -ENAMETOOLONG;
+
+    dst = &ctx->master_addr[cur];
+    left = sizeof(ctx->master_addr) - cur - 1;
+    if (cur > 0) {
+        *dst++ = ',';
+        left--;
+    }
+    strncpy(dst, more, left);
+    dst[left] = '\0';
+
+    /* 将新追加部分的 ':' 转成 ','. */
+    for (dst = &ctx->master_addr[cur ? cur + 1 : 0]; *dst; dst++) {
+        if (*dst == ':')
+            *dst = ',';
+    }
+    return 0;
+}
 
 static int powerfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 {
@@ -86,6 +161,18 @@ static int powerfs_parse_param(struct fs_context *fc, struct fs_parameter *param
 
     opt = fs_parse(fc, powerfs_fs_parameters, param, &result);
     if (opt == -ENOPARAM) {
+        /* 未识别参数: 可能是 A 写法下逗号拆出的 "master_addr 第二个 IP".
+         *    key = "172.30.0.12" / "172.30.0.13" 等 IPv4 字符串, 无 value.
+         * 若 match, 追加到 ctx->master_addr;
+         * 否则交给 vfs source parse, 不识别就静默忽略 (对齐 -ENOPARAM
+         * 常见行为: 避免 mount 因拼写错误参数时直接 EINVAL 不好排查,
+         * 我们仍然会在 fill_super 强校验 master_addr 非空, 所以不会静默连错). */
+        if (powerfs_looks_like_ipv4(param->key)) {
+            int rc = powerfs_ctx_append_master(ctx, param->key);
+            pr_info("powerfs: parse_param: stray-IP key '%s' appended to master_addr (rc=%d, now='%s')\n",
+                    param->key, rc, ctx->master_addr);
+            return rc;
+        }
         opt = vfs_parse_fs_param_source(fc, param);
         if (opt != -ENOPARAM)
             return opt;
@@ -95,17 +182,53 @@ static int powerfs_parse_param(struct fs_context *fc, struct fs_parameter *param
         return opt;
 
     switch (opt) {
-    case Opt_master_addr:
-        strncpy(ctx->master_addr, param->string, sizeof(ctx->master_addr) - 1);
+    case Opt_master_addr: {
+        /* 重置再 append: 支持 B 写法内部 ':' 分隔 + 之后再跟 stray keys 逗号追加. */
+        ctx->master_addr[0] = '\0';
+        powerfs_ctx_append_master(ctx, param->string);
         pr_info("powerfs: master_addr = %s\n", ctx->master_addr);
         break;
+    }
     case Opt_master_port:
         ctx->master_port = (u16)result.uint_32;
         pr_info("powerfs: master_port = %u\n", ctx->master_port);
         break;
+    case Opt_shard_count:
+        if (result.uint_32 == 0) {
+            pr_err("powerfs: shard_count must be > 0\n");
+            return -EINVAL;
+        }
+        if (result.uint_32 > 65535) {
+            pr_err("powerfs: shard_count %u exceeds u16 max\n", result.uint_32);
+            return -ERANGE;
+        }
+        ctx->shard_count = (u16)result.uint_32;
+        pr_info("powerfs: shard_count = %u\n", ctx->shard_count);
+        break;
     case Opt_write_batch_kb:
         ctx->write_batch_kb = result.uint_32;
         pr_info("powerfs: write_batch_kb = %u\n", ctx->write_batch_kb);
+        break;
+    case Opt_ca_crt:
+        if (param->string) {
+            strncpy(ctx->ca_crt, param->string, sizeof(ctx->ca_crt) - 1);
+            ctx->ca_crt[sizeof(ctx->ca_crt) - 1] = '\0';
+            pr_info("powerfs: ca_crt = %s\n", ctx->ca_crt);
+        }
+        break;
+    case Opt_client_crt:
+        if (param->string) {
+            strncpy(ctx->client_crt, param->string, sizeof(ctx->client_crt) - 1);
+            ctx->client_crt[sizeof(ctx->client_crt) - 1] = '\0';
+            pr_info("powerfs: client_crt = %s\n", ctx->client_crt);
+        }
+        break;
+    case Opt_client_key:
+        if (param->string) {
+            strncpy(ctx->client_key, param->string, sizeof(ctx->client_key) - 1);
+            ctx->client_key[sizeof(ctx->client_key) - 1] = '\0';
+            pr_info("powerfs: client_key = %s\n", ctx->client_key);
+        }
         break;
     }
 
@@ -140,26 +263,22 @@ static int powerfs_init_fs_context(struct fs_context *fc)
 {
     struct powerfs_ctx *ctx;
 
-    pr_info("powerfs: init_fs_context called, master_addr=%s, shard_count=%u\n",
-            master_addr, shard_count);
-
     ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
     if (!ctx)
         return -ENOMEM;
 
-    /* 默认值 */
-    strncpy(ctx->master_addr, master_addr, sizeof(ctx->master_addr) - 1);
-    ctx->master_port = master_port;
-
-    /* writepages 批量大小默认 64KB (16 pages).
-     * ROCE 网络可挂载时设为 1024 (1MB) ~ 65536 (64MB stripe). */
+    /* 默认值: 只给端口/shard_count/写批大小等非安全敏感字段合理默认.
+     * master_addr 留空, mount 时必须传;
+     * fill_super 会检查并在未提供时返回 -EINVAL, 避免连接到意外的集群. */
+    ctx->master_port = POWERFS_DEFAULT_MASTER_PORT;
+    ctx->shard_count = POWERFS_DEFAULT_SHARD_COUNT;
     ctx->write_batch_kb = POWERFS_WRITE_BATCH_DEFAULT_KB;
 
     fc->s_fs_info = ctx;
     fc->ops = &powerfs_ctx_ops;
 
-    pr_info("powerfs: init_fs_context done, ctx=%px, master_addr=%s\n",
-            ctx, ctx->master_addr);
+    pr_info("powerfs: init_fs_context done, ctx=%px (expect mount -o master_addr=...,master_port=,shard_count=)\n",
+            ctx);
 
     return 0;
 }
@@ -238,6 +357,7 @@ static void __exit powerfs_exit(void)
     powerfs_comm_exit();
     powerfs_flow_exit();
     powerfs_destroy_inode_cache();
+    powerfs_dentry_dedup_destroy_all();
 
     pr_info("powerfs: module unloaded\n");
 }

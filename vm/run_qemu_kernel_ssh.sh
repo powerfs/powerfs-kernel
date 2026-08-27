@@ -6,7 +6,8 @@
 
 set -e
 
-OUTPUT_DIR="/home/portion/powerfs/kernel/vm/output"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUTPUT_DIR="${SCRIPT_DIR}/output"
 KERNEL_IMAGE="${OUTPUT_DIR}/bzImage"
 INITRAMFS="${OUTPUT_DIR}/initramfs.cpio.gz"
 QEMU_DISK="${OUTPUT_DIR}/qemu_disk.img"
@@ -30,6 +31,9 @@ POWERFS_MASTER_ADDR="${POWERFS_MASTER_ADDR:-172.30.0.11,172.30.0.12,172.30.0.13}
 POWERFS_MASTER_PORT="${POWERFS_MASTER_PORT:-9334}"
 POWERFS_VOLUME_ADDR="${POWERFS_VOLUME_ADDR:-172.30.0.21,172.30.0.22,172.30.0.23}"
 POWERFS_VOLUME_PORT="${POWERFS_VOLUME_PORT:-8901}"
+
+# 9p 共享目录 (Host <-> VM 文件共享, 用于 hot deploy powerfs.ko 和测试脚本)
+SHARE_DIR="${SCRIPT_DIR}/share"
 
 # QEMU 参数
 MEM_SIZE="4096"
@@ -106,8 +110,10 @@ CMDLINE="${CMDLINE} wq_watchdog_thresh=0"
 CMDLINE="${CMDLINE} slub_debug=FZP"
 CMDLINE="${CMDLINE} rcupdate.rcu_cpu_stall_suppress=0"
 
-# 启动 QEMU (双网卡模式)
+# 启动 QEMU (双网卡模式 + 9p 共享)
 # 使用 sudo 以获取 KVM 访问权限
+# 9p virtfs: mount_tag=hostshare, VM 中 mount -t 9p -o trans=virtio hostshare /mnt/host
+# security_model=passthrough: 保留 Host 文件权限 (root 可读写)
 sudo qemu-system-x86_64 \
     ${KVM_ENABLED} \
     -m "${MEM_SIZE}" \
@@ -120,6 +126,7 @@ sudo qemu-system-x86_64 \
     -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56 \
     -netdev user,id=net1,hostfwd=tcp::${SSH_PORT}-:${VM_SSH_PORT} \
     -device e1000,netdev=net1,mac=52:54:00:12:34:57 \
+    -virtfs local,path="${SHARE_DIR}",mount_tag=hostshare,security_model=passthrough,id=hostshare \
     -nographic \
     -serial mon:stdio \
     -monitor none \

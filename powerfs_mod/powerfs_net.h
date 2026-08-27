@@ -62,8 +62,10 @@
 /* Phase 2: 元数据操作短超时 (ms).
  * create/unlink/rename/symlink/link 等在 VFS 持有 i_rwsem 写锁时调用,
  * 必须快速完成或失败, 避免长时间阻塞目录操作.
- * 5s 足够覆盖正常 LAN RPC (<10ms) + 重连 (3s) + 重试. */
-#define POWERFS_META_TIMEOUT_MS         5000    /* metadata ops: 5s */
+ * 15s: 覆盖正常 LAN RPC (<10ms) + Raft 选举 (~3s) + 多轮 redirect
+ * 回退重试 (4 轮 x 1.6s = 6.4s) + 安全余量. 之前 5s 在 3-Filer Raft
+ * 选举抖动 + self-redirect 黑名单 TTL 回退下频繁 deadline exceed. */
+#define POWERFS_META_TIMEOUT_MS         15000   /* metadata ops: 15s */
 
 /* 断连窗口: 断连后 5s 内视为 "最近断连", lookup/readdir 用短超时 */
 #define POWERFS_RECENT_DISCONNECT_MS    5000
@@ -139,6 +141,34 @@ enum powerfs_net_msg_type {
      * Response: VolumeId + FileKey(needle_id) */
     POWERFS_NET_MSG_MIGRATE_INLINE_ALLOC = 0x0037,
 
+    /* ===== Xattr 消息 (值必须与 Rust MsgType 枚举一致) =====
+     *
+     * SetXattr:   Client→Filer, 设置/覆盖单个 xattr (持久化到 Raft).
+     *             Request:  ShardId + Ino + XattrKey(string) + XattrValue(bytes)
+     *             Response: Status only
+     * GetXattr:   Client→Filer, 查询单个 xattr 值.
+     *             Request:  ShardId + Ino + XattrKey(string)
+     *             Response: XattrValue(bytes) 或 STATUS_ERR_NOT_FOUND
+     * RemoveXattr: Client→Filer, 删除单个 xattr (原子 Raft 持久化).
+     *             Request:  ShardId + Ino + XattrKey(string)
+     *             Response: Status only
+     * ListXattr:  Client→Filer, 枚举 inode 上所有 xattr 键名 (listxattr(2)).
+     *             Request:  ShardId + Ino
+     *             Response: XattrKeys (NUL-separated bytes) 或 empty body */
+    POWERFS_NET_MSG_SET_XATTR    = 0x0038,
+    POWERFS_NET_MSG_GET_XATTR    = 0x0039,
+    POWERFS_NET_MSG_REMOVE_XATTR = 0x003a,
+    POWERFS_NET_MSG_LIST_XATTR   = 0x003b,
+    /* Two-phase mkdir (client-routed, no server forwarding):
+     *   AllocInodeBatch (0x0033) + MkdirPhaseA (0x003c, target_shard) +
+     *   MkdirPhaseB (0x003d, parent_shard).  Required when
+     *   target_shard != parent_shard so the server does NOT have to
+     *   cross-propose to a different Raft group leader.  Value MUST match
+     *   powerfs-net/src/protocol.rs MsgType enum. */
+    POWERFS_NET_MSG_ALLOC_INODE_BATCH = 0x0033,
+    POWERFS_NET_MSG_MKDIR_PHASE_A     = 0x003c,
+    POWERFS_NET_MSG_MKDIR_PHASE_B     = 0x003d,
+
     /* 状态 */
     POWERFS_NET_MSG_STATFS = 0x0040,
 
@@ -147,10 +177,39 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_HEARTBEAT = 0x0052,
     POWERFS_NET_MSG_KEEP_CONNECTED = 0x0053,
     POWERFS_NET_MSG_VOLUME_LIST = 0x0054,
+    /* RegisterClient (0x0055): FUSE/kernel → Master 注册 client_uuid,
+     * 获取 master 统一分配的 assigned_client_id(u64).
+     * 同时 Master 检查 client_uuid 黑名单:
+     *   STATUS_OK(0) = 挂载允许, assigned_id 回传在 FieldId::ClientId
+     *   STATUS_ERR_PERMISSION_DENIED(3) = 黑名单拒绝挂载
+     *   STATUS_ERR_REDIRECT(11) = 非 leader 重定向
+     * Req: ClientUuid + Backend(type) + Name(mount) + Collection + Replication
+     *      + Owner(host) + Limit(pid)
+     * Resp: ClientId(assigned u64) + Owner(leader) + MountAllowed(u8) */
+    POWERFS_NET_MSG_REGISTER_CLIENT = 0x0055,
+    /* DeregisterClient (0x0056): 客户端 umount 时向 master 优雅下线,
+     * 提前移除心跳注册表项 (不用等到 heartbeat age 超时).
+     * Req: ClientUuid + ClientId(assigned)
+     * Resp: Owner(leader) */
+    POWERFS_NET_MSG_DEREGISTER_CLIENT = 0x0056,
 
-    /* Master topology & discovery */
+    /* Master topology & discovery
+     * 与 Rust powerfs-net/protocol.rs MsgType 枚举完全对齐:
+     *   GetTopology(0x70) / WatchTopology(0x71) / TopologyChanged(0x72) /
+     *   AssignVolumeV2(0x73) / ListFilers(0x74) / ShardLeaderUpdate(0x75) */
     POWERFS_NET_MSG_GET_TOPOLOGY = 0x0070,
+    POWERFS_NET_MSG_WATCH_TOPOLOGY = 0x0071,
+    /* Master → Client NOTIFY frame (seq=0, NOTIFY flag, empty body).
+     * Triggers after the Master receives a ShardLeaderUpdate from a filer
+     * whose shard_leader table actually changed. On receipt, clients
+     * asynchronously re-GET_TOPOLOGY to pick up the new per-shard leader
+     * map (zero-redirect fast path) instead of waiting for a lazy
+     * STATUS_ERR_REDIRECT from a stale follower. */
+    POWERFS_NET_MSG_TOPOLOGY_CHANGED = 0x0072,
     POWERFS_NET_MSG_LIST_FILERS = 0x0074,
+    /* Filer → Master, MsgType=0x0075; kernel client doesn't originate but
+     * keeps the constant for protocol audit/trace consistency. */
+    POWERFS_NET_MSG_SHARD_LEADER_UPDATE = 0x0075,
 
     /* Volume 操作 */
     POWERFS_NET_MSG_CREATE_VOLUME = 0x0060,
@@ -171,6 +230,32 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_ACQUIRE_LEASE = 0x0080,
     POWERFS_NET_MSG_RELEASE_LEASE = 0x0081,
     POWERFS_NET_MSG_RENEW_LEASE = 0x0082,
+
+    /* ===== Capability (§13 Cap model) 消息 — 值必须与 Rust MsgType 枚举一致 =====
+     *
+     * CapOpenGrant:   Client→Filer, open() 时申请初始 cap (同步 RPC)
+     *                 Request:  Ino + ClientId + IsWriteOpen
+     *                 Response: Status + LeaseToken + CapSet + CapEpoch + CapSn
+     *
+     * CapRecallAck:   Client→Filer, 收到 recall notify 后 flush 完成, 归还 cap
+     *                 Request:  Ino + ClientId + LeaseToken
+     *                 Response: Status only
+     *
+     * CapRelease:     Client→Filer, release/close 时主动释放 cap, 触发 upgrade 判定
+     *                 Request:  Ino + ClientId + LeaseToken
+     *                 Response: Status + HasUpgrade + (optional)UpgradeTask(LeaseToken/CapSet/CapEpoch/CapSn)
+     *
+     * CapRecallNotify:  Filer→Client (push, NOTIFY flag), 服务端撤销 cap
+     *                   TLV: Ino + LeaseToken + CapSet(recall_mask) + CapSet(retain_mask) + CapEpoch
+     *
+     * CapUpgradeNotify: Filer→Client (push, NOTIFY flag), 存活 writer 升级到 EXCLUSIVE
+     *                   TLV: Ino + LeaseToken + CapSet(new_granted) + CapEpoch + CapSn
+     */
+    POWERFS_NET_MSG_CAP_OPEN_GRANT = 0x0091,
+    POWERFS_NET_MSG_CAP_RECALL_ACK = 0x0092,
+    POWERFS_NET_MSG_CAP_RELEASE = 0x0093,
+    POWERFS_NET_MSG_CAP_RECALL_NOTIFY = 0x0094,
+    POWERFS_NET_MSG_CAP_UPGRADE_NOTIFY = 0x0095,
 };
 
 /* ========== 响应状态码 ========== */
@@ -227,6 +312,9 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_ENTRIES = 0x23,
     POWERFS_NET_FLD_COUNT = 0x24,
     POWERFS_NET_FLD_ENTRY = 0x25,
+    /* Message (0x26): RegisterClient 拒绝理由 (字符串),
+     * 以及通用 human-readable 错误信息. 对齐 Rust FieldId::Message = 0x26. */
+    POWERFS_NET_FLD_MESSAGE = 0x26,
     POWERFS_NET_FLD_VERSION = 0x19,  /* matches Rust FieldId::Version */
 
     /* Delta 同步字段 */
@@ -234,6 +322,14 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_SEQ = 0x31,
     POWERFS_NET_FLD_VCLOCK_ENTRIES = 0x32,
     POWERFS_NET_FLD_DELTA_OPS = 0x33,
+
+    /* 请求追踪字段 (Exactly-Once 语义), 对齐 Rust FieldId:
+     *   RequestId = 0x60, ClientUuid = 0x61, ChannelId = 0x62, ShardHash = 0x63.
+     * ClientUuid 是 RegisterClient/DeregisterClient 的主键. */
+    POWERFS_NET_FLD_REQUEST_ID = 0x60,
+    POWERFS_NET_FLD_CLIENT_UUID = 0x61,
+    POWERFS_NET_FLD_CHANNEL_ID = 0x62,
+    POWERFS_NET_FLD_SHARD_HASH = 0x63,
 
     /* K1-6: ShardId (u64), 对齐 powerfs-net FieldId::ShardId (0x70).
      * 用于 UpdateInodeSizeChunks 等需 shard 路由的消息. */
@@ -251,6 +347,12 @@ enum powerfs_net_field_id {
     /* Lease Token (Volume Server lease validation, matches Rust FieldId::LeaseToken) */
     POWERFS_NET_FLD_LEASE_TOKEN = 0x80,
 
+    /* AssignVolume / RegisterClient 字段 (对齐 Rust FieldId):
+     *   Collection = 0x90, Replication = 0x91.
+     * Collection 是存储池名称, Replication 是冗余策略字符串. */
+    POWERFS_NET_FLD_COLLECTION = 0x90,
+    POWERFS_NET_FLD_REPLICATION = 0x91,
+
     /* Volume / Needle 字段 (数据直连 Volume Server) */
     POWERFS_NET_FLD_VOLUME_ID = 0x92,   /* volume_id (u64), needle 操作中复用 Ino 字段 */
     POWERFS_NET_FLD_FILE_KEY = 0x94,    /* needle_id / file_key (u64) */
@@ -258,6 +360,20 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_INODE_V2 = 0x97,    /* inode (u64), needle 操作中与 FileKey 并存 */
     POWERFS_NET_FLD_USED_SPACE = 0x98,  /* used space (u64), matches Rust FieldId::UsedSpace */
     POWERFS_NET_FLD_FILE_COUNT = 0x99,  /* file count (u64), matches Rust FieldId::FileCount */
+
+    /* ===== Master topology / filer discovery fields (0x9A-0x9F)
+     * 值必须与 Rust powerfs-net/protocol.rs FieldId 枚举完全一致,
+     * 同步更新于 protocol.rs ZoneId (0x9A) ~ ShardLeaderEntries (0x9F). */
+    POWERFS_NET_FLD_ZONE_ID = 0x9A,      /* Zone ID (u64), matches FieldId::ZoneId */
+    POWERFS_NET_FLD_SHARD_ID_LIST = 0x9B,/* Packed u64 LE array of shard ids (bytes), FieldId::ShardIdList */
+    POWERFS_NET_FLD_FILER_ADDRESS = 0x9C,/* Filer advertise address (string "ip:net_port"), FieldId::FilerAddress */
+    POWERFS_NET_FLD_NET_PORT = 0x9D,     /* Volume server TLV net port (u16?), matches FieldId::NetPort */
+    POWERFS_NET_FLD_RAFT_PAYLOAD = 0x9E, /* Serialized eraftpb::Message bytes, FieldId::RaftPayload */
+    /* Count of per-shard leader entries in GetTopology response (u64 LE).
+     * Followed by N × (ShardId=0x70 + FilerAddress=0x9C) pairs. Populated by
+     * the Master from ShardLeaderUpdate (0x0075) broadcasts so clients route
+     * RPCs directly to the shard leader (zero-redirect fast path). */
+    POWERFS_NET_FLD_SHARD_LEADER_ENTRIES = 0x9F,
 
     /* ===== FileLayout fields (0xA0-0xAF) — powerfs-layout crate ===== */
     POWERFS_NET_FLD_PLACEMENT = 0xA0,       /* Placement 编码 (u8 tag + 后续) */
@@ -282,9 +398,12 @@ enum powerfs_net_field_id {
     POWERFS_NET_FLD_END_INODE = 0xB1,       /* AllocInodeBatch 结束 (u64), 预留 */
     POWERFS_NET_FLD_OPEN_COUNT = 0xB2,      /* open_count (u32), 预留 */
 
-    /* ===== Xattr fields (0xB3-0xB4), 预留 ===== */
-    POWERFS_NET_FLD_XATTR_KEY = 0xB3,       /* xattr 键 (string), 预留 */
-    POWERFS_NET_FLD_XATTR_VALUE = 0xB4,     /* xattr 值 (bytes), 预留 */
+    /* ===== Xattr fields (0xB3-0xB4, 0xBC) — 对齐 Rust FieldId 枚举 ===== */
+    POWERFS_NET_FLD_XATTR_KEY = 0xB3,       /* xattr 键 (string), SetXattr/GetXattr/RemoveXattr 请求 */
+    POWERFS_NET_FLD_XATTR_VALUE = 0xB4,     /* xattr 值 (bytes), SetXattr 请求 / GetXattr 响应 */
+    /* XattrKeys (0xBC): ListXattr 响应, NUL-separated xattr 键名打包成 bytes.
+     * 对齐 Rust FieldId::XattrKeys = 0xBC. */
+    POWERFS_NET_FLD_XATTR_KEYS = 0xBC,
 
     /* ===== Replica fields (0xB5) ===== */
     POWERFS_NET_FLD_REPLICA_CHUNKS = 0xB5,  /* 副本 chunk 列表 (ChunkRef 二进制数组) */
@@ -295,6 +414,57 @@ enum powerfs_net_field_id {
     /* ===== Topology extensions (0xB8-0xBD) ===== */
     POWERFS_NET_FLD_TOTAL_SHARDS = 0xB8,      /* 全局 shard_count (u64), matches Rust FieldId::TotalShards */
     POWERFS_NET_FLD_SHARD_MAP_ENTRIES = 0xBD,  /* ShardMap entries blob (bytes), matches Rust FieldId::ShardMapEntries */
+
+    /* ===== Capability (Cap) model fields (0xC4-0xC8) — §13 =====
+     * 值必须与 Rust powerfs-net FieldId 枚举一致, 同步更新于:
+     *   powerfs-net/src/protocol.rs FieldId::CapSet (0xC4) ~ HasUpgrade (0xC8). */
+    /* CapSet bitfield (u8). 服务端 3-bit 编码:
+     *   CAP_R=0b001 (SHARED_READ, 读缓存), CAP_W=0b010 (写缓存), CAP_X=0b100 (元数据独占写).
+     *   组合: EXCLUSIVE_WRITE = 0b111 (CAP_R|CAP_W|CAP_X), 空集 = SHARED_WRITE. */
+    POWERFS_NET_FLD_CAP_SET = 0xC4,
+    /* CapEpoch (u64). 每次 recall/force-reclaim 递增, 存储层用 epoch 拦截过期客户端 IO. */
+    POWERFS_NET_FLD_CAP_EPOCH = 0xC5,
+    /* IsWriteOpen (u8, 0/1). CapOpenGrant 请求: 1 = O_WRONLY/O_RDWR, 0 = O_RDONLY.
+     * 服务端据此决定授予 EXCLUSIVE (单写者) 或 CAP_R (读者). */
+    POWERFS_NET_FLD_IS_WRITE_OPEN = 0xC6,
+    /* CapSn (u64). 服务端 leader 每次 grant 分配的全局序列号,
+     * 跨 cap handoff 排序 IO, 确保被撤销 grant 的 IO 排在新 grant 之后. */
+    POWERFS_NET_FLD_CAP_SN = 0xC7,
+    /* HasUpgrade (u8, 0/1). CapRelease 响应: 1 表示剩余唯一 writer 已升级到
+     * EXCLUSIVE_WRITE, 响应体追加 LeaseToken+CapSet+CapEpoch+CapSn 升级信息; 0 = 无升级. */
+    POWERFS_NET_FLD_HAS_UPGRADE = 0xC8,
+
+    /* ===== DirStat (rstat) recursive summary fields (0xCD-0xD1) ===== */
+    /* RBytes (u64 LE): 目录递归累计字节数 = 所有子孙 inode.size 之和.
+     * Filer 在每次 UpdateChildSummary 时沿祖先链增量维护, GETATTR/LOOKUP/READDIR
+     * 响应中仅目录 inode 携带此字段; 文件 inode 不编码此字段. */
+    POWERFS_NET_FLD_RBYTES = 0xCD,
+    /* RFiles (u64 LE): 目录递归累计普通文件数 (S_IFREG 子孙 inode 数). */
+    POWERFS_NET_FLD_RFILES = 0xCE,
+    /* RSubdirs (u64 LE): 目录递归累计子目录数 (S_IFDIR 子孙 inode 数). */
+    POWERFS_NET_FLD_RSUBDIRS = 0xCF,
+    /* RCtimeSec (u64 LE): 最近一次 rstat 聚合刷新时间戳 (seconds since epoch).
+     * 用于客户端判断缓存的目录聚合统计是否过期, 与 DirVersion 联用决定
+     * d_revalidate 是否需要重新拉取 GETATTR. */
+    POWERFS_NET_FLD_RCTIME_SEC = 0xD0,
+    /* RCtimeNsec (u32 LE): rctime 纳秒部分 (0-999999999). */
+    POWERFS_NET_FLD_RCTIME_NSEC = 0xD1,
+    /* MountAllowed (u8): RegisterClient 响应标志位, 1=允许挂载 0=拒绝.
+     * 拒绝理由通常在 Message(0x26) 字段给出. */
+    POWERFS_NET_FLD_MOUNT_ALLOWED = 0xD2,
+    /* RegistrationToken (string, TLV 0xD3): Filer/Volume 节点注册时携带的
+     * 注册令牌. 与 Rust 端 FieldId::RegistrationToken=0xD3 对齐. 当前内核
+     * 客户端 RegisterClient 不发此字段, 保留宏位避免 0xD3 空洞. */
+    POWERFS_NET_FLD_REGISTRATION_TOKEN = 0xD3,
+    /* ClientCert (string PEM, TLV 0xD4): 客户端证书 PEM 原文.
+     * Master 做 4 级校验: fingerprint∈registry ∧ 未吊销 ∧ now 在
+     * [issued_at,expires_at] ∧ peer_ip∈san_ips ∧ mount_point∈mount_dirs.
+     * 由 mount -o client_crt=<path> 读取文件 PEM 内容后嵌入此处,
+     * 与 Rust FieldId::ClientCert=0xD4 严格对齐. */
+    POWERFS_NET_FLD_CLIENT_CERT = 0xD4,
+    /* ClientCertSignature (bytes, TLV 0xD5, reserved): 客户端证书对请求体
+     * 的 HMAC/签名, 留作未来重放保护; 当前未使用, 预留字段位. */
+    POWERFS_NET_FLD_CLIENT_CERT_SIGNATURE = 0xD5,
 };
 
 /* ========== 帧头结构 (28 字节, packed) ========== */
@@ -462,9 +632,8 @@ enum powerfs_conn_state {
 };
 
 /*
- * 请求对象 (参照 Ceph ceph_osd_request / ceph_mds_request 设计)
  *
- * 关键设计 (学习 Ceph):
+ * 关键设计
  *   1. kref 引用计数: 多处持有请求时自动管理生命周期
  *   2. rb_node 红黑树: by seq 快速查找 (O(log n)), 用于 reply 匹配
  *   3. 断连重发: 请求不取消, 而是标记 r_needs_resend, 重连后自动重发
@@ -481,7 +650,6 @@ enum powerfs_conn_state {
  *   6. VFS 回调读取 resp_*, powerfs_request_free (kref_put → kfree)
  */
 struct powerfs_request {
-    /* === 红黑树节点 (参照 Ceph r_node) === */
     /* 挂到 filer->req_tree, by seq 快速查找, 用于 reply 匹配 */
     struct rb_node rb_node;
 
@@ -519,6 +687,8 @@ struct powerfs_request {
     int error;                  /* 最终错误码 (0=成功, <0=错误) */
     unsigned long deadline;     /* 超时 jiffies (0=使用默认) */
     u64 ts_submit;              /* 调试: do_send 入队时间 (ktime_get_ns, 0=未启用) */
+    u64 ts_sent;                /* 调试: TX 线程发送完成时间 (pfs_process_transmit) */
+    u64 ts_recv;                /* 调试: RX dispatch 入口时间 (帧收完, 匹配前) */
 
     /* === 异步超时 (仅 callback != NULL 时启用) ===
      * 同步请求用 do_send 内 wait_for_completion_killable_timeout 兜底;
@@ -528,7 +698,7 @@ struct powerfs_request {
     struct delayed_work timeout_work;
     bool timer_armed;
 
-    /* === 重发控制 (参照 Ceph r_attempts) === */
+    /* === 重发控制 (参照 r_attempts) === */
     int attempts;               /* 发送尝试次数 */
     bool needs_resend;          /* 断连后标记, 重连后自动重发 */
 #define POWERFS_REQ_MAX_ATTEMPTS  5
@@ -542,7 +712,7 @@ struct powerfs_request {
 
     /* === 关联 === */
     struct powerfs_net_server_conn *filer;  /* 发往哪个 filer (NULL=未绑定) */
-    struct kref kref;                      /* 引用计数 (参照 Ceph r_kref) */
+    struct kref kref;                      /* 引用计数 (参照 r_kref) */
 };
 
 /* 请求分配/释放 */
@@ -579,7 +749,7 @@ struct powerfs_net_server_conn {
     __u64 client_id;            /* 本连接的 client_id (握手时分配, 帧头 route_hash 用) */
     __u8 channel;               /* 通路类型: 0=data, 1=meta (握手时设置) */
 
-    /* === 请求追踪 (参照 Ceph out_queue + out_sent) === */
+    /* === 请求追踪 (参照  out_queue + out_sent) === */
     /* pending_reqs: 已发送等待响应的请求 (链表, 按发送顺序) */
     struct list_head pending_reqs;
     /* req_tree: 按 seq 查找请求 (红黑树, O(log n), 用于 reply 匹配) */
@@ -628,7 +798,7 @@ struct powerfs_net_server_conn {
      * 才 sock_release, 防止调度器在飞时 UAF. */
     struct kref kref;
 
-    /* === 指数退避 (参照 Ceph con->delay) === */
+    /* === 指数退避 (参照  con->delay) === */
     unsigned long reconnect_delay;  /* 当前退避间隔 (jiffies) */
 #define POWERFS_NET_BASE_DELAY    1000    /* 初始 1s */
 #define POWERFS_NET_MAX_DELAY     30000   /* 最大 30s */
@@ -745,7 +915,7 @@ static inline const char *powerfs_conn_state_str(enum powerfs_conn_state s)
 /* ========== 连接池 API (新架构) ========== */
 
 /* 初始化连接池 (从 Master 发现 filer/volume 列表) */
-int powerfs_conn_pool_init(const char *master_addr, __u16 master_port);
+int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count);
 
 /* 连接池清理 */
 void powerfs_conn_pool_exit(void);
@@ -796,7 +966,7 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn);
 void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
                             enum powerfs_conn_state new_state);
 
-/* === 请求生命周期 (参照 Ceph osd_request 设计) === */
+/* === 请求生命周期 (参照  osd_request 设计) === */
 
 /*
  * 提交请求并通过连接池发送 (主入口, 替代 powerfs_net_send_request)
@@ -807,7 +977,7 @@ void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
  *   3. CHECKING: 尝试其他 filer, 或将请求挂到 shard pending 队列
  *   4. UNKNOWN: 挂到 shard pending 队列等待, 或返回 -EAGAIN
  *   5. 发送+接收, 处理 REDIRECT (更新路由表, 重试)
- *   6. 断连: 标记 needs_resend, 重连后自动重发 (参照 Ceph con_fault)
+ *   6. 断连: 标记 needs_resend, 重连后自动重发 (参照  con_fault)
  *
  * 返回 req->error (0=成功, <0=错误)
  */
@@ -911,6 +1081,27 @@ struct powerfs_net_pool {
     atomic_t last_failover_time;
     struct mutex pool_lock;
     struct delayed_work leader_check_work;
+
+    /* === KeepConnected 心跳 (对齐 FUSE MasterStatsReporter 30s 周期) ===
+     * 向 Master 周期发送 MsgType::KeepConnected(0x0053), 刷新 client 注册
+     * last_heartbeat 并维持 Admin/Client 通道活跃 (防止 ~55s 后断链/EAGAIN).
+     * 所有字符串字段来自 fill_super register_client 路径，存一份副本到 g_pool
+     * 避免回调依赖 powerfs_sb / sbi->client 生命周期 (kill_sb 清理顺序有交叉).
+     * WQ: g_pool.reconn_wq (UNBOUND, 适配 blocking socket I/O). */
+    struct delayed_work heartbeat_work;
+    bool              heartbeat_started;
+#define POWERFS_HB_INTERVAL_SECS 30
+    char              hb_client_uuid[64];
+    char              hb_client_type[16];  /* "kernel" */
+    char              hb_mount_point[256];
+    char              hb_collection[64];
+    char              hb_replication[32];
+    char              hb_host[64];
+    __u64             hb_pid;
+    u64               hb_assigned_client_id;  /* 0 = 未注册 */
+    /* client_crt 路径: 心跳不长期持 PEM, 每次心跳按需读堆 (和 register_client
+     * 一致). 路径空 = dev mode, 跳过 0xD4 嵌入. */
+    char              hb_client_crt[256];
 };
 
 /* ========== 连接管理 API (增强版) ========== */
@@ -995,6 +1186,19 @@ int powerfs_net_send_request(__u16 msg_type, u64 route_inode,
                              size_t *resp_body_len_out,
                              size_t *resp_data_len_out);
 
+/* Direct-shard variant: routes to `explicit_shard_id` instead of
+ * calculating via calc_shard_id(route_inode). Used for two-phase mkdir,
+ * AllocInodeBatch, etc., where the request must go to a specific shard
+ * unrelated to any particular inode number. */
+int powerfs_net_send_request_shard(__u16 msg_type, __u64 explicit_shard_id,
+                                   const __u8 *body, size_t body_len,
+                                   const __u8 *data, size_t data_len,
+                                   __u8 *resp_body, size_t resp_body_cap,
+                                   __u8 *resp_data, size_t resp_data_cap,
+                                   int timeout_ms,
+                                   size_t *resp_body_len_out,
+                                   size_t *resp_data_len_out);
+
 u64 powerfs_calc_shard_id(u64 inode);
 
 /* ========== 便捷方法 ========== */
@@ -1041,7 +1245,13 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
                          __u64 *size, __u32 *nlink,
                          __u64 *mtime, __u64 *atime, __u64 *ctime,
                          __u64 *volume_id, __u64 *file_key,
-                         struct powerfs_file_layout *layout);
+                         struct powerfs_file_layout *layout,
+                         /* P1-5: 输出参数（均可为 NULL = 不需要）
+                          * 目录 inode: 返回递归累计 rbytes/rfiles/rsubdirs;
+                          * 文件 inode: Filer 不编码这些字段, 保持 *out 不变.
+                          * rctime: 最近一次 rstat 聚合刷新时间 (dir-only). */
+                         __u64 *rbytes_out, __u64 *rfiles_out, __u64 *rsubdirs_out,
+                         __u64 *rctime_sec_out, __u32 *rctime_nsec_out);
 
 /* SETATTR
  * mtime/atime: unix seconds (seconds since epoch), only sent when
@@ -1154,6 +1364,51 @@ int powerfs_net_readlink(__u64 ino, char *target, size_t target_cap);
 /* LINK (硬链接) */
 int powerfs_net_link(__u64 ino, __u64 dir_ino, const char *name, size_t name_len);
 
+/* ===== Xattr API (对齐 Rust MsgType::SetXattr/GetXattr/RemoveXattr/ListXattr) =====
+ *
+ * 通用参数:
+ *   shard_id:  Filer 路由用 shard ID (通常 = 父目录 inode).
+ *             Filer 内部 calculate_shard(inode) = (inode/1_000_000) % total_shards,
+ *             但 xattr 请求按设计把路由键编码在 ShardId 字段，由客户端预计算.
+ *   ino:       目标 inode 号.
+ *   name/name_len: xattr 键 (NUL-terminated C 字符串, 不含 '\0' 的长度).
+ *
+ * 错误映射:
+ *   STATUS_ERR_NOT_FOUND(1) → -ENODATA (xattr 未设置)
+ *   STATUS_ERR_PERMISSION(3) → -EPERM
+ *   STATUS_ERR_INVALID_ARG(5) → -EINVAL
+ *   其余错误 → -EIO */
+
+/* SetXattr: 设置或覆盖 xattr 键值 (Raft 持久化).
+ * value/value_len: xattr 值 (bytes, 可含任意二进制). value_len=0 合法 (空值).
+ * 返回 0 成功, <0 错误. */
+int powerfs_net_setxattr(__u64 shard_id, __u64 ino,
+                         const char *name, size_t name_len,
+                         const __u8 *value, size_t value_len);
+
+/* GetXattr: 查询单个 xattr 值.
+ * value_out/value_cap: 调用方提供缓冲区. 若 *value_len_out > value_cap, 所需长度
+ *                     写入 *value_len_out 并返回 -ERANGE (VFS listxattr probe 语义).
+ * value_len_out:      输出, 实际 value 字节数. 未设置 xattr → 返回 -ENODATA. */
+int powerfs_net_getxattr(__u64 shard_id, __u64 ino,
+                         const char *name, size_t name_len,
+                         __u8 *value_out, size_t value_cap,
+                         size_t *value_len_out);
+
+/* RemoveXattr: 删除单个 xattr 键 (Raft 持久化).
+ * 未设置 → 返回 -ENODATA. */
+int powerfs_net_removexattr(__u64 shard_id, __u64 ino,
+                            const char *name, size_t name_len);
+
+/* ListXattr: 枚举 inode 上所有 xattr 键名 (VFS listxattr(2)).
+ * list_buf/list_cap: 调用方提供缓冲区, 填充 NUL-separated 键 (例如
+ *                   "user.foo\0security.bar\0system.posix_acl_access\0").
+ * list_len_out:     输出, 总字节数 (含尾部 NUL). 若 inode 无 xattr → *list_len_out=0.
+ *                   若缓冲区不足 → *list_len_out = 所需长度 并返回 -ERANGE. */
+int powerfs_net_listxattr(__u64 shard_id, __u64 ino,
+                          char *list_buf, size_t list_cap,
+                          size_t *list_len_out);
+
 /* PING (连接健康检查) */
 int powerfs_net_ping(void);
 
@@ -1261,6 +1516,58 @@ int net_status_to_errno(__u16 status);
  * 在 pool_init 后调用, 填充 vol_routes[] 用于 ReadNeedle 路由. */
 int powerfs_net_discover_volumes(const char *master_addrs, __u16 master_port);
 
+/* RegisterClient: 内核/FUSE 客户端在 mount 时向 Master 注册,
+ * 获取 master 统一分配的 assigned_client_id(u64).
+ * 同时 Master 检查 client_uuid 黑名单:
+ *   STATUS_OK = 挂载允许, assigned_id 回传在 Fld_CLIENT_ID
+ *   STATUS_ERR_PERMISSION = 黑名单拒绝挂载 (mount_allowed=false)
+ *   STATUS_ERR_REDIRECT = 非 leader 重定向 (内部自动跟随一次)
+ *
+ * 参数:
+ *   master_addr/master_port: Master 地址 (逗号分隔多地址 + port)
+ *   client_uuid: 本 mount 唯一字符串 UUID (见 powerfs_client.client_uuid)
+ *   client_type: 客户端类型字符串, 内核传 "kernel"
+ *   mount_point: 挂载点路径字符串 (用于审计/调试)
+ *   collection: 存储池名称, 未配置传 "default"
+ *   replication: 冗余策略字符串, 未配置传 "none"
+ *   host: 主机名/标识, 用于审计
+ *   pid: 客户端进程/挂载发起者 PID, 0 表示无
+ *   client_crt_path: 客户端证书 PEM 文件路径 (mount -o client_crt=...).
+ *       非空时, 内部用 filp_open+kernel_read 读取内容并编码到
+ *       POWERFS_NET_FLD_CLIENT_CERT(0xD4) 传给 Master 校验.
+ *       空字符串表示无证书 (Master 强制模式会拒绝挂载).
+ *   out_assigned_id: [输出] Master 分配的 numeric client_id (u64)
+ *   out_mount_allowed: [输出] true=允许挂载, false=黑名单拒绝
+ *   out_reason: [输出] 拒绝理由 (可显示给用户)
+ *   reason_cap: out_reason 缓冲区容量
+ *
+ * 返回: 0=成功收到响应 (无论 mount_allowed 与否), <0=-errno 网络/协议错误. */
+int powerfs_net_register_client(const char *master_addr, __u16 master_port,
+                                const char *client_uuid, const char *client_type,
+                                const char *mount_point, const char *collection,
+                                const char *replication, const char *host,
+                                __u64 pid,
+                                const char *client_crt_path,
+                                __u64 *out_assigned_id, bool *out_mount_allowed,
+                                char *out_reason, size_t reason_cap);
+
+/* DeregisterClient: umount 时向 Master 优雅下线, 提前移除心跳注册表项.
+ * 参数:
+ *   client_uuid: 与 RegisterClient 一致的 UUID 字符串
+ *   assigned_id: RegisterClient 返回的 numeric client_id
+ *   client_crt_path: 同 RegisterClient 解释; DeregisterClient 同样需携带
+ *       证书做认证 (防止任意主机伪造下线请求吊销合法 client).
+ * 返回: 0 成功 STATUS_OK, <0 错误 (调用方通常忽略, 最佳努力) */
+int powerfs_net_deregister_client(const char *master_addr, __u16 master_port,
+                                  const char *client_uuid, __u64 assigned_id,
+                                  const char *client_crt_path);
+
+/* 读 PEM 文件的小工具: GFP_NOFS 分配缓冲区返回 heap 指针 + 可选 *out_len,
+ * 失败返回 NULL. 调用方需 kfree() 返回指针.
+ * 内部通过 filp_open(path, O_RDONLY, 0) + kernel_read, 兼容内核 6.17
+ * (kernel_read 直接取 file->f_pos, 无需 set_fs/KERNEL_DS). */
+char *powerfs_read_pem_file(const char *path, gfp_t gfp, size_t *out_len);
+
 /* Phase 3: RangeLease 续约 (直连 volume server).
  * volume_id: 目标 volume (路由查找)
  * ino: inode 号 (lease 按 inode + stripe 注册)
@@ -1302,6 +1609,173 @@ int powerfs_net_release_lease(__u64 volume_id, __u64 ino,
                               const char *token, size_t token_len,
                               const char *client_id);
 
+/* ========== §13 Capability (Cap) model API (Client↔Filer) ==========
+ *
+ * 三条同步 RPC 对应服务端 net_handler.rs:
+ *   1. CapOpenGrant   = 0x0091 — open() 时申请初始 cap (永不阻塞)
+ *   2. CapRecallAck   = 0x0092 — flush 完成后确认归还 recalled caps
+ *   3. CapRelease     = 0x0093 — release/close 主动释放, 触发 upgrade 判定
+ *
+ * 服务端字段编码 (TLV) 对齐:
+ *   Request:  Ino(0x07) + ClientId(0x30, string) [+ IsWriteOpen(0xC6) / LeaseToken(0x80)]
+ *   Response: LeaseToken(0x80, string) + CapSet(0xC4, u8) + CapEpoch(0xC5, u64)
+ *             + CapSn(0xC7, u64) + LeaseDuration(0x41, u64)
+ *             [CapRelease 还含 HasUpgrade(0xC8, u8)]
+ *
+ * 所有 cap RPC 路由到 shard_leader_map[inode] 对应的 Filer leader 连接,
+ * 非 leader 返回 STATUS_ERR_REDIRECT 时客户端自动重试新 leader (send_request 内处理).
+ */
+
+/* — Service-side (Filer) wire-format CapSet bits (3-bit in u8) —
+ * 与 Rust cap_manager.rs CapSet 位域严格一致:
+ *   CAP_R (0b001) = 本地读缓存 (getattr/read 无需 RPC)
+ *   CAP_W (0b010) = 本地写缓存 (write 无需 RPC)
+ *   CAP_X (0b100) = 本地元数据写 (setattr/truncate 无需 RPC)
+ *   EXCLUSIVE = 0b111 (R|W|X 全持 = EXCLUSIVE_WRITE 持有者)
+ *   空集 = SHARED_WRITE 参与者 (open 成功但无本地缓存, IO 走同步路径) */
+#define POWERFS_NET_CAP_R   0x01
+#define POWERFS_NET_CAP_W   0x02
+#define POWERFS_NET_CAP_X   0x04
+#define POWERFS_NET_CAP_EXCLUSIVE  0x07  /* R|W|X */
+
+/* CapOpenGrant: open() 时向 Filer 申请初始 cap (同步 RPC, 永不阻塞).
+ *
+ * Request TLV:  Ino(u64) + ClientId(string) + IsWriteOpen(u8: 0/1)
+ * Response TLV: LeaseToken(string) + CapSet(u8) + CapEpoch(u64) + CapSn(u64)
+ *               + LeaseDuration(u64, ms)
+ *
+ * 参数:
+ *   ino:           文件 inode 号 (用于 shard 路由 + cap_manager 定位)
+ *   client_id:     客户端字符串标识 (与 FUSE ClientId 一致, 用于 recall 推送)
+ *   is_write_open: true = O_WRONLY/O_RDWR, false = O_RDONLY
+ *
+ * 输出 (可为 NULL, 不关心则跳过):
+ *   lease_token_out:   调用方提供 >=64B 缓冲, 填充 Filer 授予的 lease_token
+ *                      (后续 CapRecallAck/CapRelease 需携带此 token)
+ *   token_len_out:     实际 token 字节数
+ *   cap_set_out:       授予的 wire-format CapSet (POWERFS_NET_CAP_* 位组合)
+ *   epoch_out:         CapEpoch (fencer 递增号, recall 时 IO 依此判定过期)
+ *   sn_out:            CapSn (全局 grant 序列号, 跨 handoff 排序 IO)
+ *   duration_ms_out:   Lease 有效期 (毫秒), 0 表示服务端未返回
+ *
+ * 返回: 0 成功, <0 错误 (-ENOTCONN / -ETIMEDOUT / -EIO 等).
+ * 注意: CapOpenGrant 永不 EAGAIN, 服务端总是返回 STATUS_OK 并授予适配当前
+ * 并发场景的 cap (EXCLUSIVE / CAP_R / NONE for SHARED_WRITE). */
+int powerfs_net_cap_open_grant(__u64 ino,
+                               const char *client_id,
+                               bool is_write_open,
+                               char *lease_token_out, size_t *token_len_out,
+                               __u8 *cap_set_out, __u64 *epoch_out,
+                               __u64 *sn_out, __u64 *duration_ms_out);
+
+/* CapRecallAck: 收到 Filer→Client CapRecallNotify 推送后,
+ * flush 完脏数据 + 降级 cap 位, 向服务端 ACK.
+ *
+ * Request TLV:  Ino(u64) + ClientId(string) + LeaseToken(string)
+ * Response TLV: 仅状态, 无 body (成功 STATUS_OK).
+ *
+ * 参数:
+ *   ino / client_id / token: 对应被 recall 的那份 cap (与 CapOpenGrant 响应一致)
+ *   token_len: token 实际字节数
+ *
+ * 返回: 0 成功, <0 错误. 服务端收到 ACK 后完成 recall 流程,
+ * 才能将 cap 授予新申请者 (否则新申请者最多得 SHARED_WRITE). */
+int powerfs_net_cap_recall_ack(__u64 ino,
+                               const char *client_id,
+                               const char *token, size_t token_len);
+
+/* CapRelease: release/close 时主动向 Filer 释放 cap,
+ * 触发 upgrade 判定 (若剩余唯一 writer → 升级回 EXCLUSIVE_WRITE).
+ *
+ * Request TLV:  Ino(u64) + ClientId(string) + LeaseToken(string)
+ * Response TLV: HasUpgrade(u8)
+ *               [if 1]: LeaseToken(string) + CapSet(u8) + CapEpoch(u64) + CapSn(u64)
+ *
+ * 参数:
+ *   ino / client_id / token: 与 CapOpenGrant 响应一致
+ *   token_len: token 实际字节数
+ *
+ * 输出 (仅 HasUpgrade=1 时填充, 均可为 NULL):
+ *   has_upgrade_out: 1 = 有剩余 writer 被升级; 0 = 无升级
+ *   upgrade_token_out: 升级后的 token (>=64B 缓冲)
+ *   upgrade_token_len_out: 实际字节数
+ *   upgrade_cap_set_out: 升级后的 CapSet (通常 EXCLUSIVE 0b111)
+ *   upgrade_epoch_out: 升级后的 epoch
+ *   upgrade_sn_out: 升级后的 sn
+ *
+ * 返回: 0 成功, <0 错误. HasUpgrade=1 的响应已内嵌, 此外 Filer 也会通过
+ * NOTIFY 通道推送 CapUpgradeNotify (异步, 用于跨 RPC 周期提醒存活 writer). */
+int powerfs_net_cap_release(__u64 ino,
+                            const char *client_id,
+                            const char *token, size_t token_len,
+                            __u8 *has_upgrade_out,
+                            char *upgrade_token_out, size_t *upgrade_token_len_out,
+                            __u8 *upgrade_cap_set_out,
+                            __u64 *upgrade_epoch_out, __u64 *upgrade_sn_out);
+
+/* ========== §13 Cap server push: NOTIFY dispatcher (Filer→Client) ==========
+ *
+ * Filer 推送两类异步 NOTIFY (帧头 flags |= POWERFS_NET_FLAG_NOTIFY):
+ *   - CapRecallNotify  (0x0094): 服务端要撤销本客户端的某些 cap 位,
+ *     客户端必须 flush 对应脏数据后回 CapRecallAck (§13.4.2).
+ *     TLV body: Ino + LeaseToken + CapSet(recall_mask)
+ *                + CapSet(retain_mask) + CapEpoch
+ *   - CapUpgradeNotify (0x0095): 存活 SHARED_WRITE writer 升级回 EXCLUSIVE_WRITE,
+ *     客户端调 cap_issue 更新 issued 位 (从 0/SHARED 到 R|W|X).
+ *     TLV body: Ino + LeaseToken + CapSet(new_granted) + CapEpoch + CapSn
+ *
+ * 注册 / 查询 dispatcher:
+ *   powerfs_net_reg_cap_notify_handlers 在模块 init 时由 fs 层注册,
+ *   RX dispatcher (pfs_rx_dispatch) 根据 msg_type 调对应回调.
+ *
+ * 两个回调均运行在 RX 调度器线程上下文 (非中断, 可调度/睡眠),
+ * 允许内部: powerfs_cap_revoke() → flush + recall_ack (阻塞网络 I/O 安全). */
+
+/* CapRecallNotify 回调: 对应服务端 cap_manager.rs::RecallInfo:
+ *   @recall_mask: wire-format CapSet bits to revoke (POWERFS_NET_CAP_* 位组合)
+ *   @retain_mask: wire-format CapSet bits that remain valid (recall 之后)
+ *   @epoch: 新 CapEpoch (被撤销 IO 用旧 epoch 会被 fencing 拦截) */
+typedef void (*powerfs_cap_recall_notify_fn)(u64 ino,
+            const char *lease_token, size_t token_len,
+            __u8 recall_mask, __u8 retain_mask, __u64 epoch);
+
+/* CapUpgradeNotify 回调: 存活 writer 被升级回 EXCLUSIVE_WRITE:
+ *   @new_granted: wire-format CapSet bits (通常 POWERFS_NET_CAP_EXCLUSIVE=0b111)
+ *   @epoch/@sn: 新 epoch + sn 号, 写入 cap->epoch/seq */
+typedef void (*powerfs_cap_upgrade_notify_fn)(u64 ino,
+            const char *lease_token, size_t token_len,
+            __u8 new_granted, __u64 epoch, __u64 sn);
+
+/* 注册 fs 层的 cap NOTIFY 回调 (模块初始化时一次性调用).
+ * recall_fn 不可 NULL, upgrade_fn 不可 NULL. */
+void powerfs_net_reg_cap_notify_handlers(
+        powerfs_cap_recall_notify_fn recall_fn,
+        powerfs_cap_upgrade_notify_fn upgrade_fn);
+
+/* === KeepConnected 心跳 (B1: kernel 补齐与 FUSE 对齐的能力) ===
+ * 对齐 powerfs-fuse MasterStatsReporter 30s 周期, 向 Master 发送
+ * MsgType::KeepConnected(0x0053) 刷新 client 注册 last_heartbeat.
+ * 缺了这个 kernel 可能在 ~55s 窗口后出现 Filer EAGAIN/连接失活.
+ *
+ * start:  在 fill_sber(register_client 成功 assigned_client_id 后) 调用,
+ *         把参数存副本到 g_pool, 启动 delayed_work 到 reconn_wq.
+ * update: KeepConnected 心跳发送前用 assigned_client_id 最新值刷新
+ *         (register_client 完成前 start 可能被调但 assigned=0, 通知 kernel
+ *          侧 update 即可; 或 fill_super 后再 start).
+ * stop:   在 kill_sb_super DeregisterClient 之后 cancel_delayed_work_sync,
+ *         确保卸载时 work 不再调度. */
+int powerfs_net_start_heartbeat(const char *client_uuid,
+                                const char *client_type,
+                                const char *mount_point,
+                                const char *collection,
+                                const char *replication,
+                                const char *host,
+                                __u64 pid,
+                                u64 assigned_client_id,
+                                const char *client_crt_path);
+void powerfs_net_update_heartbeat_id(u64 assigned_client_id);
+void powerfs_net_stop_heartbeat(void);
+
 /* ========== 初始化/清理 ========== */
 
 int  powerfs_net_init(void);
@@ -1309,8 +1783,16 @@ void powerfs_net_exit(void);
 
 /* ========== 内部工具 ========== */
 
-/* CRC32C 计算 */
+/* CRC32C 计算
+ *   powerfs_crc32c        - RFC3720 standard one-shot (init ~0, out ~x), 用于数据块校验.
+ *   powerfs_crc32c_append - 对齐 Rust crc32c crate (0.6.8) crc32c::crc32c_append:
+ *                          输入反转 (~crc) + 输出反转 (~state), 即 RFC3720 one-shot
+ *                          风格的流式接口. crc32c_append(0, data) ≡ powerfs_crc32c(data).
+ *                          专门用于 FrameHeader::calc_header_crc / verify_crc.
+ *                          (RC-4 修复前误以为 Rust 是流式无取反, 导致 master 端
+ *                          verify_crc 失败 drop 连接; 现已对齐.) */
 __u32 powerfs_crc32c(const __u8 *data, size_t len);
+__u32 powerfs_crc32c_append(__u32 crc, const __u8 *data, size_t len);
 
 /* 帧头编解码 */
 void powerfs_net_frame_hdr_encode(struct powerfs_net_frame_hdr *hdr,

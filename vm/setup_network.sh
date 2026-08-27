@@ -20,12 +20,17 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# 动态查找 Docker powerfs-network 网桥 (网桥 ID 在 Docker 重启后会变化)
-if [ -z "${DOCKER_BRIDGE:-}" ]; then
+# Docker compose 已通过 driver_opts 指定固定网桥名 powerfs-br0,
+# 不再需要动态查找 (旧方案每次 docker compose down/up 后 bridge ID 会变).
+DOCKER_BRIDGE="${DOCKER_BRIDGE:-powerfs-br0}"
+
+# 如果 powerfs-br0 不存在, 回退到动态查找 (兼容旧配置)
+if ! ip link show ${DOCKER_BRIDGE} &>/dev/null; then
+    echo "[INFO] ${DOCKER_BRIDGE} 不存在, 回退到动态查找..."
     # 方法1: 通过 docker network inspect 查找
     DOCKER_BRIDGE=$(docker network inspect docker_powerfs-network \
         --format '{{range .Options}}{{.}}{{end}}' 2>/dev/null | grep -oE 'br-[0-9a-f]{12}' | head -1)
-    # 方法2: 通过 brctl/ip 查找 powerfs-network 关联的网桥
+    # 方法2: 通过 network ID 推导
     if [ -z "${DOCKER_BRIDGE}" ]; then
         DOCKER_BRIDGE=$(docker network inspect docker_powerfs-network \
             --format '{{.Id}}' 2>/dev/null | head -c 12 | xargs -I{} echo "br-{}")

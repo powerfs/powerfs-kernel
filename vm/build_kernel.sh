@@ -4,9 +4,10 @@
 
 set -e
 
-# 路径配置
-KERNEL_SOURCE="/home/portion/powerfs/linux-6.17"
-OUTPUT_DIR="/home/portion/powerfs/kernel/vm/output"
+# 路径配置 (支持环境变量覆盖，CI 中通过 env 设置 KERNEL_SOURCE)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+KERNEL_SOURCE="${KERNEL_SOURCE:-/home/portion/powerfs/linux-6.17}"
+OUTPUT_DIR="${SCRIPT_DIR}/output"
 BUILD_DIR="${OUTPUT_DIR}/build"
 
 # 内核版本检测
@@ -43,9 +44,10 @@ echo "=== 优化内核配置 (QEMU + 调试) ==="
 ./scripts/config --disable CONFIG_DEBUG_INFO_REDACTED
 
 # 启用 printk 详细输出
+# LOG_BUF_SHIFT=20 → 2^20 = 1MB ring buffer (原 17=128KB 在并发删除测试中溢出)
 ./scripts/config --enable CONFIG_PRINTK
 ./scripts/config --enable CONFIG_LOG_BUF_SHIFT
-./scripts/config --set-val CONFIG_LOG_BUF_SHIFT 17
+./scripts/config --set-val CONFIG_LOG_BUF_SHIFT 20
 
 # 启用文件系统调试
 ./scripts/config --enable CONFIG_DEBUG_FS
@@ -206,7 +208,7 @@ cp vmlinux "${OUTPUT_DIR}/vmlinux"
 
 # 编译模块
 echo "=== 编译 PowerFS 内核模块 ==="
-POWERFS_MOD_DIR="/home/portion/powerfs/kernel/powerfs_mod"
+POWERFS_MOD_DIR="${SCRIPT_DIR}/../powerfs_mod"
 if [ -d "${POWERFS_MOD_DIR}" ]; then
     cd "${POWERFS_MOD_DIR}"
     make clean 2>/dev/null || true
