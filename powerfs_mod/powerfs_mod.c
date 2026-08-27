@@ -356,6 +356,17 @@ static void __exit powerfs_exit(void)
     unregister_filesystem(&powerfs_fs_type);
     powerfs_comm_exit();
     powerfs_flow_exit();
+
+    /* 等待所有 pending RCU 回调完成, 确保 kill_sb 期间排队的
+     * call_rcu (dentry_info 释放等) 在 slab 缓存销毁前执行完毕.
+     *
+     * kill_sb 中 kill_anon_super 后的 rcu_barrier 覆盖单次 mount 的回调,
+     * 但如果有多个 mount 或 umount 后仍有延迟回调, 需要此处兜底.
+     * 否则 kmem_cache_destroy(dentry_cachep) 后, powerfs_di_free_rcu
+     * 执行 kmem_cache_free 到已销毁缓存 → SLUB 元数据损坏 →
+     * 随机内存腐败 (表现为 bpf_prog_aux 被覆盖等). */
+    rcu_barrier();
+
     powerfs_destroy_inode_cache();
     powerfs_dentry_dedup_destroy_all();
 
