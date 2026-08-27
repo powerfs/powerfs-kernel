@@ -1407,9 +1407,11 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->client_crt[sizeof(sbi->client_crt) - 1]     = '\0';
         sbi->client_key[sizeof(sbi->client_key) - 1]     = '\0';
         /* 释放 init_fs_context 分配的 ctx, 释放后 sb->s_fs_info 仍指向已释放内存,
-         * 必须在下方设置 sb->s_fs_info = sbi 之前完成 */
+         * 必须清除以避免 kill_sb 访问悬空指针 (fill_super 早期失败时 VFS 仍会
+         * 调用 kill_sb). 下方 sb->s_fs_info = sbi 会重新设置. */
         kfree(ctx);
         ctx = NULL;
+        sb->s_fs_info = NULL;
     }
 
     /* 挂载时必须传 master_addr. 不能再从 module_param 全局默认值回退:
@@ -1529,6 +1531,7 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     if (ret) {
         pr_err("powerfs: super_setup_bdi failed: %d\n", ret);
         kfree(sbi);
+        sb->s_fs_info = NULL;
         return ret;
     }
 
@@ -1803,6 +1806,7 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
             pr_err("powerfs: connection pool init failed (%d)\n", pool_ret);
             return pool_ret;
         }
+        sbi->pool_initialized = true;
         pr_info("powerfs: connection pool init success (master=%s:%u shard_count=%u)\n",
                 maddr ? maddr : "(null)", (unsigned)mport, (unsigned)scount);
 
@@ -1871,6 +1875,19 @@ void powerfs_kill_sb_super(struct super_block *sb)
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
 
     pr_debug("powerfs: kill_sb_super\n");
+
+    /* FIX: fill_super 早期失败 (如 missing master_addr) 时 sbi 为 NULL 或
+     * 未完全初始化. VFS 仍会调用 kill_sb, 此时不能执行 sync_filesystem
+     * (sb->s_op 可能未设置)、stop_heartbeat、destroy_workqueue 等操作.
+     * 直接 kill_anon_super 释放超级块并返回. */
+    if (!sbi || !sbi->initialized) {
+        pr_warn("powerfs: kill_sb early return (sbi=%p initialized=%d)\n",
+                sbi, sbi ? sbi->initialized : -1);
+        if (g_powerfs_sb == sb)
+            g_powerfs_sb = NULL;
+        kill_anon_super(sb);
+        return;
+    }
 
     /* 清除全局超级块指针 */
     if (g_powerfs_sb == sb)
@@ -1947,11 +1964,21 @@ void powerfs_kill_sb_super(struct super_block *sb)
     rcu_barrier();
 
     /* 3. 设置 stopping 标志: 让 send_request 立即返回 -ENOTCONN,
-     *    阻止 reconnect_work 在 g_pool 清零后访问野指针. */
-    powerfs_net_set_stopping();
+     *    阻止 reconnect_work 在 g_pool 清零后访问野指针.
+     *
+     * FIX: 仅当 conn_pool_init 曾成功完成 (sbi->pool_initialized) 时才执行
+     * 全局清理. fill_super 早期失败 (如 missing master_addr) 触发的 kill_sb
+     * 此时 sbi 可能已 kfree 或 pool 未初始化, 无条件清理会破坏其他活跃 mount
+     * 的 g_pool (stopping=1, filer_count=0), 导致 "Transport endpoint is not
+     * connected" 且不可恢复. */
+    if (sbi && sbi->pool_initialized) {
+        powerfs_net_set_stopping();
 
-    /* 4. 关闭所有连接 (g_pool 会被清零) */
-    powerfs_net_pool_cleanup();
+        /* 4. 关闭所有连接 (g_pool 会被清零) */
+        powerfs_net_pool_cleanup();
+    } else if (sbi) {
+        pr_warn("powerfs: kill_sb skip global pool cleanup (pool_initialized=false)\n");
+    }
 
     /* 5. kill_anon_super → generic_shutdown_super:
      *    a) shrink_dcache_for_umount — 释放所有 dentry (d_release → call_rcu)
@@ -1966,6 +1993,16 @@ void powerfs_kill_sb_super(struct super_block *sb)
      * 网络 RPC (release_all_leases) 在 net_set_stopping 后立即返回 -ENOTCONN,
      * 不阻塞; 本地 cap/lease 清理在 evict_inode 中继续. */
     kill_anon_super(sb);
+
+    /* 5b. 等待 kill_anon_super 期间排队的 RCU 回调完成.
+     *
+     * kill_anon_super → evict_inodes → d_release → call_rcu(powerfs_di_free_rcu)
+     * 这些 call_rcu 排队在 step 7 的 rcu_barrier 之后, 不会被它等待.
+     * 如果不在此处 rcu_barrier, 后续 kmem_cache_destroy(cap_cachep) 和
+     * module_exit 中的 kmem_cache_destroy(dentry_cachep) 可能在 RCU 回调
+     * 执行前完成, 导致 kmem_cache_free 到已销毁的缓存 → SLUB 元数据损坏
+     * → 随机内存腐败 (如 bpf_prog_aux 被 SSH 字符串覆盖). */
+    rcu_barrier();
 
     /* 6. 所有 inode 已被 evict_inode 驱逐, cap/cap_flush/cap_snap 对象已
      *    kmem_cache_free 回 slab. 现在安全销毁 per-sb cap slab caches. */

@@ -940,6 +940,13 @@ struct powerfs_sb_info {
     /* 是否初始化完成 (兼容旧代码, 新代码用 client->mount_state) */
     bool initialized;
 
+    /* 标记 powerfs_conn_pool_init 是否成功完成.
+     * kill_sb 检查此标志: 仅当 pool 已初始化时才执行
+     * powerfs_net_set_stopping + powerfs_net_pool_cleanup.
+     * 否则 fill_super 早期失败 (如 missing master_addr) 触发的
+     * kill_sb 会无条件清理全局 g_pool, 导致其他活跃 mount 不可用. */
+    bool pool_initialized;
+
     /* Phase 3: 卸载标志. kill_sb_super 设置为 true, lease_renew_work_func
      * 检查此标志避免在 destroy_workqueue 期间重新排队导致 flush 循环.
      * (兼容旧代码; 新代码判 client->mount_state == UNMOUNTING/SHUTDOWN) */
