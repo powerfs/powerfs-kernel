@@ -151,8 +151,9 @@ struct powerfs_wb_ctx {
     int needle_end_idx;                    /* 结束索引 (exclusive) */
     __u64 volume_id;
     __u64 needle_id;
-    __u8 *needle_buf;                      /* 2MB, per-ctx (read 写入, write 读出) */
-    __u32 needle_len;                      /* needle 有效数据长度 */
+    __u8 *needle_buf;                      /* 2MB (RMW) 或 extent_size (blob) */
+    __u32 needle_len;                      /* needle 有效数据长度 / blob size */
+    __u64 blob_offset;                     /* WriteNeedleBlob: offset within needle */
     char lease_token[64];
     size_t lease_token_len;
     /* 持久缓冲区: 异步请求的 req_body / resp_body, 存活到 callback 触发 */
@@ -162,8 +163,271 @@ struct powerfs_wb_ctx {
 
 /* 前向声明 */
 static void powerfs_wb_final_cleanup(struct powerfs_writepage_work *wpw);
+static void powerfs_wb_fail_pages(struct powerfs_wb_ctx *ctx, int err);
 static int powerfs_wb_read_cb(struct powerfs_request *req);
 static int powerfs_wb_write_cb(struct powerfs_request *req);
+
+/* powerfs_wb_needle_full_coverage - 检查脏页是否完全覆盖 needle 范围
+ *
+ * 当 needle 组内脏页完全覆盖 [needle_start, needle_start + max_needle_len)
+ * 且 max_needle_len == POWERFS_CHUNK_SIZE 时, 返回 true. 此时 RMW 的 read
+ * 阶段是多余的 (所有旧数据都将被覆盖), 可跳过 read 直接 write.
+ *
+ * 要求 max_needle_len == POWERFS_CHUNK_SIZE 的原因: 当 i_size 未对齐到
+ * chunk 边界时 (max_needle_len < POWERFS_CHUNK_SIZE), server needle 可能
+ * 保留 truncate 前的 stale 数据. 直接 write 短 needle 只覆盖前 N 字节,
+ * 不会清除 stale 数据. 仅当写入完整 1MB chunk 时, server needle 被完全
+ * 替换, 无 stale 风险.
+ */
+static bool powerfs_wb_needle_full_coverage(struct powerfs_writepage_work *wpw,
+                                            int group_start, int group_end,
+                                            loff_t needle_start,
+                                            __u32 max_needle_len)
+{
+    loff_t need_end = needle_start + max_needle_len;
+    loff_t covered = needle_start;
+    int i;
+
+    if (max_needle_len != POWERFS_CHUNK_SIZE)
+        return false;
+
+    for (i = group_start; i < group_end; i++) {
+        loff_t offset = wpw->offsets[i];
+        size_t count = wpw->counts[i];
+
+        if (count == 0)
+            continue;
+
+        /* Page must be within needle range */
+        if (offset < needle_start || offset + count > need_end)
+            return false;
+
+        /* Check contiguity: no gap before this page */
+        if (offset > covered)
+            return false;
+
+        /* Extend covered range */
+        if (offset + count > covered)
+            covered = offset + count;
+    }
+
+    return covered >= need_end;
+}
+
+/* powerfs_wb_submit_write_direct - 跳过 read, 直接从脏页填充 needle_buf 并提交 write
+ *
+ * 当脏页完全覆盖 needle 范围时调用. needle_buf 已 zero-init, 只需将脏页
+ * memcpy 到对应位置, 然后提交 write_needle_async.
+ *
+ * 此函数在 work_fn 上下文 (process context) 执行, 可安全调用 kmap.
+ * 提交成功后 ctx 由 write_cb 异步清理; 提交失败由调用方清理.
+ *
+ * 返回 0 = 提交成功 (ctx 由 write_cb 异步释放); <0 = 提交失败 (调用方清理).
+ */
+static int powerfs_wb_submit_write_direct(struct powerfs_wb_ctx *ctx)
+{
+    struct powerfs_writepage_work *wpw = ctx->wpw;
+    struct inode *inode = wpw->inode;
+    int j, ret;
+
+    /* 填充 needle_buf: 将脏页数据 memcpy 到 needle_buf 对应位置 */
+    for (j = ctx->needle_start_idx; j < ctx->needle_end_idx; j++) {
+        struct page *page = wpw->pages[j];
+        loff_t offset = wpw->offsets[j];
+        size_t count = wpw->counts[j];
+        size_t offset_in_needle;
+
+        if (count == 0)
+            continue;
+
+        offset_in_needle = offset % POWERFS_CHUNK_SIZE;
+        {
+            char *kaddr = kmap_local_page(page);
+            memcpy(ctx->needle_buf + offset_in_needle, kaddr, count);
+            kunmap_local(kaddr);
+        }
+    }
+
+    /* 全覆盖: needle_len = POWERFS_CHUNK_SIZE */
+    ctx->needle_len = POWERFS_CHUNK_SIZE;
+
+    pr_debug("powerfs: WB_WRITE_DIRECT ino=%lu nid=%llu len=%u (skip read)\n",
+            inode->i_ino, (unsigned long long)ctx->needle_id,
+            ctx->needle_len);
+
+    ret = powerfs_net_write_needle_async(
+        ctx->volume_id, ctx->needle_id, inode->i_ino,
+        ctx->needle_buf, ctx->needle_len,
+        ctx->lease_token_len > 0 ? ctx->lease_token : NULL,
+        ctx->lease_token_len,
+        ctx->req_body, sizeof(ctx->req_body),
+        ctx->resp_body, sizeof(ctx->resp_body),
+        30000, powerfs_wb_write_cb, ctx);
+
+    return ret;
+}
+
+/* powerfs_wb_submit_blob_extents - 对非全覆盖的 needle 组, 按 extent 提交 WriteNeedleBlob
+ *
+ * 遍历 [group_start, group_end) 内的脏页, 将连续页合并为 extent,
+ * 对每个 extent 创建独立 ctx 并提交 powerfs_net_write_needle_blob_async.
+ *
+ * 每个 extent 的 ctx 独立分配 (kzalloc ctx + kmalloc buf), 由 write_cb 异步释放.
+ * Volume Server coalescer 合并同一 needle 的多次 partial write.
+ *
+ * pending_needles 调整:
+ *   调用前: 该 needle 组已被 first pass 计为 1
+ *   函数内: 若提交了 N 个 extent, atomic_add(N-1) 补偿差额
+ *   每个 extent 成功: write_cb 异步 dec; 失败: 函数内同步 dec
+ *
+ * 返回: 提交的 extent 数量 (0 = 全部失败或无有效页)
+ */
+static int powerfs_wb_submit_blob_extents(struct powerfs_writepage_work *wpw,
+                                          int group_start, int group_end,
+                                          __u64 volume_id, __u64 needle_id,
+                                          struct inode *inode)
+{
+    int i = group_start;
+    int extents_submitted = 0;
+
+    while (i < group_end) {
+        int ext_start;
+        loff_t ext_offset;
+        size_t ext_size = 0;
+        size_t token_len = 0;
+        struct powerfs_wb_ctx *ctx;
+        __u8 *buf;
+        int ret;
+        int j;
+
+        /* Skip count==0 pages */
+        while (i < group_end && wpw->counts[i] == 0)
+            i++;
+        if (i >= group_end)
+            break;
+        ext_start = i;
+
+        /* Find contiguous extent */
+        ext_offset = wpw->offsets[i];
+        ext_size = wpw->counts[i];
+        i++;
+        while (i < group_end && wpw->counts[i] > 0 &&
+               wpw->offsets[i] == wpw->offsets[i - 1] + wpw->counts[i - 1]) {
+            ext_size += wpw->counts[i];
+            i++;
+        }
+
+        /* Allocate ctx */
+        ctx = kzalloc(sizeof(*ctx), GFP_NOFS);
+        if (!ctx) {
+            struct powerfs_wb_ctx fail_ctx = {
+                .wpw = wpw,
+                .needle_start_idx = ext_start,
+                .needle_end_idx = i,
+            };
+            powerfs_wb_fail_pages(&fail_ctx, -ENOMEM);
+            /* Account for this failed extent */
+            if (extents_submitted == 0 && i >= group_end) {
+                /* No successful submissions; the group's +1 in
+                 * pending_needles needs to be decremented */
+                if (atomic_dec_and_test(&wpw->pending_needles))
+                    powerfs_wb_final_cleanup(wpw);
+            }
+            continue;
+        }
+
+        /* Allocate extent data buffer */
+        buf = kmalloc(ext_size, GFP_NOFS);
+        if (!buf) {
+            struct powerfs_wb_ctx fail_ctx = {
+                .wpw = wpw,
+                .needle_start_idx = ext_start,
+                .needle_end_idx = i,
+            };
+            kfree(ctx);
+            powerfs_wb_fail_pages(&fail_ctx, -ENOMEM);
+            if (extents_submitted == 0 && i >= group_end) {
+                if (atomic_dec_and_test(&wpw->pending_needles))
+                    powerfs_wb_final_cleanup(wpw);
+            }
+            continue;
+        }
+
+        /* Copy page data into buffer */
+        {
+            size_t copied = 0;
+            for (j = ext_start; j < i; j++) {
+                char *kaddr;
+                if (wpw->counts[j] == 0)
+                    continue;
+                kaddr = kmap_local_page(wpw->pages[j]);
+                memcpy(buf + copied, kaddr, wpw->counts[j]);
+                kunmap_local(kaddr);
+                copied += wpw->counts[j];
+            }
+        }
+
+        /* Setup ctx */
+        ctx->wpw = wpw;
+        ctx->needle_start_idx = ext_start;
+        ctx->needle_end_idx = i;
+        ctx->volume_id = volume_id;
+        ctx->needle_id = needle_id;
+        ctx->needle_buf = buf;
+        ctx->needle_len = ext_size;
+        ctx->blob_offset = ext_offset % POWERFS_CHUNK_SIZE;
+
+        /* Get lease */
+        if (powerfs_get_lease_token(inode, ext_offset,
+                                    ctx->lease_token, &token_len)) {
+            pr_warn("powerfs: blob lease ino=%lu, continuing without\n",
+                    inode->i_ino);
+        }
+        ctx->lease_token_len = token_len;
+
+        /* Adjust pending_needles for additional extents */
+        if (extents_submitted > 0)
+            atomic_inc(&wpw->pending_needles);
+
+        /* Submit WriteNeedleBlob */
+        pr_debug("powerfs: WB_BLOB_SUBMIT ino=%lu nid=%llu off=%llu len=%zu\n",
+                inode->i_ino, (unsigned long long)needle_id,
+                (unsigned long long)ctx->blob_offset, ext_size);
+
+        ret = powerfs_net_write_needle_blob_async(
+            volume_id, needle_id, inode->i_ino,
+            ctx->blob_offset,
+            buf, ext_size,
+            ctx->lease_token_len > 0 ? ctx->lease_token : NULL,
+            ctx->lease_token_len,
+            ctx->req_body, sizeof(ctx->req_body),
+            ctx->resp_body, sizeof(ctx->resp_body),
+            30000, powerfs_wb_write_cb, ctx);
+
+        if (ret) {
+            pr_warn("powerfs: blob submit ino=%lu nid=%llu off=%llu err=%d\n",
+                    inode->i_ino, (unsigned long long)needle_id,
+                    (unsigned long long)ctx->blob_offset, ret);
+            powerfs_wb_fail_pages(ctx, ret);
+            kfree(buf);
+            kfree(ctx);
+            /* Decrement: this extent's submission failed */
+            if (atomic_dec_and_test(&wpw->pending_needles))
+                powerfs_wb_final_cleanup(wpw);
+        } else {
+            extents_submitted++;
+        }
+    }
+
+    /* If no extents were submitted (all failed), the group's +1 in
+     * pending_needles needs to be decremented */
+    if (extents_submitted == 0) {
+        if (atomic_dec_and_test(&wpw->pending_needles))
+            powerfs_wb_final_cleanup(wpw);
+    }
+
+    return extents_submitted;
+}
 
 /* powerfs_wb_fail_pages - 失败一个 ctx 范围内的所有页面
  *
@@ -202,22 +466,21 @@ static void powerfs_wb_free_rcu(struct rcu_head *rcu)
  *
  * 释放 batch 级资源: inode 引用, wb_in_flight 计数.
  * wpw 内存通过 call_rcu 延迟释放 (work_struct 生命周期约束).
- * 由最后一个完成的 ctx (或 work_fn 的自身 ref) 触发. */
+ * 由最后一个完成的 ctx (或 work_fn 的自身 ref) 触发.
+ *
+ * 并发安全: VFS writeback 子系统通过 PAGECACHE_TAG_DIRTY →
+ * PAGECACHE_TAG_WRITEBACK 的原子转换保证同一页面不会被并发 writeback.
+ * 不同 needle 组的 WriteNeedleBlob 请求天然独立, 同一 needle 的并发
+ * partial write 由 Volume Server coalescer 安全合并. */
 static void powerfs_wb_final_cleanup(struct powerfs_writepage_work *wpw)
 {
     struct inode *inode = wpw->inode;
     struct super_block *sb = inode->i_sb;
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
-    struct powerfs_inode_info *pi = POWERFS_I(inode);
 
     pr_debug("powerfs: WB_FINAL_CLEANUP ino=%lu wb_in_flight=%d\n",
             inode->i_ino, atomic_read(&sbi->wb_in_flight));
     atomic_dec(&sbi->wb_in_flight);
-
-    /* writeback 互斥: 最后一个 batch 完成时释放 wb_mutex,
-     * 允许下一次 powerfs_writepages 执行. */
-    if (atomic_dec_and_test(&pi->wb_batch_count))
-        mutex_unlock(&pi->wb_mutex);
 
     iput(inode);
     /* 延迟释放 wpw: work_struct 在 wpw 中, workqueue 在 work_fn 返回后
@@ -516,12 +779,14 @@ static int powerfs_wb_write_cb(struct powerfs_request *req)
 /*
  * powerfs_writepage_work_fn - 批量异步写 workqueue 函数 (异步提交模式)
  *
- * 按 needle_id 分组, 每组创建 ctx 并异步提交 read_needle. work_fn 在所有
- * ctx 提交后立即返回 (不阻塞等待网络响应), 由 read_cb → write_cb 两阶段
- * 回调完成实际写入并清除 PageWriteback.
+ * 按 needle_id 分组, 每组根据脏页覆盖率选择提交路径:
+ *   1. 全覆盖: powerfs_wb_submit_write_direct — 跳过 read, 直接从脏页填充
+ *      needle_buf 并提交 write_needle (短期优化, 消除读放大).
+ *   2. 非全覆盖: powerfs_wb_submit_blob_extents — 按 extent 合并脏页,
+ *      提交 write_needle_blob partial write (中期优化, 消除 RMW 读放大).
  *
- * needle 模型: write_needle 整体替换 needle 内容, 不支持 partial write.
- * 需 read-modify-write: 读现有 needle (异步) → 合并脏页 (read_cb) → 写回 (异步).
+ * work_fn 在所有 ctx 提交后立即返回 (不阻塞等待网络响应), 由 write_cb
+ * 异步回调完成实际写入并清除 PageWriteback.
  */
 static void powerfs_writepage_work_fn(struct work_struct *work)
 {
@@ -594,9 +859,6 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     /* 若无有效页面 (全为 count==0 或 locate 失败), 直接清理 */
     if (num_groups == 0) {
         atomic_dec(&sbi->wb_in_flight);
-        /* writeback 互斥: 最后一个 batch 完成时释放 wb_mutex */
-        if (atomic_dec_and_test(&pi->wb_batch_count))
-            mutex_unlock(&pi->wb_mutex);
         iput(inode);
         /* 延迟释放: 同 final_cleanup, work_fn 上下文不能直接 kvfree wpw. */
         call_rcu(&wpw->rcu, powerfs_wb_free_rcu);
@@ -640,12 +902,33 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
                 /* 提交 [cur_start, i) 这一组 */
                 struct powerfs_wb_ctx *ctx;
                 loff_t group_offset;
+                loff_t needle_start;
+                loff_t isize;
+                __u32 max_needle_len;
                 size_t token_len = 0;
                 int ret;
 
+                group_offset = wpw->offsets[cur_start];
+                needle_start = group_offset -
+                    (group_offset % POWERFS_CHUNK_SIZE);
+                isize = i_size_read(inode);
+                max_needle_len = (__u32)min_t(loff_t,
+                    isize - needle_start, POWERFS_CHUNK_SIZE);
+
+                /* 中期优化: 非全覆盖时走 WriteNeedleBlob partial write,
+                 * 消除 RMW 读放大; 函数内部自管理 ctx 分配与 pending_needles */
+                if (!powerfs_wb_needle_full_coverage(wpw, cur_start, i,
+                                                     needle_start,
+                                                     max_needle_len)) {
+                    powerfs_wb_submit_blob_extents(wpw, cur_start, i,
+                                                   cur_volume_id,
+                                                   cur_needle_id, inode);
+                    goto next_group;
+                }
+
+                /* 全覆盖: 跳过 read, 直接从脏页填充 needle_buf 并提交 write */
                 ctx = kzalloc(sizeof(*ctx), GFP_NOFS);
                 if (!ctx) {
-                    /* 分配失败: 失败该组页面, dec 计数 (此 ctx 不会回调) */
                     struct powerfs_wb_ctx fail_ctx = {
                         .wpw = wpw,
                         .needle_start_idx = cur_start,
@@ -678,7 +961,6 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
                 ctx->needle_len = 0;
 
                 /* 获取 lease (同步, 快速: ensure_lease 有快速路径) */
-                group_offset = wpw->offsets[cur_start];
                 if (powerfs_get_lease_token(inode, group_offset,
                                             ctx->lease_token,
                                             &token_len)) {
@@ -689,25 +971,11 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
                 }
                 ctx->lease_token_len = token_len;
 
-                /* 异步提交 read_needle (非阻塞) */
-                pr_debug("powerfs: WB_READ_SUBMIT ino=%lu vid=%llu nid=%llu pages=[%d,%d)\n",
-                        inode->i_ino, (unsigned long long)cur_volume_id,
-                        (unsigned long long)cur_needle_id, cur_start, i);
-                ret = powerfs_net_read_needle_async(
-                    cur_volume_id, cur_needle_id,
-                    ctx->needle_buf, POWERFS_CHUNK_SIZE,
-                    ctx->req_body, sizeof(ctx->req_body),
-                    30000, powerfs_wb_read_cb, ctx);
-
+                ret = powerfs_wb_submit_write_direct(ctx);
                 if (ret) {
-                    /* 提交失败: callback 不会触发, 手动清理 */
-                    pr_warn("powerfs: writepage read submit ino=%lu nid=%llu err=%d\n",
-                            inode->i_ino, (unsigned long long)cur_needle_id,
-                            ret);
                     powerfs_wb_fail_pages(ctx, ret);
                     kvfree(ctx->needle_buf);
                     kfree(ctx);
-                    /* dec 计数: 此 ctx 不会回调 */
                     if (atomic_dec_and_test(&wpw->pending_needles))
                         powerfs_wb_final_cleanup(wpw);
                 }
@@ -723,9 +991,32 @@ next_group:
         if (cur_start >= 0) {
             struct powerfs_wb_ctx *ctx;
             loff_t group_offset;
+            loff_t needle_start;
+            loff_t isize;
+            __u32 max_needle_len;
             size_t token_len = 0;
             int ret;
 
+            group_offset = wpw->offsets[cur_start];
+            needle_start = group_offset -
+                (group_offset % POWERFS_CHUNK_SIZE);
+            isize = i_size_read(inode);
+            max_needle_len = (__u32)min_t(loff_t,
+                isize - needle_start, POWERFS_CHUNK_SIZE);
+
+            /* 中期优化: 非全覆盖时走 WriteNeedleBlob partial write */
+            if (!powerfs_wb_needle_full_coverage(wpw, cur_start,
+                                                 wpw->num_pages,
+                                                 needle_start,
+                                                 max_needle_len)) {
+                powerfs_wb_submit_blob_extents(wpw, cur_start,
+                                               wpw->num_pages,
+                                               cur_volume_id,
+                                               cur_needle_id, inode);
+                goto last_group_done;
+            }
+
+            /* 全覆盖: 跳过 read, 直接从脏页填充 needle_buf 并提交 write */
             ctx = kzalloc(sizeof(*ctx), GFP_NOFS);
             if (!ctx) {
                 struct powerfs_wb_ctx fail_ctx = {
@@ -759,7 +1050,6 @@ next_group:
             ctx->needle_id = cur_needle_id;
             ctx->needle_len = 0;
 
-            group_offset = wpw->offsets[cur_start];
             if (powerfs_get_lease_token(inode, group_offset,
                                         ctx->lease_token,
                                         &token_len)) {
@@ -770,16 +1060,8 @@ next_group:
             }
             ctx->lease_token_len = token_len;
 
-            ret = powerfs_net_read_needle_async(
-                cur_volume_id, cur_needle_id,
-                ctx->needle_buf, POWERFS_CHUNK_SIZE,
-                ctx->req_body, sizeof(ctx->req_body),
-                30000, powerfs_wb_read_cb, ctx);
-
+            ret = powerfs_wb_submit_write_direct(ctx);
             if (ret) {
-                pr_warn("powerfs: writepage read submit ino=%lu nid=%llu err=%d\n",
-                        inode->i_ino, (unsigned long long)cur_needle_id,
-                        ret);
                 powerfs_wb_fail_pages(ctx, ret);
                 kvfree(ctx->needle_buf);
                 kfree(ctx);
@@ -806,9 +1088,6 @@ fail_all:
         put_page(wpw->pages[i]);
     }
     atomic_dec(&sbi->wb_in_flight);
-    /* writeback 互斥: 最后一个 batch 完成时释放 wb_mutex */
-    if (atomic_dec_and_test(&pi->wb_batch_count))
-        mutex_unlock(&pi->wb_mutex);
     iput(inode);
     /* 延迟释放: 同 final_cleanup, work_fn 上下文不能直接 kvfree wpw
      * (work_struct 生命周期约束). */
@@ -818,13 +1097,15 @@ fail_all:
 /*
  * powerfs_writepages - 批量 writeback 入口
  *
- * 自己遍历脏页 (pagevec_lookup_range_tag), 批量收集到 work item.
+ * 自己遍历脏页 (filemap_get_folios_tag), 批量收集到 work item.
  * 替代 VFS 默认的 write_cache_pages + writepage 逐页模式.
  *
- * 并发控制:
- *   - max_active=4 限制全局并发 worker (workqueue 级)
- *   - batch 内串行发送 (单 work item 内页面顺序写)
- *   - writepages 由 writeback 子系统串行调用 (per-inode 不会并发)
+ * 并发控制 (参考 Ceph ceph_writepages_start):
+ *   - max_active 限制全局并发 worker (workqueue 级)
+ *   - wb_in_flight 全局 in-flight 上限 (throttle)
+ *   - 无 per-inode mutex: 不同 needle 组的 WriteNeedleBlob 天然并行
+ *     同一页不被并发处理 (VFS page tag 原子转换保证)
+ *     同一 needle 的并发 partial write 由 Volume Server coalescer 合并
  */
 int powerfs_writepages(struct address_space *mapping,
                                struct writeback_control *wbc)
@@ -894,17 +1175,10 @@ int powerfs_writepages(struct address_space *mapping,
         return 0;
     }
 
-    /* writeback 互斥: 确保同一 inode 的 writeback 串行执行.
-     * powerfs_writepages 是异步的 (queue_work), 返回后异步 work 可能仍在执行.
-     * 若 writeback 线程再次调用 powerfs_writepages 处理同一 needle 的不同
-     * 页面, 两个 RMW 并发会导致后写入的覆盖先写入的数据 (data corruption).
-     * mutex_lock 等待上一次 writeback 的所有 batch 完成.
-     *
-     * 自引用 (+1): writepages 在提交 batch 期间持有一份 wb_batch_count 引用,
-     * 防止已提交的 batch 快速完成后将 count 归零并释放 wb_mutex, 导致后续
-     * batch 提交期间另一次 writepages 并发执行. writepages 结束时释放此引用. */
-    mutex_lock(&pi->wb_mutex);
-    atomic_inc(&pi->wb_batch_count);
+    /* 无 per-inode writeback mutex: 参考 Ceph ceph_writepages_start,
+     * 不取任何 per-inode 锁。VFS writeback 子系统通过 page tag 原子转换
+     * (DIRTY → WRITEBACK) 保证同一页面不被并发 writeback; 不同 needle
+     * 组的 WriteNeedleBlob 请求天然独立, 可并行 in-flight。 */
 
     folio_batch_init(&fbatch);
 
@@ -951,7 +1225,6 @@ int powerfs_writepages(struct address_space *mapping,
                             inode->i_ino, batch->num_pages, prev_needle_idx,
                             batch->offsets[0],
                             batch->offsets[batch->num_pages - 1] + batch->counts[batch->num_pages - 1]);
-                    atomic_inc(&pi->wb_batch_count);
                     atomic_inc(&sbi->wb_in_flight);
                     queue_work(sbi->writeback_wq, &batch->work);
                     batch = NULL;
@@ -1007,7 +1280,6 @@ int powerfs_writepages(struct address_space *mapping,
                         inode->i_ino, batch->num_pages,
                         batch->offsets[0],
                         batch->offsets[batch->num_pages - 1] + batch->counts[batch->num_pages - 1]);
-                atomic_inc(&pi->wb_batch_count);
                 atomic_inc(&sbi->wb_in_flight);
                 queue_work(sbi->writeback_wq, &batch->work);
                 batch = NULL;
@@ -1027,7 +1299,6 @@ done:
     /* 提交剩余的 batch */
     if (batch) {
         if (batch->num_pages > 0) {
-            atomic_inc(&pi->wb_batch_count);
             atomic_inc(&sbi->wb_in_flight);
             queue_work(sbi->writeback_wq, &batch->work);
         } else {
@@ -1035,13 +1306,6 @@ done:
             kvfree(batch);
         }
     }
-
-    /* writeback 互斥: 释放 writepages 自身引用.
-     * 若所有 batch 已完成 (或无 batch 提交), 此处归零并释放 wb_mutex.
-     * 这防止了 batch 完成后提前释放 wb_mutex, 导致后续 batch 提交期间
-     * 另一次 writepages 并发执行造成同一 needle 的 RMW 数据覆盖. */
-    if (atomic_dec_and_test(&pi->wb_batch_count))
-        mutex_unlock(&pi->wb_mutex);
 
     return ret;
 }
@@ -1058,7 +1322,6 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
     struct inode *inode = page->mapping->host;
     struct super_block *sb = inode->i_sb;
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(sb);
-    struct powerfs_inode_info *pi = POWERFS_I(inode);
     struct powerfs_writepage_work *wpw;
     loff_t offset = page_offset(page);
     size_t count = PAGE_SIZE;
@@ -1076,19 +1339,12 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
     if (offset + count > i_size_read(inode))
         count = i_size_read(inode) - offset;
 
-    /* writeback 互斥: 与 powerfs_writepages 共用 wb_mutex, 防止
-     * 单页 fallback 与批量 writeback 并发对同一 needle 做 RMW. */
-    mutex_lock(&pi->wb_mutex);
-    /* 自引用 + batch 引用: work_fn 完成时 dec batch 引用,
-     * writepage 结束时 dec 自引用, 归零者释放 wb_mutex. */
-    atomic_inc(&pi->wb_batch_count);
+    /* 无 per-inode mutex: 与 powerfs_writepages 一致, 参考 Ceph. */
 
     wpw = powerfs_alloc_write_batch(1, GFP_NOFS);
     if (!wpw) {
         redirty_page_for_writepage(wbc, page);
         unlock_page(page);
-        if (atomic_dec_and_test(&pi->wb_batch_count))
-            mutex_unlock(&pi->wb_mutex);
         return 0;
     }
 
@@ -1100,8 +1356,6 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
         kvfree(wpw);
         redirty_page_for_writepage(wbc, page);
         unlock_page(page);
-        if (atomic_dec_and_test(&pi->wb_batch_count))
-            mutex_unlock(&pi->wb_mutex);
         return 0;
     }
     get_page(page);
@@ -1112,13 +1366,8 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
 
     set_page_writeback(page);
     unlock_page(page);
-    atomic_inc(&pi->wb_batch_count);   /* batch 引用 */
     atomic_inc(&sbi->wb_in_flight);
     queue_work(sbi->writeback_wq, &wpw->work);
-
-    /* 释放自引用; 若 batch 已完成, 此处归零并释放 wb_mutex */
-    if (atomic_dec_and_test(&pi->wb_batch_count))
-        mutex_unlock(&pi->wb_mutex);
 
     return 0;
 }

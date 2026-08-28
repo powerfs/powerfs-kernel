@@ -215,6 +215,7 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_CREATE_VOLUME = 0x0060,
     POWERFS_NET_MSG_DELETE_VOLUME = 0x0061,
     POWERFS_NET_MSG_WRITE_NEEDLE = 0x0062,
+    POWERFS_NET_MSG_WRITE_NEEDLE_BLOB = 0x006B,
     POWERFS_NET_MSG_READ_NEEDLE = 0x0063,
     POWERFS_NET_MSG_DELETE_NEEDLE = 0x0064,
     POWERFS_NET_MSG_BATCH_WRITE_NEEDLE = 0x0065,
@@ -1492,6 +1493,23 @@ int powerfs_net_write_needle_async(__u64 volume_id, __u64 file_key, __u64 inode,
                                    int timeout_ms,
                                    int (*callback)(struct powerfs_request *),
                                    void *priv);
+
+/* 异步 WriteNeedleBlob (partial write, offset+size).
+ * 与 write_needle_async 相同, 但额外编码 Offset 字段, data 仅为 partial 数据.
+ * Volume Server 通过 coalescer 合并多次 partial write, 避免 kernel 端 RMW.
+ *
+ * 参数:
+ *   offset: 写入偏移 (needle 内字节偏移, 非文件偏移)
+ *   其余参数同 powerfs_net_write_needle_async */
+int powerfs_net_write_needle_blob_async(__u64 volume_id, __u64 file_key,
+                                        __u64 inode, __u64 offset,
+                                        const __u8 *data, size_t data_len,
+                                        const char *lease_token, size_t token_len,
+                                        __u8 *req_body, size_t req_body_cap,
+                                        __u8 *resp_body, size_t resp_body_cap,
+                                        int timeout_ms,
+                                        int (*callback)(struct powerfs_request *),
+                                        void *priv);
 
 /* 异步 ReadNeedle (writeback RMW 读现有 needle).
  * req_body/req_body_cap: TLV body 缓冲区 (函数内编码, 持久存活)

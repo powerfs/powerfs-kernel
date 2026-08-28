@@ -109,11 +109,11 @@ step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 # SSH 辅助函数
 # ============================================================
 ssh_vm() {
-    sshpass -p "${SSH_PASS}" ssh \
+    ssh \
         -o StrictHostKeyChecking=no \
         -o ConnectTimeout=5 \
-        -o PreferredAuthentications=password \
-        -o PubkeyAuthentication=no \
+        -o PreferredAuthentications=publickey \
+        -o PubkeyAuthentication=yes \
         -p "${SSH_PORT}" \
         "${SSH_USER}@localhost" "$@"
 }
