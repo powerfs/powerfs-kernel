@@ -33,12 +33,19 @@ $(MODULE_NAME)-objs := \
     powerfs_net_pool.o \
     powerfs_net_discover.o \
     powerfs_net_lease.o \
+    powerfs_net_tcp_ops.o \
     powerfs_tlv.o \
     powerfs_transport.o \
     powerfs_serializer.o \
     powerfs_flow.o \
     powerfs_ec.o \
     page_cache.o
+
+# RDMA 传输 (CONFIG_INFINIBAND=y 时编译)
+ifdef CONFIG_INFINIBAND
+    $(MODULE_NAME)-objs += powerfs_net_rdma.o
+    ccflags-y += -DCONFIG_POWERFS_RDMA=1
+endif
 
 # NOTE: tlk_codec.o / lock_client.o have been REMOVED from the kernel link.
 #

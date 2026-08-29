@@ -2471,6 +2471,8 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 sha
         conn->port = srv->port;
         conn->type = srv->type;
         conn->in_use = true;
+        conn->transport = &powerfs_tcp_ops;
+        conn->transport_type = POWERFS_TRANSPORT_TCP;
         conn->sock = NULL;
         conn->state = CONN_INIT;
         atomic_set(&conn->seq_counter, 1);
@@ -2534,6 +2536,8 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 sha
         conn->port = srv->port;
         conn->type = srv->type;
         conn->in_use = true;
+        conn->transport = &powerfs_tcp_ops;
+        conn->transport_type = POWERFS_TRANSPORT_TCP;
         conn->sock = NULL;
         conn->state = CONN_INIT;
         atomic_set(&conn->seq_counter, 1);

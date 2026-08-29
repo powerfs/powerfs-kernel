@@ -37,6 +37,13 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
+#include "powerfs_net_transport.h"
+
+/* RDMA 前向声明 (完整定义在 powerfs_net_rdma.h, 供 .c 文件 include) */
+#ifdef CONFIG_INFINIBAND
+struct powerfs_rdma_conn;
+#endif
+
 /* ========== 协议常量 ========== */
 
 #define POWERFS_NET_MAGIC       0x5046534E  /* "PFSN" */
@@ -728,9 +735,18 @@ struct powerfs_net_server_conn {
     enum powerfs_net_server_type type;
     bool in_use;                /* 该槽位是否已使用 */
 
+    /* === 传输层 === */
+    const struct powerfs_transport_ops *transport;
+    enum powerfs_transport_type transport_type;
+
     /* TCP 连接 */
     struct socket *sock;        /* 当前 socket (NULL=未连接) */
     wait_queue_head_t sock_user_wq;
+
+#ifdef CONFIG_INFINIBAND
+    /* RDMA 连接 (transport_type == RDMA 时使用) */
+    struct powerfs_rdma_conn *rdma;
+#endif
 
     /* 状态机 */
     enum powerfs_conn_state state;
