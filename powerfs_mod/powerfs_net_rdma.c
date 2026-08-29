@@ -39,6 +39,7 @@
 #include <linux/scatterlist.h>
 #include <linux/mm.h>
 #include <linux/gfp.h>
+#include <linux/delay.h>
 #include <net/net_namespace.h>
 
 #include <rdma/ib_verbs.h>
@@ -51,6 +52,9 @@
 
 /* CQ 单次 poll 的 WC 数 (栈数组, 16 * ~80B = 1.3KB, 8KB 栈足够) */
 #define PFS_RDMA_WC_BATCH        16
+
+/* CQ comp_handler 单次调用处理上限 (对齐内核 ib_poll_handler budget) */
+#define PFS_RDMA_CQ_BUDGET       256
 
 /* ============= 内部辅助 ============= */
 
@@ -319,22 +323,29 @@ void powerfs_rdma_cq_comp_handler(struct ib_cq *cq, void *ctx)
     struct powerfs_rdma_conn *rdma = (struct powerfs_rdma_conn *)ctx;
     struct ib_wc wcs[PFS_RDMA_WC_BATCH];
     int n, i, missed;
+    int budget = PFS_RDMA_CQ_BUDGET;
 
     if (!rdma)
         return;
 
 poll_again:
-    /* 1. 排空当前完成 */
-    while ((n = ib_poll_cq(cq, PFS_RDMA_WC_BATCH, wcs)) > 0) {
+    /* 1. 排空当前完成 (受 budget 限制, 防止完成风暴下长时间占用 CPU) */
+    while ((n = ib_poll_cq(cq, min_t(int, PFS_RDMA_WC_BATCH, budget), wcs)) > 0) {
         for (i = 0; i < n; i++)
             powerfs_rdma_process_wc(rdma, &wcs[i]);
+        budget -= n;
+        if (budget <= 0)
+            break;
     }
 
-    /* 2. 重新 arm CQ; 若有遗漏事件, 再 poll 一次防丢失 */
-    missed = ib_req_notify_cq(cq, IB_CQ_NEXT_COMP |
-                              IB_CQ_REPORT_MISSED_EVENTS);
-    if (missed > 0)
-        goto poll_again;
+    /* 2. 重新 arm CQ; 若有遗漏事件, 再 poll 一次防丢失.
+     * budget 耗尽时遗漏事件会在下次 comp_handler 触发时处理. */
+    if (budget > 0) {
+        missed = ib_req_notify_cq(cq, IB_CQ_NEXT_COMP |
+                                  IB_CQ_REPORT_MISSED_EVENTS);
+        if (missed > 0)
+            goto poll_again;
+    }
 }
 
 /* ============= rdma_cm 事件处理 ============= */
@@ -789,7 +800,8 @@ void powerfs_rdma_disconnect(struct powerfs_net_server_conn *conn)
     if (rdma->cm_id && rdma->qp) {
         rdma_disconnect(rdma->cm_id);
         /* 等 QP 转 ERROR 让在飞 WR 以错误完成. 软件卡 (RXE) 同步完成;
-         * 硬件卡可能需 drain. 这里轮询两个 CQ 各 200ms 兜底. */
+         * 硬件卡可能需 drain. 这里轮询两个 CQ 各 200ms 兜底.
+         * 此函数在 workqueue 上下文执行 (可睡眠), 用 usleep_range 替代 udelay. */
         for (i = 0; i < 200; i++) {
             int got = 0;
             while ((n = ib_poll_cq(rdma->send_cq, PFS_RDMA_WC_BATCH, wcs)) > 0) {
@@ -806,7 +818,7 @@ void powerfs_rdma_disconnect(struct powerfs_net_server_conn *conn)
             }
             if (!got)
                 break;
-            udelay(1000);
+            usleep_range(1000, 2000);
         }
     }
 
@@ -891,8 +903,22 @@ int powerfs_rdma_send_frame(struct powerfs_net_server_conn *conn,
         return -EMSGSIZE;
     }
 
-    /* 选池: 数据帧 (>=64KB) 用 data_pool (2MB), 否则 ctrl_pool (64KB) */
-    pool = (total > PFS_RDMA_CTRL_BUF_SIZE) ? &rdma->data_pool : &rdma->ctrl_pool;
+    /* Phase 1: 仅支持 <= ctrl_pool 缓冲 (64KB) 的控制帧.
+     * 大数据帧 (write_needle 1MB) 需 RDMA READ 流程 (后续 Phase 实现),
+     * 当前 RECV 缓冲仅 64KB, 发送 >64KB 会导致对端 IB_WC_LOC_LEN_ERR. */
+    if (total > PFS_RDMA_CTRL_BUF_SIZE) {
+        pr_warn_ratelimited("powerfs_rdma: frame %zu > ctrl buf %d, "
+                            "large frames require RDMA READ (not yet impl)\n",
+                            total, PFS_RDMA_CTRL_BUF_SIZE);
+        return -EOPNOTSUPP;
+    }
+    pool = &rdma->ctrl_pool;
+
+    /* 防御: 确保帧不超过所选池的缓冲大小 */
+    if (total > pool->buf_size) {
+        pr_err("powerfs_rdma: frame %zu > pool buf %zu\n", total, pool->buf_size);
+        return -EMSGSIZE;
+    }
 
     /* 抢 credit (atomic_dec_if_positive 不阻塞, 没有就 -EAGAIN) */
     if (atomic_dec_if_positive(&rdma->send_credits) < 0)
@@ -1056,8 +1082,9 @@ repost:
         wr.num_sge = 1;
 
         if (ib_post_recv(rdma->qp, &wr, &bad)) {
-            /* post 失败: entry 还回 ctrl 池, recv_posted 减 1 */
-            powerfs_rdma_mr_pool_release(&rdma->ctrl_pool, e);
+            /* post 失败: entry 还回所属池, recv_posted 减 1 */
+            struct powerfs_rdma_mr_pool *pool = pfs_mr_entry_pool(rdma, e);
+            powerfs_rdma_mr_pool_release(pool, e);
             atomic_dec(&rdma->recv_posted);
             rdma->errored = true;
             /* 若上面解析失败, 以原错误返回; 否则覆盖为 post 失败 */
