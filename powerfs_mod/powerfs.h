@@ -20,6 +20,7 @@
      * detailed block comments explaining WHY it's dead — nothing functional. */
 #include "powerfs_lock.h"  /* MDLock 独立锁对象 */
 #endif /* DEAD_CODE */
+#include "powerfs_net_transport.h"  /* enum powerfs_transport_type + transport_ops */
 
 /* ========== 常量定义 ========== */
 
@@ -920,6 +921,12 @@ struct powerfs_sb_info {
     char master_addr[64];
     u16  master_port;
     u16  shard_count;   /* Filer 总分片数, 用于元数据路由 (inode/1M) % shard_count */
+
+    /* 传输层类型: TCP (默认) 或 RDMA (CONFIG_INFINIBAND=y 时可用).
+     * 由 mount -o transport=tcp|rdma 传入, fill_super 解析后存此.
+     * powerfs_conn_pool_init 读取此字段设置 g_pool.transport_type,
+     * conn 初始化时按 g_pool.transport_type 选择 ops. */
+    enum powerfs_transport_type transport_type;
 
     /* 证书路径: fill_super 阶段从 ctx 暂存到此, 后续 powerfs_client 初始化
      * 时再拷贝到 client->ca_crt/client_crt/client_key. 长度 511B + NUL. */

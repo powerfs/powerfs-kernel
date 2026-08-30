@@ -86,4 +86,21 @@ struct powerfs_transport_ops {
 /* TCP 传输 ops (定义在 powerfs_net_tcp_ops.c) */
 extern const struct powerfs_transport_ops powerfs_tcp_ops;
 
+/* RDMA 传输 ops (定义在 powerfs_net_rdma.c, 仅 CONFIG_INFINIBAND=y 时存在).
+ * powerfs_net_conn.c 按 g_pool.transport_type 选 tcp/rdma ops. */
+#ifdef CONFIG_INFINIBAND
+extern const struct powerfs_transport_ops powerfs_rdma_ops;
+#endif
+
+/* 按 transport_type 选择 ops. 未启用 INFINIBAND 时 rdma 退化为 tcp (防御). */
+static inline const struct powerfs_transport_ops *
+powerfs_transport_pick_ops(enum powerfs_transport_type type)
+{
+#ifdef CONFIG_INFINIBAND
+    if (type == POWERFS_TRANSPORT_RDMA)
+        return &powerfs_rdma_ops;
+#endif
+    return &powerfs_tcp_ops;
+}
+
 #endif /* POWERFS_NET_TRANSPORT_H */

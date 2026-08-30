@@ -40,6 +40,7 @@ enum powerfs_param {
     Opt_ca_crt,
     Opt_client_crt,
     Opt_client_key,
+    Opt_transport,
 };
 
 static const struct fs_parameter_spec powerfs_fs_parameters[] = {
@@ -50,6 +51,7 @@ static const struct fs_parameter_spec powerfs_fs_parameters[] = {
     fsparam_string("ca_crt",       Opt_ca_crt),
     fsparam_string("client_crt",   Opt_client_crt),
     fsparam_string("client_key",   Opt_client_key),
+    fsparam_string("transport",    Opt_transport),
     {}
 };
 
@@ -70,6 +72,10 @@ struct powerfs_ctx {
     char ca_crt[512];
     char client_crt[512];
     char client_key[512];
+    /* 传输层选择: "tcp" (默认) 或 "rdma" (CONFIG_INFINIBAND=y 时可用).
+     * 由 mount -o transport=tcp|rdma 传入. fill_super 解析为 transport_type
+     * 存入 sbi->transport_type 并传播到 g_pool.transport_type. */
+    char transport[8];
 };
 
 /* ========== 外部函数声明 (在 powerfs_fs.c 中定义) ========== */
@@ -230,6 +236,20 @@ static int powerfs_parse_param(struct fs_context *fc, struct fs_parameter *param
             pr_info("powerfs: client_key = %s\n", ctx->client_key);
         }
         break;
+    case Opt_transport:
+        if (param->string) {
+            strncpy(ctx->transport, param->string, sizeof(ctx->transport) - 1);
+            ctx->transport[sizeof(ctx->transport) - 1] = '\0';
+            /* 校验: 只接受 "tcp" 或 "rdma", 其他值拒绝挂载避免静默走错路径. */
+            if (strcmp(ctx->transport, "tcp") != 0 &&
+                strcmp(ctx->transport, "rdma") != 0) {
+                pr_err("powerfs: invalid transport='%s' (must be tcp or rdma)\n",
+                       ctx->transport);
+                return -EINVAL;
+            }
+            pr_info("powerfs: transport = %s\n", ctx->transport);
+        }
+        break;
     }
 
     return 0;
@@ -273,6 +293,9 @@ static int powerfs_init_fs_context(struct fs_context *fc)
     ctx->master_port = POWERFS_DEFAULT_MASTER_PORT;
     ctx->shard_count = POWERFS_DEFAULT_SHARD_COUNT;
     ctx->write_batch_kb = POWERFS_WRITE_BATCH_DEFAULT_KB;
+    /* 默认传输: tcp (最通用, 无需 CONFIG_INFINIBAND).
+     * rdma 需要内核 CONFIG_INFINIBAND=y + 服务端 RDMA 监听. */
+    strcpy(ctx->transport, "tcp");
 
     fc->s_fs_info = ctx;
     fc->ops = &powerfs_ctx_ops;

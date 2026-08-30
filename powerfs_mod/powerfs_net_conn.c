@@ -1874,6 +1874,41 @@ int powerfs_conn_connect_one(struct powerfs_net_server_conn *conn)
 
     powerfs_conn_set_state(conn, CONN_CONNECTING);
 
+#ifdef CONFIG_INFINIBAND
+    /* RDMA 路径: 走 transport ops (cm_id + QP + RTS), 不创建 socket.
+     * handshake 在 ops->connect 内部或后续 send_frame/recv_frame 层完成.
+     * 当前 Phase 2: 仅建立 RDMA 连接, 验证传输层正确性.
+     * TODO: handshake 接入 (需通过 transport->send_frame/recv_frame 收发). */
+    if (conn->transport_type == POWERFS_TRANSPORT_RDMA && conn->transport) {
+        const struct powerfs_transport_ops *ops = conn->transport;
+
+        /* init_conn: 分配 conn->rdma (cm_id/CQ/QP 容器) */
+        ret = ops->init_conn(conn);
+        if (ret) {
+            pr_err("powerfs: rdma init_conn %s:%u failed: %d\n",
+                   conn->addr, conn->port, ret);
+            powerfs_conn_set_state(conn, CONN_RECONNECTING);
+            return ret;
+        }
+        /* connect: addr/route resolve → PD/CQ/QP → RTS → CONNECTED 事件 */
+        ret = ops->connect(conn);
+        if (ret) {
+            pr_err("powerfs: rdma connect %s:%u failed: %d\n",
+                   conn->addr, conn->port, ret);
+            ops->fini_conn(conn);
+            powerfs_conn_set_state(conn, CONN_RECONNECTING);
+            return ret;
+        }
+        powerfs_conn_set_state(conn, CONN_CONNECTED);
+        conn->reconnect_count = 0;
+        conn->reconnect_delay = 0;
+        atomic_set(&conn->consecutive_timeouts, 0);
+        pr_info("powerfs: rdma filer %s:%u connected\n", conn->addr, conn->port);
+        return 0;
+    }
+#endif /* CONFIG_INFINIBAND */
+
+    /* TCP 路径 (现有逻辑) */
     sock = powerfs_net_create_tcp_socket();
     if (!sock) {
         powerfs_conn_set_state(conn, CONN_RECONNECTING);
@@ -1951,6 +1986,24 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
     if (filer_idx >= 0)
         powerfs_shard_route_on_filer_disconnect(filer_idx);
 
+#ifdef CONFIG_INFINIBAND
+    /* RDMA 路径: 断开 RDMA 连接 + 释放资源, 跳过 socket 操作.
+     * pfs_conn_remove_from_sched 对 RDMA 仍需要 (清理调度器引用),
+     * 但 sk 回调 reset 仅 TCP 有意义 (RDMA 无 sk 回调). */
+    if (conn->transport_type == POWERFS_TRANSPORT_RDMA && conn->transport) {
+        const struct powerfs_transport_ops *ops = conn->transport;
+        /* 从调度器摘除 (kref 引用, 与 TCP 一致) */
+        pfs_conn_remove_from_sched(conn);
+        /* 断开 RDMA 连接 (cm_id destroy) */
+        ops->disconnect(conn);
+        /* 释放 rdma 资源 (CQ/MR/PD, cm_id 已在 disconnect 销毁) */
+        ops->fini_conn(conn);
+        pr_debug("powerfs: rdma filer %s:%u disconnected\n",
+                 conn->addr, conn->port);
+        goto disconnect_done;
+    }
+#endif /* CONFIG_INFINIBAND */
+
     /* 1. v2: 恢复 sk 回调 + 清 sk_user_data (此后 softirq 回调 NOOP, 调原始回调).
      *    必须在 shutdown 前执行, 防止 shutdown 触发的回调访问已拆的 conn. */
     if (sock)
@@ -1965,6 +2018,7 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
     if (sock)
         kernel_sock_shutdown(sock, SHUT_RDWR);
 
+disconnect_done:
     /* 4. 唤醒在途请求的主线程: 以 -ENOTCONN complete 所有 pending 请求.
      *    主线程的 do_send 从 wait_for_completion_timeout 醒来, 看到 -ENOTCONN,
      *    返回到 submit 循环, 由主线程自己重试 (重新查路由, 选其他 filer 或等重连).
@@ -2393,7 +2447,8 @@ EXPORT_SYMBOL_GPL(powerfs_net_stop_heartbeat);
 
 /* === 6. 连接池 init/exit === */
 
-int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count)
+int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count,
+                           enum powerfs_transport_type transport_type)
 {
     int i, ret;
 
@@ -2407,6 +2462,9 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 sha
         g_pool.master_port = master_port;
         g_pool.master_set = true;
     }
+    /* 传输层类型: 由 fill_super 从 mount -o transport= 解析传入.
+     * conn 初始化 (本函数下方) + powerfs_conn_connect_one 分流都读此字段. */
+    g_pool.transport_type = transport_type;
     atomic_set(&g_pool.stopping, 0);
     g_pool.heartbeat_started = false;
 
@@ -2471,8 +2529,10 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 sha
         conn->port = srv->port;
         conn->type = srv->type;
         conn->in_use = true;
-        conn->transport = &powerfs_tcp_ops;
-        conn->transport_type = POWERFS_TRANSPORT_TCP;
+        /* 按 g_pool.transport_type 选 ops (mount -o transport=tcp|rdma).
+         * TCP 走现有 socket 路径, RDMA 走 powerfs_rdma_ops (CONFIG_INFINIBAND). */
+        conn->transport = powerfs_transport_pick_ops(g_pool.transport_type);
+        conn->transport_type = g_pool.transport_type;
         conn->sock = NULL;
         conn->state = CONN_INIT;
         atomic_set(&conn->seq_counter, 1);
@@ -2536,8 +2596,10 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 sha
         conn->port = srv->port;
         conn->type = srv->type;
         conn->in_use = true;
-        conn->transport = &powerfs_tcp_ops;
-        conn->transport_type = POWERFS_TRANSPORT_TCP;
+        /* 按 g_pool.transport_type 选 ops (mount -o transport=tcp|rdma).
+         * TCP 走现有 socket 路径, RDMA 走 powerfs_rdma_ops (CONFIG_INFINIBAND). */
+        conn->transport = powerfs_transport_pick_ops(g_pool.transport_type);
+        conn->transport_type = g_pool.transport_type;
         conn->sock = NULL;
         conn->state = CONN_INIT;
         atomic_set(&conn->seq_counter, 1);

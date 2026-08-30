@@ -931,8 +931,10 @@ static inline const char *powerfs_conn_state_str(enum powerfs_conn_state s)
 
 /* ========== 连接池 API (新架构) ========== */
 
-/* 初始化连接池 (从 Master 发现 filer/volume 列表) */
-int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count);
+/* 初始化连接池 (从 Master 发现 filer/volume 列表)
+ * transport_type: 由 fill_super 从 mount -o transport= 解析, 决定 conn 选 tcp/rdma ops */
+int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count,
+                           enum powerfs_transport_type transport_type);
 
 /* 连接池清理 */
 void powerfs_conn_pool_exit(void);
@@ -1058,6 +1060,14 @@ struct powerfs_net_pool {
     char master_addr[64];
     __u16 master_port;
     bool master_set;
+
+    /* === 传输层类型 (由 fill_super 从 sbi->transport_type 设置) ===
+     * conn 初始化 (powerfs_conn_pool_init) 读取此字段选择 ops:
+     *   TCP  → powerfs_tcp_ops (现有路径)
+     *   RDMA → powerfs_rdma_ops (CONFIG_INFINIBAND=y 时)
+     * powerfs_net_pool_init memset 清零 g_pool 后, fill_super 在 pool_init
+     * 调用之后设置此字段, 故 conn 初始化时已就绪. */
+    enum powerfs_transport_type transport_type;
 
     atomic_t stopping;
 

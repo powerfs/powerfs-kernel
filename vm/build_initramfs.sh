@@ -931,6 +931,104 @@ else
     echo "  [WARN] 宿主未安装 bash, 测试脚本在 VM 中只能用 busybox sh 兼容模式"
 fi
 
+# =====================================================================
+# 打包 RDMA 诊断工具 (vfio-pci 直通 VF 时在 VM 内验证设备可见性)
+#   - ibv_devices / ibv_devinfo / ibv_rc_pingpong / ibstatus (rdma-core)
+#   - librdmacm / libibverbs / libnl-3 / libnl-route-3 依赖
+#   - libmlx5 provider:  libmlx5-rdmav34.so (VM 内 mlx5_ib 驱动配对, 通过
+#     /usr/lib/x86_64-linux-gnu/libibverbs/provider/ 提供)
+#   - lspci: 查看 vfio 直通到 VM 的 PCI BDF 是否被 VM 内核枚举
+# =====================================================================
+echo "=== 打包 RDMA 诊断工具 (ibv_* / lspci) ==="
+RDMA_BINS=(
+    /usr/bin/ibv_devices
+    /usr/bin/ibv_devinfo
+    /usr/bin/ibv_rc_pingpong
+    /usr/sbin/ibstatus
+    /usr/bin/lspci
+    /usr/bin/rdma
+    /usr/sbin/setpci
+)
+for util in "${RDMA_BINS[@]}"; do
+    name=$(basename "${util}")
+    if [ ! -x "${util}" ]; then
+        echo "  [SKIP] ${util} 不存在"
+        continue
+    fi
+    cp "${util}" "usr/bin/${name}" 2>/dev/null || continue
+    chmod +x "usr/bin/${name}" 2>/dev/null
+    # 同名软链到 /bin
+    if [ ! -f "bin/${name}" ]; then
+        ln -sf "/usr/bin/${name}" "bin/${name}" 2>/dev/null || true
+    fi
+    # 展开 .so 依赖
+    for so in $(ldd "${util}" 2>/dev/null | awk '/=> \// {print $3} /^\s*\/lib.*ld-linux/ {print $1}'); do
+        if [ -n "${BASH_BIN}" ] && declare -F _copy_so >/dev/null 2>&1; then
+            _copy_so "${so}"
+        else
+            sname=$(basename "${so}")
+            [ -n "${sname}" ] && [ -f "${so}" ] && cp -L "${so}" "lib/${sname}" 2>/dev/null || true
+        fi
+    done
+    echo "  + ${name}"
+done
+# 额外补齐 rdma-core provider 共享库 (用户态驱动, 需要被 libibverbs dlopen)
+mkdir -p lib/libibverbs  lib/librdmacm
+_provider_list=(
+    "/usr/lib/x86_64-linux-gnu/libibverbs/libmlx5-rdmav34.so"
+    "/usr/lib/x86_64-linux-gnu/libmlx5.so.1"
+    "/usr/lib/x86_64-linux-gnu/libmlx4.so.1"
+    "/usr/lib/x86_64-linux-gnu/libefa.so.1"
+    "/usr/lib/x86_64-linux-gnu/librdmacm.so.1"
+    "/usr/lib/x86_64-linux-gnu/libibverbs.so.1"
+    "/usr/lib/x86_64-linux-gnu/libnl-3.so.200"
+    "/usr/lib/x86_64-linux-gnu/libnl-route-3.so.200"
+)
+for f in "${_provider_list[@]}"; do
+    if [ ! -f "${f}" ]; then continue; fi
+    # 保留 symlink: 将 real file + symlink 都放到 lib/ (dlopen 用 soname 找, 目录结构
+    # 必须和 host 一致: libmlx5-rdmav34.so 放到 lib/libibverbs/)
+    dest="lib/$(echo "${f}" | sed 's|.*/x86_64-linux-gnu/||')"
+    dest_dir="$(dirname "${dest}")"
+    mkdir -p "${dest_dir}"
+    if [ -L "${f}" ]; then
+        tgt="$(readlink "${f}")"
+        if [ "${tgt#/}" = "${tgt}" ] && [ -f "$(dirname "${f}")/${tgt}" ]; then
+            # 相对链接: 复制目标再 ln
+            cp "$(dirname "${f}")/${tgt}" "${dest_dir}/${tgt}" 2>/dev/null || true
+            (cd "${dest_dir}" && ln -sf "${tgt}" "$(basename "${dest}")" 2>/dev/null || true)
+        elif [ -f "${tgt}" ]; then
+            cp "${tgt}" "lib/$(basename "${tgt}")" 2>/dev/null || true
+        fi
+    else
+        cp "${f}" "${dest}" 2>/dev/null || true
+    fi
+    # 同步复制到 lib/ 根 (兼容一些实现不进子目录)
+    cp -L "${f}" "lib/$(basename "${f}")" 2>/dev/null || true
+done
+# libnl-genl-3: libnl-route-3 间接依赖 (有时未被 ldd 展开, 以防万一)
+for extra in libnl-genl-3.so.200 libpci.so.3 libkmod.so.2 libz.so.1 libzstd.so.1 liblzma.so.5 libudev.so.1 libcrypto.so.1.1 libpthread.so.0 libdl.so.2 libresolv.so.2; do
+    found="$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu -name "${extra}" -not -name '*.a' 2>/dev/null | head -1)"
+    if [ -n "${found}" ]; then
+        if declare -F _copy_so >/dev/null 2>&1; then
+            _copy_so "${found}"
+        else
+            cp -L "${found}" "lib/$(basename "${found}")" 2>/dev/null || true
+        fi
+    fi
+done
+# 补齐 /etc/libibverbs.d/*.driver (rdma-core 运行时驱动描述文件, 否则 libmlx5 不被
+# libibverbs 枚举, ibv_devices 看不到 mlx5 设备).
+mkdir -p etc/libibverbs.d
+if [ -d /etc/libibverbs.d ]; then
+    for f in /etc/libibverbs.d/*; do
+        [ -f "${f}" ] || continue
+        cp "${f}" "etc/libibverbs.d/$(basename "${f}")"
+        echo "  + etc/libibverbs.d/$(basename "${f}")"
+    done
+fi
+echo "  RDMA 工具打包完成"
+
 # 创建简单的挂载工具。
 # 挂载点与 FUSE 容器一致: /mnt/powerfs, 保证 test_t1_vfs_basic.sh /
 # test_t2_correctness.sh 两边同路径、一套脚本复用。

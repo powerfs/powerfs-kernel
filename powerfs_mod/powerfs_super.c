@@ -330,6 +330,8 @@ static int powerfs_show_options(struct seq_file *m, struct dentry *root)
 
     seq_printf(m, ",master_addr=%s", sbi->master_addr);
     seq_printf(m, ",master_port=%u", sbi->master_port);
+    seq_printf(m, ",transport=%s",
+               sbi->transport_type == POWERFS_TRANSPORT_RDMA ? "rdma" : "tcp");
 
     return 0;
 }
@@ -1373,6 +1375,7 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         char ca_crt[512];
         char client_crt[512];
         char client_key[512];
+        char transport[8];   /* "tcp" (默认) 或 "rdma" */
     };
     /* 注意: sget_fc() 会将 fc->s_fs_info 转移到 sb->s_fs_info, 然后将
      * fc->s_fs_info 置 NULL. 因此必须从 sb->s_fs_info 获取 ctx, 而不是
@@ -1406,6 +1409,23 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->ca_crt[sizeof(sbi->ca_crt) - 1]             = '\0';
         sbi->client_crt[sizeof(sbi->client_crt) - 1]     = '\0';
         sbi->client_key[sizeof(sbi->client_key) - 1]     = '\0';
+
+        /* transport: 解析 "tcp"/"rdma" → sbi->transport_type.
+         * parse_param 已校验只接受 tcp/rdma, 这里防御性二次校验. */
+        if (strcmp(ctx->transport, "rdma") == 0) {
+#ifndef CONFIG_INFINIBAND
+            pr_err("powerfs: transport=rdma requires CONFIG_INFINIBAND=y\n");
+            kfree(sbi);
+            kfree(ctx);
+            sb->s_fs_info = NULL;
+            return -EINVAL;
+#else
+            sbi->transport_type = POWERFS_TRANSPORT_RDMA;
+#endif
+        } else {
+            /* 空字符串或 "tcp" 都默认 TCP (兼容旧 mount 命令不传 transport). */
+            sbi->transport_type = POWERFS_TRANSPORT_TCP;
+        }
         /* 释放 init_fs_context 分配的 ctx, 释放后 sb->s_fs_info 仍指向已释放内存,
          * 必须清除以避免 kill_sb 访问悬空指针 (fill_super 早期失败时 VFS 仍会
          * 调用 kill_sb). 下方 sb->s_fs_info = sbi 会重新设置. */
@@ -1801,7 +1821,8 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         const char *maddr = sbi->master_addr[0] ? sbi->master_addr : NULL;
         __u16 mport = sbi->master_port ? sbi->master_port : 9334;
         __u16 scount = sbi->shard_count ? sbi->shard_count : 3;
-        int pool_ret = powerfs_conn_pool_init(maddr, mport, scount);
+        int pool_ret = powerfs_conn_pool_init(maddr, mport, scount,
+                                                sbi->transport_type);
         if (pool_ret != 0) {
             pr_err("powerfs: connection pool init failed (%d)\n", pool_ret);
             return pool_ret;

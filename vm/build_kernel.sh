@@ -159,6 +159,52 @@ echo "=== 优化内核配置 (QEMU + 调试) ==="
 # 启用 FUSE (用户态文件系统, 可选参考)
 ./scripts/config --enable CONFIG_FUSE_FS
 
+# === 启用 InfiniBand + RDMA (Phase 2: 内核态 RDMA 传输) ===
+# powerfs_net_rdma.c 依赖 rdma_cm/ib_core/ib_verbs 符号.
+# VM 用 initramfs 无 /lib/modules, 故所有 RDMA 必须编译进内核 (=y, 不能 =m).
+# rxe (Soft-RoCE) 用于 QEMU 虚拟环境 RDMA 测试 (走 UDP 封装, 无需真实硬件).
+# mlx5_core/mlx5_ib 为硬件 ConnectX VF (vfio-pci 直通) 的 kernel 驱动,
+# 配合 powerfs.ko 里 CONFIG_INFINIBAND 的 RDMA transport 路径.
+./scripts/config --enable CONFIG_INFINIBAND
+./scripts/config --enable CONFIG_INFINIBAND_USER_ACCESS
+./scripts/config --enable CONFIG_INFINIBAND_USER_MEM
+./scripts/config --enable CONFIG_INFINIBAND_ON_DEMAND_PAGING
+./scripts/config --enable CONFIG_INFINIBAND_ADDR_TRANS
+./scripts/config --enable CONFIG_INFINIBAND_VIRT_DMA
+./scripts/config --enable CONFIG_RDMA_RXE
+./scripts/config --enable CONFIG_RDMA_SIW
+# Mellanox ConnectX (mlx5) 低延时 HCA / VF 驱动 (硬件直通时需要).
+# 依赖: 64-bit (默认) + PCI + ETHERNET + NET_DEV + INFINIBAND + FW_LOADER + CRC32 + PTP_1588_CLOCK_OPTIONAL.
+./scripts/config --enable CONFIG_ETHERNET
+./scripts/config --enable CONFIG_NET_VENDOR_MELLANOX
+./scripts/config --enable CONFIG_MLX5_CORE
+./scripts/config --enable CONFIG_MLX5_CORE_EN
+./scripts/config --enable CONFIG_MLX5_FPGA       # 可选, 但避免 olddefconfig 未补齐导致 MLX5_IB 依赖缺失
+./scripts/config --enable CONFIG_MLX5_IPSEC      # 同上
+./scripts/config --enable CONFIG_MLX5_TLS         # 同上
+./scripts/config --enable CONFIG_MLX5_EN_TLS      # 同上
+./scripts/config --enable CONFIG_MLX5_EN_IPSEC    # 同上
+./scripts/config --enable CONFIG_MLX5_IB
+./scripts/config --enable CONFIG_MLX5_INFINIBAND
+./scripts/config --enable CONFIG_INFINIBAND_MTHCA # 兼容性兜底
+# IPoIB: 为 ConnectX VF 提供 L3 网络接口 (ibN 设备), 用于 rdma_cm 地址解析.
+# rdma_resolve_addr 要求 sockaddr_in 指向的 IP 地址属于本机某个 IB/以太网设备.
+./scripts/config --enable CONFIG_INFINIBAND_IPOIB
+./scripts/config --enable CONFIG_INFINIBAND_IPOIB_CM
+./scripts/config --enable CONFIG_INFINIBAND_SRP
+./scripts/config --enable CONFIG_INFINIBAND_ISER
+./scripts/config --enable CONFIG_I2C
+./scripts/config --enable CONFIG_I2C_ALGOBIT
+./scripts/config --enable CONFIG_MDIO
+./scripts/config --enable CONFIG_PTP_1588_CLOCK_OPTIONAL
+./scripts/config --enable CONFIG_FW_LOADER
+./scripts/config --enable CONFIG_CRC32
+./scripts/config --enable CONFIG_PCI_IOV         # SR-IOV (Host 已用, VM 侧 VF 驱动仍建议打开)
+# 保证 VFIO 设备暴露的 PCI 功能可被 VM 内核枚举 (PCI/PCIe hotplug 已由 defconfig 提供,
+# 这里再显式开辅助项避免遗漏).
+./scripts/config --enable CONFIG_HOTPLUG_PCI
+./scripts/config --enable CONFIG_HOTPLUG_PCI_ACPI
+
 # 启用 NFS (网络文件系统, 可选)
 ./scripts/config --enable CONFIG_NFS_FS
 ./scripts/config --enable CONFIG_NFS_V3
@@ -191,6 +237,8 @@ echo "=== 优化内核配置 (QEMU + 调试) ==="
 
 echo "=== 开始编译内核 (使用所有 CPU 核心) ==="
 cd "${KERNEL_SOURCE}"
+# olddefconfig: 处理新增 CONFIG 选项的依赖关系 (如 INFINIBAND 依赖 NET/PCI/INET)
+make olddefconfig
 make -j$(nproc)
 
 echo "=== 编译模块 ==="
