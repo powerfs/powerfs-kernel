@@ -20,7 +20,9 @@
 /* ========== RDMA 配置 ========== */
 
 #define PFS_RDMA_MAX_SEND_WR    64
-#define PFS_RDMA_MAX_RECV_WR    64
+/* RECV WR 数量必须 <= PFS_RDMA_CTRL_BUF_NUM, 每个 RECV WR 占一个 ctrl 池条目.
+ * 旧值 64 > 池 32 致 post_recv 32/64 后 -ENOMEM(-12). */
+#define PFS_RDMA_MAX_RECV_WR    32
 #define PFS_RDMA_MAX_SGE        3       /* hdr + body + data */
 #define PFS_RDMA_MAX_INLINE     64      /* 28B header 可 inline */
 

@@ -103,16 +103,23 @@ fi
 USE_VFIO_RDMA="${USE_VFIO_RDMA:-0}"
 # VF 设备 BDF (默认取 host 上第一个绑定 vfio-pci 的 ConnectX VF).
 VFIO_BDF="${VFIO_BDF:-}"
-# 当 USE_VFIO_RDMA=1 且未指定时, 自动探测 host 上第一个 vfio-pci 绑定的 PCI VF.
+# 当 USE_VFIO_RDMA=1 且未指定时, 自动探测 host 上 mlx5 VF 绑定 vfio-pci 的设备.
+# 过滤 mlx5 vendor (15b3) 避免误选其他 vfio-pci 设备 (如 GPU/VF).
 if [ "${USE_VFIO_RDMA}" = "1" ] && [ -z "${VFIO_BDF}" ]; then
     VFIO_BDF=""
-    for s in /sys/bus/pci/devices/*/driver; do
-        if [ -L "$s" ] && readlink "$s" 2>/dev/null | grep -q "vfio-pci"; then
-            VFIO_BDF="$(basename "$(dirname "$s")")"
-            break
-        fi
+    for dev in /sys/bus/pci/devices/*; do
+        [ -L "${dev}/driver" ] || continue
+        readlink "${dev}/driver" 2>/dev/null | grep -q "vfio-pci" || continue
+        # 仅选 ConnectX (Mellanox vendor 0x15b3) 的 VF
+        _vendor=$(cat "${dev}/vendor" 2>/dev/null)
+        [ "${_vendor}" = "0x15b3" ] || continue
+        # 必须是 VF (有 physfn 符号链接指向父 PF), 跳过 PF 自身
+        [ -L "${dev}/physfn" ] || continue
+        VFIO_BDF="$(basename "${dev}")"
+        break
     done
-    if [ -n "${VFIO_BDF}" ] && [ "${VFIO_BDF:0:4}" != "0000:" ]; then
+    # 规范 BDF 前缀: domain:bus:dev.func (8 位 domain + 冒号)
+    if [ -n "${VFIO_BDF}" ] && [ "${VFIO_BDF:0:5}" != "0000:" ]; then
         VFIO_BDF="0000:${VFIO_BDF}"
     fi
 fi

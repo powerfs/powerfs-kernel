@@ -79,7 +79,7 @@ pfs_mr_entry_pool(struct powerfs_rdma_conn *rdma,
  *
  * 每个 entry:
  *   1. __get_free_pages 分配页对齐缓冲 (DMA 友好, 比 kmalloc 更易整页注册)
- *   2. ib_alloc_mr(IB_MR_TYPE_MEM_REG, 1) 分配 MR 描述符
+ *   2. ib_alloc_mr(IB_MR_TYPE_MEM_REG, buf_size/PAGE_SIZE) 分配 MR 描述符
  *   3. ib_dma_map_single 取 DMA 地址
  *   4. ib_map_mr_sg 把单条 SG (整个缓冲) 烧入 MR
  * 之后 entry->mr->lkey 可直接用于 SGE.
@@ -120,7 +120,10 @@ int powerfs_rdma_mr_pool_init(struct ib_pd *pd,
         }
         e->size = buf_size;
 
-        e->mr = ib_alloc_mr(pd, IB_MR_TYPE_MEM_REG, 1);
+        /* max_num_sg 必须 >= buf_size/PAGE_SIZE, 否则 mlx5 内部
+         * ndescs=ALIGN(max_num_sg,4) 不足, set_page 返回 -ENOMEM
+         * 致 ib_map_mr_sg 返回 -EINVAL. */
+        e->mr = ib_alloc_mr(pd, IB_MR_TYPE_MEM_REG, buf_size / PAGE_SIZE);
         if (IS_ERR(e->mr)) {
             ret = PTR_ERR(e->mr);
             e->mr = NULL;
@@ -134,7 +137,19 @@ int powerfs_rdma_mr_pool_init(struct ib_pd *pd,
         }
         e->dma = dma;
 
-        /* 单条 SG 覆盖整个缓冲, ib_map_mr_sg 把 DMA 地址烧入 MR */
+        /* 单条 SG 覆盖整个缓冲, ib_map_mr_sg 把 DMA 地址烧入 MR.
+         *
+         * 内核签名 (linux-6.17/drivers/infiniband/core/verbs.c):
+         *   int ib_map_mr_sg(mr, sg, sg_nents, *sg_offset, page_size)
+         * 4 参 sg_offset: 指针, 传 NULL 表示无偏移.
+         * 5 参 page_size:  值,   必须传 PAGE_SIZE 等页大小, 否则
+         *   mr->page_size=0 -> page_mask=0 -> page_addr 恒为 0 ->
+         *   set_page 反复写 0 直到 max_descs 耗尽 -> 返回 0 ->
+         *   nents(0) != 1 -> -EINVAL(-22). 旧代码两参颠倒即此症.
+         *
+         * ib_sg_to_pages 仅读 sg_dma_address/sg_dma_len, 不读 sg_page,
+         * 故 pre-DMA-mapped SG 手动设置这两个字段是内核标准用法.
+         */
         sg_init_table(&sg, 1);
         sg_set_buf(&sg, e->buf, buf_size);
         sg_dma_address(&sg) = dma;

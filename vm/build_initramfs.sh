@@ -420,6 +420,70 @@ fi
 # 等待网络就绪
 sleep 1
 
+# 创建 InfiniBand 用户态设备节点 (/dev/infiniband/uverbs0 等).
+# 内核注册 IB 设备后, /sys/class/infiniband_verbs/uverbsN/dev 给出 "major:minor",
+# 但 tmpfs /dev 不会自动 mknod (无 udev), 必须手动创建, 否则 ibv_devinfo 看不到设备,
+# powerfs RDMA transport 无法打开 verbs context.
+echo "创建 InfiniBand 设备节点..."
+mkdir -p /dev/infiniband
+for uv in /sys/class/infiniband_verbs/uverbs*; do
+    [ -e "${uv}/dev" ] || continue
+    name=$(basename "${uv}")
+    major_minor=$(cat "${uv}/dev" 2>/dev/null)
+    if [ -n "${major_minor}" ]; then
+        maj=$(echo "${major_minor}" | cut -d: -f1)
+        min=$(echo "${major_minor}" | cut -d: -f2)
+        if [ -n "${MKNOD_CMD}" ]; then
+            ${MKNOD_CMD} "/dev/infiniband/${name}" c "${maj}" "${min}" 2>/dev/null
+            chmod 666 "/dev/infiniband/${name}" 2>/dev/null || true
+            echo "  + /dev/infiniband/${name} (c ${maj}:${min})"
+        fi
+    fi
+done
+# rdma_cm 字符设备 (RDMA CM 用户态接口, rdma_cm 模块加载后出现)
+if [ -e /sys/class/infiniband_cm/rdma_cm/dev ]; then
+    cm_mm=$(cat /sys/class/infiniband_cm/rdma_cm/dev 2>/dev/null)
+    if [ -n "${cm_mm}" ]; then
+        cm_maj=$(echo "${cm_mm}" | cut -d: -f1)
+        cm_min=$(echo "${cm_mm}" | cut -d: -f2)
+        if [ -n "${MKNOD_CMD}" ] && [ ! -c /dev/infiniband/rdma_cm ]; then
+            ${MKNOD_CMD} /dev/infiniband/rdma_cm c "${cm_maj}" "${cm_min}" 2>/dev/null
+            chmod 666 /dev/infiniband/rdma_cm 2>/dev/null || true
+            echo "  + /dev/infiniband/rdma_cm (c ${cm_maj}:${cm_min})"
+        fi
+    fi
+fi
+# umad (InfiniBand MAD 用户态访问, ibv_devices 枚举需要)
+for um in /sys/class/infiniband_umad/umad*; do
+    [ -e "${um}/dev" ] || continue
+    uname=$(basename "${um}")
+    um_mm=$(cat "${um}/dev" 2>/dev/null)
+    if [ -n "${um_mm}" ] && [ -n "${MKNOD_CMD}" ]; then
+        um_maj=$(echo "${um_mm}" | cut -d: -f1)
+        um_min=$(echo "${um_mm}" | cut -d: -f2)
+        ${MKNOD_CMD} "/dev/infiniband/${uname}" c "${um_maj}" "${um_min}" 2>/dev/null
+        chmod 666 "/dev/infiniband/${uname}" 2>/dev/null || true
+        echo "  + /dev/infiniband/${uname} (c ${um_maj}:${um_min})"
+    fi
+done
+# issm (InfiniBand Subnet Manager 接口)
+for is in /sys/class/infiniband_umad/issm*; do
+    [ -e "${is}/dev" ] || continue
+    iname=$(basename "${is}")
+    is_mm=$(cat "${is}/dev" 2>/dev/null)
+    if [ -n "${is_mm}" ] && [ -n "${MKNOD_CMD}" ]; then
+        is_maj=$(echo "${is_mm}" | cut -d: -f1)
+        is_min=$(echo "${is_mm}" | cut -d: -f2)
+        ${MKNOD_CMD} "/dev/infiniband/${iname}" c "${is_maj}" "${is_min}" 2>/dev/null
+        chmod 666 "/dev/infiniband/${iname}" 2>/dev/null || true
+    fi
+done
+# 验证 IB 设备可见性
+if command -v ibv_devices >/dev/null 2>&1; then
+    echo "  ibv_devices:"
+    ibv_devices 2>/dev/null | head -5
+fi
+
 # 挂载 Host 共享目录 (9p virtfs, 用于快速部署 powerfs.ko 和测试脚本)
 echo "挂载 Host 共享目录 (9p virtfs)..."
 mkdir -p /mnt/host
