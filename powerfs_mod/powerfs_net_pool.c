@@ -137,6 +137,16 @@ void powerfs_net_pool_exit(void)
     if (!g_pool_initialized)
         return;
 
+    /* 完整清理连接池: 取消 heartbeat/reconnect delayed_work (防 timer wheel
+     * 卸载后访问已释放模块内存 → page fault panic) + 断开连接 + 停止调度器
+     * 线程 (pfs_rx/pfs_vrx/pfs_tx, conn_pool_exit 内部调 powerfs_sched_exit)
+     * + 销毁 reconn_wq. 正常 umount 路径 (kill_sb→net_pool_cleanup) 已做,
+     * 此处兜底 rmmod 直接触发 module_exit 的场景 (尤其 conn_pool_init
+     * 半途失败: 线程/delayed_work 已创建但 sbi->pool_initialized=false 致
+     * kill_sb 跳过清理). conn_pool_exit 幂等 (count=0/schedulers=NULL/wq=NULL
+     * 时均 no-op), 与 kill_sb 路径重复调用安全. */
+    powerfs_conn_pool_exit();
+
     mutex_destroy(&g_pool.pool_lock);
     g_pool_initialized = false;
 
