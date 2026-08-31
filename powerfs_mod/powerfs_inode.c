@@ -540,9 +540,15 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
      * this order and risk deadlock. */
     u64 local_content_size;
     bool local_inline_dirty;
+    bool local_caps_dirty;
     spin_lock(&pi->i_lock);
     local_content_size = pi->content_size;
     local_inline_dirty = pi->inline_dirty;
+    /* ROOT35: Also check i_dirty_caps — after writeback completes, pages are
+     * clean but cap is still dirty (size not yet synced to Filer via
+     * write_inode). Without this check, refresh_work sees no dirty pages,
+     * accepts stale server size (0), resets i_size → 0-byte files. */
+    local_caps_dirty = (pi->i_dirty_caps & POWERFS_CAP_FILE_WR) != 0;
     spin_unlock(&pi->i_lock);
 
     /* Determine if local client has pending (uncommitted) modifications.
@@ -562,7 +568,8 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
      * client or the local writeback has completed). */
     bool local_pending = mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
                          mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK) ||
-                         local_inline_dirty;
+                         local_inline_dirty ||
+                         local_caps_dirty;
 
     spin_lock(&inode->i_lock);
     if (local_pending) {
@@ -694,6 +701,15 @@ out_free:
 int powerfs_invalidate_one(u64 ino)
 {
     struct powerfs_refresh_work *rw;
+
+    /* Guard against NULL workqueue: happens when RX path delivers NOTIFY
+     * after fill_super failed or during/after kill_sb teardown.
+     * Mirrors the same NULL-wq check in powerfs_caps.c queue_notify_work/
+     * queue_lease_expiry_work + powerfs_invalidate_dentry below. */
+    if (!powerfs_refresh_wq) {
+        pr_warn_ratelimited("powerfs: invalidate_one ino=%llu skipped (refresh_wq NULL, mount not ready or tearing down)\n", ino);
+        return -ENODEV;
+    }
 
     /* Schedule async refresh work with inode=NULL: the work function will
      * do the ilookup5 in workqueue context, NOT in the RX dispatcher thread.

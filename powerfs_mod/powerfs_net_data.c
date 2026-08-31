@@ -530,6 +530,16 @@ int pfs_ensure_volume_conn(const char *ip, __u16 port,
     conn->port = port;
     conn->type = type;
     conn->in_use = true;
+    /* Volume OSD connections ALWAYS use TCP regardless of mount -o transport=xxx.
+     * volume.toml specifies transport=tcp; kernel-side filer meta channel alone
+     * honors transport=rdma. If we inherit g_pool.transport_type here, RDMA
+     * connect ops go out against a TCP volume listener → immediate EOF and
+     * errors=1 on the server → write_needle returns ret=-107 (ENOTCONN) on
+     * every MIGRATE inline→flat transition (ROOT32).
+     * NOTE: pool_init static volume path in powerfs_net_conn.c has the same
+     * override. Keep the two in sync. */
+    conn->transport = powerfs_transport_pick_ops(POWERFS_TRANSPORT_TCP);
+    conn->transport_type = POWERFS_TRANSPORT_TCP;
     conn->sock = NULL;
     conn->state = CONN_INIT;
     atomic_set(&conn->seq_counter, 1);
@@ -573,11 +583,11 @@ int pfs_ensure_volume_conn(const char *ip, __u16 port,
     mutex_unlock(&g_pool.pool_lock);
 
     /* 后台建立 TCP 连接 (不阻塞 mount) */
-    queue_delayed_work(g_pool.reconn_wq, &conn->reconnect_work, 0);
-
-    pr_info("powerfs: vol_route: auto-connected %s:%u (type=%d, %s)\n",
+    pr_info("powerfs: vol_route: auto-added %s:%u (type=%d, %s) transport=tcp (forced)\n",
             ip, port, type,
             type == POWERFS_NET_SERVER_VOLUME_META ? "meta" : "data");
+    queue_delayed_work(g_pool.reconn_wq, &conn->reconnect_work, 0);
+
     return idx;
 }
 

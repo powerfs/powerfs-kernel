@@ -1662,15 +1662,21 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
             }
             folio_mark_uptodate(folio);
         }
+        /* ROOT35: Mark folio + cap dirty BEFORE updating i_size.
+         * Closes the race window where refresh_work checks
+         * mapping_tagged(PAGECACHE_TAG_DIRTY) between i_size_write
+         * and folio_mark_dirty, finds no dirty pages, then overwrites
+         * i_size with stale server value (0) + invalidate_mapping_pages
+         * discards the just-written data → 0-byte files. */
+        folio_mark_dirty(folio);
+        powerfs_cap_mark_dirty(pi, POWERFS_CAP_FILE_WR);
         if (end_pos > i_size_read(inode)) {
-            i_size_write(inode, end_pos);
+            spin_lock(&inode->i_lock);
+            if (end_pos > i_size_read(inode))
+                i_size_write(inode, end_pos);
+            spin_unlock(&inode->i_lock);
             mark_inode_dirty(inode);
         }
-        folio_mark_dirty(folio);
-
-        /* 标记 FILE_WR cap dirty — writeback/revoke 时 flush 到 Filer.
-         * 对齐  xxx_write_end → __xxx_mark_caps_dirty(CEPH_CAP_FILE_WR). */
-        powerfs_cap_mark_dirty(pi, POWERFS_CAP_FILE_WR);
 
         /* K2: Inline 模式 — 同步写入数据到 inline_data 缓冲.
          * writeback 不会将 Inline 文件的数据发送到 Volume Server,

@@ -20,15 +20,19 @@
 /* ========== RDMA 配置 ========== */
 
 #define PFS_RDMA_MAX_SEND_WR    64
-/* RECV WR 数量必须 <= PFS_RDMA_CTRL_BUF_NUM, 每个 RECV WR 占一个 ctrl 池条目.
- * 旧值 64 > 池 32 致 post_recv 32/64 后 -ENOMEM(-12). */
+/* [ROOT CAUSE 21 FIX G] RECV 与 SEND 共享同一个 ctrl MR pool.
+ * 规则: CTRL_BUF_NUM 必须 >= MAX_RECV_WR(always-posted on HCA RQ)
+ *   + MAX_SEND_WR (concurrent in-flight SEND WRs), 否则 pre-post 32
+ *   占满全部 32 pool 条 → SEND acquire 永远 NULL → POST_SEND_EAGAIN
+ *   pool_empty. 旧值 32 = MAX_RECV_WR, 无任何余量给 SEND.
+ * 新值 128 = 32 RECV + 64 SEND max + 32 冗余 (short recv recycle 波动). */
 #define PFS_RDMA_MAX_RECV_WR    32
 #define PFS_RDMA_MAX_SGE        3       /* hdr + body + data */
 #define PFS_RDMA_MAX_INLINE     64      /* 28B header 可 inline */
 
 /* MR 池: 控制帧缓冲 (64KB, 足够覆盖 256KB body 的多数情况) */
 #define PFS_RDMA_CTRL_BUF_SIZE  65536   /* 64KB */
-#define PFS_RDMA_CTRL_BUF_NUM   32      /* 32 个控制缓冲 */
+#define PFS_RDMA_CTRL_BUF_NUM   128     /* 128 个: 32 RECV posted + 64 SEND inflight + 32 slack */
 
 /* MR 池: 大数据帧缓冲 (2MB, 对齐 POWERFS_NET_MAX_DATA) */
 #define PFS_RDMA_DATA_BUF_SIZE  (2 * 1024 * 1024)  /* 2MB */
@@ -54,7 +58,22 @@ struct powerfs_rdma_mr_entry {
     dma_addr_t      dma;
     size_t          size;
     struct list_head list;   /* 挂到 pool->free_list */
-    int              pool_idx; /* 所属池: 0=ctrl, 1=data */
+    int              pool_idx; /* 所属池: 0=ctrl, 1=data (功能性勿改) */
+    /* [RC18d DIAG FIX] 条目唯一索引 0..total-1. pool_idx 是 TYPE 标记
+     * (ctrl=0/data=1) 不是编号, 过去诊断误用它导致全显示 idx=0. */
+    int              entry_id;
+    /* [ROOT CAUSE 15 FIX] 每个 MR entry 内嵌 ib_cqe.
+     * 现代内核 IB_POLL_WORKQUEUE/SOFTIRQ/DIRECT 的 __ib_process_cq(cq.c L109)
+     * 标准契约是: HCA 写 CQE → 内核 poll → wc->wr_cqe != NULL →
+     *   `wc->wr_cqe->done(cq, wc)` 回调.
+     * 绝不允许直接覆盖 cq->comp_handler (原做法):
+     *   内核 cq.c L248-258 设 comp_handler 为 direct/softirq/wq 内部函数,
+     *   cancel_work_sync/cq_cleanup 路径会把 comp_handler 置 NULL →
+     *   我们随后的 ib_process_cq_direct → __ib_process_cq 走 wc->wr_cqe NULL
+     *   分支, 但我们老的 comp_handler 模式设 wr_id 指针, wr_cqe=NULL →
+     *   进 else WARN (软) 然后 comp_handler = NULL 被 call *NULL →
+     *   RIP=0x0 #PF Oops 0010 (qemu.log L128-L153). */
+    struct ib_cqe    cqe;
 };
 
 /**
@@ -73,6 +92,9 @@ struct powerfs_rdma_mr_pool {
     int                          total;
     atomic_t                     free;
     size_t                       buf_size;
+    /* V3: dma_unmap_single 需要 dev; 存在此处 (不依赖 e->mr 存 dev).
+     * V1/V2 回滚兼容: 若为 NULL, mr_pool_free 用 e->mr->device. */
+    struct ib_device            *dev;
 };
 
 /* ========== RDMA 连接 ========== */
@@ -119,6 +141,23 @@ struct powerfs_rdma_conn {
     bool                      connected;
     bool                      errored;
 
+    /* PFSN 握手阶段 (建链后、connected=true 前).
+     * CQ handler 通过此标志拦截首个 SEND/RECV WC, 分别完成量唤醒. */
+    bool                      handshake_in_progress;
+    bool                      hs_send_handled;  /* [RC16b] 握手 SEND WC 已处理 (防重复WC重复complete/repost) */
+    bool                      hs_recv_handled;  /* [RC16b] 握手 RECV WC 已处理 */
+    struct completion         hs_send_done;  /* 握手请求 SEND 完成 */
+    struct completion         hs_recv_done;  /* 握手响应 RECV 完成 */
+    u8                        hs_resp[24];   /* 握手响应缓冲 (≥ 18B) */
+    size_t                    hs_resp_len;   /* 握手响应实际字节数 */
+    /* 握手专用 1 页缓冲 + DMA map. [RC15] SEND WR 不再用 magic wr_id,
+     * 改挂 hs_send_cqe (ib_cqe->done 标准回调). PFS_RDMA_HANDSHAKE_SEND_CQE
+     * 作辅助识别: compare &rdma->hs_send_cqe == wc->wr_cqe 直接判定. */
+    void                     *hs_send_page;
+    dma_addr_t                hs_send_dma;
+    struct ib_cqe             hs_send_cqe;   /* 握手 SEND 专用 CQE */
+#define PFS_RDMA_HANDSHAKE_SEND_WR_ID   0x48535752U   /* "HSWR" 旧 magic, 仅兼容保留 */
+
     /* 所属 conn (回指针) */
     struct powerfs_net_server_conn *owner;
 };
@@ -158,8 +197,9 @@ void powerfs_rdma_enable_tx_notify(struct powerfs_net_server_conn *conn);
 int  powerfs_rdma_global_init(void);
 void powerfs_rdma_global_exit(void);
 
-/* CQ completion handler (softirq 上下文) */
-void powerfs_rdma_cq_comp_handler(struct ib_cq *cq, void *ctx);
+/* CQ completion: 现代内核 wc->wr_cqe->done 标准回调.
+ * 不再直接覆盖 cq->comp_handler (会在 WORKQUEUE cancel 时被置 NULL 导致 Oops). */
+void powerfs_rdma_cqe_done(struct ib_cq *cq, struct ib_wc *wc);
 
 /* rdma_cm event handler */
 int powerfs_rdma_cm_event_handler(struct rdma_cm_id *cm_id,

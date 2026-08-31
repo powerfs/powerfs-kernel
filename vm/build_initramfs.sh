@@ -214,7 +214,8 @@ if [ -f "${BUSYBOX_PATH}" ]; then
                whoami xargs yes zcat chroot clear cmp comm cut diff dirname \
                head less sed tail tr uniq awk basename cal dir expr factor \
                groups id printenv printf seq sleep tee time timeout tty \
-               wc wget which who xxd strings strace ltrace; do
+               wc wget which who xxd strings strace ltrace \
+               sha256sum sha1sum sha512sum md5sum; do
         if bin/busybox | grep -q "${cmd}"; then
             ln -sf busybox bin/${cmd} 2>/dev/null || true
         fi
