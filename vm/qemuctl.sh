@@ -80,6 +80,50 @@ GATEWAY="172.30.0.1"
 POWERFS_MASTER_ADDR="${POWERFS_MASTER_ADDR:-172.30.0.11,172.30.0.12,172.30.0.13}"
 POWERFS_MASTER_PORT="${POWERFS_MASTER_PORT:-9334}"
 
+# RDMA 模式开关 (由 service --rdma 设置)
+# 启用后:
+#   - 使用独立 docker-compose.rdma.yml (非覆盖, host 网络模式)
+#   - 先停止 TCP 服务再启动 RDMA 服务 (避免端口冲突)
+#   - 服务地址改为 172.30.0.1 (宿主机 powerfs-br0 IP)
+USE_RDMA="${USE_RDMA:-0}"
+
+# RDMA 模式下的 Master 地址 (host 网络, 单节点)
+if [ "${USE_RDMA}" = "1" ]; then
+    POWERFS_MASTER_ADDR="172.30.0.1"
+    POWERFS_MASTER_PORT="9334"
+fi
+
+# VFIO RDMA 直通开关 (用于内核态 powerfs.ko 的 RDMA 传输测试).
+# =1 时将 host 上的 mlx5 VF (VFIO_BDF) 通过 vfio-pci 直通给 QEMU VM.
+# 前置条件:
+#   - BIOS 开启 VT-d, 内核 cmdline intel_iommu=on iommu=pt
+#   - SR-IOV 已启用: echo N > /sys/class/infiniband/mlx5_X/device/sriov_numvfs
+#   - VF 已解绑 mlx5_core 并绑定 vfio-pci 驱动
+# 用法: USE_VFIO_RDMA=1 VFIO_BDF=0000:a0:02.3 ./qemuctl.sh start
+USE_VFIO_RDMA="${USE_VFIO_RDMA:-0}"
+# VF 设备 BDF (默认取 host 上第一个绑定 vfio-pci 的 ConnectX VF).
+VFIO_BDF="${VFIO_BDF:-}"
+# 当 USE_VFIO_RDMA=1 且未指定时, 自动探测 host 上 mlx5 VF 绑定 vfio-pci 的设备.
+# 过滤 mlx5 vendor (15b3) 避免误选其他 vfio-pci 设备 (如 GPU/VF).
+if [ "${USE_VFIO_RDMA}" = "1" ] && [ -z "${VFIO_BDF}" ]; then
+    VFIO_BDF=""
+    for dev in /sys/bus/pci/devices/*; do
+        [ -L "${dev}/driver" ] || continue
+        readlink "${dev}/driver" 2>/dev/null | grep -q "vfio-pci" || continue
+        # 仅选 ConnectX (Mellanox vendor 0x15b3) 的 VF
+        _vendor=$(cat "${dev}/vendor" 2>/dev/null)
+        [ "${_vendor}" = "0x15b3" ] || continue
+        # 必须是 VF (有 physfn 符号链接指向父 PF), 跳过 PF 自身
+        [ -L "${dev}/physfn" ] || continue
+        VFIO_BDF="$(basename "${dev}")"
+        break
+    done
+    # 规范 BDF 前缀: domain:bus:dev.func (8 位 domain + 冒号)
+    if [ -n "${VFIO_BDF}" ] && [ "${VFIO_BDF:0:5}" != "0000:" ]; then
+        VFIO_BDF="0000:${VFIO_BDF}"
+    fi
+fi
+
 # QEMU 参数
 MEM_SIZE="4096"
 CPU_CORES="4"
@@ -106,14 +150,27 @@ title() { echo -e "\n${BLUE}=== $* ===${NC}"; }
 step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 
 # ============================================================
+# Docker Compose 文件列表辅助函数
+# 根据 USE_RDMA 开关返回 -f 参数列表
+# RDMA 模式使用独立 docker-compose.rdma.yml (非覆盖)
+# ============================================================
+compose_files() {
+    if [ "${USE_RDMA}" = "1" ]; then
+        echo "-f ${DOCKER_DIR}/docker-compose.rdma.yml"
+    else
+        echo "-f ${DOCKER_DIR}/docker-compose.yml"
+    fi
+}
+
+# ============================================================
 # SSH 辅助函数
 # ============================================================
 ssh_vm() {
-    sshpass -p "${SSH_PASS}" ssh \
+    ssh \
         -o StrictHostKeyChecking=no \
         -o ConnectTimeout=5 \
-        -o PreferredAuthentications=password \
-        -o PubkeyAuthentication=no \
+        -o PreferredAuthentications=publickey \
+        -o PubkeyAuthentication=yes \
         -p "${SSH_PORT}" \
         "${SSH_USER}@localhost" "$@"
 }
@@ -385,6 +442,40 @@ cmd_start() {
     cmdline="${cmdline} rcupdate.rcu_cpu_stall_panic=1"
     cmdline="${cmdline} panic=-1"
 
+    # ===== VFIO RDMA 直通 =====
+    local vfio_flag=""
+    if [ "${USE_VFIO_RDMA}" = "1" ]; then
+        if [ -z "${VFIO_BDF}" ]; then
+            error "USE_VFIO_RDMA=1 但未找到可用的 vfio-pci 绑定的 VF"
+            echo "  请确保: echo 1 > /sys/class/infiniband/mlx5_<X>/device/sriov_numvfs"
+            echo "          然后将 VF BDF 解绑 mlx5_core 并绑定 vfio-pci."
+            exit 1
+        fi
+        # 校验 BDF 路径存在且驱动为 vfio-pci.
+        if [ ! -e "/sys/bus/pci/devices/${VFIO_BDF}" ]; then
+            error "VFIO BDF 不存在: /sys/bus/pci/devices/${VFIO_BDF}"
+            exit 1
+        fi
+        local _drv
+        _drv="$(basename "$(readlink /sys/bus/pci/devices/${VFIO_BDF}/driver 2>/dev/null)" 2>/dev/null)"
+        if [ "${_drv}" != "vfio-pci" ]; then
+            error "VFIO BDF ${VFIO_BDF} 的驱动是 '${_drv}', 不是 vfio-pci"
+            exit 1
+        fi
+        # 要求 vfio-pci 设备组 /dev/vfio/<iommu_group> 可访问.
+        local _iommu_group
+        _iommu_group="$(basename "$(readlink /sys/bus/pci/devices/${VFIO_BDF}/iommu_group 2>/dev/null)" 2>/dev/null)"
+        if [ -z "${_iommu_group}" ] || [ ! -c "/dev/vfio/${_iommu_group}" ]; then
+            error "VFIO ${VFIO_BDF} 没有可用的 /dev/vfio/<group> (IOMMU group: ${_iommu_group:-none})"
+            exit 1
+        fi
+        if ! sudo test -r "/dev/vfio/${_iommu_group}" || ! sudo test -w "/dev/vfio/${_iommu_group}"; then
+            sudo chmod 666 "/dev/vfio/${_iommu_group}" 2>/dev/null || true
+        fi
+        vfio_flag="-device vfio-pci,host=${VFIO_BDF}"
+        info "VFIO RDMA 直通: ${VFIO_BDF} (iommu_group=${_iommu_group})"
+    fi
+
     info "启动 QEMU (后台运行, 日志: ${QEMU_LOG})"
     info "  内核:    ${KERNEL_IMAGE}"
     info "  Initramfs: ${INITRAMFS}"
@@ -407,6 +498,7 @@ cmd_start() {
         -netdev user,id=net1,hostfwd=tcp::${SSH_PORT}-:22 \
         -device e1000,netdev=net1,mac=52:54:00:12:34:57 \
         -virtfs local,path=${SHARE_DIR},mount_tag=${SHARE_TAG},security_model=mapped-xattr,id=${SHARE_TAG} \
+        ${vfio_flag} \
         -nographic \
         -serial file:"${QEMU_LOG}" \
         -monitor none \
@@ -580,6 +672,36 @@ cmd_debug() {
     cmdline="${cmdline} rcupdate.rcu_cpu_stall_panic=1"
     cmdline="${cmdline} panic=-1"
 
+    # ===== VFIO RDMA 直通 (与 cmd_start 相同逻辑) =====
+    local vfio_flag=""
+    if [ "${USE_VFIO_RDMA}" = "1" ]; then
+        if [ -z "${VFIO_BDF}" ]; then
+            error "USE_VFIO_RDMA=1 但未找到可用的 vfio-pci 绑定的 VF"
+            exit 1
+        fi
+        if [ ! -e "/sys/bus/pci/devices/${VFIO_BDF}" ]; then
+            error "VFIO BDF 不存在: /sys/bus/pci/devices/${VFIO_BDF}"
+            exit 1
+        fi
+        local _drv
+        _drv="$(basename "$(readlink /sys/bus/pci/devices/${VFIO_BDF}/driver 2>/dev/null)" 2>/dev/null)"
+        if [ "${_drv}" != "vfio-pci" ]; then
+            error "VFIO BDF ${VFIO_BDF} 的驱动是 '${_drv}', 不是 vfio-pci"
+            exit 1
+        fi
+        local _iommu_group
+        _iommu_group="$(basename "$(readlink /sys/bus/pci/devices/${VFIO_BDF}/iommu_group 2>/dev/null)" 2>/dev/null)"
+        if [ -z "${_iommu_group}" ] || [ ! -c "/dev/vfio/${_iommu_group}" ]; then
+            error "VFIO ${VFIO_BDF} 没有可用的 /dev/vfio/<group> (IOMMU group: ${_iommu_group:-none})"
+            exit 1
+        fi
+        if ! sudo test -r "/dev/vfio/${_iommu_group}" || ! sudo test -w "/dev/vfio/${_iommu_group}"; then
+            sudo chmod 666 "/dev/vfio/${_iommu_group}" 2>/dev/null || true
+        fi
+        vfio_flag="-device vfio-pci,host=${VFIO_BDF}"
+        info "VFIO RDMA 直通: ${VFIO_BDF} (iommu_group=${_iommu_group})"
+    fi
+
     info "启动 QEMU (后台运行 + 调试参数, 日志: ${QEMU_LOG})"
     info "  内核:      ${KERNEL_IMAGE}"
     info "  Initramfs: ${INITRAMFS}"
@@ -602,6 +724,7 @@ cmd_debug() {
         -netdev user,id=net1,hostfwd=tcp::${SSH_PORT}-:22 \
         -device e1000,netdev=net1,mac=52:54:00:12:34:57 \
         -virtfs local,path=${SHARE_DIR},mount_tag=${SHARE_TAG},security_model=mapped-xattr,id=${SHARE_TAG} \
+        ${vfio_flag} \
         -nographic \
         -serial file:"${QEMU_LOG}" \
         -monitor none \
@@ -838,7 +961,8 @@ cmd_ssh() {
 }
 
 # ============================================================
-# 命令: mount
+# 命令: mount [--rdma]
+# 在 VM 内挂载 PowerFS, --rdma 时附加 transport=rdma mount 选项
 # ============================================================
 cmd_mount() {
     title "在 VM 内挂载 PowerFS"
@@ -846,6 +970,16 @@ cmd_mount() {
         error "QEMU 未运行"
         exit 1
     fi
+
+    # 解析 --rdma 参数
+    local use_rdma=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --rdma) use_rdma=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
     # 证书路径 (VM 内路径, 支持环境变量覆盖)
     # Master 强制证书认证: 必须提供 ca_crt/client_crt/client_key
     # 首选 initramfs 预打包的 /etc/powerfs/ (VM 重启后仍存在), 兼容 /tmp/
@@ -853,6 +987,11 @@ cmd_mount() {
     local cert_crt="${POWERFS_CLIENT_CRT:-/etc/powerfs/kernel-client-1.crt}"
     local cert_key="${POWERFS_CLIENT_KEY:-/etc/powerfs/kernel-client-1.key}"
     local mount_opts="master_addr=${POWERFS_MASTER_ADDR},master_port=${POWERFS_MASTER_PORT},shard_count=3,ca_crt=${cert_ca},client_crt=${cert_crt},client_key=${cert_key}"
+
+    if [ "${use_rdma}" = "1" ]; then
+        mount_opts="${mount_opts},transport=rdma"
+        info "使用 RDMA 传输挂载 (mount 选项附加 transport=rdma)"
+    fi
 
     # 如果 ko 未加载 (重启后 lsmod 没 powerfs), 先从 9p share insmod。
     # 注: powerfs.ko 通过 -virtfs 共享到 VM 的 /mnt/host/powerfs.ko。
@@ -1020,11 +1159,156 @@ cmd_net() {
 }
 
 # ============================================================
+# 命令: rdma-setup
+# 在宿主机上配置 rxe (Soft-RoCE) RDMA 环境:
+#   1. 加载 rdma_rxe 内核模块
+#   2. 在 docker bridge (powerfs-br0) 上创建 rxe 设备
+#   3. 验证 /dev/infiniband/uverbs0 和 rdma_cm 设备已创建
+#   4. 显示 RDMA 设备状态
+#
+# rxe 封装 RDMA over UDP, 宿主机 + 容器 + VM (TAP 在同一 bridge)
+# 均可使用同一 rxe 设备通信。
+# ============================================================
+cmd_rdma_setup() {
+    title "配置宿主机 rxe (Soft-RoCE) RDMA 环境"
+
+    local netdev="${1:-powerfs-br0}"
+
+    step "1/5 检查 rdma_rxe 模块..."
+    if lsmod | grep -q rdma_rxe; then
+        info "rdma_rxe 模块已加载"
+    else
+        info "加载 rdma_rxe 模块..."
+        sudo modprobe rdma_rxe 2>&1 || {
+            error "rdma_rxe 加载失败, 请确认内核已编译 CONFIG_RDMA_RXE=y"
+            error "  查看内核配置: zcat /proc/config.gz | grep RDMA_RXE"
+            return 1
+        }
+        info "rdma_rxe 模块已加载"
+    fi
+
+    step "2/5 检查 netdev '${netdev}'..."
+    if ! ip link show "${netdev}" &>/dev/null; then
+        warn "netdev '${netdev}' 不存在"
+        echo "  可用网络设备:"
+        ip -br link show 2>/dev/null | head -10
+        echo ""
+        warn "尝试使用宿主机主网卡替代 (例如 eth0, ens33, enp0s...)"
+        read -r -p "请输入 netdev 名称 (或 Ctrl-C 退出): " netdev
+        if [ -z "${netdev}" ] || ! ip link show "${netdev}" &>/dev/null; then
+            error "无效的 netdev: ${netdev}"
+            return 1
+        fi
+    fi
+    info "使用 netdev: ${netdev}"
+
+    step "3/5 创建 rxe 设备..."
+    if rdma link show 2>/dev/null | grep -q "rxe"; then
+        info "rxe 设备已存在, 跳过创建"
+    else
+        # 注: 宿主机可能已有 mlx5 硬件 RDMA, rxe 会创建为 uverbs2
+        # sysfs 参数名是 "add" (非 "add_link"), 值为 netdev 名称
+        # 用 printf 避免结尾换行触发 "Invalid argument"
+        if printf '%s' "${netdev}" | sudo tee /sys/module/rdma_rxe/parameters/add 2>/dev/null | grep -q "${netdev}"; then
+            info "rxe 设备已创建 (netdev=${netdev})"
+        else
+            error "rxe 创建失败"
+            return 1
+        fi
+    fi
+
+    step "4/5 验证 /dev/infiniband 设备..."
+    # rxe 通常创建为 uverbs2 (前两个可能是 mlx5 硬件)
+    local rxe_uverbs=""
+    for i in 0 1 2 3 4; do
+        if [ -c "/dev/infiniband/uverbs${i}" ]; then
+            # 检查此 uverbs 设备对应的 IB 设备名
+            local ib_dev=$(cat "/sys/class/infiniband_verbs/uverbs${i}/device/infiniband/"* 2>/dev/null || \
+                           ls /sys/class/infiniband_verbs/uverbs${i}/../ 2>/dev/null | head -1)
+            info "/dev/infiniband/uverbs${i} → ${ib_dev:-unknown}"
+            if [ "${ib_dev}" = "rxe0" ] || echo "${ib_dev}" | grep -q "rxe"; then
+                rxe_uverbs="uverbs${i}"
+            fi
+        fi
+    done
+
+    if [ -n "${rxe_uverbs}" ]; then
+        info "rxe0 对应设备: /dev/infiniband/${rxe_uverbs}"
+    else
+        warn "未找到 rxe 对应的 uverbs 设备"
+    fi
+
+    # rdma_cm 设备 (所有 RDMA 设备共用)
+    if [ -c /dev/infiniband/rdma_cm ]; then
+        info "/dev/infiniband/rdma_cm 已就绪"
+    else
+        warn "/dev/infiniband/rdma_cm 缺失"
+    fi
+
+    step "5/5 RDMA 设备状态..."
+    rdma link show 2>/dev/null || true
+    echo ""
+    if command -v ibv_devinfo &>/dev/null; then
+        info "ibv_devinfo 输出 (宿主机, 可能缺 rxe provider):"
+        ibv_devinfo 2>/dev/null | head -20
+    else
+        warn "ibverbs-utils 未安装在宿主机 (容器内有)"
+    fi
+
+    if [ -n "${rxe_uverbs}" ] && [ -c /dev/infiniband/rdma_cm ]; then
+        echo ""
+        info "RDMA 环境就绪, 可启动 RDMA 模式服务:"
+        echo "  ./qemuctl.sh service start --rdma"
+        echo "  ./qemuctl.sh mount --rdma"
+    else
+        echo ""
+        error "RDMA 设备不完整, 检查内核配置和 rxe 模块"
+        return 1
+    fi
+}
+
+# ============================================================
 # 命令: service (管理 Docker 服务)
+#
+# 用法:
+#   service start [--rdma]   启动服务 (TCP 默认, --rdma 启用 RDMA 传输)
+#   service stop [--rdma]    停止服务
+#   service restart [--rdma] 重启服务
+#   service status           查看服务状态 (含 RDMA 设备检查)
+#   service log <n>          查看服务日志
 # ============================================================
 cmd_service() {
     local action="${1:-status}"
-    local target="${2:-}"
+    shift || true
+    local target=""
+    local rdma_flag=0
+
+    # 解析参数: --rdma 和 target
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --rdma)
+                rdma_flag=1
+                shift
+                ;;
+            *)
+                target="$1"
+                shift
+                ;;
+        esac
+    done
+
+    # 设置全局 RDMA 开关
+    USE_RDMA="${rdma_flag}"
+
+    if [ "${USE_RDMA}" = "1" ]; then
+        info "RDMA 模式已启用 (附加 docker-compose.rdma.yml)"
+        # 检查 RDMA 前置条件
+        if ! ls /dev/infiniband/uverbs0 &>/dev/null; then
+            warn "/dev/infiniband/uverbs0 不存在, 请先配置 rxe (参见: rdma-setup)"
+            warn "  sudo modprobe rdma_rxe"
+            warn "  sudo rdma link add rxe0 type rxe <netdev>"
+        fi
+    fi
 
     case "${action}" in
         start)
@@ -1051,20 +1335,42 @@ cmd_service() {
             ;;
         *)
             error "未知 service 命令: ${action}"
-            echo "  可用: start, stop, restart, status, log"
+            echo "  可用: start [--rdma], stop [--rdma], restart [--rdma], status, log"
             exit 1
             ;;
     esac
 }
 
 cmd_service_start() {
-    title "启动 Docker 服务 (master -> volume -> filer)"
+    title "启动 Docker 服务 (RDMA=${USE_RDMA})"
 
-    if [ ! -f "${DOCKER_DIR}/docker-compose.yml" ]; then
-        error "未找到 docker-compose.yml: ${DOCKER_DIR}/docker-compose.yml"
-        exit 1
+    if [ "${USE_RDMA}" = "1" ]; then
+        if [ ! -f "${DOCKER_DIR}/docker-compose.rdma.yml" ]; then
+            error "未找到 docker-compose.rdma.yml: ${DOCKER_DIR}/docker-compose.rdma.yml"
+            exit 1
+        fi
+        # RDMA 前置条件检查
+        if ! ls /dev/infiniband/uverbs2 &>/dev/null; then
+            error "/dev/infiniband/uverbs2 不存在, 请先执行: ./qemuctl.sh rdma-setup"
+            exit 1
+        fi
+        # 先停止 TCP 服务 (避免端口冲突)
+        local tcp_running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -cE "master-1|volume-1|filer-1" || echo 0)
+        if [ "${tcp_running}" -gt 0 ]; then
+            warn "检测到 TCP 服务运行中, 先停止以避免端口冲突..."
+            cd "${DOCKER_DIR}"
+            docker compose -f docker-compose.yml down 2>&1 | tail -3
+            sleep 2
+        fi
+    else
+        if [ ! -f "${DOCKER_DIR}/docker-compose.yml" ]; then
+            error "未找到 docker-compose.yml: ${DOCKER_DIR}/docker-compose.yml"
+            exit 1
+        fi
     fi
 
+    local cf_files
+    cf_files=$(compose_files)
     cd "${DOCKER_DIR}"
 
     # 检查服务是否已在运行
@@ -1076,7 +1382,7 @@ cmd_service_start() {
     fi
 
     step "1/3 启动 Redis + Master..."
-    docker compose up -d redis master-1 master-2 master-3 2>&1 | tail -5
+    docker compose ${cf_files} up -d redis master-1 2>&1 | tail -5
 
     # 等待 master 就绪
     info "等待 master 就绪..."
@@ -1091,17 +1397,13 @@ cmd_service_start() {
     done
 
     step "2/3 启动 Volume..."
-    docker compose up -d volume-1 volume-2 volume-3 2>&1 | tail -5
+    docker compose ${cf_files} up -d volume-1 2>&1 | tail -5
 
     info "等待 volume 就绪..."
     tries=0
     while [ ${tries} -lt 30 ]; do
-        local ready=0
-        docker exec volume-1 nc -z 127.0.0.1 8080 2>/dev/null && ready=$((ready + 1))
-        docker exec volume-2 nc -z 127.0.0.1 8080 2>/dev/null && ready=$((ready + 1))
-        docker exec volume-3 nc -z 127.0.0.1 8080 2>/dev/null && ready=$((ready + 1))
-        if [ ${ready} -ge 3 ]; then
-            info "全部 volume 就绪"
+        if docker exec volume-1 nc -z 127.0.0.1 8080 2>/dev/null; then
+            info "volume-1 就绪"
             break
         fi
         sleep 1
@@ -1109,12 +1411,12 @@ cmd_service_start() {
     done
 
     step "3/3 启动 Filer..."
-    docker compose up -d filer-1 filer-2 filer-3 2>&1 | tail -5
+    docker compose ${cf_files} up -d filer-1 2>&1 | tail -5
 
     info "等待 filer 就绪..."
     tries=0
     while [ ${tries} -lt 30 ]; do
-        if docker exec filer-1 nc -z 127.0.0.1 9334 2>/dev/null; then
+        if docker exec filer-1 nc -z 127.0.0.1 8888 2>/dev/null; then
             info "filer-1 就绪"
             break
         fi
@@ -1123,7 +1425,7 @@ cmd_service_start() {
     done
 
     echo ""
-    info "服务启动完成"
+    info "服务启动完成 (RDMA=${USE_RDMA}, Master=${POWERFS_MASTER_ADDR})"
     cmd_service_status
 }
 
@@ -1135,9 +1437,11 @@ cmd_service_stop() {
         exit 1
     fi
 
+    local cf_files
+    cf_files=$(compose_files)
     cd "${DOCKER_DIR}"
-    docker compose down 2>&1 | tail -5
-    info "Docker 服务已停止"
+    docker compose ${cf_files} down 2>&1 | tail -5
+    info "Docker 服务已停止 (RDMA=${USE_RDMA})"
 }
 
 cmd_service_status() {
@@ -1148,11 +1452,38 @@ cmd_service_status() {
         return 1
     fi
 
+    # RDMA 设备和 rxe 状态检查
+    echo "RDMA 环境:"
+    if ls /dev/infiniband/uverbs0 &>/dev/null 2>&1; then
+        printf "  ${GREEN}%-15s${NC} %s\n" "uverbs0:" "/dev/infiniband/uverbs0 (可用)"
+    else
+        printf "  ${YELLOW}%-15s${NC} %s\n" "uverbs0:" "未找到 (TCP 模式可用, RDMA 模式需先配置 rxe)"
+    fi
+    if command -v rdma &>/dev/null; then
+        local rxe_links=$(rdma link show 2>/dev/null | grep -c "rxe" || echo 0)
+        if [ "${rxe_links}" -gt 0 ]; then
+            printf "  ${GREEN}%-15s${NC} %s\n" "rxe:" "${rxe_links} 个 rxe 设备"
+            rdma link show 2>/dev/null | head -3 | while read -r line; do
+                echo "    ${line}"
+            done
+        else
+            printf "  ${YELLOW}%-15s${NC} %s\n" "rxe:" "无 rxe 设备 (RDMA 模式需先创建)"
+        fi
+    else
+        printf "  ${YELLOW}%-15s${NC} %s\n" "rdma:" "rdma-tools 未安装"
+    fi
+    if [ "${USE_RDMA}" = "1" ]; then
+        printf "  ${GREEN}%-15s${NC} %s\n" "transport:" "RDMA (docker-compose.rdma.yml 已附加)"
+    else
+        printf "  ${GREEN}%-15s${NC} %s\n" "transport:" "TCP (默认)"
+    fi
+    echo ""
+
     local services=("redis" "master-1" "master-2" "master-3" \
                     "volume-1" "volume-2" "volume-3" \
                     "filer-1" "filer-2" "filer-3")
 
-    echo ""
+    echo "服务状态:"
     printf "  %-15s %-15s %s\n" "SERVICE" "STATUS" "PORTS"
     printf "  %-15s %-15s %s\n" "-------" "------" "-----"
 
@@ -1205,7 +1536,7 @@ PowerFS QEMU 统一管理脚本
 
 [VM 操作]
   ssh               SSH 登录到 VM
-  mount             在 VM 内挂载 PowerFS
+  mount [--rdma]    在 VM 内挂载 PowerFS (--rdma 附加 transport=rdma 选项)
   umount            在 VM 内卸载 PowerFS
   exec <cmd>        在 VM 内执行命令
   log [grep]        查看 VM dmesg 日志 (可选 grep 关键词, 需 SSH 通)
@@ -1213,17 +1544,29 @@ PowerFS QEMU 统一管理脚本
   serial [grep] [N]  读宿主机 qemu.log 最后 N 行 (VM 卡死也能用, 默认 100)
   serial-tail [grep] 实时 tail 宿主机 qemu.log (VM 卡死也能用)
 
+[RDMA]
+  rdma-setup [netdev]  配置宿主机 rxe (Soft-RoCE) RDMA 环境
+                       netdev 默认 powerfs-br0, 也可指定 eth0/ens33 等
+
 [Docker 服务]
-  service start     启动 master/volume/filer 服务
-  service stop      停止服务
-  service restart   重启服务
-  service status    查看服务状态
-  service log <n>   查看服务日志 (master-1/volume-1/filer-1 等)
+  service start [--rdma]   启动 master/volume/filer 服务 (--rdma 启用 RDMA 传输)
+  service stop [--rdma]    停止服务
+  service restart [--rdma] 重启服务
+  service status           查看服务状态 (含 RDMA 设备检查)
+  service log <n>          查看服务日志 (master-1/volume-1/filer-1 等)
 
 [环境]
   clean             清理环境 (停止 QEMU + 清理 initramfs 构建目录)
   clean-all         清理全部 (QEMU + initramfs + docker volumes)
   net               配置 TAP 网络 (调用 setup_network.sh)
+
+RDMA 端到端测试流程:
+  1. ./qemuctl.sh rdma-setup                # 配置宿主机 rxe
+  2. ./qemuctl.sh service start --rdma      # 启动 RDMA 模式服务
+  3. ./qemuctl.sh service status            # 验证 RDMA 设备 + 服务状态
+  4. ./qemuctl.sh deploy                    # 部署 powerfs.ko + 启动 QEMU
+  5. ./qemuctl.sh mount --rdma               # 在 VM 内以 RDMA 挂载
+  6. ./qemuctl.sh monitor powerfs           # 监控 dmesg
 
 示例:
   ./qemuctl.sh service start && ./qemuctl.sh deploy
@@ -1261,6 +1604,7 @@ main() {
         serial-tail)    cmd_serial_tail "$@" ;;
         exec)           cmd_exec "$@" ;;
         net)            cmd_net "$@" ;;
+        rdma-setup)     cmd_rdma_setup "$@" ;;
         service)        cmd_service "$@" ;;
         clean)          cmd_clean "$@" ;;
         clean-all)      cmd_clean_all "$@" ;;

@@ -730,6 +730,18 @@ int powerfs_invalidate_dentry(u64 parent_ino, const char *name, size_t name_len,
     memcpy(w->name, name, name_len);
     w->name[name_len] = '\0';
 
+    /* Guard against NULL workqueue: same rationale as powerfs_invalidate_one
+     * in powerfs_inode.c — RX NOTIFY may arrive before fill_super created
+     * powerfs_refresh_wq (register_client mount failed race) or after kill_sb
+     * already destroyed it. Without this, queue_work(NULL, work) dereferences
+     * offset 0x100 into a NULL pointer (__queue_work flags field) and Oopses. */
+    if (!powerfs_refresh_wq) {
+        pr_warn_ratelimited("powerfs: invalidate_dentry parent=%llu name=%.*s skipped (refresh_wq NULL)\n",
+                            parent_ino, (int)name_len, name);
+        kfree(w);
+        return -ENODEV;
+    }
+
     queue_work(powerfs_refresh_wq, &w->work);
     pr_debug("powerfs: invalidate_dentry parent=%llu name=%.*s ver=%llu queued\n",
             parent_ino, (int)name_len, name, version);

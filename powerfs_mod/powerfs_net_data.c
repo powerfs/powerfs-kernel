@@ -530,6 +530,16 @@ int pfs_ensure_volume_conn(const char *ip, __u16 port,
     conn->port = port;
     conn->type = type;
     conn->in_use = true;
+    /* Volume OSD connections ALWAYS use TCP regardless of mount -o transport=xxx.
+     * volume.toml specifies transport=tcp; kernel-side filer meta channel alone
+     * honors transport=rdma. If we inherit g_pool.transport_type here, RDMA
+     * connect ops go out against a TCP volume listener → immediate EOF and
+     * errors=1 on the server → write_needle returns ret=-107 (ENOTCONN) on
+     * every MIGRATE inline→flat transition (ROOT32).
+     * NOTE: pool_init static volume path in powerfs_net_conn.c has the same
+     * override. Keep the two in sync. */
+    conn->transport = powerfs_transport_pick_ops(POWERFS_TRANSPORT_TCP);
+    conn->transport_type = POWERFS_TRANSPORT_TCP;
     conn->sock = NULL;
     conn->state = CONN_INIT;
     atomic_set(&conn->seq_counter, 1);
@@ -573,11 +583,11 @@ int pfs_ensure_volume_conn(const char *ip, __u16 port,
     mutex_unlock(&g_pool.pool_lock);
 
     /* 后台建立 TCP 连接 (不阻塞 mount) */
-    queue_delayed_work(g_pool.reconn_wq, &conn->reconnect_work, 0);
-
-    pr_info("powerfs: vol_route: auto-connected %s:%u (type=%d, %s)\n",
+    pr_info("powerfs: vol_route: auto-added %s:%u (type=%d, %s) transport=tcp (forced)\n",
             ip, port, type,
             type == POWERFS_NET_SERVER_VOLUME_META ? "meta" : "data");
+    queue_delayed_work(g_pool.reconn_wq, &conn->reconnect_work, 0);
+
     return idx;
 }
 
@@ -878,6 +888,85 @@ int powerfs_net_write_needle_async(__u64 volume_id, __u64 file_key, __u64 inode,
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_net_write_needle_async);
+
+/* powerfs_net_write_needle_blob_async - 异步 partial write needle
+ *
+ * 与 write_needle_async 相同, 但编码 Offset 字段并使用 WriteNeedleBlob 消息类型.
+ * data 仅为 partial write 数据 (非整个 chunk), Volume Server 通过 coalescer 合并.
+ *
+ * 返回 0: 提交成功, callback 将被调用
+ * 返回 <0: 提交失败, callback 不会被调用 */
+int powerfs_net_write_needle_blob_async(__u64 volume_id, __u64 file_key,
+                                        __u64 inode, __u64 offset,
+                                        const __u8 *data, size_t data_len,
+                                        const char *lease_token, size_t token_len,
+                                        __u8 *req_body, size_t req_body_cap,
+                                        __u8 *resp_body, size_t resp_body_cap,
+                                        int timeout_ms,
+                                        int (*callback)(struct powerfs_request *),
+                                        void *priv)
+{
+    struct powerfs_tlv_enc enc;
+    struct powerfs_net_server_conn *conn;
+    struct powerfs_request *req;
+    int ret;
+
+    if (atomic_read(&g_pool.stopping))
+        return -ENOTCONN;
+
+    powerfs_tlv_enc_init(&enc, req_body, req_body_cap);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, volume_id);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_FILE_KEY, file_key);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INODE_V2, inode);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_OFFSET, offset);
+    if (lease_token && token_len > 0 && token_len < 64)
+        powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_LEASE_TOKEN,
+                               lease_token, token_len);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                           "kernel-client", strlen("kernel-client"));
+
+    conn = powerfs_net_find_volume_conn(volume_id, false);
+    if (!conn) {
+        pr_warn("powerfs: write_needle_blob_async: no volume conn for volume_id=%llu\n",
+                (unsigned long long)volume_id);
+        return -ENOTCONN;
+    }
+
+    req = powerfs_request_alloc(POWERFS_NET_MSG_WRITE_NEEDLE_BLOB, GFP_NOFS);
+    if (!req)
+        return -ENOMEM;
+
+    req->req_body = req_body;
+    req->req_body_len = powerfs_tlv_enc_len(&enc);
+    req->req_data = data;
+    req->req_data_len = data_len;
+    req->resp_body = resp_body;
+    req->resp_body_cap = resp_body_cap;
+    req->resp_data = NULL;
+    req->resp_data_cap = 0;
+    req->shard_id = 0;
+    req->filer = conn;
+    req->callback = callback;
+    req->priv = priv;
+    if (timeout_ms > 0)
+        req->deadline = jiffies + msecs_to_jiffies(timeout_ms);
+
+    {
+        int flow_idx = pfs_conn_flow_idx(conn);
+        powerfs_flow_record_start(flow_idx,
+                                  req->req_body_len + req->req_data_len);
+    }
+
+    ret = powerfs_request_do_send(req, conn);
+    if (ret != 0) {
+        powerfs_flow_record_complete(pfs_conn_flow_idx(conn), 0, 0, true);
+        powerfs_request_free(req);
+        return ret;
+    }
+
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_write_needle_blob_async);
 
 /* powerfs_net_read_needle_async - 异步读 needle (writeback RMW 读)
  *

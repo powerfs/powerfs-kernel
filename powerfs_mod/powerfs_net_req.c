@@ -352,13 +352,20 @@ int powerfs_request_do_send(struct powerfs_request *req,
     if (conn->state != CONN_CONNECTED)
         return -ENOTCONN;
 
-    /* 在 state_lock 下确认状态, 防止 disconnect_one 并发关闭.
-     * v2 不再获取 sock 本地引用 (sock 由调度器独占访问, do_send 不碰 sock). */
+    /* [RC17 FIX ROOT CAUSE 17] 状态检查不依赖 conn->sock:
+     * TCP 路径 state==CONNECTED 时 conn->sock 已赋值 (L1952 sock= → L1953
+     * set_state CONNECTED), 故 state 检查隐含 sock 非空; RDMA 路径 conn->sock
+     * 永远 NULL, 但 conn->transport 已分配且 transport->is_connected 在
+     * pfs_process_transmit 会再次检查. 删除硬编码的 !conn->sock 允许 RDMA
+     * conns 进入发送调度, 否则 L394 pfs_tx_schedule 永不调用导致
+     * step-1 FAIL 0 SEND_ENTER / meta RPC 全部 deadline exceeded. */
     spin_lock(&conn->state_lock);
-    if (conn->state != CONN_CONNECTED || !conn->sock) {
+    if (conn->state != CONN_CONNECTED) {
         spin_unlock(&conn->state_lock);
-        pr_debug("powerfs: do_send: filer %s:%u not connected\n",
-                 conn->addr, conn->port);
+        pr_debug("powerfs: do_send: filer %s:%u not connected (state=%d tpt=%s)\n",
+                 conn->addr, conn->port, conn->state,
+                 conn->transport_type == POWERFS_TRANSPORT_RDMA ? "rdma" :
+                 (conn->transport_type == POWERFS_TRANSPORT_TCP ? "tcp" : "none"));
         return -ENOTCONN;
     }
     spin_unlock(&conn->state_lock);

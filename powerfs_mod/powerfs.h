@@ -20,6 +20,7 @@
      * detailed block comments explaining WHY it's dead — nothing functional. */
 #include "powerfs_lock.h"  /* MDLock 独立锁对象 */
 #endif /* DEAD_CODE */
+#include "powerfs_net_transport.h"  /* enum powerfs_transport_type + transport_ops */
 
 /* ========== 常量定义 ========== */
 
@@ -921,6 +922,12 @@ struct powerfs_sb_info {
     u16  master_port;
     u16  shard_count;   /* Filer 总分片数, 用于元数据路由 (inode/1M) % shard_count */
 
+    /* 传输层类型: TCP (默认) 或 RDMA (CONFIG_INFINIBAND=y 时可用).
+     * 由 mount -o transport=tcp|rdma 传入, fill_super 解析后存此.
+     * powerfs_conn_pool_init 读取此字段设置 g_pool.transport_type,
+     * conn 初始化时按 g_pool.transport_type 选择 ops. */
+    enum powerfs_transport_type transport_type;
+
     /* 证书路径: fill_super 阶段从 ctx 暂存到此, 后续 powerfs_client 初始化
      * 时再拷贝到 client->ca_crt/client_crt/client_key. 长度 511B + NUL. */
     char ca_crt[512];
@@ -939,6 +946,13 @@ struct powerfs_sb_info {
 
     /* 是否初始化完成 (兼容旧代码, 新代码用 client->mount_state) */
     bool initialized;
+
+    /* 标记 powerfs_conn_pool_init 是否成功完成.
+     * kill_sb 检查此标志: 仅当 pool 已初始化时才执行
+     * powerfs_net_set_stopping + powerfs_net_pool_cleanup.
+     * 否则 fill_super 早期失败 (如 missing master_addr) 触发的
+     * kill_sb 会无条件清理全局 g_pool, 导致其他活跃 mount 不可用. */
+    bool pool_initialized;
 
     /* Phase 3: 卸载标志. kill_sb_super 设置为 true, lease_renew_work_func
      * 检查此标志避免在 destroy_workqueue 期间重新排队导致 flush 循环.

@@ -918,14 +918,23 @@ void pfs_error_report(struct sock *sk)
     read_unlock_bh(&g_pool.global_lock);
 }
 
-/* RX 回调: 标记 rx_ready + 投递到 sched->rx_conns + 唤醒调度器 */
+/* RX 回调: 标记 rx_ready + 投递到 sched->rx_conns + 唤醒调度器
+ *
+ * 注意: 调用上下文有两类:
+ *   (a) TCP sock sk_data_ready/sk_state_change 回调: 进程或 bh enabled softirq;
+ *   (b) RDMA CQ comp_handler: IB_POLL_SOFTIRQ 上下文, 此时 BH 已 disabled,
+ *       若再用 spin_lock_bh/unlock_bh 会触发 softirq.c:__local_bh_enable_ip 的
+ *       WARNING (不平衡的 bh disable/enable 计数).
+ * 因此统一用 irqsave 版本: 无论进程/softirq/hardirq 上下文均安全, 锁持有时间
+ * 极短 (list_add_tail + wake_up), 额外关中断性能影响可忽略. */
 void pfs_rx_callback(struct powerfs_net_server_conn *conn)
 {
     struct powerfs_net_sched *sched = conn->sched;
+    unsigned long flags;
     if (!sched)
         return;
 
-    spin_lock_bh(&sched->rx_lock);
+    spin_lock_irqsave(&sched->rx_lock, flags);
     conn->rx_ready = 1;
     if (!conn->rx_scheduled) {
         list_add_tail(&conn->rx_list, &sched->rx_conns);
@@ -933,17 +942,19 @@ void pfs_rx_callback(struct powerfs_net_server_conn *conn)
         powerfs_conn_get(conn);            /* 调度器持引用 (防收发中拆除) */
         wake_up(&sched->rx_waitq);
     }
-    spin_unlock_bh(&sched->rx_lock);
+    spin_unlock_irqrestore(&sched->rx_lock, flags);
 }
 
-/* TX 回调: 标记 tx_ready + 投递到 sched->tx_conns + 唤醒 TX 线程 */
+/* TX 回调: 标记 tx_ready + 投递到 sched->tx_conns + 唤醒 TX 线程
+ * 同上: 统一 irqsave 版本以适配 RDMA softirq 上下文. */
 void pfs_tx_callback(struct powerfs_net_server_conn *conn)
 {
     struct powerfs_net_sched *sched = conn->sched;
+    unsigned long flags;
     if (!sched)
         return;
 
-    spin_lock_bh(&sched->tx_lock);
+    spin_lock_irqsave(&sched->tx_lock, flags);
     conn->tx_ready = 1;
     if (!conn->tx_scheduled) {
         list_add_tail(&conn->tx_list, &sched->tx_conns);
@@ -951,7 +962,7 @@ void pfs_tx_callback(struct powerfs_net_server_conn *conn)
         powerfs_conn_get(conn);
         wake_up(&sched->tx_waitq);
     }
-    spin_unlock_bh(&sched->tx_lock);
+    spin_unlock_irqrestore(&sched->tx_lock, flags);
 }
 
 /* 建连: 保存原始回调 + 安装自定义回调 (参照 Lustre ksocknal_lib_save_callback +
@@ -1665,8 +1676,18 @@ void pfs_process_receive(struct powerfs_net_server_conn *conn)
     int ret;
     int frames = 0;
 
+    /* [RC17 evidence] RDMA RX 调度: 与 TX DISPATCH 对称, 证明 RX worker
+     * 实际轮询到 RDMA conns (否则 "invalid frame header"→断连无法
+     * 区分是 recv_frame hdr decode 失败 还是 process_receive 根本没跑). */
+    if (conn->transport_type == POWERFS_TRANSPORT_RDMA) {
+        static atomic_t pfs_tot_rdma_rx_dispatched;
+        if (atomic_inc_return(&pfs_tot_rdma_rx_dispatched) <= 8)
+            pr_info("powerfs rx: RDMA DISPATCH enter %s:%u channel=%d frames_in_this_run=BEGIN\n",
+                    conn->addr, conn->port, conn->channel);
+    }
+
     while (1) {
-        ret = pfs_rx_step(conn);
+        ret = conn->transport->recv_frame(conn);
         if (ret == 0) {
             /* 一帧完整: dispatch + reset, 继续收下一帧 */
             pfs_rx_dispatch(conn);
@@ -1680,19 +1701,22 @@ void pfs_process_receive(struct powerfs_net_server_conn *conn)
             continue;
         }
         if (ret == -EAGAIN) {
-            /* 当前没数据. 检查 skb_queue:
-             *   非空 → 继续 (数据已在 queue, 重试 recv)
-             *   空  → break, rx_ready 的最终决定交给 pfs_rx_thread_fn
-             *         在 rx_lock 下做 (避免与 sk_data_ready 回调 race:
-             *         无锁清 rx_ready=0 会 clobber 回调刚设的 rx_ready=1) */
-            if (conn->sock && conn->sock->sk &&
-                !skb_queue_empty(&conn->sock->sk->sk_receive_queue))
+            /* 当前没数据. 检查 transport->has_rx_data:
+             *   true  → 继续 (数据已就绪, 重试 recv_frame)
+             *   false → break, rx_ready 的最终决定交给 pfs_rx_thread_fn
+             *           在 rx_lock 下做 (避免与回调 race:
+             *           无锁清 rx_ready=0 会 clobber 回调刚设的 rx_ready=1) */
+            if (conn->transport->has_rx_data(conn))
                 continue;
             break;
         }
         /* EOF/RST/错误 → 断连, reset partial 状态 */
-        pr_debug("powerfs: scheduler RX %s:%u step error %d, scheduling disconnect\n",
-                conn->addr, conn->port, ret);
+        if (conn->transport_type == POWERFS_TRANSPORT_RDMA)
+            pr_info("powerfs rx: RDMA RECV ERROR %s:%u ret=%d scheduling disconnect\n",
+                    conn->addr, conn->port, ret);
+        else
+            pr_debug("powerfs: scheduler RX %s:%u step error %d, scheduling disconnect\n",
+                    conn->addr, conn->port, ret);
         pfs_rx_reset_partial(conn);
         queue_work(g_pool.reconn_wq, &conn->disconnect_work);
         return;
@@ -1710,11 +1734,29 @@ void pfs_process_transmit(struct powerfs_net_server_conn *conn)
 {
     struct powerfs_request *req = NULL;
     struct powerfs_net_frame_hdr hdr;
-    struct socket *sock;
     int ret;
 
-    sock = conn->sock;
-    if (!sock) {
+    /* [RC17 FIX evidence] 首次 RDMA dispatch 打 info: 证明 Fix A
+     * (移除 do_send !conn->sock guard) 生效, RDMA conns 真正被
+     * 调度器送入 process_transmit 入口 (否则 0 SEND_ENTER 无法
+     * 区分 dispatch 前 vs dispatch 内 send_frame 内部故障). */
+    if (conn->transport_type == POWERFS_TRANSPORT_RDMA) {
+        static atomic_t pfs_tot_rdma_dispatched;
+        if (atomic_inc_return(&pfs_tot_rdma_dispatched) <= 16)
+            pr_info("powerfs tx: RDMA DISPATCH enter %s:%u channel=%d "
+                    "transport=%s is_conn=%d\n",
+                    conn->addr, conn->port, conn->channel,
+                    conn->transport ? conn->transport->name : "null",
+                    conn->transport && conn->transport->is_connected ? 1 : 0);
+    }
+
+    /* [ROOT CAUSE 9 FIX] 统一走 transport ops 接口.
+     * 旧代码硬编码 `sock = conn->sock; if (!sock) queue_work disconnect`
+     * 对 RDMA conn 来说 sock=NULL → 每个 RDMA filer conn 一上来就被触发
+     * 断连 → req 也丢了 (已从 tx_queue 删掉但从未进入发送路径) → 全
+     * 部 request deadline exceeded. 现在用 transport->is_connected, 对
+     * TCP (sock + state==CONNECTED) / RDMA (qp connected) 语义一致. */
+    if (!conn->transport || !conn->transport->is_connected(conn)) {
         queue_work(g_pool.reconn_wq, &conn->disconnect_work);
         return;
     }
@@ -1739,9 +1781,9 @@ void pfs_process_transmit(struct powerfs_net_server_conn *conn)
     if (req->ts_submit == 0)
         req->ts_submit = ktime_get_ns();
 
-    ret = pfs_frame_send_nonblock(sock, &hdr,
-                                   req->req_body, req->req_body_len,
-                                   req->req_data, req->req_data_len, req);
+    ret = conn->transport->send_frame(conn, &hdr,
+                                       req->req_body, req->req_body_len,
+                                       req->req_data, req->req_data_len, req);
 
     if (ret == -EAGAIN || ret == -ENOMEM) {
         /* TCP 缓冲区满 (MSG_DONTWAIT): 保留 send_offset, 重挂 tx_queue head.
@@ -1874,6 +1916,41 @@ int powerfs_conn_connect_one(struct powerfs_net_server_conn *conn)
 
     powerfs_conn_set_state(conn, CONN_CONNECTING);
 
+#ifdef CONFIG_INFINIBAND
+    /* RDMA 路径: 走 transport ops (cm_id + QP + RTS), 不创建 socket.
+     * handshake 在 ops->connect 内部或后续 send_frame/recv_frame 层完成.
+     * 当前 Phase 2: 仅建立 RDMA 连接, 验证传输层正确性.
+     * TODO: handshake 接入 (需通过 transport->send_frame/recv_frame 收发). */
+    if (conn->transport_type == POWERFS_TRANSPORT_RDMA && conn->transport) {
+        const struct powerfs_transport_ops *ops = conn->transport;
+
+        /* init_conn: 分配 conn->rdma (cm_id/CQ/QP 容器) */
+        ret = ops->init_conn(conn);
+        if (ret) {
+            pr_err("powerfs: rdma init_conn %s:%u failed: %d\n",
+                   conn->addr, conn->port, ret);
+            powerfs_conn_set_state(conn, CONN_RECONNECTING);
+            return ret;
+        }
+        /* connect: addr/route resolve → PD/CQ/QP → RTS → CONNECTED 事件 */
+        ret = ops->connect(conn);
+        if (ret) {
+            pr_err("powerfs: rdma connect %s:%u failed: %d\n",
+                   conn->addr, conn->port, ret);
+            ops->fini_conn(conn);
+            powerfs_conn_set_state(conn, CONN_RECONNECTING);
+            return ret;
+        }
+        powerfs_conn_set_state(conn, CONN_CONNECTED);
+        conn->reconnect_count = 0;
+        conn->reconnect_delay = 0;
+        atomic_set(&conn->consecutive_timeouts, 0);
+        pr_info("powerfs: rdma filer %s:%u connected\n", conn->addr, conn->port);
+        return 0;
+    }
+#endif /* CONFIG_INFINIBAND */
+
+    /* TCP 路径 (现有逻辑) */
     sock = powerfs_net_create_tcp_socket();
     if (!sock) {
         powerfs_conn_set_state(conn, CONN_RECONNECTING);
@@ -1951,6 +2028,74 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
     if (filer_idx >= 0)
         powerfs_shard_route_on_filer_disconnect(filer_idx);
 
+#ifdef CONFIG_INFINIBAND
+    /* RDMA 路径: 断开 RDMA 连接 + 释放资源, 跳过 socket 操作.
+     * pfs_conn_remove_from_sched 对 RDMA 仍需要 (清理调度器引用),
+     * 但 sk 回调 reset 仅 TCP 有意义 (RDMA 无 sk 回调).
+     *
+     * [ROOT CAUSE 8 FIX / slab corruption]
+     * RDMA disconnect 必须与 TCP 路径等价: remove_from_sched 之后,
+     * 先唤醒 sched->rx/tx_waitq (RDMA 没有 socket shutdown 可以唤醒
+     * 在 wait_event_interruptible(rx_conns 空) 上的调度器线程),
+     * 然后等待 conn->kref 引用降到 1 (调度器已完全放下 conn 引用,
+     * 不会再调用 recv_frame/send_frame 访问 rdma 对象).
+     * 之前 RDMA 缺 kref wait, 导致 sched 线程仍在用 rdma 时我们就
+     * ops->fini_conn kfree(conn->rdma) → use-after-free → slab freelist
+     * 被脏写 → 下次 reconnect alloc_pd 内部 kmalloc_cache memset
+     * 踩到非法 RDI → __kmalloc_noprof Oops panic. */
+    if (conn->transport_type == POWERFS_TRANSPORT_RDMA && conn->transport) {
+        const struct powerfs_transport_ops *ops = conn->transport;
+        long wr;
+        /* 1) 从调度器队列摘 (列表上的 conn 会立即 put; 不在列表但正被 sched
+         *    线程处理的 conn, sched 处理完会自己 put, 需等下方 kref wait) */
+        pfs_conn_remove_from_sched(conn);
+        /* 2) 唤醒 conn->sched 归属的 rx/tx 调度器线程, 让它们立即退出
+         *    wait_event(rx/tx_conns 空), 看到 conn->state=RECONNECTING
+         *    立即 put conn 引用 (释放).
+         *    RDMA 没有 socket shutdown 隐式唤醒, 必须显式.
+         *    同时遍历所有 sched 兜底唤醒 (防止归属 hash 与实际 pick 不一致,
+         *    或 vol_sched 通路: 参考 pool_exit 唤醒模式). */
+        if (conn->sched) {
+            wake_up_all(&conn->sched->rx_waitq);
+            wake_up_all(&conn->sched->tx_waitq);
+        }
+        {
+            int i;
+            for (i = 0; i < g_pool.num_sched; i++) {
+                wake_up_all(&g_pool.schedulers[i].rx_waitq);
+                wake_up_all(&g_pool.schedulers[i].tx_waitq);
+            }
+            for (i = 0; i < g_pool.num_vol_sched; i++) {
+                wake_up_all(&g_pool.vol_schedulers[i].rx_waitq);
+                wake_up_all(&g_pool.vol_schedulers[i].tx_waitq);
+            }
+        }
+        /* 3) 等待 conn->kref 引用降到 1 (只剩 conn->owner 单引用).
+         *    == 调度器线程已经完全放下 conn, 不会再调用
+         *       ops->recv_frame / ops->send_frame / ops->has_rx_data 访问 conn->rdma.
+         *    == 才安全执行 ops->disconnect (destroy cm_id/qp/cq) + ops->fini_conn
+         *       (kfree(conn->rdma)).
+         *    [ROOT CAUSE 8 FIX] 之前缺此步骤: sched 线程仍在用 rdma 对象时
+         *    fini_conn 就 kfree → use-after-free → slab freelist 脏写
+         *    → reconnect alloc_pd → kmalloc_cache memset(illegal_addr,0,512)
+         *    → __kmalloc_noprof Oops → panic_on_oops → VM reboot.
+         *    超时兜底 15s, 与 TCP 路径 L2082-L2089 一致. */
+        wr = wait_event_timeout(conn->sock_user_wq,
+            kref_read(&conn->kref) == 1,
+            msecs_to_jiffies(15000));
+        if (wr == 0)
+            pr_warn("powerfs: rdma filer %s:%u disconnect: kref refcount=%d after 15s "
+                    "(use-after-free risk)\n",
+                    conn->addr, conn->port, kref_read(&conn->kref));
+        /* 4) 安全销毁 RDMA 资源 + 私有 rdma conn 对象 (kref==1 → 无并发访问) */
+        ops->disconnect(conn);
+        ops->fini_conn(conn);
+        pr_debug("powerfs: rdma filer %s:%u disconnected\n",
+                 conn->addr, conn->port);
+        goto disconnect_done;
+    }
+#endif /* CONFIG_INFINIBAND */
+
     /* 1. v2: 恢复 sk 回调 + 清 sk_user_data (此后 softirq 回调 NOOP, 调原始回调).
      *    必须在 shutdown 前执行, 防止 shutdown 触发的回调访问已拆的 conn. */
     if (sock)
@@ -1965,6 +2110,7 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn)
     if (sock)
         kernel_sock_shutdown(sock, SHUT_RDWR);
 
+disconnect_done:
     /* 4. 唤醒在途请求的主线程: 以 -ENOTCONN complete 所有 pending 请求.
      *    主线程的 do_send 从 wait_for_completion_timeout 醒来, 看到 -ENOTCONN,
      *    返回到 submit 循环, 由主线程自己重试 (重新查路由, 选其他 filer 或等重连).
@@ -2393,7 +2539,8 @@ EXPORT_SYMBOL_GPL(powerfs_net_stop_heartbeat);
 
 /* === 6. 连接池 init/exit === */
 
-int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count)
+int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count,
+                           enum powerfs_transport_type transport_type)
 {
     int i, ret;
 
@@ -2407,6 +2554,9 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 sha
         g_pool.master_port = master_port;
         g_pool.master_set = true;
     }
+    /* 传输层类型: 由 fill_super 从 mount -o transport= 解析传入.
+     * conn 初始化 (本函数下方) + powerfs_conn_connect_one 分流都读此字段. */
+    g_pool.transport_type = transport_type;
     atomic_set(&g_pool.stopping, 0);
     g_pool.heartbeat_started = false;
 
@@ -2471,6 +2621,10 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 sha
         conn->port = srv->port;
         conn->type = srv->type;
         conn->in_use = true;
+        /* 按 g_pool.transport_type 选 ops (mount -o transport=tcp|rdma).
+         * TCP 走现有 socket 路径, RDMA 走 powerfs_rdma_ops (CONFIG_INFINIBAND). */
+        conn->transport = powerfs_transport_pick_ops(g_pool.transport_type);
+        conn->transport_type = g_pool.transport_type;
         conn->sock = NULL;
         conn->state = CONN_INIT;
         atomic_set(&conn->seq_counter, 1);
@@ -2534,6 +2688,17 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 sha
         conn->port = srv->port;
         conn->type = srv->type;
         conn->in_use = true;
+        /* Volume connections ALWAYS use TCP regardless of mount -o transport=xxx.
+         * volume.toml comment documents: "内核 vol_route 仅支持TCP, volume需
+         * TCP listener".  transport=rdma mount-opt controls ONLY the filer
+         * metadata channel. BUG: using g_pool.transport_type here propagated
+         * RDMA ops into the OSD volume path → immediate EOF on TCP volume
+         * listener → ret=-107 (ENOTCONN) on every MIGRATE WriteNeedle. */
+        conn->transport = powerfs_transport_pick_ops(POWERFS_TRANSPORT_TCP);
+        conn->transport_type = POWERFS_TRANSPORT_TCP;
+        pr_info("powerfs: volume[%d] conn %s:%u init transport=tcp (forced, global transport_type=%s per mount)\n",
+                g_pool.volume_count, conn->addr, conn->port,
+                (g_pool.transport_type == POWERFS_TRANSPORT_RDMA) ? "rdma" : "tcp");
         conn->sock = NULL;
         conn->state = CONN_INIT;
         atomic_set(&conn->seq_counter, 1);

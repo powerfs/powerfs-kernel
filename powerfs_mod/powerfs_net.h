@@ -37,6 +37,13 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
+#include "powerfs_net_transport.h"
+
+/* RDMA 前向声明 (完整定义在 powerfs_net_rdma.h, 供 .c 文件 include) */
+#ifdef CONFIG_INFINIBAND
+struct powerfs_rdma_conn;
+#endif
+
 /* ========== 协议常量 ========== */
 
 #define POWERFS_NET_MAGIC       0x5046534E  /* "PFSN" */
@@ -215,6 +222,7 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_CREATE_VOLUME = 0x0060,
     POWERFS_NET_MSG_DELETE_VOLUME = 0x0061,
     POWERFS_NET_MSG_WRITE_NEEDLE = 0x0062,
+    POWERFS_NET_MSG_WRITE_NEEDLE_BLOB = 0x006B,
     POWERFS_NET_MSG_READ_NEEDLE = 0x0063,
     POWERFS_NET_MSG_DELETE_NEEDLE = 0x0064,
     POWERFS_NET_MSG_BATCH_WRITE_NEEDLE = 0x0065,
@@ -727,9 +735,18 @@ struct powerfs_net_server_conn {
     enum powerfs_net_server_type type;
     bool in_use;                /* 该槽位是否已使用 */
 
+    /* === 传输层 === */
+    const struct powerfs_transport_ops *transport;
+    enum powerfs_transport_type transport_type;
+
     /* TCP 连接 */
     struct socket *sock;        /* 当前 socket (NULL=未连接) */
     wait_queue_head_t sock_user_wq;
+
+#ifdef CONFIG_INFINIBAND
+    /* RDMA 连接 (transport_type == RDMA 时使用) */
+    struct powerfs_rdma_conn *rdma;
+#endif
 
     /* 状态机 */
     enum powerfs_conn_state state;
@@ -914,8 +931,10 @@ static inline const char *powerfs_conn_state_str(enum powerfs_conn_state s)
 
 /* ========== 连接池 API (新架构) ========== */
 
-/* 初始化连接池 (从 Master 发现 filer/volume 列表) */
-int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count);
+/* 初始化连接池 (从 Master 发现 filer/volume 列表)
+ * transport_type: 由 fill_super 从 mount -o transport= 解析, 决定 conn 选 tcp/rdma ops */
+int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 shard_count,
+                           enum powerfs_transport_type transport_type);
 
 /* 连接池清理 */
 void powerfs_conn_pool_exit(void);
@@ -1041,6 +1060,14 @@ struct powerfs_net_pool {
     char master_addr[64];
     __u16 master_port;
     bool master_set;
+
+    /* === 传输层类型 (由 fill_super 从 sbi->transport_type 设置) ===
+     * conn 初始化 (powerfs_conn_pool_init) 读取此字段选择 ops:
+     *   TCP  → powerfs_tcp_ops (现有路径)
+     *   RDMA → powerfs_rdma_ops (CONFIG_INFINIBAND=y 时)
+     * powerfs_net_pool_init memset 清零 g_pool 后, fill_super 在 pool_init
+     * 调用之后设置此字段, 故 conn 初始化时已就绪. */
+    enum powerfs_transport_type transport_type;
 
     atomic_t stopping;
 
@@ -1492,6 +1519,23 @@ int powerfs_net_write_needle_async(__u64 volume_id, __u64 file_key, __u64 inode,
                                    int timeout_ms,
                                    int (*callback)(struct powerfs_request *),
                                    void *priv);
+
+/* 异步 WriteNeedleBlob (partial write, offset+size).
+ * 与 write_needle_async 相同, 但额外编码 Offset 字段, data 仅为 partial 数据.
+ * Volume Server 通过 coalescer 合并多次 partial write, 避免 kernel 端 RMW.
+ *
+ * 参数:
+ *   offset: 写入偏移 (needle 内字节偏移, 非文件偏移)
+ *   其余参数同 powerfs_net_write_needle_async */
+int powerfs_net_write_needle_blob_async(__u64 volume_id, __u64 file_key,
+                                        __u64 inode, __u64 offset,
+                                        const __u8 *data, size_t data_len,
+                                        const char *lease_token, size_t token_len,
+                                        __u8 *req_body, size_t req_body_cap,
+                                        __u8 *resp_body, size_t resp_body_cap,
+                                        int timeout_ms,
+                                        int (*callback)(struct powerfs_request *),
+                                        void *priv);
 
 /* 异步 ReadNeedle (writeback RMW 读现有 needle).
  * req_body/req_body_cap: TLV body 缓冲区 (函数内编码, 持久存活)
