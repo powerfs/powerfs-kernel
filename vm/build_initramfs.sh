@@ -1028,6 +1028,12 @@ RDMA_BINS=(
     /usr/bin/lspci
     /usr/bin/rdma
     /usr/sbin/setpci
+    /usr/bin/ib_send_lat
+    /usr/bin/ib_send_bw
+    /usr/bin/ib_read_lat
+    /usr/bin/ib_read_bw
+    /usr/bin/ib_write_lat
+    /usr/bin/ib_write_bw
 )
 for util in "${RDMA_BINS[@]}"; do
     name=$(basename "${util}")
@@ -1087,7 +1093,7 @@ for f in "${_provider_list[@]}"; do
     cp -L "${f}" "lib/$(basename "${f}")" 2>/dev/null || true
 done
 # libnl-genl-3: libnl-route-3 间接依赖 (有时未被 ldd 展开, 以防万一)
-for extra in libnl-genl-3.so.200 libpci.so.3 libkmod.so.2 libz.so.1 libzstd.so.1 liblzma.so.5 libudev.so.1 libcrypto.so.1.1 libpthread.so.0 libdl.so.2 libresolv.so.2; do
+for extra in libnl-genl-3.so.200 libpci.so.3 libkmod.so.2 libz.so.1 libzstd.so.1 liblzma.so.5 libudev.so.1 libcrypto.so.1.1 libpthread.so.0 libdl.so.2 libresolv.so.2 libibumad.so.3 libibmad.so.5 libm.so.6; do
     found="$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu -name "${extra}" -not -name '*.a' 2>/dev/null | head -1)"
     if [ -n "${found}" ]; then
         if declare -F _copy_so >/dev/null 2>&1; then
@@ -1099,12 +1105,18 @@ for extra in libnl-genl-3.so.200 libpci.so.3 libkmod.so.2 libz.so.1 libzstd.so.1
 done
 # 补齐 /etc/libibverbs.d/*.driver (rdma-core 运行时驱动描述文件, 否则 libmlx5 不被
 # libibverbs 枚举, ibv_devices 看不到 mlx5 设备).
+# 只复制 mlx5.driver — 过滤 vmw_pvrdma.driver 等不存在的 provider, 避免
+# libibverbs 启动时 dlopen 失败的 Warning 刷屏.
 mkdir -p etc/libibverbs.d
 if [ -d /etc/libibverbs.d ]; then
     for f in /etc/libibverbs.d/*; do
         [ -f "${f}" ] || continue
-        cp "${f}" "etc/libibverbs.d/$(basename "${f}")"
-        echo "  + etc/libibverbs.d/$(basename "${f}")"
+        dname="$(basename "${f}")"
+        # 只保留 mlx5 (我们 VFIO 直通的是 mlx5, 其他 provider 如 vmw_pvrdma,
+        # hns 等不需要, 留着只会触发 "couldn't load driver" Warning)
+        [ "${dname}" = "mlx5.driver" ] || continue
+        cp "${f}" "etc/libibverbs.d/${dname}"
+        echo "  + etc/libibverbs.d/${dname}"
     done
 fi
 echo "  RDMA 工具打包完成"
