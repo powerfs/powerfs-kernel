@@ -485,19 +485,34 @@ if command -v ibv_devices >/dev/null 2>&1; then
     ibv_devices 2>/dev/null | head -5
 fi
 
-# 挂载 Host 共享目录 (9p virtfs, 用于快速部署 powerfs.ko 和测试脚本)
+# 挂载 Host 共享目录 (9p virtfs, 用于快速部署 powerfs.ko 和测试脚本).
+# mount_tag fallback 顺序:
+#   1) hostshare        — qemuctl2.sh 新版 (vm_share_tag 统一为 "hostshare")
+#   2) hostshare_vm1    — qemuctl2.sh 老版 vm1
+#   3) hostshare_vm2    — qemuctl2.sh 老版 vm2
+# 4) hostshare_vm{1,2}  防止将来 qemu 脚本与 initramfs 不同步导致 9p 挂载静默
+#    失败 → init 退用 initramfs 内置的旧 powerfs.ko (不含内核 RDMA PFSN 握手代码),
+#    进而触发 ROOT36-D: filer 端 step=0 永不到 step-1, RPC 全 deadline exceeded.
 echo "挂载 Host 共享目录 (9p virtfs)..."
 mkdir -p /mnt/host
-mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/host 2>/dev/null
-if [ $? -eq 0 ]; then
-    echo "[OK] Host 共享目录已挂载: /mnt/host"
+SHARE_MOUNTED=0
+for share_tag in hostshare hostshare_vm1 hostshare_vm2; do
+    mount -t 9p -o trans=virtio,version=9p2000.L "${share_tag}" /mnt/host 2>/dev/null
+    if [ $? -eq 0 ] && [ -d /mnt/host ] && ls /mnt/host >/dev/null 2>&1; then
+        SHARE_MOUNTED=1
+        echo "[OK] Host 共享目录已挂载 (tag=${share_tag}): /mnt/host"
+        break
+    fi
+done
+if [ "${SHARE_MOUNTED}" -eq 1 ]; then
     # fio 动态库在 9p 共享目录, 设置 LD_LIBRARY_PATH 使 fio 可用
     if [ -d /mnt/host/fio-libs ]; then
         export LD_LIBRARY_PATH=/mnt/host/fio-libs
         echo "[OK] LD_LIBRARY_PATH=/mnt/host/fio-libs (fio 动态库)"
     fi
 else
-    echo "[INFO] 9p 挂载失败 (可忽略, 不影响基本功能)"
+    echo "[WARN] 9p 挂载失败: tried tags hostshare / hostshare_vm1 / hostshare_vm2. " \
+         "将只能使用 initramfs 内置的 powerfs.ko (可能过期, 导致 RDMA 握手缺失)."
 fi
 
 # 加载 PowerFS 内核模块 (只需 Master 地址, Filer/Volume 通过 Master 动态发现)

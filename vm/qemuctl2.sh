@@ -761,7 +761,33 @@ fi
 # Clean prior state
 umount -l /mnt/powerfs 2>/dev/null; sleep 1
 lsmod | grep -q powerfs && ( rmmod powerfs 2>/dev/null; sleep 1 )
-insmod /mnt/host/powerfs.ko 2>/dev/null || insmod /powerfs.ko 2>/dev/null
+# ============================================================
+# ROOT36-D defensive 9p mount: ensure /mnt/host is really mounted before
+# insmod /mnt/host/powerfs.ko.  Running VMs were launched with qemu
+# mount_tag=hostshare_\$name (old qemuctl2 before tag sync fix), while
+# fresh boots via new build_initramfs.sh try mount_tag=hostshare first.
+# Try all tags; only treat as mounted if we can actually stat powerfs.ko.
+# If none work we fall back to initramfs-built-in /powerfs.ko with a WARN.
+# ============================================================
+mkdir -p /mnt/host 2>/dev/null
+if [ ! -f /mnt/host/powerfs.ko ]; then
+  umount /mnt/host 2>/dev/null
+  for _tag in hostshare hostshare_vm1 hostshare_vm2; do
+    mount -t 9p -o trans=virtio,version=9p2000.L "\${_tag}" /mnt/host >/dev/null 2>&1
+    if [ -f /mnt/host/powerfs.ko ]; then
+      _ksz=\$(stat -c%s /mnt/host/powerfs.ko 2>/dev/null)
+      echo '9P_HOST_OK: mounted tag='"\${_tag}"' /mnt/host powerfs.ko size='"\${_ksz}"
+      break
+    fi
+    umount /mnt/host 2>/dev/null
+  done
+fi
+if [ -f /mnt/host/powerfs.ko ]; then
+  insmod /mnt/host/powerfs.ko && echo 'INSMOD_OK: /mnt/host/powerfs.ko'
+else
+  echo 'WARN_9P_FALLBACK: /mnt/host powerfs.ko missing - use builtin /powerfs.ko'
+  insmod /powerfs.ko 2>/dev/null
+fi
 timeout 35 mount -t powerfs \
   -o master_addr=172.30.0.1,master_port=9334,shard_count=1 \
   -o ca_crt=\${CA},client_crt=\${CRT},client_key=\${KEY} \
