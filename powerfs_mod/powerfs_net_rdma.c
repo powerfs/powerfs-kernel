@@ -820,6 +820,9 @@ int powerfs_rdma_init_conn(struct powerfs_net_server_conn *conn)
 
 /**
  * powerfs_rdma_fini_conn - 释放 conn->rdma (资源已在 disconnect 时销毁)
+ *
+ * 兜底路径: 若 disconnect 未跑完, 强制清理. 为避免 ib_free_cq WARNING
+ * (cq.c:273 cqe_used!=0), 若 QP 仍存活则先 ib_drain_qp.
  */
 void powerfs_rdma_fini_conn(struct powerfs_net_server_conn *conn)
 {
@@ -829,9 +832,15 @@ void powerfs_rdma_fini_conn(struct powerfs_net_server_conn *conn)
         return;
 
     /* 兜底: 若 disconnect 未跑完, 强制清理 (理论不应触发) */
+    if (rdma->cm_id && rdma->qp) {
+        /* drain QP 确保 cqe_used==0, 避免 ib_free_cq WARNING + CQ 泄漏 */
+        rdma_disconnect(rdma->cm_id);
+        ib_drain_qp(rdma->qp);
+    }
     if (rdma->cm_id) {
         rdma_destroy_id(rdma->cm_id);
         rdma->cm_id = NULL;
+        rdma->qp = NULL;
     }
     if (rdma->send_cq) {
         ib_free_cq(rdma->send_cq);
@@ -1399,12 +1408,14 @@ err_cm_id:     goto err_data_pool;
  * powerfs_rdma_disconnect - 拆链 + 销毁 RDMA 资源
  *
  * 顺序:
- *   1. rdma_disconnect → QP 转 ERROR, 在飞 WR 以错误完成
- *   2. 排空 CQ (ib_poll_cq 处理错误完成, 释放 MR/credit)
- *   3. ib_free_cq × 2 (irq_poll_disable 会等在飞 poll 完成)
- *   4. rdma_destroy_id (销毁 cm_id + 内嵌 qp)
- *   5. powerfs_rdma_mr_pool_free × 2
- *   6. ib_dealloc_pd
+ *   1. rdma_disconnect → 发 CM DISCONNECT
+ *   2. ib_drain_qp → QP 转 ERR + drain 所有 WR + workqueue 处理所有 CQE
+ *      (从源头修复 ib_free_cq cq.c:273 cqe_used!=0 WARNING + CQ 资源泄漏)
+ *   3. rdma_destroy_id → 销毁 cm_id + 内嵌 qp (ib_drain_qp 后无新 CQE)
+ *   4. 兜底 poll (防御性, 理论上 ib_drain_qp 已处理完)
+ *   5. ib_free_cq × 2 (cqe_used==0, 无 WARNING, 无泄漏)
+ *   6. powerfs_rdma_mr_pool_free × 2
+ *   7. ib_dealloc_pd
  *
  * 不负责状态机/回调清理 (由 powerfs_conn_disconnect_one 处理).
  */
@@ -1421,55 +1432,32 @@ void powerfs_rdma_disconnect(struct powerfs_net_server_conn *conn)
     rdma->errored   = true;
     wake_up(&rdma->send_waitq);
 
-    /* 1. 发起断连 (若 QP 还在) */
+    /* 1. 发起断连 + drain (若 QP 还在).
+     *    rdma_disconnect 发 CM DISCONNECT; ib_drain_qp 内部:
+     *    a) ib_modify_qp(qp, IB_QPS_ERR) → 在飞 WR 以错误完成
+     *    b) post drain WR (SQ+RQ)
+     *    c) wait_for_completion → 等 drain WR 完成
+     *       (IB_POLL_WORKQUEUE 模式下, workqueue 必已处理所有前序 CQE,
+     *        cqe_used 归 0)
+     *    替代之前不可靠的 200+400 次 ib_process_cq_direct 手动 drain. */
     if (rdma->cm_id && rdma->qp) {
         rdma_disconnect(rdma->cm_id);
-        /* 等 QP 转 ERROR 让在飞 WR 以错误完成. 软件卡 (RXE) 同步完成;
-         * 硬件卡可能需 drain. 这里轮询两个 CQ 各 200ms 兜底.
-         * 此函数在 workqueue 上下文执行 (可睡眠), 用 usleep_range 替代 udelay. */
-        for (i = 0; i < 200; i++) {
-            int got = 0;
-            while ((n = ib_poll_cq(rdma->send_cq, PFS_RDMA_WC_BATCH, wcs)) > 0) {
-                int j;
-                for (j = 0; j < n; j++)
-                    powerfs_rdma_process_wc(rdma, &wcs[j]);
-                got = 1;
-            }
-            while ((n = ib_poll_cq(rdma->recv_cq, PFS_RDMA_WC_BATCH, wcs)) > 0) {
-                int j;
-                for (j = 0; j < n; j++)
-                    powerfs_rdma_process_wc(rdma, &wcs[j]);
-                got = 1;
-            }
-            if (!got)
-                break;
-            usleep_range(1000, 2000);
-        }
+        ib_drain_qp(rdma->qp);
     }
 
-    /* 2. 销毁 cm_id + 内嵌 qp (rdma_destroy_id 自带 rdma_destroy_qp) */
+    /* 2. 销毁 cm_id + 内嵌 qp (rdma_destroy_id 自带 rdma_destroy_qp).
+     *    ib_drain_qp 后所有 WR 已完成, destroy_id 不会产生新 CQE. */
     if (rdma->cm_id) {
         rdma_destroy_id(rdma->cm_id);
         rdma->cm_id = NULL;
         rdma->qp = NULL;
     }
 
-    /* 2.5 [RC13 加强] destroy qp/cm_id 后, 二次 drain 所有 CQE:
-     *   先 400× ib_process_cq_direct (每个 budget=-1), 再 ib_poll_cq 兜底.
-     *   ib_free_cq(cq.c:322) WARNING 的根因是: WORKQUEUE poll 模式下,
-     *   cq_poll_wq worker 仍持有 pending CQE 没跑完, destroy_id 之后才回
-     *   写 CQ → ib_free_cq 时 wcqe_head != NULL → WARNING. 强制 direct
-     *   drain 同步等待所有 CQE 被 process 就不会触发. */
-    for (i = 0; i < 400; i++) {
+    /* 2.5 安全兜底: ib_drain_qp 后再 poll 一次, 处理可能的残留 CQE
+     *    (理论上 ib_drain_qp 已处理完, 此处仅做防御性检查, 确保 MR
+     *    pool entry 全部归还). */
+    for (i = 0; i < 10; i++) {
         int any = 0;
-        if (rdma->recv_cq) {
-            int k = ib_process_cq_direct(rdma->recv_cq, -1);
-            if (k > 0) any = 1;
-        }
-        if (rdma->send_cq) {
-            int k = ib_process_cq_direct(rdma->send_cq, -1);
-            if (k > 0) any = 1;
-        }
         while (rdma->recv_cq && (n = ib_poll_cq(rdma->recv_cq, PFS_RDMA_WC_BATCH, wcs)) > 0) {
             int j;
             for (j = 0; j < n; j++)
@@ -1486,7 +1474,8 @@ void powerfs_rdma_disconnect(struct powerfs_net_server_conn *conn)
         usleep_range(1000, 2000);
     }
 
-    /* 3. 释放 CQ. ib_free_cq 内部 cancel_work_sync 同步 workqueue. */
+    /* 3. 释放 CQ. ib_drain_qp 已确保 cqe_used==0, ib_free_cq 不会触发
+     *    WARNING(cq.c:273) 也不会泄漏 CQ 资源. */
     if (rdma->send_cq) {
         ib_free_cq(rdma->send_cq);
         rdma->send_cq = NULL;
