@@ -100,6 +100,13 @@ VM2_MAC0="${VM2_MAC0:-52:54:00:12:34:58}"
 VM2_MAC1="${VM2_MAC1:-52:54:00:12:34:59}"
 VM2_VF_IDX="${VM2_VF_IDX:-1}"   # virtfnN on mlx5_1 (1 = second VF)
 
+# CPU pinning: HCA mlx5_1 + both VFs are on NUMA node 1.
+# Pin each VM to 4 distinct physical cores on node 1 (odd CPUs, no HT siblings).
+# This avoids cross-socket DMA latency and inter-VM context switches.
+# Physical cores on node 1: 1,3,5,...,39 (HT siblings: 41,43,...,79).
+VM1_CPUS="${VM1_CPUS:-1,3,5,7}"
+VM2_CPUS="${VM2_CPUS:-9,11,13,15}"
+
 # SR-IOV PF: mlx5_1 (link ACTIVE, max 16 VFs)
 IB_PF_NAME="${IB_PF_NAME:-mlx5_1}"
 IB_NUM_VFS="${IB_NUM_VFS:-2}"  # need at least 2 for two VMs
@@ -138,6 +145,7 @@ vm_val() {
         1MAC0) echo "${VM1_MAC0}" ;;
         1MAC1) echo "${VM1_MAC1}" ;;
         1VFI)  echo "${VM1_VF_IDX}" ;;
+        1CPUS) echo "${VM1_CPUS}" ;;
         2NAME) echo "${VM2_NAME}" ;;
         2SSH)  echo "${VM2_SSH_PORT}" ;;
         2TAP)  echo "${VM2_TAP}" ;;
@@ -146,6 +154,7 @@ vm_val() {
         2MAC0) echo "${VM2_MAC0}" ;;
         2MAC1) echo "${VM2_MAC1}" ;;
         2VFI)  echo "${VM2_VF_IDX}" ;;
+        2CPUS) echo "${VM2_CPUS}" ;;
         *) error "Unknown key: $key for vm $n"; return 1 ;;
     esac
 }
@@ -175,8 +184,14 @@ ssh_vm() {
         "${SSH_USER}@localhost" "$@"
 }
 is_vm_running() {
+    local vid="$1"
+    local name
+    name="$(vm_val "${vid}" NAME)"
+    # Check systemd service first (for systemd-run launched VMs)
+    sudo systemctl is-active "powerfs-${name}" >/dev/null 2>&1 && return 0
+    # Fallback: check pidfile + process
     local pidfile
-    pidfile="$(vm_pid_file "$1")"
+    pidfile="$(vm_pid_file "${vid}")"
     [ -f "${pidfile}" ] || return 1
     local pid
     pid="$(cat "${pidfile}" 2>/dev/null)"
@@ -415,11 +430,12 @@ start_single() {
     iip="$(vm_val "${vid}" IIP)"
     mac0="$(vm_val "${vid}" MAC0)"
     mac1="$(vm_val "${vid}" MAC1)"
-    local disk pidfile logfile share_tag
+    local disk pidfile logfile share_tag vm_cpus
     disk="$(vm_disk "${vid}")"
     pidfile="$(vm_pid_file "${vid}")"
     logfile="$(vm_log "${vid}")"
     share_tag="$(vm_share_tag "${vid}")"
+    vm_cpus="$(vm_val "${vid}" CPUS)"
 
     title "Start ${name} — ssh=:${ssh_port} eth0=${eip} ib0=${iip} VF=${vf_bdf}"
 
@@ -454,7 +470,13 @@ start_single() {
     [ -c /dev/kvm ] && kvm_flag="-enable-kvm"
 
     # Note: 9p share_tag must be unique per VM (same sharedir OK, tag must differ)
-    sudo nohup qemu-system-x86_64 \
+    # CPU pinning: after QEMU starts, pin all its threads (main + vCPU KVM threads)
+    # to NUMA node 1 physical cores (same socket as mlx5_1 HCA) for lowest RDMA latency.
+    # systemd-run: start as transient service so QEMU survives terminal session cleanup.
+    local svc="powerfs-${name}"
+    sudo systemctl stop "${svc}" 2>/dev/null  # clean up any stale service
+    sudo systemd-run --unit="${svc}" --quiet -- \
+        qemu-system-x86_64 \
         ${kvm_flag} \
         -name "powerfs-${name},debug-threads=on" \
         -m "${MEM_SIZE}" \
@@ -472,26 +494,27 @@ start_single() {
         -nographic \
         -serial file:"${logfile}" \
         -monitor none \
-        -display none \
-        -pidfile "${pidfile}.tmp" \
-        > "${logfile}.stdout" 2>&1 &
+        -display none
 
-    local launcher_pid=$!
-    disown ${launcher_pid} 2>/dev/null || true
     sleep 1
 
-    # Copy pid from pidfile.tmp to canonical pidfile (qemu itself writes it;
-    # pidfile.tmp owned by qemu (root), we need sudo to read it).
+    # Get QEMU PID from systemd service
+    local qemu_pid
     for _ in 1 2 3 4 5; do
-        if [ -f "${pidfile}.tmp" ]; then
-            sudo cat "${pidfile}.tmp" > "${pidfile}" 2>/dev/null
-            sudo rm -f "${pidfile}.tmp" 2>/dev/null
-            [ -s "${pidfile}" ] && break
-        fi
+        qemu_pid="$(sudo systemctl show --property=MainPID --value "${svc}" 2>/dev/null)"
+        [ -n "${qemu_pid}" ] && [ "${qemu_pid}" != "0" ] && break
         sleep 1
     done
-    if [ ! -s "${pidfile}" ]; then
-        echo "${launcher_pid}" > "${pidfile}"
+    echo "${qemu_pid}" > "${pidfile}"
+
+    # Pin all QEMU threads (main + vCPU KVM threads) to NUMA node 1 physical
+    # cores (same socket as mlx5_1 HCA) to avoid cross-socket DMA latency.
+    if [ -n "${qemu_pid}" ] && [ "${qemu_pid}" != "0" ] && [ -n "${vm_cpus}" ]; then
+        for tid in /proc/"${qemu_pid}"/task/*; do
+            [ -d "${tid}" ] || continue
+            sudo taskset -c -p "${vm_cpus}" "$(basename "${tid}")" 2>/dev/null
+        done
+        info "${name} CPU pinned to cores ${vm_cpus} (NUMA node 1, same as HCA)"
     fi
 
     sleep 2
@@ -540,6 +563,29 @@ stop_single() {
     name="$(vm_val "${vid}" NAME)"
     title "Stop ${name}"
 
+    # Try systemd service stop first (for systemd-run launched VMs)
+    local svc="powerfs-${name}"
+    if sudo systemctl is-active "${svc}" >/dev/null 2>&1; then
+        info "  systemctl stop ${svc}"
+        sudo systemctl stop "${svc}" 2>/dev/null
+        for _ in $(seq 1 10); do
+            if ! sudo systemctl is-active "${svc}" >/dev/null 2>&1; then
+                info "${name} exited cleanly"
+                sudo rm -f "$(vm_disk "${vid}").lock" 2>/dev/null || true
+                rm -f "$(vm_pid_file "${vid}")"
+                return 0
+            fi
+            sleep 0.5
+        done
+        warn "${name} still alive, kill -9"
+        sudo systemctl kill "${svc}" --signal=SIGKILL 2>/dev/null || true
+        sleep 1
+        sudo rm -f "$(vm_disk "${vid}").lock" 2>/dev/null
+        rm -f "$(vm_pid_file "${vid}")"
+        return 0
+    fi
+
+    # Fallback: legacy process kill (for non-systemd-run VMs)
     if ! is_vm_running "${vid}"; then
         info "${name} not running"
         rm -f "$(vm_pid_file "${vid}")"
