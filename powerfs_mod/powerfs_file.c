@@ -551,7 +551,6 @@ static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
             pr_debug("powerfs: write_iter ensure_lease ino=%lu off=%lld ret=%d, continuing without lease\n",
                      inode->i_ino, offset, lease_ret);
     }
-
     ret = generic_file_write_iter(iocb, from);
 
     /* 写入成功后标记 cap WR dirty (对齐 __xxx_mark_dirty_caps 在 write_end),

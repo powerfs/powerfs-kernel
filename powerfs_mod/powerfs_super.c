@@ -1537,6 +1537,12 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     sb->s_blocksize_bits = 12;
     sb->s_maxbytes = MAX_LFS_FILESIZE;
     sb->s_time_gran = 1;
+    /* SB_NOSEC: 允许 VFS 为无 xattr 的 inode 设置 S_NOSEC,
+     * 跳过每次 write 都触发 security_inode_need_killpriv →
+     * powerfs_xattr_handler_get → net getxattr 的网络往返 (~1ms/次).
+     * PowerFS 不依赖 VFS 默认的 setuid/capability xattr 管理,
+     * 权限由 Filer 端 Raft 强一致仲裁. */
+    sb->s_flags |= SB_NOSEC;
 
     /* Stage C: 设置 BDI 支持 writeback.
      *

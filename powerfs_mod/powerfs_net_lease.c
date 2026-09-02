@@ -577,6 +577,100 @@ out:
 }
 EXPORT_SYMBOL_GPL(powerfs_net_cap_release);
 
+/*
+ * powerfs_net_cap_acquire - §13.5 P0-1: 增量请求升级 cap (同步 RPC).
+ *
+ * 当客户端 wanted > issued 时 (如 write 打开但只有 FILE_SHARED, 需要 FILE_WR/EXCL),
+ * 通过本 RPC 向 Filer 请求升级. Filer 内部走 lock_arbiter 的 wrlock/xlock →
+ * 若有其他 holder 则触发 GATHER recall → 返回升级后的新 cap.
+ *
+ * 对齐 Filer handle_cap_acquire (net_handler.rs):
+ *   - 请求 TLV: Ino + ClientId(string) + LeaseToken(string) + CapSet(wanted u8)
+ *   - 响应 TLV: LeaseToken + CapSet(granted) + CapEpoch + CapSn + LeaseDuration
+ *
+ * 返回: 0 成功, <0 错误. 响应体与 cap_open_grant 共用 decode_cap_grant_fields.
+ */
+int powerfs_net_cap_acquire(__u64 ino,
+                             const char *client_id,
+                             const char *token, size_t token_len,
+                             __u8 wanted_capset,
+                             char *grant_token_out, size_t *grant_token_len_out,
+                             __u8 *cap_set_out, __u64 *epoch_out,
+                             __u64 *sn_out, __u64 *duration_ms_out)
+{
+    __u8 body[512];
+    struct powerfs_tlv_enc enc;
+    __u8 *resp_body;
+    size_t resp_body_len = 0;
+    size_t cid_len;
+    struct powerfs_tlv_dec dec;
+    int ret;
+
+    if (!client_id || !token)
+        return -EINVAL;
+    cid_len = strlen(client_id);
+    if (cid_len == 0 || cid_len > 255)
+        return -EINVAL;
+    if (token_len == 0 || token_len > 255)
+        return -EINVAL;
+    if (ino == 0)
+        return -EINVAL;
+
+    /* 初始化输出 */
+    if (grant_token_out)
+        grant_token_out[0] = '\0';
+    if (grant_token_len_out)
+        *grant_token_len_out = 0;
+    if (cap_set_out)
+        *cap_set_out = 0;
+    if (epoch_out)
+        *epoch_out = 0;
+    if (sn_out)
+        *sn_out = 0;
+    if (duration_ms_out)
+        *duration_ms_out = 0;
+
+    resp_body = kvmalloc(POWERFS_NET_MAX_BODY, GFP_NOFS);
+    if (!resp_body)
+        return -ENOMEM;
+
+    /* 编码请求: Ino + ClientId + LeaseToken + CapSet(wanted) */
+    powerfs_tlv_enc_init(&enc, body, sizeof(body));
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID, client_id, cid_len);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_LEASE_TOKEN, token, token_len);
+    powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_CAP_SET, wanted_capset);
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_CAP_ACQUIRE, ino,
+                                   body, powerfs_tlv_enc_len(&enc),
+                                   NULL, 0,
+                                   resp_body, POWERFS_NET_MAX_BODY,
+                                   NULL, 0,
+                                   POWERFS_META_TIMEOUT_MS,
+                                   &resp_body_len, NULL);
+    if (ret < 0)
+        goto out;
+    if (ret > 0) {
+        ret = net_status_to_errno((__u16)ret);
+        goto out;
+    }
+
+    /* 解码响应: 与 cap_open_grant 共用 decode_cap_grant_fields */
+    if (resp_body_len > 0) {
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        decode_cap_grant_fields(&dec,
+                                grant_token_out, grant_token_len_out,
+                                cap_set_out, epoch_out,
+                                sn_out, duration_ms_out);
+    }
+
+    ret = 0;
+out:
+    kvfree(resp_body);
+    return ret;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_cap_acquire);
+
 /* ========== §13 Cap NOTIFY dispatch (Filer→Client async push) ==========
  *
  * 回调注册点: 模块 init 时 fs 层注册 recall / upgrade handler.

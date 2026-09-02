@@ -1023,16 +1023,32 @@ void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
  * 对齐  xxx_flush_dirty_caps + __send_cap.
  *
  * 流程:
- *   1. 分配 powerfs_cap_flush 记录, 挂到 i_cap_flush_list + 全局 cap_flush_list
+ *   0. 预先在锁外分配 cf (避免持 spinlock + kmem_cache_alloc 的 GFP_* 触发睡眠
+ *      → preempt_count > 0 时的 "sleeping function called from invalid context" BUG).
+ *      cf_alloc == NULL 且无预分配槽时, 进入锁内用 GFP_ATOMIC 最后手段 (不睡眠).
+ *   1. 取得 powerfs_cap_flush 记录, 挂到 i_cap_flush_list + 全局 cap_flush_list
  *   2. 将 dirty_caps 移到 flushing_caps
  *   3. 发送 CapFlush RPC 到 Filer (TODO: 接入 powerfs_net 层)
  *   4. 等待 i_cap_wq 唤醒 (ACK 回调唤醒)
  *
- * 调用方不持锁. */
+ * 调用方不持锁.
+ *
+ * P0-0 修复 (vm1 ×1 GFP BUG): 原实现在 L1079-L1092 持 pi->i_lock (spin_lock) 期间
+ * 执行 kmem_cache_alloc(GFP_NOFS). 尽管 GFP_NOFS 比 GFP_KERNEL 更严, 但在
+ * PREEMPT_DYNAMIC + 持 spin_lock (preempt_count ≥ 1) 的上下文中, slab allocator
+ * 仍可能进入 direct reclaim / compaction 路径而调用 might_sleep(), 触发
+ * `BUG: sleeping function called from invalid context at mm.h:321`
+ * (preempt_count=1, in_atomic=1, kmem_cache_alloc 偏移 0x53b).
+ * 修复方式严格遵循 "持锁不分配, 分配不持锁":
+ *   ① 在 spin_lock_irqsave 前尝试 GFP_KERNEL (1st alloc, 无竞态安全可睡眠);
+ *   ② 锁内先取预分配槽 i_prealloc_cap_flush;
+ *   ③ 1st 分配 NULL 且无预分配 → GFP_ATOMIC (持锁内最后手段, 保证不睡眠);
+ *   ④ 仍失败 → 回滚脏位 + 返回 -ENOMEM, 下次重试 (宁可重复推送不丢脏). */
 int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
 {
     struct inode *inode = &pi->netfs.inode;
     struct powerfs_cap_flush *cf;
+    struct powerfs_cap_flush *cf_prealloc = NULL;  /* 锁外 GFP_KERNEL 预分配 */
     struct powerfs_sb_info *sbi;
     unsigned int flushing;
     unsigned int need_data_flush = 0;
@@ -1043,12 +1059,29 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
 
     sbi = POWERFS_SB_INFO(inode->i_sb);
 
+    /* === Step 0: 锁外 1st 分配 (GFP_KERNEL, 允许睡眠, 不在 atomic context) ===
+     * 绝大多数情况这里直接拿到对象, 后续锁内只是 "取指针 or 退栈 GFP_ATOMIC".
+     * 分配失败不致命: 进入锁内优先用 inode 预分配槽, 仍空再 GFP_ATOMIC. */
+    if (sbi && sbi->cap_flush_cachep) {
+        cf_prealloc = kmem_cache_alloc(sbi->cap_flush_cachep, GFP_KERNEL);
+        /* cf_prealloc == NULL 正常进入, 不在此做失败分支 */
+    }
+
     spin_lock(&pi->i_lock);
 
     /* 取 dirty_caps 与 mask 的交集 (需要 flush 的位) */
     flushing = pi->i_dirty_caps & mask;
     if (!flushing) {
         spin_unlock(&pi->i_lock);
+        /* 无 flush 工作 → 锁外预分配若成功 → 作为 inode 预分配槽缓存 (下一次命中) */
+        if (cf_prealloc) {
+            spin_lock(&pi->i_lock);
+            if (!pi->i_prealloc_cap_flush)
+                pi->i_prealloc_cap_flush = cf_prealloc;
+            else
+                kmem_cache_free(sbi->cap_flush_cachep, cf_prealloc);
+            spin_unlock(&pi->i_lock);
+        }
         return 0;
     }
 
@@ -1076,12 +1109,32 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
     pi->i_dirty_caps &= ~flushing;
     pi->i_flushing_caps |= flushing;
 
-    /* 分配 flush 记录 (优先用预分配槽) */
+    /* --- 分配 cf: 优先级 ① inode 预分配槽 → ② 锁外 GFP_KERNEL → ③ GFP_ATOMIC 最后手段 ---
+     * 所有分配都在持 spin_lock 期间不会触发任何可能睡眠的路径:
+     *   - ① inode 槽: 只是取指针, 0 分配开销
+     *   - ② cf_prealloc: 已在锁外完成分配, 此处只引用
+     *   - ③ GFP_ATOMIC: 明确 __GFP_DIRECT_RECLAIM 清空, 保证不睡眠
+     *                     (在 preempt_count ≥ 1 下安全) */
     if (pi->i_prealloc_cap_flush) {
         cf = pi->i_prealloc_cap_flush;
         pi->i_prealloc_cap_flush = NULL;
+        /* 消耗了 inode 预分配槽 → 若 ② cf_prealloc 存在则把它补到预分配槽,
+         * 让下一次 cap_flush 在 ① 直接命中, 省一次 slab 开销. */
+        if (cf_prealloc) {
+            pi->i_prealloc_cap_flush = cf_prealloc;
+            cf_prealloc = NULL;
+        }
+    } else if (cf_prealloc) {
+        /* inode 槽空, 但锁外 1st 分配已拿到 → 直接使用, 零持锁内分配. */
+        cf = cf_prealloc;
+        cf_prealloc = NULL;
     } else {
-        cf = kmem_cache_alloc(sbi->cap_flush_cachep, GFP_NOFS);
+        /* 极端路径: ① ② 都没有 → GFP_ATOMIC 最后手段.
+         * 注意 kmem_cache_alloc(GFP_ATOMIC) 在内存压力非常高时可能失败,
+         * 此时我们回滚 flushing → dirty, 让下一次 recall/fsync 再试.
+         * 在 preempt_count ≥ 1 下, GFP_ATOMIC 绝对不会触发 might_sleep(). */
+        BUILD_BUG_ON(!(GFP_ATOMIC & __GFP_HIGH));
+        cf = kmem_cache_alloc(sbi->cap_flush_cachep, GFP_ATOMIC);
         if (!cf) {
             /* 内存不足: 回滚, dirty 保留, 下次再推 (宁可推两遍也不丢脏). */
             pi->i_dirty_caps |= flushing;
@@ -1089,6 +1142,12 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
             spin_unlock(&pi->i_lock);
             return -ENOMEM;
         }
+    }
+    /* cf_prealloc 若到此处仍非 NULL (理论上不会, 已在优先级①中消耗补槽):
+     * 安全起见释放回 slab, 不泄漏. */
+    if (unlikely(cf_prealloc)) {
+        kmem_cache_free(sbi->cap_flush_cachep, cf_prealloc);
+        cf_prealloc = NULL;
     }
 
     cf->tid = atomic64_inc_return(&pi->i_release_count);
@@ -1449,11 +1508,86 @@ void powerfs_check_caps(struct powerfs_inode_info *pi, int flags)
         return;
     }
 
-    /* TODO: 接入 net 层后, 根据 wanted vs issued 决定:
-     *   - wanted & ~issued → 发送 AcquireCap RPC
-     *   - issued & ~wanted & ~used → 发送 ReleaseCap RPC
-     *   - revoking & ~dirty → 发送 CapAck 确认降级
-     * 当前阶段仅日志, 不实际发送. */
+    /* P0-1: wanted > issued → 发送 AcquireCap RPC 请求升级.
+     * wanted & ~issued 计算出需要增量请求的内核 cap 位.
+     * 转换到 wire 3-bit CapSet 后发 AcquireCap(0x96) RPC.
+     * RPC 可阻塞 → 必须先释放 i_lock, RPC 完成后在 i_lock 内 cap_issue.
+     *
+     * 防止重复 RPC: i_flushing_caps 非空时说明上一轮 flush 正在走,
+     * 等 flush 完成后再 check_caps (flush 结束 wake_up_all 会重新调 check_caps). */
+    {
+        unsigned int need_acquire = wanted & ~issued;
+        unsigned int k_issued;
+        __u8 wire_wanted, wire_granted = 0;
+        __u64 new_epoch = 0, new_sn = 0, new_dur = 0;
+        char grant_token[64];
+        size_t grant_toklen = sizeof(grant_token);
+        char cid[64];
+        size_t cid_len;
+        size_t cur_toklen;
+        int acq_ret;
+        struct powerfs_cap *cap = pi->i_auth_cap;
+
+        if (need_acquire && cap && !pi->i_flushing_caps) {
+            /* 有 cap 且非 flushing → 转换 wanted 到 wire 格式发 RPC */
+            wire_wanted = kernel_bits_to_wire_capset(need_acquire);
+            if (wire_wanted == 0) {
+                /* 无 wire 映射的位 (如 PIN) → 不发 RPC, 直接解锁返回 */
+                spin_unlock(&pi->i_lock);
+                return;
+            }
+            cur_toklen = strlen(cap->token);
+            cid_len = get_mount_client_id(inode->i_sb, cid, sizeof(cid));
+
+            pr_debug("powerfs: check_caps ACQUIRE ino=%lu want_k=0x%x wire_w=0x%02x "
+                     "issued=0x%x token_len=%zu\n",
+                     inode->i_ino, need_acquire, wire_wanted,
+                     issued, cur_toklen);
+
+            /* 释放 i_lock (RPC 可阻塞) */
+            spin_unlock(&pi->i_lock);
+
+            acq_ret = powerfs_net_cap_acquire(inode->i_ino, cid,
+                                               cap->token, cur_toklen,
+                                               wire_wanted,
+                                               grant_token, &grant_toklen,
+                                               &wire_granted, &new_epoch,
+                                               &new_sn, &new_dur);
+
+            if (acq_ret == 0) {
+                /* 成功: 在 i_lock 内更新 cap + cap_issue */
+                spin_lock(&pi->i_lock);
+                /* 升级 token (Filer 可能换了 token) */
+                if (grant_toklen > 0 && grant_toklen < sizeof(cap->token)) {
+                    memcpy(cap->token, grant_token, grant_toklen);
+                    cap->token[grant_toklen] = '\0';
+                }
+                cap->epoch = new_epoch;
+                cap->seq = new_sn;
+                cap->issue_seq = new_sn;
+                if (new_dur > 0)
+                    cap->expire_jiffies = jiffies + msecs_to_jiffies(new_dur);
+                else
+                    cap->expire_jiffies = jiffies + POWERFS_LEASE_DURATION;
+
+                k_issued = wire_capset_to_kernel_bits(wire_granted);
+                powerfs_cap_issue(pi, cap, k_issued);
+                spin_unlock(&pi->i_lock);
+                wake_up_all(&pi->i_cap_wq);
+
+                pr_debug("powerfs: check_caps ACQUIRE ok ino=%lu wire_g=0x%02x "
+                         "kernel=0x%x epoch=%llu sn=%llu\n",
+                         inode->i_ino, wire_granted, k_issued,
+                         (unsigned long long)new_epoch,
+                         (unsigned long long)new_sn);
+                return;
+            } else {
+                pr_debug("powerfs: check_caps ACQUIRE ino=%lu ret=%d (will retry)\n",
+                         inode->i_ino, acq_ret);
+                return;
+            }
+        }
+    }
 
     spin_unlock(&pi->i_lock);
 }

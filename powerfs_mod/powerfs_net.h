@@ -264,6 +264,7 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_CAP_RELEASE = 0x0093,
     POWERFS_NET_MSG_CAP_RECALL_NOTIFY = 0x0094,
     POWERFS_NET_MSG_CAP_UPGRADE_NOTIFY = 0x0095,
+    POWERFS_NET_MSG_CAP_ACQUIRE       = 0x0096,  /* P0-1: Client→Filer 增量请求升级 cap */
 };
 
 /* ========== 响应状态码 ========== */
@@ -1756,6 +1757,20 @@ int powerfs_net_cap_release(__u64 ino,
                             char *upgrade_token_out, size_t *upgrade_token_len_out,
                             __u8 *upgrade_cap_set_out,
                             __u64 *upgrade_epoch_out, __u64 *upgrade_sn_out);
+
+/* powerfs_net_cap_acquire - P0-1: 增量请求升级 cap (wanted > issued 时调用).
+ *
+ * 请求 TLV: Ino + ClientId + LeaseToken + CapSet(wanted u8)
+ * 响应 TLV: LeaseToken + CapSet(granted) + CapEpoch + CapSn + LeaseDuration
+ *
+ * 返回: 0 成功, <0 错误. 成功时输出参数填充升级后的 grant 信息. */
+int powerfs_net_cap_acquire(__u64 ino,
+                             const char *client_id,
+                             const char *token, size_t token_len,
+                             __u8 wanted_capset,
+                             char *grant_token_out, size_t *grant_token_len_out,
+                             __u8 *cap_set_out, __u64 *epoch_out,
+                             __u64 *sn_out, __u64 *duration_ms_out);
 
 /* ========== §13 Cap server push: NOTIFY dispatcher (Filer→Client) ==========
  *
