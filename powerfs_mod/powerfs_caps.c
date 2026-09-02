@@ -1921,3 +1921,114 @@ void powerfs_cap_shrinker_destroy(struct powerfs_client *cli)
         cli->cap_shrinker = NULL;
     }
 }
+
+/* ========== P2-4: Quiesce 接口 (热迁移 / Filer balancer) ==========
+ *
+ * powerfs_quiesce_all - 让客户端 "静默": sync dirty + release cap +
+ * invalidate page cache. 供 Filer balancer 迁移 inode 前调用.
+ *
+ * 语义 (对齐 Ceph MDS quiesce):
+ *   1. sync_inodes_sb — 等待所有 dirty pages 写回完成 (含 RDMA 写)
+ *   2. 遍历所有 inode, 对有 cap 且无活跃 fd 的 inode:
+ *      a. cap_send_release — 通知 Filer "本客户端不再使用此 cap"
+ *      b. invalidate_mapping_pages — 清除本地 page cache
+ *      c. 从 cap_lru_list 移除 (避免 shrinker 重复处理)
+ *   3. 返回释放的 inode 数量
+ *
+ * 并发安全 (与 shrinker 相同设计):
+ *   cap 不 rb_erase/kfree, 仍在 cap_tree 中由 evict_inode 统一释放.
+ *   避免 close 路径 use-after-free.
+ *
+ * 跳过条件:
+ *   - 有活跃 fd (i_nr_by_mode[RD]+[WR] > 0) — 不能释放
+ *   - 有 dirty/writeback pages — 正在 I/O, 不能释放
+ */
+int powerfs_quiesce_all(struct super_block *sb, unsigned long *released)
+{
+    struct powerfs_client *client = POWERFS_SB_INFO(sb)->client;
+    struct inode *inode;
+    unsigned long count = 0;
+    LIST_HEAD(dispose);
+
+    if (!client)
+        return -EINVAL;
+
+    pr_info("powerfs: quiesce_all starting...\n");
+
+    /* 1. sync 所有 dirty pages (等待写回完成, 含 RDMA) */
+    sync_inodes_sb(sb);
+
+    /* 2. 遍历所有 inode, 收集可 quiesce 的 cap */
+    spin_lock(&sb->s_inode_list_lock);
+    list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+        struct powerfs_inode_info *pi;
+        struct powerfs_cap *cap;
+
+        if (!igrab(inode))
+            continue;
+        spin_unlock(&sb->s_inode_list_lock);
+
+        pi = POWERFS_I(inode);
+        spin_lock(&pi->i_lock);
+        cap = pi->i_auth_cap;
+        if (!cap || cap->token[0] == '\0') {
+            spin_unlock(&pi->i_lock);
+            iput(inode);
+            spin_lock(&sb->s_inode_list_lock);
+            continue;
+        }
+        spin_unlock(&pi->i_lock);
+
+        /* 跳过有活跃 fd 的 inode */
+        if (pi->i_nr_by_mode[POWERFS_FILE_MODE_RD] > 0 ||
+            pi->i_nr_by_mode[POWERFS_FILE_MODE_WR] > 0) {
+            iput(inode);
+            spin_lock(&sb->s_inode_list_lock);
+            continue;
+        }
+
+        /* 跳过有 dirty/writeback 的 inode */
+        if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+            mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK)) {
+            iput(inode);
+            spin_lock(&sb->s_inode_list_lock);
+            continue;
+        }
+
+        /* 从 LRU 移除 (避免 shrinker 重复) */
+        spin_lock(&client->cap_lru_lock);
+        list_del_init(&cap->lru_item);
+        spin_unlock(&client->cap_lru_lock);
+
+        list_add(&cap->lru_item, &dispose);
+        count++;
+        /* 不 iput 这里, dispose 阶段统一处理 */
+
+        spin_lock(&sb->s_inode_list_lock);
+    }
+    spin_unlock(&sb->s_inode_list_lock);
+
+    /* 3. 释放 cap + invalidate page cache */
+    while (!list_empty(&dispose)) {
+        struct powerfs_cap *cap = list_first_entry(&dispose,
+                                                     struct powerfs_cap,
+                                                     lru_item);
+        struct powerfs_inode_info *pi = cap->ci;
+        struct inode *inode = &pi->netfs.inode;
+
+        list_del_init(&cap->lru_item);
+
+        /* 通知 Filer 释放 cap (同步 RPC) */
+        cap_send_release(pi, cap);
+
+        /* 清除本地 page cache */
+        invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
+
+        iput(inode);
+    }
+
+    *released = count;
+    pr_info("powerfs: quiesce_all done, released %lu inodes\n", count);
+    return 0;
+}
+

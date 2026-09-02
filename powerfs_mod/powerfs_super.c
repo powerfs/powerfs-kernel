@@ -1181,6 +1181,39 @@ DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_dentries);
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_leases);
 
 /*
+ * powerfs_debugfs_quiesce_write - P2-4: 用户态触发 quiesce (热迁移测试入口)
+ *
+ * 用法: echo 1 > /sys/kernel/debug/sb-XXX/quiesce
+ *
+ * 语义: 触发 powerfs_quiesce_all — sync 脏页 + 释放 cap + invalidate page cache.
+ * 用于 Filer balancer 迁移 inode 前的客户端静默, 也可用于压力测试.
+ * 返回写入的字节数 (始终等于 len, 表示成功).
+ */
+static ssize_t powerfs_debugfs_quiesce_write(struct file *f, const char __user *buf,
+                                             size_t len, loff_t *ppos)
+{
+    struct super_block *sb = file_inode(f)->i_private;
+    unsigned long released = 0;
+    int ret;
+
+    if (!sb)
+        return -EINVAL;
+
+    ret = powerfs_quiesce_all(sb, &released);
+    if (ret < 0)
+        return ret;
+
+    pr_info("powerfs: quiesce triggered via debugfs, released=%lu\n", released);
+    return len;
+}
+
+static const struct file_operations powerfs_debugfs_quiesce_fops = {
+    .owner   = THIS_MODULE,
+    .write   = powerfs_debugfs_quiesce_write,
+    .llseek  = noop_llseek,
+};
+
+/*
  * powerfs_debugfs_init - 在 fill_super 中调用, 创建 debugfs 目录和文件.
  *
  * 目录结构: /sys/kernel/debug/powerfs/<sb_id>/
@@ -1212,6 +1245,8 @@ static void powerfs_debugfs_init(struct super_block *sb)
     debugfs_create_file("inodes",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_inodes_fops);
     debugfs_create_file("dentries", 0400, sbi->debugfs_dir, sb, &powerfs_debugfs_dentries_fops);
     debugfs_create_file("leases",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_leases_fops);
+    /* P2-4: quiesce 写入口 — echo 1 > quiesce 触发客户端静默 */
+    debugfs_create_file("quiesce",  0200, sbi->debugfs_dir, sb, &powerfs_debugfs_quiesce_fops);
 
     pr_info("powerfs: debugfs entries at /sys/kernel/debug/%s/\n", name);
 }

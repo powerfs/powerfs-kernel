@@ -918,6 +918,11 @@ struct powerfs_client {
 int powerfs_cap_shrinker_init(struct powerfs_client *cli);
 void powerfs_cap_shrinker_destroy(struct powerfs_client *cli);
 
+/* P2-4: Quiesce 接口 (热迁移 / Filer balancer 调用)
+ * 同步脏数据 + 释放 cap + 清除 page cache, 让客户端 "静默".
+ * 返回 0 成功, *released 为释放的 inode 数; 负值表示错误. */
+int powerfs_quiesce_all(struct super_block *sb, unsigned long *released);
+
 /* ========== 超级块私有信息 (参考 powerfs_fs_client + 挂载层 slab) ========== */
 
 struct powerfs_sb_info {
