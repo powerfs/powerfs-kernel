@@ -909,8 +909,9 @@ static int powerfs_debugfs_caps_show(struct seq_file *s, void *p)
     struct powerfs_client *client = POWERFS_SB_INFO(sb)->client;
     struct inode *inode;
 
-    seq_printf(s, "ino              issued           implemented      dirty           flushing        refs\n");
-    seq_printf(s, "------------------------------------------------------------------------------------------\n");
+    /* P2-3: 增强 cap dump — 增加 wanted/epoch/sn/holders 列 */
+    seq_printf(s, "ino              issued     wanted     dirty     flushing   epoch     seq        pin_refs  rd_refs  wr_refs\n");
+    seq_printf(s, "-----------------------------------------------------------------------------------------------------------\n");
 
     if (!client) {
         seq_puts(s, "(client not initialized)\n");
@@ -931,13 +932,17 @@ static int powerfs_debugfs_caps_show(struct seq_file *s, void *p)
 
         spin_lock(&pi->i_lock);
         if (pi->i_auth_cap || pi->i_dirty_caps || pi->i_flushing_caps) {
-            seq_printf(s, "%-16lu%-17x%-17x%-17x%-17x%-4d\n",
+            seq_printf(s, "%-16lu%-11x%-11x%-11x%-11x%-10llu%-11llu%-11d%-9d%-9d\n",
                        inode->i_ino,
                        pi->i_auth_cap ? pi->i_auth_cap->issued : 0,
-                       pi->i_auth_cap ? pi->i_auth_cap->implemented : 0,
+                       pi->i_auth_cap ? pi->i_auth_cap->wanted : 0,
                        pi->i_dirty_caps,
                        pi->i_flushing_caps,
-                       pi->i_pin_ref);
+                       pi->i_auth_cap ? (unsigned long long)pi->i_auth_cap->epoch : 0ULL,
+                       pi->i_auth_cap ? (unsigned long long)pi->i_auth_cap->seq : 0ULL,
+                       pi->i_pin_ref,
+                       pi->i_nr_by_mode[POWERFS_FILE_MODE_RD],
+                       pi->i_nr_by_mode[POWERFS_FILE_MODE_WR]);
         }
         spin_unlock(&pi->i_lock);
 
@@ -971,6 +976,71 @@ static int powerfs_debugfs_caps_show(struct seq_file *s, void *p)
 
         seq_printf(s, "cap_flush_list: %d\n", flush_count);
     }
+
+    return 0;
+}
+
+/*
+ * powerfs_debugfs_locks_show - P2-3: 输出 per-inode cap 锁等待状态
+ *
+ * 用于定位 recall hang: 若 dirty_caps 非零但 pin_ref 很高,
+ * 说明有线程等待 cap flush ACK, 可能 Filer 端 recall 卡住.
+ *
+ * 对齐 Ceph 的 /sys/kernel/debug/ceph/mdsc/locks:
+ *   ino, dirty, flushing, pin_refs, cap_gen, token, expire_jiffies
+ */
+static int powerfs_debugfs_locks_show(struct seq_file *s, void *p)
+{
+    struct super_block *sb = s->private;
+    struct inode *inode;
+
+    seq_printf(s, "ino              dirty     flushing   pin_refs  cap_gen  token                         epoch     expire_ms\n");
+    seq_printf(s, "----------------------------------------------------------------------------------------------------------\n");
+
+    spin_lock(&sb->s_inode_list_lock);
+    list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+        struct powerfs_inode_info *pi = POWERFS_I(inode);
+        struct powerfs_cap *cap;
+
+        if (!pi)
+            continue;
+
+        if (!igrab(inode))
+            continue;
+        spin_unlock(&sb->s_inode_list_lock);
+
+        spin_lock(&pi->i_lock);
+        /* 只输出有 cap 或有 dirty/flushing 的 inode */
+        if (pi->i_auth_cap || pi->i_dirty_caps || pi->i_flushing_caps) {
+            cap = pi->i_auth_cap;
+            if (cap) {
+                unsigned long expire_ms = 0;
+                if (cap->expire_jiffies)
+                    expire_ms = jiffies_to_msecs(cap->expire_jiffies - jiffies);
+                seq_printf(s, "%-16lu%-11x%-11x%-11d%-10u%-31s%-10llu%-11lu\n",
+                           inode->i_ino,
+                           pi->i_dirty_caps,
+                           pi->i_flushing_caps,
+                           pi->i_pin_ref,
+                           cap->cap_gen,
+                           cap->token[0] ? cap->token : "(none)",
+                           (unsigned long long)cap->epoch,
+                           expire_ms);
+            } else {
+                seq_printf(s, "%-16lu%-11x%-11x%-11d%-10s%-31s%-10s%-11s\n",
+                           inode->i_ino,
+                           pi->i_dirty_caps,
+                           pi->i_flushing_caps,
+                           pi->i_pin_ref,
+                           "-", "(no_cap)", "-", "-");
+            }
+        }
+        spin_unlock(&pi->i_lock);
+
+        iput(inode);
+        spin_lock(&sb->s_inode_list_lock);
+    }
+    spin_unlock(&sb->s_inode_list_lock);
 
     return 0;
 }
@@ -1105,6 +1175,7 @@ static int powerfs_debugfs_leases_show(struct seq_file *s, void *p)
 
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_status);
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_caps);
+DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_locks);
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_inodes);
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_dentries);
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_leases);
@@ -1114,7 +1185,8 @@ DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_leases);
  *
  * 目录结构: /sys/kernel/debug/powerfs/<sb_id>/
  *   status    - 挂载状态总览
- *   caps      - 所有 inode cap 状态
+ *   caps      - 所有 inode cap 状态 (P2-3: issued/wanted/dirty/epoch/sn/holders)
+ *   locks     - per-inode cap 锁等待状态 (P2-3: dirty/flushing/pin_refs/cap_gen/token/expire)
  *   inodes    - 所有 inode 关键属性
  *   dentries  - dentry lease 列表
  *   leases    - 目录 lease 状态
@@ -1136,6 +1208,7 @@ static void powerfs_debugfs_init(struct super_block *sb)
 
     debugfs_create_file("status",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_status_fops);
     debugfs_create_file("caps",     0400, sbi->debugfs_dir, sb, &powerfs_debugfs_caps_fops);
+    debugfs_create_file("locks",    0400, sbi->debugfs_dir, sb, &powerfs_debugfs_locks_fops);
     debugfs_create_file("inodes",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_inodes_fops);
     debugfs_create_file("dentries", 0400, sbi->debugfs_dir, sb, &powerfs_debugfs_dentries_fops);
     debugfs_create_file("leases",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_leases_fops);
