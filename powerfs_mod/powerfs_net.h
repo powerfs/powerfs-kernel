@@ -1730,7 +1730,8 @@ int powerfs_net_cap_open_grant(__u64 ino,
  * 才能将 cap 授予新申请者 (否则新申请者最多得 SHARED_WRITE). */
 int powerfs_net_cap_recall_ack(__u64 ino,
                                const char *client_id,
-                               const char *token, size_t token_len);
+                               const char *token, size_t token_len,
+                               __u8 *piggyback_caps_out);
 
 /* CapRelease: release/close 时主动向 Filer 释放 cap,
  * 触发 upgrade 判定 (若剩余唯一 writer → 升级回 EXCLUSIVE_WRITE).

@@ -542,6 +542,7 @@ static int cap_send_recall_ack(struct powerfs_inode_info *pi, struct powerfs_cap
     size_t cid_len;
     size_t token_len;
     int ret;
+    __u8 piggyback_caps = 0;
 
     if (!cap)
         return -EINVAL;
@@ -555,12 +556,24 @@ static int cap_send_recall_ack(struct powerfs_inode_info *pi, struct powerfs_cap
     cid_len = get_mount_client_id(sb, cid, sizeof(cid));
 
     ret = powerfs_net_cap_recall_ack(pi->netfs.inode.i_ino, cid,
-                                     cap->token, token_len);
+                                     cap->token, token_len,
+                                     &piggyback_caps);
     if (ret < 0) {
         pr_warn_ratelimited("powerfs: cap_recall_ack ino=%lu ret=%d (服务端可能已完成 recall)\n",
                             pi->netfs.inode.i_ino, ret);
+        return ret;
     }
-    return ret;
+
+    /* P2-1: 应用 piggyback CapSet (省 1 次 CapUpgradeNotify RTT) */
+    if (piggyback_caps != 0) {
+        unsigned int k_issued = wire_capset_to_kernel_bits(piggyback_caps);
+        spin_lock(&pi->i_lock);
+        powerfs_cap_issue(pi, cap, k_issued);
+        spin_unlock(&pi->i_lock);
+        pr_debug("powerfs: recall_ack piggyback applied ino=%lu wire=0x%02x kernel=0x%x\n",
+                 pi->netfs.inode.i_ino, piggyback_caps, k_issued);
+    }
+    return 0;
 }
 
 /* §13.4 场景 3: 主动 CapRelease (close 时). 返回 HasUpgrade 结果,

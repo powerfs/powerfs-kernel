@@ -434,16 +434,24 @@ EXPORT_SYMBOL_GPL(powerfs_net_cap_open_grant);
  * powerfs_net_cap_recall_ack - §13.4 向 Filer ACK: 已 flush 脏数据并降级.
  *
  * Request TLV:  Ino + ClientId(string) + LeaseToken(string)
- * Response TLV: 仅状态码 (STATUS_OK / ERR_SERVER / ERR_BAD_REQUEST).
+ * Response TLV: STATUS_OK + optional CapSet(u8, P2-1 piggyback grant).
+ *   If CapSet present: client should update issued caps immediately,
+ *   saving 1 CapUpgradeNotify RTT.
  */
 int powerfs_net_cap_recall_ack(__u64 ino,
                                const char *client_id,
-                               const char *token, size_t token_len)
+                               const char *token, size_t token_len,
+                               __u8 *piggyback_caps_out)
 {
     __u8 body[512];
     struct powerfs_tlv_enc enc;
     size_t cid_len;
     int ret;
+    __u8 resp_body[256];
+    size_t resp_body_len = 0;
+
+    if (piggyback_caps_out)
+        *piggyback_caps_out = 0;
 
     if (!client_id || !token)
         return -EINVAL;
@@ -464,13 +472,26 @@ int powerfs_net_cap_recall_ack(__u64 ino,
     ret = powerfs_net_send_request(POWERFS_NET_MSG_CAP_RECALL_ACK, ino,
                                    body, powerfs_tlv_enc_len(&enc),
                                    NULL, 0,
-                                   NULL, 0, NULL, 0,
+                                   resp_body, sizeof(resp_body),
+                                   NULL, 0,
                                    POWERFS_META_TIMEOUT_MS,
-                                   NULL, NULL);
+                                   &resp_body_len, NULL);
     if (ret < 0)
         return ret;
     if (ret > 0)
         return net_status_to_errno((__u16)ret);
+
+    /* P2-1: 解码 piggyback CapSet (如果存在) */
+    if (resp_body_len > 0 && piggyback_caps_out) {
+        struct powerfs_tlv_dec dec;
+        __u8 capset = 0;
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        if (!powerfs_tlv_dec_u8(&dec, POWERFS_NET_FLD_CAP_SET, &capset)) {
+            *piggyback_caps_out = capset;
+            pr_debug("powerfs: recall_ack piggyback caps=0x%x ino=%llu\n",
+                     capset, ino);
+        }
+    }
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_net_cap_recall_ack);
