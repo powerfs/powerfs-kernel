@@ -802,6 +802,81 @@ out:
 }
 EXPORT_SYMBOL_GPL(powerfs_net_batch_cap_release);
 
+/* ========== P1-3: POSIX file lock (flock/fcntl) Filer RPC ==========
+ *
+ * powerfs_net_file_lock_request — 发送 FileLockRequest(0x0098) 到 Filer,
+ * 请求跨 VM 仲裁的 POSIX advisory file lock.
+ *
+ * 返回值: 0=成功 (granted_out 已设置), <0=网络错误/errno
+ */
+int powerfs_net_file_lock_request(__u64 ino,
+                                   const char *client_id, size_t client_id_len,
+                                   __u8 lock_mode,
+                                   __u8 wait,
+                                   __u8 *granted_out)
+{
+    struct powerfs_tlv_enc enc;
+    __u8 *body = NULL, *resp_body = NULL;
+    size_t body_cap, resp_body_len = 0;
+    int ret;
+    __u8 resp_granted = 0;
+
+    if (granted_out)
+        *granted_out = 0;
+
+    /* 编码 Request: Ino + ClientId + LockMode(IsWriteOpen) + Wait(HasUpgrade) */
+    body_cap = 64 + client_id_len + 32;
+    body = kvmalloc(body_cap, GFP_NOFS);
+    if (!body)
+        return -ENOMEM;
+
+    powerfs_tlv_enc_init(&enc, body, body_cap);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                           client_id, client_id_len);
+    powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_IS_WRITE_OPEN, lock_mode);
+    powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_HAS_UPGRADE, wait);
+
+    resp_body = kvmalloc(POWERFS_NET_MAX_BODY, GFP_NOFS);
+    if (!resp_body) {
+        kvfree(body);
+        return -ENOMEM;
+    }
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_FILE_LOCK_REQUEST,
+                                   ino,
+                                   body, powerfs_tlv_enc_len(&enc),
+                                   NULL, 0,
+                                   resp_body, POWERFS_NET_MAX_BODY,
+                                   NULL, 0,
+                                   POWERFS_META_TIMEOUT_MS,
+                                   &resp_body_len, NULL);
+    kvfree(body);
+    if (ret < 0)
+        goto out;
+    if (ret > 0) {
+        ret = net_status_to_errno((__u16)ret);
+        goto out;
+    }
+
+    /* 解码 Response: LockMode(u8 echo) + Granted(u8) */
+    {
+        struct powerfs_tlv_dec dec;
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        powerfs_tlv_dec_u8(&dec, POWERFS_NET_FLD_IS_WRITE_OPEN, &resp_granted);
+        powerfs_tlv_dec_u8(&dec, POWERFS_NET_FLD_HAS_UPGRADE, &resp_granted);
+    }
+
+    if (granted_out)
+        *granted_out = resp_granted;
+
+    ret = 0;
+out:
+    kvfree(resp_body);
+    return ret;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_file_lock_request);
+
 /* ========== §13 Cap NOTIFY dispatch (Filer→Client async push) ==========
  *
  * 回调注册点: 模块 init 时 fs 层注册 recall / upgrade handler.

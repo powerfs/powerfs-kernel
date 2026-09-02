@@ -266,6 +266,8 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_CAP_UPGRADE_NOTIFY = 0x0095,
     POWERFS_NET_MSG_CAP_ACQUIRE       = 0x0096,  /* P0-1: Client→Filer 增量请求升级 cap */
     POWERFS_NET_MSG_BATCH_CAP_RELEASE = 0x0097, /* P1-1: 批量 CapRelease, session 级合并 */
+    POWERFS_NET_MSG_FILE_LOCK_REQUEST = 0x0098, /* P1-3: Client→Filer POSIX file lock */
+    POWERFS_NET_MSG_FILE_LOCK_GRANT   = 0x0099, /* P1-3: Filer→Client 异步 grant 通知 */
 };
 
 /* ========== 响应状态码 ========== */
@@ -1799,6 +1801,26 @@ int powerfs_net_batch_cap_release(const char *client_id,
                                   const struct powerfs_batch_cap_release_entry *entries,
                                   __u32 count,
                                   __u16 *entry_status_out);
+
+/* ========== P1-3: POSIX file lock (flock/fcntl) Filer RPC ==========
+ *
+ * MsgType 0x0098 FileLockRequest (Client→Filer)
+ *   Request:  Ino(u64) + ClientId(string) + LockMode(u8: 0=RD, 1=WR, 2=UNLOCK)
+ *             + Wait(u8: 0=non-block, 1=block)
+ *   Response: LockMode(u8 echo) + Granted(u8: 1=granted, 0=denied)
+ *
+ * MsgType 0x0099 FileLockGrant (Filer→Client, async notification)
+ *   Body: Ino(u64) + LockMode(u8) + Granted(u8=1)
+ */
+#define POWERFS_NET_FILE_LOCK_MODE_RD     0   /* shared/read lock (LOCK_SH / F_RDLCK) */
+#define POWERFS_NET_FILE_LOCK_MODE_WR     1   /* exclusive/write lock (LOCK_EX / F_WRLCK) */
+#define POWERFS_NET_FILE_LOCK_MODE_UNLOCK 2   /* unlock (LOCK_UN / F_UNLCK) */
+
+int powerfs_net_file_lock_request(__u64 ino,
+                                   const char *client_id, size_t client_id_len,
+                                   __u8 lock_mode,
+                                   __u8 wait,
+                                   __u8 *granted_out);
 
 /* ========== §13 Cap server push: NOTIFY dispatcher (Filer→Client) ==========
  *

@@ -1126,31 +1126,93 @@ static ssize_t powerfs_copy_file_range(struct file *src_file, loff_t src_off,
 }
 
 /* ========== File Locking (POSIX record locks + BSD flock) ==========
- * 设计决策 (同  xxx_lock.c 的初版架构):
- *   先做**单机一致性锁**: 委托 VFS 通用框架 (posix_lock_file / locks_lock_inode_wait)
- *   在内存 inode 内维护锁冲突链表和阻塞队列. 多客户端场景下, 跨节点锁仲裁
- *   需 Filer 侧新增 LOCK/UNLOCK 协议帧, 路线图:
- *     Phase 1 (本地, 当前): 单机多进程/多线程正确互斥. 覆盖 90% 单机使用场景.
- *     Phase 2 (分布式): wrapper 内先本地冲突检测, 再发 Filer LOCK RPC 仲裁.
+ * P1-3: 跨 VM 集群锁 — 先 Filer lock_arbiter 仲裁, 再本地 VFS 锁.
  *
- * 为什么不返回 -ENOSYS (P0 修复前的行为):
- *   大量应用 (SQLite, PostgreSQL, Maildir, Python fcntl.flock, git) 依赖
- *   fcntl(F_SETLK) / flock() == 0 的成功路径; -ENOSYS 会直接 panic 应用.
+ * 设计:
+ *   1. LOCK_SH/F_RDLCK → Filer rdlock(Posix) + 本地 posix_lock_file
+ *   2. LOCK_EX/F_WRLCK → Filer wrlock(Posix) + 本地 posix_lock_file
+ *   3. LOCK_UN/F_UNLCK → 本地解锁 + Filer posix_unlock
+ *   4. 非阻塞 (LOCK_NB / F_SETLK): Filer denied → 直接 -EAGAIN
+ *   5. 阻塞 (F_SETLKW): Filer denied → 轮询 100ms 重试, 信号可中断
+ *
+ * 本地 VFS posix_lock_file 继续处理同 VM 内多进程互斥.
+ * Filer lock_arbiter Posix lock type (SimpleLock class) 处理跨 VM 互斥.
  */
+
+static int powerfs_filer_lock_mode(int fl_type)
+{
+    switch (fl_type) {
+    case F_RDLCK: return POWERFS_NET_FILE_LOCK_MODE_RD;
+    case F_WRLCK: return POWERFS_NET_FILE_LOCK_MODE_WR;
+    case F_UNLCK: return POWERFS_NET_FILE_LOCK_MODE_UNLOCK;
+    default: return -EINVAL;
+    }
+}
+
+static int powerfs_filer_file_lock(struct inode *inode, int fl_type, int blocking)
+{
+    struct powerfs_client *cli = POWERFS_SB_INFO(inode->i_sb)->client;
+    int filer_mode, ret;
+    __u8 granted = 0;
+
+    if (!cli || !cli->client_id[0])
+        return -ENOTCONN;
+
+    filer_mode = powerfs_filer_lock_mode(fl_type);
+    if (filer_mode < 0)
+        return filer_mode;
+
+    ret = powerfs_net_file_lock_request(inode->i_ino,
+                                         cli->client_id, cli->client_id_len,
+                                         filer_mode, 0, &granted);
+    if (ret < 0)
+        return ret;
+
+    if (filer_mode == POWERFS_NET_FILE_LOCK_MODE_UNLOCK)
+        return 0;
+
+    if (!granted) {
+        if (!blocking)
+            return -EAGAIN;
+        for (;;) {
+            if (signal_pending(current))
+                return -ERESTARTSYS;
+            msleep_interruptible(100);
+            ret = powerfs_net_file_lock_request(inode->i_ino,
+                                                 cli->client_id, cli->client_id_len,
+                                                 filer_mode, 0, &granted);
+            if (ret < 0)
+                return ret;
+            if (granted)
+                break;
+        }
+    }
+    return 0;
+}
+
+static void powerfs_filer_file_unlock(struct inode *inode)
+{
+    struct powerfs_client *cli = POWERFS_SB_INFO(inode->i_sb)->client;
+    __u8 granted;
+    if (!cli || !cli->client_id[0])
+        return;
+    powerfs_net_file_lock_request(inode->i_ino,
+                                   cli->client_id, cli->client_id_len,
+                                   POWERFS_NET_FILE_LOCK_MODE_UNLOCK,
+                                   0, &granted);
+}
 
 /*
  * powerfs_lock — POSIX 记录锁 (fcntl(2) F_SETLK/F_SETLKW/F_GETLK/F_OFD_*).
  *
- * VFS 层传 cmd: F_SETLK (非阻塞), F_SETLKW (阻塞), F_GETLK (查询冲突锁),
- * 以及 OFD 版本 (F_OFD_SETLK etc). struct file_lock *fl 含锁类型/范围/owner.
- * 直接用 VFS 通用 posix_lock_file 实现, 内核已维护冲突检测 + 文件锁阻塞队列
- * (fl->fl_blocked 链表 + wake_up). 此函数 EXPORT_SYMBOL.
+ * P1-3: SETLK/SETLKW 先发 Filer FileLockRequest 仲裁跨 VM 冲突,
+ * 再调 VFS posix_lock_file 处理本地进程互斥. GETLK 仅查本地.
  */
 int powerfs_lock(struct file *filp, int cmd, struct file_lock *fl)
 {
     struct inode *inode = file_inode(filp);
     struct powerfs_inode_info *pi = POWERFS_I(inode);
-    int err;
+    int err, blocking;
 
     if (unlikely(!pi || pi->shutdown))
         return -ENOTCONN;
@@ -1158,49 +1220,66 @@ int powerfs_lock(struct file *filp, int cmd, struct file_lock *fl)
     pr_debug("powerfs: lock ino=%lu cmd=%d type=%d pid=%d\n",
              inode->i_ino, cmd, fl->c.flc_type, current->pid);
 
-    /* P0 单机 VFS 通用锁表:
-     *   posix_lock_file(file, fl, conflock) ——
-     *     [in] file: 目标文件
-     *     [in] fl:   新锁请求 (类型/范围/owner)
-     *     [out] conflock: GETLK 场景返回首个冲突锁; SET/UNLOCK 传 NULL
-     *   内核内部已实现冲突检测、阻塞等待 (SETLKW)、信号唤醒.
-     *   此函数 EXPORT_SYMBOL (fs/locks.c:1404). */
+    if (cmd == F_GETLK || cmd == F_OFD_GETLK) {
+        posix_test_lock(filp, fl);  /* sets fl to F_UNLCK or conflict */
+        return 0;
+    }
+
+    blocking = (cmd == F_SETLKW || cmd == F_OFD_SETLKW);
+
+    if (fl->c.flc_type != F_UNLCK) {
+        err = powerfs_filer_file_lock(inode, fl->c.flc_type, blocking);
+        if (err)
+            return err;
+    }
+
     err = posix_lock_file(filp, fl, NULL);
 
-    if (err < 0)
-        pr_debug_ratelimited("powerfs: lock ino=%lu failed: %d\n",
-                             inode->i_ino, err);
+    if (err < 0 && fl->c.flc_type != F_UNLCK)
+        powerfs_filer_file_unlock(inode);
+
+    if (!err && fl->c.flc_type == F_UNLCK)
+        powerfs_filer_file_unlock(inode);
+
     return err;
 }
 
 /*
  * powerfs_flock — BSD 风格 flock(2).
  *
- * VFS 把 LOCK_SH/LOCK_EX/LOCK_UN (+ LOCK_NB) 转换成 file_lock 结构 (fl_type
- * F_RDLCK/F_WRLCK/F_UNLCK, fl_flags |= FL_FLOCK 标记) 后传入.
- * 通用入口 locks_lock_inode_wait 内部按 FL_FLOCK 分派到 flock_lock_inode_wait
- * 处理冲突检测 + 等待. 此函数 EXPORT_SYMBOL.
+ * P1-3: 先发 Filer FileLockRequest 仲裁跨 VM 冲突,
+ * 再调 VFS locks_lock_inode_wait 处理本地进程互斥.
  */
 int powerfs_flock(struct file *filp, int cmd, struct file_lock *fl)
 {
     struct inode *inode = file_inode(filp);
     struct powerfs_inode_info *pi = POWERFS_I(inode);
-    int err;
+    int err, blocking;
 
     if (unlikely(!pi || pi->shutdown))
         return -ENOTCONN;
 
-    /* flock 锁的 fl_flags 需要 FL_FLOCK: VFS 传进来时通常已设置, 但为了
-     * 兜底 (lockf 共享路径) 我们显式标记. */
     fl->c.flc_flags |= FL_FLOCK;
 
     pr_debug("powerfs: flock ino=%lu cmd=%d type=%d pid=%d\n",
              inode->i_ino, cmd, fl->c.flc_type, current->pid);
 
+    blocking = !(cmd & LOCK_NB);
+
+    if (fl->c.flc_type != F_UNLCK) {
+        err = powerfs_filer_file_lock(inode, fl->c.flc_type, blocking);
+        if (err)
+            return err;
+    }
+
     err = locks_lock_inode_wait(inode, fl);
-    if (err < 0)
-        pr_debug_ratelimited("powerfs: flock ino=%lu failed: %d\n",
-                             inode->i_ino, err);
+
+    if (err < 0 && fl->c.flc_type != F_UNLCK)
+        powerfs_filer_file_unlock(inode);
+
+    if (!err && fl->c.flc_type == F_UNLCK)
+        powerfs_filer_file_unlock(inode);
+
     return err;
 }
 
