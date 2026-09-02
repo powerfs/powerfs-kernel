@@ -36,6 +36,7 @@
 #include <linux/splice.h>       /* splice_copy_file_range (P2-5) */
 #include <linux/utsname.h>      /* init_utsname() 主机名 */
 #include <linux/jiffies.h>      /* jiffies_64 时间戳 */
+#include <linux/shrinker.h>     /* register_shrinker (P2-2) */
 
 #include "powerfs.h"
 #include "powerfs_comm.h"
@@ -1778,5 +1779,145 @@ int powerfs_get_caps(struct inode *inode, struct file *filp,
         /* 50ms 超时: 配合 30 轮, 最多等 1.5s. */
         schedule_timeout(msecs_to_jiffies(50));
         remove_wait_queue(&pi->i_cap_wq, &wait);
+    }
+}
+
+/* ========== P2-2: Cap Shrinker — 低内存时主动释放 cap + invalidate page cache ========== */
+
+static unsigned long powerfs_cap_shrinker_count(struct shrinker *shrink,
+                                                 struct shrink_control *sc)
+{
+    struct powerfs_client *cli = shrink->private_data;
+    unsigned long count;
+
+    spin_lock(&cli->cap_lru_lock);
+    count = cli->cap_lru_list.next == &cli->cap_lru_list ? 0 : 1;
+    /* Use list length estimate: count items in the list */
+    if (count) {
+        struct powerfs_cap *cap;
+        count = 0;
+        list_for_each_entry(cap, &cli->cap_lru_list, lru_item)
+            count++;
+    }
+    spin_unlock(&cli->cap_lru_lock);
+
+    return count;
+}
+
+static unsigned long powerfs_cap_shrinker_scan(struct shrinker *shrink,
+                                                struct shrink_control *sc)
+{
+    struct powerfs_client *cli = shrink->private_data;
+    unsigned long freed = 0;
+    unsigned long nr_to_scan = sc->nr_to_scan;
+    LIST_HEAD(dispose);
+
+    /* Phase 1: collect candidate caps (no dirty, no writeback).
+     *
+     * 设计说明 (并发安全):
+     *   - cap 没有 refcount, cap 的生命周期由 inode evict 管理
+     *     (powerfs_evict_inode 清理 cap_tree).
+     *   - 若 shrinker 在此释放 cap (rb_erase + kfree), close 路径
+     *     (powerfs_file_release) 在持锁拿 auth_cap → 释放锁 → 调
+     *     cap_send_release(auth_cap) 之间存在 use-after-free 窗口.
+     *   - 因此 shrinker 仅 invalidate page cache, 不释放 cap 本身.
+     *     cap 从 LRU 移除避免重复处理, 但仍留在 cap_tree 供其他路径
+     *     正常使用, 直至 inode evict 时统一释放.
+     */
+    spin_lock(&cli->cap_lru_lock);
+    while (freed < nr_to_scan && !list_empty(&cli->cap_lru_list)) {
+        struct powerfs_cap *cap = list_first_entry(&cli->cap_lru_list,
+                                                     struct powerfs_cap,
+                                                     lru_item);
+        struct powerfs_inode_info *pi = cap->ci;
+        struct inode *inode;
+
+        if (!pi) {
+            list_del_init(&cap->lru_item);
+            continue;
+        }
+
+        inode = &pi->netfs.inode;
+
+        /* Skip caps with dirty pages or writeback in progress */
+        if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+            mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK)) {
+            /* Move to tail — give it another chance */
+            list_move_tail(&cap->lru_item, &cli->cap_lru_list);
+            continue;
+        }
+
+        /* Skip if token is empty (never granted) */
+        if (cap->token[0] == '\0') {
+            list_del_init(&cap->lru_item);
+            continue;
+        }
+
+        /* Try to grab inode reference */
+        if (!igrab(inode)) {
+            list_del_init(&cap->lru_item);
+            continue;
+        }
+
+        /* Remove from LRU (避免 scan 时无限循环) and move to dispose list.
+         * cap 仍在 pi->i_caps rbtree 中, 不影响其他路径使用. */
+        list_del_init(&cap->lru_item);
+        list_add(&cap->lru_item, &dispose);
+        freed++;
+    }
+    spin_unlock(&cli->cap_lru_lock);
+
+    /* Phase 2: invalidate page cache outside the lock.
+     * 不发 cap_release RPC (cap 仍有效), 不 rb_erase, 不 kfree. */
+    while (!list_empty(&dispose)) {
+        struct powerfs_cap *cap = list_first_entry(&dispose,
+                                                     struct powerfs_cap,
+                                                     lru_item);
+        struct powerfs_inode_info *pi = cap->ci;
+        struct inode *inode = &pi->netfs.inode;
+
+        list_del_init(&cap->lru_item);
+
+        /* Invalidate clean page cache for this inode.
+         * 只回收 clean pages, dirty/writeback 已在 Phase 1 跳过. */
+        invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
+
+        iput(inode);
+    }
+
+    pr_debug_ratelimited("powerfs: cap shrinker invalidated %lu inodes page cache\n", freed);
+    return freed;
+}
+
+static struct shrinker *powerfs_cap_shrinker_alloc(struct powerfs_client *cli)
+{
+    struct shrinker *s = shrinker_alloc(0, "powerfs-cap-shrinker");
+    if (!s)
+        return NULL;
+    s->count_objects = powerfs_cap_shrinker_count;
+    s->scan_objects = powerfs_cap_shrinker_scan;
+    s->private_data = cli;
+    return s;
+}
+
+int powerfs_cap_shrinker_init(struct powerfs_client *cli)
+{
+    cli->cap_shrinker = powerfs_cap_shrinker_alloc(cli);
+    if (!cli->cap_shrinker)
+        return -ENOMEM;
+    /* 6.17 API: shrinker_alloc + shrinker_register + shrinker_free.
+     * 旧 API register_shrinker/unregister_shrinker 在 6.17 已移除,
+     * shrinker_free 会同步完成 unregister + free. */
+    shrinker_register(cli->cap_shrinker);
+    pr_info("powerfs: cap shrinker registered\n");
+    return 0;
+}
+
+void powerfs_cap_shrinker_destroy(struct powerfs_client *cli)
+{
+    if (cli->cap_shrinker) {
+        /* shrinker_free 会内部调用 unregister + kfree. */
+        shrinker_free(cli->cap_shrinker);
+        cli->cap_shrinker = NULL;
     }
 }

@@ -1527,6 +1527,16 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     }
     pr_info("powerfs: client allocated, client_id=%s\n", sbi->client->client_id);
 
+    /* P2-2: Register cap shrinker for memory pressure handling */
+    ret = powerfs_cap_shrinker_init(sbi->client);
+    if (ret) {
+        pr_err("powerfs: cap shrinker init failed: %d\n", ret);
+        kfree(sbi->client);
+        sbi->client = NULL;
+        kfree(sbi);
+        return ret;
+    }
+
     /* 设置超级块 (覆盖 sb->s_fs_info, 之前指向已释放的 ctx) */
     sb->s_fs_info = sbi;
     sb->s_op = &powerfs_super_ops;
@@ -2006,6 +2016,10 @@ void powerfs_kill_sb_super(struct super_block *sb)
     } else if (sbi) {
         pr_warn("powerfs: kill_sb skip global pool cleanup (pool_initialized=false)\n");
     }
+
+    /* P2-2: Unregister cap shrinker before evict_inodes (prevent race) */
+    if (sbi && sbi->client)
+        powerfs_cap_shrinker_destroy(sbi->client);
 
     /* 5. kill_anon_super → generic_shutdown_super:
      *    a) shrink_dcache_for_umount — 释放所有 dentry (d_release → call_rcu)
