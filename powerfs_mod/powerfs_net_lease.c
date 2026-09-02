@@ -671,6 +671,137 @@ out:
 }
 EXPORT_SYMBOL_GPL(powerfs_net_cap_acquire);
 
+/*
+ * powerfs_net_batch_cap_release - §13.6 P1-1: Session-level batch CapRelease.
+ *
+ * 把 N 个 close 时的 CapRelease 合并成 1 个 RTT. 适用于多文件批量 close
+ * 场景 (如 cp -r), 节省 N-1 次 RTT. Filer 端迭代 entries, 逐个 release
+ * 并独立做 upgrade 判定 (与单次 CapRelease 语义完全一致).
+ *
+ * TLV (对齐 powerfs-net MsgType::BatchCapRelease = 0x0097):
+ *   Request: ClientId(string) + Limit(u64=batch_count)
+ *            + per-entry (Ino + LeaseToken + CapSet) × batch_count
+ *   Response: Status(u16) + Limit(u64=echo)
+ *            + per-entry (Ino + Status) × batch_count
+ *
+ * entries[i].token 必须在调用期间保持有效 (不复制字符串, 零拷贝编码).
+ * entry_status_out[i]: 每个 entry 的状态 (0=成功, <0=errno).
+ *
+ * 返回: 0 = RPC 整体成功 (可能有部分 entry 失败, 看 entry_status_out);
+ *       <0 = RPC 整体失败 (无法解析响应等).
+ */
+int powerfs_net_batch_cap_release(const char *client_id,
+                                  const struct powerfs_batch_cap_release_entry *entries,
+                                  __u32 count,
+                                  __u16 *entry_status_out)
+{
+    __u8 *body = NULL;
+    size_t body_cap;
+    struct powerfs_tlv_enc enc;
+    __u8 *resp_body = NULL;
+    size_t resp_body_len = 0;
+    size_t cid_len;
+    struct powerfs_tlv_dec dec;
+    int ret;
+    __u32 i;
+
+    if (!client_id || !entries || count == 0)
+        return -EINVAL;
+
+    cid_len = strlen(client_id);
+    if (cid_len == 0 || cid_len > 255)
+        return -EINVAL;
+
+    /* 预估 body 大小: ClientId + Limit + per-entry(Ino + Token + CapSet)
+     * TLV 编码额外开销: 4 bytes field header per field. */
+    body_cap = cid_len + 4 + 8 + 4; /* ClientId field + Limit field */
+    for (i = 0; i < count; i++) {
+        size_t tl;
+        if (entries[i].ino == 0)
+            return -EINVAL;
+        if (!entries[i].token)
+            return -EINVAL;
+        tl = entries[i].token_len;
+        if (tl == 0 || tl > 255)
+            return -EINVAL;
+        /* per-entry: Ino(4+8) + LeaseToken(4+tl) + CapSet(4+1) */
+        body_cap += 4 + 8 + 4 + tl + 4 + 1;
+    }
+    body_cap += 32; /* 安全余量 */
+
+    body = kvmalloc(body_cap, GFP_NOFS);
+    if (!body)
+        return -ENOMEM;
+
+    powerfs_tlv_enc_init(&enc, body, body_cap);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID, client_id, cid_len);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_LIMIT, count);
+
+    for (i = 0; i < count; i++) {
+        powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, entries[i].ino);
+        powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_LEASE_TOKEN,
+                               entries[i].token, entries[i].token_len);
+        powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_CAP_SET, entries[i].capset);
+    }
+
+    resp_body = kvmalloc(POWERFS_NET_MAX_BODY, GFP_NOFS);
+    if (!resp_body) {
+        kvfree(body);
+        return -ENOMEM;
+    }
+
+    ret = powerfs_net_send_request(POWERFS_NET_MSG_BATCH_CAP_RELEASE,
+                                   entries[0].ino, /* 用第一个 ino 做 shard 路由 hint */
+                                   body, powerfs_tlv_enc_len(&enc),
+                                   NULL, 0,
+                                   resp_body, POWERFS_NET_MAX_BODY,
+                                   NULL, 0,
+                                   POWERFS_META_TIMEOUT_MS,
+                                   &resp_body_len, NULL);
+    kvfree(body);
+    if (ret < 0)
+        goto out;
+    if (ret > 0) {
+        ret = net_status_to_errno((__u16)ret);
+        goto out;
+    }
+
+    /* 解码响应 — 全部顺序解码 (per-entry 是重复 field, find_ 不适用).
+     *
+     * Filer 编码顺序: Limit(u64) + per-entry(Ino u64 + EntryStatus u8) × batch_count
+     *   EntryStatus 用 POWERFS_NET_FLD_CAP_SET (0xC4) 承载, 值为 0=成功, >0=错误.
+     *   (避免新增 FieldId, 复用现有值). */
+    if (resp_body_len > 0) {
+        __u64 batch_echo = 0;
+        __u32 j;
+        __u8  entry_st;
+
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+
+        /* 先读 Limit (echo batch_count) */
+        powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_LIMIT, &batch_echo);
+
+        /* 顺序读 per-entry: 每个 entry = Ino(u64) + EntryStatus(u8) */
+        for (j = 0; j < count; j++) {
+            __u64 ino = 0;
+
+            if (powerfs_tlv_dec_u64(&dec, POWERFS_NET_FLD_INO, &ino) != 0)
+                break; /* 响应不完整 */
+
+            /* EntryStatus 复用 CAP_SET field id, 语义 = 0=OK, >0=errno */
+            entry_st = 0;
+            powerfs_tlv_dec_u8(&dec, POWERFS_NET_FLD_CAP_SET, &entry_st);
+            entry_status_out[j] = entry_st;
+        }
+    }
+
+    ret = 0;
+out:
+    kvfree(resp_body);
+    return ret;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_batch_cap_release);
+
 /* ========== §13 Cap NOTIFY dispatch (Filer→Client async push) ==========
  *
  * 回调注册点: 模块 init 时 fs 层注册 recall / upgrade handler.

@@ -265,6 +265,7 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_CAP_RECALL_NOTIFY = 0x0094,
     POWERFS_NET_MSG_CAP_UPGRADE_NOTIFY = 0x0095,
     POWERFS_NET_MSG_CAP_ACQUIRE       = 0x0096,  /* P0-1: Client→Filer 增量请求升级 cap */
+    POWERFS_NET_MSG_BATCH_CAP_RELEASE = 0x0097, /* P1-1: 批量 CapRelease, session 级合并 */
 };
 
 /* ========== 响应状态码 ========== */
@@ -1771,6 +1772,33 @@ int powerfs_net_cap_acquire(__u64 ino,
                              char *grant_token_out, size_t *grant_token_len_out,
                              __u8 *cap_set_out, __u64 *epoch_out,
                              __u64 *sn_out, __u64 *duration_ms_out);
+
+/* P1-1: Session-level batch CapRelease.
+ *
+ * 把 N 个 close 时的 CapRelease 合并成 1 个 RTT. 适用于多文件
+ * 批量 close 场景 (如 cp -r), 节省 N-1 次 RTT.
+ *
+ * entries[i].token 必须在调用期间保持有效 (不复制字符串).
+ * entry_status_out: 输出数组, 与 entries 等长, 每个 entry 对应状态码.
+ *   0 = 成功, <0 = 错误码 (errno).
+ *
+ * 返回: 0 = 整体成功 (可能有部分 entry 失败, 看 entry_status_out);
+ *       <0 = RPC 整体失败 (无法解析响应等).
+ *
+ * TLV (对齐 powerfs-net MsgType::BatchCapRelease = 0x0097):
+ *   Request: ClientId + Limit(batch_count) + per-entry (Ino + LeaseToken + CapSet)
+ *   Response: Status + Limit + per-entry (Ino + Status) */
+struct powerfs_batch_cap_release_entry {
+    __u64 ino;
+    const char *token;      /* 调用期间保持有效, 不复制 */
+    size_t token_len;
+    __u8  capset;           /* wire CapSet (POWERFS_NET_CAP_*) */
+};
+
+int powerfs_net_batch_cap_release(const char *client_id,
+                                  const struct powerfs_batch_cap_release_entry *entries,
+                                  __u32 count,
+                                  __u16 *entry_status_out);
 
 /* ========== §13 Cap server push: NOTIFY dispatcher (Filer→Client) ==========
  *
