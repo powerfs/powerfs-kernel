@@ -40,6 +40,7 @@
 #include "powerfs.h"
 #include "powerfs_comm.h"
 #include "powerfs_net.h"
+#include "powerfs_net_internal.h"
 #include "powerfs_flow.h"
 
 #include "powerfs_vfs.h"
@@ -1895,6 +1896,12 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
                 return -EPERM;
             }
             sbi->client->assigned_client_id = assigned_id;
+            /* 将 master 签发的 assigned_id 写入 g_pool, 供 filer/volume
+             * handshake (TCP + RDMA) 和 heartbeat 使用. 缺失此调用会导致
+             * handshake 回退到 seq_counter+1000000 (恒为 1000001), 多客户端
+             * 连同一 filer 时 session id 冲突 → 第二连接踢掉第一个 → mount
+             * auto-deregister. (ROOT40) */
+            powerfs_net_update_heartbeat_id(assigned_id);
             /* Cap RPC (open_grant / recall_ack / release) 发送 STRING
              * holder 给 filer lock_arbiter 作为 session key. 将 master
              * 分配的 numeric id 字符串化后写入 client_id[], 确保 cap
@@ -2121,8 +2128,18 @@ void powerfs_kill_sb_super(struct super_block *sb)
 
         /* 4. 关闭所有连接 (g_pool 会被清零) */
         powerfs_net_pool_cleanup();
-    } else if (sbi) {
-        pr_warn("powerfs: kill_sb skip global pool cleanup (pool_initialized=false)\n");
+    } else if (sbi && g_pool_initialized) {
+        /* ROOT41: pool init 部分完成 (g_pool_initialized=true 但
+         * sbi->pool_initialized=false): filer 连接已创建 (带 reconnect
+         * workqueue) 但 30s 内未连上 → fill_super 返回错误 → kill_sb.
+         * 若不清理, reconnect workqueue 永远运行 → rmmod 失败 → 下次
+         * mount 复用 stale 连接 → use-after-free.
+         * powerfs_net_pool_cleanup 内部检查 g_pool_initialized 后执行
+         * powerfs_conn_pool_exit 取消所有 delayed_work + 断开连接. */
+        pr_warn("powerfs: kill_sb cleaning up partially-initialized pool "
+                "(filer_count=%d)\n", g_pool.filer_count);
+        powerfs_net_set_stopping();
+        powerfs_net_pool_cleanup();
     }
 
     /* P2-2: Unregister cap shrinker before evict_inodes (prevent race) */

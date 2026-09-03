@@ -1136,7 +1136,13 @@ int powerfs_writepages(struct address_space *mapping,
     /* K2: Inline 文件不走 Volume Server writeback.
      * 数据已在 write_end 中同步到 inline_data 缓冲,
      * close 时通过 UPDATE_INODE 提交到 Filer.
-     * 这里清理脏页标记, 让 writeback 认为已完成. */
+     * 这里清理脏页标记, 让 writeback 认为已完成.
+     *
+     * ROOT46: 必须用 folio_clear_dirty_for_io + start/end_writeback
+     * 完整流程, 而非 folio_clear_dirty. 后者只清 PG_dirty 标志位,
+     * 不清 xarray 的 PAGECACHE_TAG_DIRTY tag, 导致 refresh_work 的
+     * mapping_tagged(PAGECACHE_TAG_DIRTY) 误判为有脏页, 跳过 page
+     * cache invalidate, 其他客户端写入后本地读到旧数据. */
     if (POWERFS_I(inode)->placement == POWERFS_PLACEMENT_INLINE) {
         struct folio_batch fbatch2;
         pgoff_t idx2 = wbc->range_start >> PAGE_SHIFT;
@@ -1150,7 +1156,13 @@ int powerfs_writepages(struct address_space *mapping,
             for (i = 0; i < folio_batch_count(&fbatch2); i++) {
                 struct folio *f = fbatch2.folios[i];
                 folio_lock(f);
-                folio_clear_dirty(f);
+                /* 清 PG_dirty → start_writeback 清 xarray DIRTY tag
+                 * 并设 WRITEBACK tag → end_writeback 清 WRITEBACK tag.
+                 * 无实际 I/O (INLINE 数据已在 write_end 同步到 inline_data). */
+                if (folio_clear_dirty_for_io(f)) {
+                    folio_start_writeback(f);
+                    folio_end_writeback(f);
+                }
                 folio_unlock(f);
                 folio_put(f);
             }

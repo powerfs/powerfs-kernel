@@ -264,10 +264,10 @@ static loff_t powerfs_llseek(struct file *file, loff_t offset, int whence)
             /* 远端不通：回退到 generic，避免应用死锁。若 local 也 stale 则
              * 至少应用看到 ENXIO，不会在错误 offset 上写。 */
         } else {
-            /* 用权威 size 原子更新本地 i_size（对齐 powerfs_inode_set_size，
-             * 但这里只有 size 更新，直接拿 inode->i_lock spinlock）。 */
+            /* 用权威 size 原子更新本地 i_size. MAX(remote, local) 防止
+             * writeback 未提交时 remote < local 导致 i_size 回退 (ROOT42). */
             spin_lock(&inode->i_lock);
-            if ((loff_t)remote_size != i_size_read(inode)) {
+            if ((loff_t)remote_size > i_size_read(inode)) {
                 i_size_write(inode, (loff_t)remote_size);
                 pr_debug("powerfs: llseek ino=%lu i_size updated local→remote %lld→%llu\n",
                          inode->i_ino, i_size_read(inode), remote_size);
@@ -512,26 +512,114 @@ static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
      * VFS generic_file_write_iter 不主动处理 O_APPEND, 必须由 FS
      * 在 ->write_iter 入口把 iocb->ki_pos 重置到 i_size (对齐
      * ext4_file_write_iter / NFS write_iter 开头).
-     * Note: 即使 ->open 中已经设置了 f_pos=i_size, 多进程并行
-     * 写时别的 writer 先 extend 了 i_size, 本进程必须再次
-     * "read i_size then write", 否则覆盖后写入的数据. */
+     *
+     * ROOT39: 多客户端并发 O_APPEND 时, 本地 i_size 可能过期 —
+     * VM1 append 500 行后 VM2 本地 size 仍为旧值 → ki_pos=旧值 →
+     * 覆盖 VM1 的写入. 修复: O_APPEND 写入前从 Filer 获取权威 size
+     * (对齐 SEEK_END 路径 L253), 防止 stale offset 覆盖数据.
+     *
+     * ROOT42: getattr 返回的 remote_size 可能小于本地 i_size (writeback
+     * 未提交到 filer), 直接覆盖 i_size 会导致写偏移回退、覆盖前一行.
+     * 修复: 取 MAX(remote_size, local_i_size) — remote > local 时用 remote
+     * (另一客户端追加了数据), local > remote 时用 local (本端 writeback
+     * 未提交). 单客户端顺序 append 也能避免竞态丢行.
+     *
+     * ROOT43: 并发 O_APPEND 竞态 — 两台 VM 同时 getattr 得到 size=0,
+     * 都写到 offset 0 → 互相覆盖. 修复: O_APPEND 路径在 getattr 之前
+     * 先获取 FILE_EXCL 排他 cap, 序列化并发 append. 持有 EXCL 期间
+     * 其他客户端的 write 被 cap 协议阻塞, getattr 拿到的 size 是权威值.
+     *
+     * ROOT47: powerfs_get_caps 在 30 轮等待 (1.5s) 后降级放行 —
+     * 仅满足 need (FILE_WR) 就返回 0, *got 不含 FILE_EXCL. 旧代码
+     * 只检查 err<0, 没检查 *got, 导致并发 O_APPEND 时两台 VM 同时
+     * 持有 FILE_WR, getattr 拿到的 size 不含对方未提交的 inline_data,
+     * 写入互相覆盖 (实测两台 VM 各 append 30 行, 60 行丢 1 行,
+     * concurrent_test.txt 两台 VM 视图大小不同).
+     *
+     * 修复: O_APPEND 路径调用 powerfs_get_caps 后必须检查 *got 包含
+     * FILE_EXCL, 否则 put_refs + 退避 + 重试 max_append_retries 次.
+     * 仍拿不到返回 -EAGAIN 让 VFS/应用重试 (符合项目约束
+     * "Write open operations must enforce lease acquisition (not
+     * best-effort); retry on failure and return EAGAIN if retry
+     * limit reached").
+     *
+     * 性能: 每次 O_APPEND 增加一次 getattr RPC (~1ms). 后续可通过
+     * cap 检查优化: 有 EXCL cap 时本地 size 是权威值, 跳过 getattr. */
     if (unlikely(file->f_flags & O_APPEND)) {
         loff_t isz;
-        spin_lock(&pi->i_lock);
-        isz = i_size_read(inode);
-        spin_unlock(&pi->i_lock);
+        __u64 remote_size = 0;
+
+        /* ROOT43+ROOT47: 强制 FILE_EXCL 序列化并发 append.
+         * 检查 *got 包含 EXCL, 没有就 put_refs + 退避 + 重试.
+         * endoff 传 count (offset 此刻未知, powerfs_get_caps 的 endoff
+         * 当前未使用, 仅预留). */
+        if (S_ISREG(inode->i_mode) && count > 0) {
+            int append_retries = 0;
+            const int max_append_retries = 3;
+
+            while (append_retries++ < max_append_retries) {
+                err = powerfs_get_caps(inode, file,
+                                       POWERFS_CAP_FILE_WR,
+                                       POWERFS_CAP_WR_DATA,
+                                       (loff_t)count, &got);
+                /* 必须检查 *got 含 EXCL: powerfs_get_caps 1.5s 后
+                 * 降级放行, *got 不含 EXCL 也返回 0. */
+                if (err == 0 && (got & POWERFS_CAP_FILE_EXCL))
+                    break;
+
+                /* 降级放行或错误: 释放已拿到的部分引用, 退避后重试 */
+                if (got) {
+                    powerfs_cap_put_refs(pi, got);
+                    got = 0;
+                }
+                if (err == -ERESTARTSYS) {
+                    pr_warn("powerfs: O_APPEND ino=%lu interrupted by signal\n",
+                            inode->i_ino);
+                    return err;
+                }
+                if (append_retries < max_append_retries)
+                    usleep_range(5000, 10000);  /* 5-10ms 退避 */
+            }
+            if (!(got & POWERFS_CAP_FILE_EXCL)) {
+                pr_warn("powerfs: O_APPEND ino=%lu cannot acquire FILE_EXCL "
+                        "after %d retries (got=0x%x), returning -EAGAIN\n",
+                        inode->i_ino, max_append_retries, got);
+                return -EAGAIN;
+            }
+        }
+
+        /* 持有 EXCL cap 后 getattr, 其他客户端无法在此期间写入 */
+        int gerr = powerfs_net_getattr(inode->i_ino,
+                                       NULL, NULL, NULL,   /* mode, uid, gid */
+                                       &remote_size,        /* size ← authoritative */
+                                       NULL,                /* nlink */
+                                       NULL, NULL, NULL,   /* mtime, atime, ctime */
+                                       NULL, NULL, NULL,   /* volume_id, file_key, layout */
+                                       NULL, NULL, NULL,   /* rbytes, rfiles, rsubdirs */
+                                       NULL, NULL);         /* rctime_sec, rctime_nsec */
+        if (gerr == 0) {
+            spin_lock(&inode->i_lock);
+            /* MAX(remote, local): 防止 writeback 未提交时 remote < local
+             * 导致 i_size 回退 (ROOT42) */
+            if ((loff_t)remote_size > i_size_read(inode))
+                i_size_write(inode, (loff_t)remote_size);
+            isz = i_size_read(inode);
+            spin_unlock(&inode->i_lock);
+        } else {
+            /* getattr 失败: 回退到本地 size (best-effort). */
+            isz = i_size_read(inode);
+        }
         iocb->ki_pos = isz;
         file->f_pos = isz;
-        pr_debug("powerfs: write_iter ino=%lu O_APPEND -> ki_pos=f_pos=%lld\n",
-                 inode->i_ino, (long long)isz);
+        offset = iocb->ki_pos;
+        pr_debug("powerfs: write_iter ino=%lu O_APPEND -> ki_pos=%lld (remote=%llu)\n",
+                 inode->i_ino, (long long)isz, remote_size);
+    } else {
+        offset = iocb->ki_pos;
     }
-    offset = iocb->ki_pos;
 
-    /* 对齐  page_mkwrite (addr.c L2087):
-     *   need = FILE_WR, want = FILE_WR|FILE_EXCL (BUFFER).
-     * write_begin 内部还会 try_get_caps 作为快速路径, 这里在 i_rwsem 外
-     * 提前阻塞获取, 避免 write_begin 内循环 EAGAIN 重试开销. */
-    if (S_ISREG(inode->i_mode) && count > 0) {
+    /* 非 O_APPEND 路径, 或 O_APPEND cap 获取失败时的重试 */
+    if (!got && S_ISREG(inode->i_mode) && count > 0) {
         err = powerfs_get_caps(inode, file,
                                POWERFS_CAP_FILE_WR,
                                POWERFS_CAP_WR_DATA,

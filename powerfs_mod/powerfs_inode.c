@@ -279,15 +279,30 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
         pi->inline_max_size = POWERFS_INLINE_MAX_SIZE;
 
     /* K2: InlineData — 仅在 placement==INLINE 时应用.
-     * 其他模式不应携带 inline_data, 但若误传则释放避免泄漏. */
+     * 其他模式不应携带 inline_data, 但若误传则释放避免泄漏.
+     *
+     * ROOT45: 当 inline_dirty=true 时, 本地 inline_data 包含 write_end 合并的
+     * 未提交数据 (尚未通过 close 同步到 Filer). 此时 Filer 端的 inline_data
+     * 是陈旧的 (缺少本地写入). 若用 server 数据覆盖, 会丢失本地数据.
+     * 与 placement 保护 (K2 第 256 行) 一致: 有未提交本地修改时跳过覆盖. */
     if (pi->placement == POWERFS_PLACEMENT_INLINE && layout->has_inline_data) {
-        /* inline_data 所有权转移: 先释放旧 buffer, 再挂载新 buffer */
-        old_inline = pi->inline_data;
-        pi->inline_data = layout->inline_data;
-        pi->inline_len = layout->inline_len;
-        layout->inline_data = NULL;       /* 所有权转移, 防止 double-free */
-        layout->inline_len = 0;
-        kfree(old_inline);
+        if (pi->inline_dirty) {
+            /* 本地有未提交 inline_data, 不能被 server 陈旧数据覆盖.
+             * 释放 layout->inline_data 避免泄漏. */
+            pr_info("powerfs: apply_layout skip inline_data overwrite, inline_dirty ino=%lu (local=%u server=%u)\n",
+                    pi->netfs.inode.i_ino, pi->inline_len, layout->inline_len);
+            kfree(layout->inline_data);
+            layout->inline_data = NULL;
+            layout->inline_len = 0;
+        } else {
+            /* inline_data 所有权转移: 先释放旧 buffer, 再挂载新 buffer */
+            old_inline = pi->inline_data;
+            pi->inline_data = layout->inline_data;
+            pi->inline_len = layout->inline_len;
+            layout->inline_data = NULL;       /* 所有权转移, 防止 double-free */
+            layout->inline_len = 0;
+            kfree(old_inline);
+        }
     } else {
         /* Flat/Stripe: 不应持有 inline_data, 释放误传的 buffer */
         kfree(layout->inline_data);
@@ -566,9 +581,9 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
      * detect pending LOCAL modifications. If no local writes are pending,
      * always accept the server's attributes (the change came from another
      * client or the local writeback has completed). */
-    bool local_pending = mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
-                         mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK) ||
-                         local_inline_dirty ||
+    bool has_dirty_pages = mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+                           mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK);
+    bool local_pending = has_dirty_pages || local_inline_dirty ||
                          local_caps_dirty;
 
     spin_lock(&inode->i_lock);
@@ -636,10 +651,19 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
      * now ensure the server needle is properly zeroed on extend/punch_hole.
      * The truncate-extend fix (setattr) also triggers synchronous writeback,
      * so by the time refresh_work runs, the server needle is up-to-date. */
-    if (local_pending) {
-        pr_debug("powerfs: refresh_work ino=%llu skip pagecache invalidate (local pending)\n",
-                rw->ino);
+    /* ROOT44: page cache 失效条件与 attr 更新条件分离.
+     * attr 更新用 local_pending (含 caps_dirty 防止 size 回退),
+     * 但 page cache 失效只需检查 has_dirty_pages 和 inline_dirty
+     * (真正的未同步数据). caps_dirty 表示 cap 状态未同步到 Filer,
+     * 但 page cache 数据已通过 cap_flush/release 同步, 可以安全失效.
+     * 这样当其他客户端修改 inline 文件后, 即使本地 caps_dirty 为 true,
+     * 也能失效 page cache, 避免读到旧数据. */
+    if (has_dirty_pages || local_inline_dirty) {
+        pr_info("powerfs: refresh_work ino=%llu skip pagecache invalidate (dirty_pages=%d inline_dirty=%d)\n",
+                rw->ino, has_dirty_pages, local_inline_dirty);
     } else {
+        pr_info("powerfs: refresh_work ino=%llu invalidate pagecache (caps_dirty=%d, safe to invalidate)\n",
+                rw->ino, local_caps_dirty);
         invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
     }
 
@@ -729,7 +753,7 @@ int powerfs_invalidate_one(u64 ino)
     rw->inode = NULL;  /* NULL → work function will do ilookup5 */
     queue_work(powerfs_refresh_wq, &rw->work);
 
-    pr_debug("powerfs: invalidate_one ino=%llu queued (lookup deferred to workqueue)\n", ino);
+    pr_info("powerfs: invalidate_one ino=%llu queued (lookup deferred to workqueue)\n", ino);
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_invalidate_one);

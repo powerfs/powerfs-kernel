@@ -473,8 +473,12 @@ start_single() {
     # CPU pinning: after QEMU starts, pin all its threads (main + vCPU KVM threads)
     # to NUMA node 1 physical cores (same socket as mlx5_1 HCA) for lowest RDMA latency.
     # systemd-run: start as transient service so QEMU survives terminal session cleanup.
+    # ROOT49: transient service 失败/被杀后进入 failed 状态, unit 仍留在
+    # systemd 内存中. 下次 systemd-run 会报 "Unit xxx.service already exists".
+    # 必须 stop + reset-failed 才能彻底移除残留 unit.
     local svc="powerfs-${name}"
-    sudo systemctl stop "${svc}" 2>/dev/null  # clean up any stale service
+    sudo systemctl stop "${svc}" 2>/dev/null        # 先停掉正在运行的
+    sudo systemctl reset-failed "${svc}" 2>/dev/null # 移除 failed/inactive 残留 unit
     sudo systemd-run --unit="${svc}" --quiet -- \
         qemu-system-x86_64 \
         ${kvm_flag} \
@@ -571,6 +575,7 @@ stop_single() {
         for _ in $(seq 1 10); do
             if ! sudo systemctl is-active "${svc}" >/dev/null 2>&1; then
                 info "${name} exited cleanly"
+                sudo systemctl reset-failed "${svc}" 2>/dev/null  # ROOT49: 移除 unit 残留
                 sudo rm -f "$(vm_disk "${vid}").lock" 2>/dev/null || true
                 rm -f "$(vm_pid_file "${vid}")"
                 return 0
@@ -580,6 +585,7 @@ stop_single() {
         warn "${name} still alive, kill -9"
         sudo systemctl kill "${svc}" --signal=SIGKILL 2>/dev/null || true
         sleep 1
+        sudo systemctl reset-failed "${svc}" 2>/dev/null  # ROOT49: 杀完也清掉 failed 状态
         sudo rm -f "$(vm_disk "${vid}").lock" 2>/dev/null
         rm -f "$(vm_pid_file "${vid}")"
         return 0

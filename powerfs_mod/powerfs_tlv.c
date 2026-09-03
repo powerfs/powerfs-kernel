@@ -346,10 +346,11 @@ int powerfs_tlv_dec_u32(struct powerfs_tlv_dec *dec, __u8 field, __u32 *val)
     if (!data)
         return -ENOENT;
 
-    *val = (__u32)data[0] |
-           ((__u32)data[1] << 8) |
-           ((__u32)data[2] << 16) |
-           ((__u32)data[3] << 24);
+    if (val)
+        *val = (__u32)data[0] |
+               ((__u32)data[1] << 8) |
+               ((__u32)data[2] << 16) |
+               ((__u32)data[3] << 24);
     dec->pos += 4;
     return 0;
 }
@@ -366,9 +367,11 @@ int powerfs_tlv_dec_u64(struct powerfs_tlv_dec *dec, __u8 field, __u64 *val)
     if (!data)
         return -ENOENT;
 
-    *val = 0;
-    for (i = 0; i < 8; i++)
-        *val |= (__u64)data[i] << (i * 8);
+    if (val) {
+        *val = 0;
+        for (i = 0; i < 8; i++)
+            *val |= (__u64)data[i] << (i * 8);
+    }
     dec->pos += 8;
     return 0;
 }
@@ -461,9 +464,11 @@ int powerfs_tlv_dec_find_u64(struct powerfs_tlv_dec *dec, __u8 field, __u64 *val
             break;
 
         if (cur_field == field && cur_len == 8) {
-            *val = 0;
-            for (i = 0; i < 8; i++)
-                *val |= (__u64)dec->buf[dec->pos + i] << (i * 8);
+            if (val) {
+                *val = 0;
+                for (i = 0; i < 8; i++)
+                    *val |= (__u64)dec->buf[dec->pos + i] << (i * 8);
+            }
             dec->pos += 8;
             return 0;
         }
@@ -490,10 +495,11 @@ int powerfs_tlv_dec_find_u32(struct powerfs_tlv_dec *dec, __u8 field, __u32 *val
             break;
 
         if (cur_field == field && cur_len == 4) {
-            *val = (__u32)dec->buf[dec->pos] |
-                   ((__u32)dec->buf[dec->pos + 1] << 8) |
-                   ((__u32)dec->buf[dec->pos + 2] << 16) |
-                   ((__u32)dec->buf[dec->pos + 3] << 24);
+            if (val)
+                *val = (__u32)dec->buf[dec->pos] |
+                       ((__u32)dec->buf[dec->pos + 1] << 8) |
+                       ((__u32)dec->buf[dec->pos + 2] << 16) |
+                       ((__u32)dec->buf[dec->pos + 3] << 24);
             dec->pos += 4;
             return 0;
         }
@@ -518,7 +524,8 @@ int powerfs_tlv_dec_find_u8(struct powerfs_tlv_dec *dec, __u8 field, __u8 *val)
             break;
 
         if (cur_field == field && cur_len == 1) {
-            *val = dec->buf[dec->pos];
+            if (val)
+                *val = dec->buf[dec->pos];
             dec->pos += 1;
             return 0;
         }

@@ -1019,6 +1019,55 @@ void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
         pi->dir_complete = false;
     }
 
+    /* 4b. ROOT44: 当 FILE_WR 或 FILE_EXCL 被撤销时, 说明其他客户端即将
+     * 获得写权限. 对于 Inline 文件, 本地 inline_data 副本和 page cache
+     * 即将过期 (其他客户端写入后会更新 filer 端 inline_data).
+     *
+     * 必须在此处:
+     *   a) 释放 pi->inline_data (设为 NULL) — 标记为 stale, 防止后续
+     *      issue_read 从旧副本读取 (issue_read 在 inline_data 为 NULL 时
+     *      返回 0 字节 + HIT_EOF, 不会读到错误数据);
+     *   b) 失效 page cache (invalidate_mapping_pages) — 丢弃本地写入
+     *      的 page cache, 强制下次 read 触发 issue_read;
+     *   c) 触发 refresh_work (powerfs_invalidate_one) — 异步 getattr
+     *      拉取最新 inline_data, refresh_work 完成后 pi->inline_data
+     *      被更新, 后续 read 能读到最新数据.
+     *
+     * 时序保证:
+     *   - cap_flush 已在步骤 2 完成, dirty 数据已同步到 filer
+     *   - ACK 在步骤 5 发送, filer 收到 ACK 后才将 EXCL 授予其他客户端
+     *   - 其他客户端写入后 filer 广播 Invalidate, VM 收到后再次 refresh
+     *   - 即使 NOTIFY 丢失, recall 后的第一次 read 可能读到 0 字节,
+     *     但 refresh_work 完成后第二次 read 能读到最新数据 */
+    if (revoking & (POWERFS_CAP_FILE_WR | POWERFS_CAP_FILE_EXCL)) {
+        if (pi->placement == POWERFS_PLACEMENT_INLINE) {
+            u8 *old_inline;
+
+            pr_info("powerfs: cap_revoke INLINE ino=%lu revoking=0x%x — "
+                    "release inline_data + invalidate pagecache\n",
+                    inode->i_ino, revoking);
+
+            /* a) 释放 inline_data, 标记为 stale */
+            old_inline = pi->inline_data;
+            pi->inline_data = NULL;
+            pi->inline_len = 0;
+            pi->inline_dirty = false;
+            spin_unlock(&pi->i_lock);
+            kfree(old_inline);
+
+            /* b) 失效 page cache (非阻塞, 跳过 dirty/locked pages) */
+            invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
+
+            /* c) 触发 refresh_work 异步拉取最新 inline_data.
+             * powerfs_invalidate_one 是非阻塞的, 只排队 work.
+             * 注意: 不能同步等待 refresh_work, 因为当前就在
+             * powerfs_refresh_wq 中运行, 同步等待会死锁. */
+            powerfs_invalidate_one(inode->i_ino);
+
+            spin_lock(&pi->i_lock);
+        }
+    }
+
     /* 5. §13.4.2: 发 CapRecallAck 到 Filer, 证明 flush 完成 + issued 已降级.
      *    服务端收到 ACK 才会完成 recall 流程, 将 EXCLUSIVE 权限授予新申请者.
      *    注意: RPC 不能在 spinlock 下执行, 临时释放 i_lock (此时已无 shared
