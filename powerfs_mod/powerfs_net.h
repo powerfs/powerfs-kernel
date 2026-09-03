@@ -264,6 +264,10 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_CAP_RELEASE = 0x0093,
     POWERFS_NET_MSG_CAP_RECALL_NOTIFY = 0x0094,
     POWERFS_NET_MSG_CAP_UPGRADE_NOTIFY = 0x0095,
+    POWERFS_NET_MSG_CAP_ACQUIRE       = 0x0096,  /* P0-1: Client→Filer 增量请求升级 cap */
+    POWERFS_NET_MSG_BATCH_CAP_RELEASE = 0x0097, /* P1-1: 批量 CapRelease, session 级合并 */
+    POWERFS_NET_MSG_FILE_LOCK_REQUEST = 0x0098, /* P1-3: Client→Filer POSIX file lock */
+    POWERFS_NET_MSG_FILE_LOCK_GRANT   = 0x0099, /* P1-3: Filer→Client 异步 grant 通知 */
 };
 
 /* ========== 响应状态码 ========== */
@@ -1726,7 +1730,8 @@ int powerfs_net_cap_open_grant(__u64 ino,
  * 才能将 cap 授予新申请者 (否则新申请者最多得 SHARED_WRITE). */
 int powerfs_net_cap_recall_ack(__u64 ino,
                                const char *client_id,
-                               const char *token, size_t token_len);
+                               const char *token, size_t token_len,
+                               __u8 *piggyback_caps_out);
 
 /* CapRelease: release/close 时主动向 Filer 释放 cap,
  * 触发 upgrade 判定 (若剩余唯一 writer → 升级回 EXCLUSIVE_WRITE).
@@ -1756,6 +1761,67 @@ int powerfs_net_cap_release(__u64 ino,
                             char *upgrade_token_out, size_t *upgrade_token_len_out,
                             __u8 *upgrade_cap_set_out,
                             __u64 *upgrade_epoch_out, __u64 *upgrade_sn_out);
+
+/* powerfs_net_cap_acquire - P0-1: 增量请求升级 cap (wanted > issued 时调用).
+ *
+ * 请求 TLV: Ino + ClientId + LeaseToken + CapSet(wanted u8)
+ * 响应 TLV: LeaseToken + CapSet(granted) + CapEpoch + CapSn + LeaseDuration
+ *
+ * 返回: 0 成功, <0 错误. 成功时输出参数填充升级后的 grant 信息. */
+int powerfs_net_cap_acquire(__u64 ino,
+                             const char *client_id,
+                             const char *token, size_t token_len,
+                             __u8 wanted_capset,
+                             char *grant_token_out, size_t *grant_token_len_out,
+                             __u8 *cap_set_out, __u64 *epoch_out,
+                             __u64 *sn_out, __u64 *duration_ms_out);
+
+/* P1-1: Session-level batch CapRelease.
+ *
+ * 把 N 个 close 时的 CapRelease 合并成 1 个 RTT. 适用于多文件
+ * 批量 close 场景 (如 cp -r), 节省 N-1 次 RTT.
+ *
+ * entries[i].token 必须在调用期间保持有效 (不复制字符串).
+ * entry_status_out: 输出数组, 与 entries 等长, 每个 entry 对应状态码.
+ *   0 = 成功, <0 = 错误码 (errno).
+ *
+ * 返回: 0 = 整体成功 (可能有部分 entry 失败, 看 entry_status_out);
+ *       <0 = RPC 整体失败 (无法解析响应等).
+ *
+ * TLV (对齐 powerfs-net MsgType::BatchCapRelease = 0x0097):
+ *   Request: ClientId + Limit(batch_count) + per-entry (Ino + LeaseToken + CapSet)
+ *   Response: Status + Limit + per-entry (Ino + Status) */
+struct powerfs_batch_cap_release_entry {
+    __u64 ino;
+    const char *token;      /* 调用期间保持有效, 不复制 */
+    size_t token_len;
+    __u8  capset;           /* wire CapSet (POWERFS_NET_CAP_*) */
+};
+
+int powerfs_net_batch_cap_release(const char *client_id,
+                                  const struct powerfs_batch_cap_release_entry *entries,
+                                  __u32 count,
+                                  __u16 *entry_status_out);
+
+/* ========== P1-3: POSIX file lock (flock/fcntl) Filer RPC ==========
+ *
+ * MsgType 0x0098 FileLockRequest (Client→Filer)
+ *   Request:  Ino(u64) + ClientId(string) + LockMode(u8: 0=RD, 1=WR, 2=UNLOCK)
+ *             + Wait(u8: 0=non-block, 1=block)
+ *   Response: LockMode(u8 echo) + Granted(u8: 1=granted, 0=denied)
+ *
+ * MsgType 0x0099 FileLockGrant (Filer→Client, async notification)
+ *   Body: Ino(u64) + LockMode(u8) + Granted(u8=1)
+ */
+#define POWERFS_NET_FILE_LOCK_MODE_RD     0   /* shared/read lock (LOCK_SH / F_RDLCK) */
+#define POWERFS_NET_FILE_LOCK_MODE_WR     1   /* exclusive/write lock (LOCK_EX / F_WRLCK) */
+#define POWERFS_NET_FILE_LOCK_MODE_UNLOCK 2   /* unlock (LOCK_UN / F_UNLCK) */
+
+int powerfs_net_file_lock_request(__u64 ino,
+                                   const char *client_id, size_t client_id_len,
+                                   __u8 lock_mode,
+                                   __u8 wait,
+                                   __u8 *granted_out);
 
 /* ========== §13 Cap server push: NOTIFY dispatcher (Filer→Client) ==========
  *

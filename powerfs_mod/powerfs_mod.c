@@ -332,7 +332,6 @@ static int __init powerfs_init(void)
 
     pr_info("========================================\n");
     pr_info("  PowerFS Kernel Module v%s\n", POWERFS_VERSION);
-    pr_info("  Ceph-style Architecture\n");
     pr_info("========================================\n");
 
     /* 创建全局 slab 缓存 */
@@ -401,5 +400,5 @@ module_exit(powerfs_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("PowerFS Team");
-MODULE_DESCRIPTION("PowerFS Kernel Filesystem (Ceph-style architecture)");
+MODULE_DESCRIPTION("PowerFS Kernel Filesystem");
 MODULE_VERSION(POWERFS_VERSION);

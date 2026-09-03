@@ -900,6 +900,9 @@ struct powerfs_client {
     struct list_head cap_lru_list;
     spinlock_t cap_lru_lock;
 
+    /* P2-2: Cap shrinker — 低内存时主动释放 cap + invalidate page cache */
+    struct shrinker *cap_shrinker;
+
     /* 全局 CapFlush 列表 (对齐  mdsc->cap_dirty_lock 级别的 g_list) */
     struct list_head cap_flush_list;
     spinlock_t cap_flush_lock;
@@ -910,6 +913,15 @@ struct powerfs_client {
     /* 全局锁 */
     struct mutex mount_mutex;
 };
+
+/* P2-2: Cap shrinker init/destroy (powerfs_caps.c) */
+int powerfs_cap_shrinker_init(struct powerfs_client *cli);
+void powerfs_cap_shrinker_destroy(struct powerfs_client *cli);
+
+/* P2-4: Quiesce 接口 (热迁移 / Filer balancer 调用)
+ * 同步脏数据 + 释放 cap + 清除 page cache, 让客户端 "静默".
+ * 返回 0 成功, *released 为释放的 inode 数; 负值表示错误. */
+int powerfs_quiesce_all(struct super_block *sb, unsigned long *released);
 
 /* ========== 超级块私有信息 (参考 powerfs_fs_client + 挂载层 slab) ========== */
 

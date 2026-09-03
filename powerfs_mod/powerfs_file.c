@@ -264,10 +264,10 @@ static loff_t powerfs_llseek(struct file *file, loff_t offset, int whence)
             /* 远端不通：回退到 generic，避免应用死锁。若 local 也 stale 则
              * 至少应用看到 ENXIO，不会在错误 offset 上写。 */
         } else {
-            /* 用权威 size 原子更新本地 i_size（对齐 powerfs_inode_set_size，
-             * 但这里只有 size 更新，直接拿 inode->i_lock spinlock）。 */
+            /* 用权威 size 原子更新本地 i_size. MAX(remote, local) 防止
+             * writeback 未提交时 remote < local 导致 i_size 回退 (ROOT42). */
             spin_lock(&inode->i_lock);
-            if ((loff_t)remote_size != i_size_read(inode)) {
+            if ((loff_t)remote_size > i_size_read(inode)) {
                 i_size_write(inode, (loff_t)remote_size);
                 pr_debug("powerfs: llseek ino=%lu i_size updated local→remote %lld→%llu\n",
                          inode->i_ino, i_size_read(inode), remote_size);
@@ -512,26 +512,114 @@ static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
      * VFS generic_file_write_iter 不主动处理 O_APPEND, 必须由 FS
      * 在 ->write_iter 入口把 iocb->ki_pos 重置到 i_size (对齐
      * ext4_file_write_iter / NFS write_iter 开头).
-     * Note: 即使 ->open 中已经设置了 f_pos=i_size, 多进程并行
-     * 写时别的 writer 先 extend 了 i_size, 本进程必须再次
-     * "read i_size then write", 否则覆盖后写入的数据. */
+     *
+     * ROOT39: 多客户端并发 O_APPEND 时, 本地 i_size 可能过期 —
+     * VM1 append 500 行后 VM2 本地 size 仍为旧值 → ki_pos=旧值 →
+     * 覆盖 VM1 的写入. 修复: O_APPEND 写入前从 Filer 获取权威 size
+     * (对齐 SEEK_END 路径 L253), 防止 stale offset 覆盖数据.
+     *
+     * ROOT42: getattr 返回的 remote_size 可能小于本地 i_size (writeback
+     * 未提交到 filer), 直接覆盖 i_size 会导致写偏移回退、覆盖前一行.
+     * 修复: 取 MAX(remote_size, local_i_size) — remote > local 时用 remote
+     * (另一客户端追加了数据), local > remote 时用 local (本端 writeback
+     * 未提交). 单客户端顺序 append 也能避免竞态丢行.
+     *
+     * ROOT43: 并发 O_APPEND 竞态 — 两台 VM 同时 getattr 得到 size=0,
+     * 都写到 offset 0 → 互相覆盖. 修复: O_APPEND 路径在 getattr 之前
+     * 先获取 FILE_EXCL 排他 cap, 序列化并发 append. 持有 EXCL 期间
+     * 其他客户端的 write 被 cap 协议阻塞, getattr 拿到的 size 是权威值.
+     *
+     * ROOT47: powerfs_get_caps 在 30 轮等待 (1.5s) 后降级放行 —
+     * 仅满足 need (FILE_WR) 就返回 0, *got 不含 FILE_EXCL. 旧代码
+     * 只检查 err<0, 没检查 *got, 导致并发 O_APPEND 时两台 VM 同时
+     * 持有 FILE_WR, getattr 拿到的 size 不含对方未提交的 inline_data,
+     * 写入互相覆盖 (实测两台 VM 各 append 30 行, 60 行丢 1 行,
+     * concurrent_test.txt 两台 VM 视图大小不同).
+     *
+     * 修复: O_APPEND 路径调用 powerfs_get_caps 后必须检查 *got 包含
+     * FILE_EXCL, 否则 put_refs + 退避 + 重试 max_append_retries 次.
+     * 仍拿不到返回 -EAGAIN 让 VFS/应用重试 (符合项目约束
+     * "Write open operations must enforce lease acquisition (not
+     * best-effort); retry on failure and return EAGAIN if retry
+     * limit reached").
+     *
+     * 性能: 每次 O_APPEND 增加一次 getattr RPC (~1ms). 后续可通过
+     * cap 检查优化: 有 EXCL cap 时本地 size 是权威值, 跳过 getattr. */
     if (unlikely(file->f_flags & O_APPEND)) {
         loff_t isz;
-        spin_lock(&pi->i_lock);
-        isz = i_size_read(inode);
-        spin_unlock(&pi->i_lock);
+        __u64 remote_size = 0;
+
+        /* ROOT43+ROOT47: 强制 FILE_EXCL 序列化并发 append.
+         * 检查 *got 包含 EXCL, 没有就 put_refs + 退避 + 重试.
+         * endoff 传 count (offset 此刻未知, powerfs_get_caps 的 endoff
+         * 当前未使用, 仅预留). */
+        if (S_ISREG(inode->i_mode) && count > 0) {
+            int append_retries = 0;
+            const int max_append_retries = 3;
+
+            while (append_retries++ < max_append_retries) {
+                err = powerfs_get_caps(inode, file,
+                                       POWERFS_CAP_FILE_WR,
+                                       POWERFS_CAP_WR_DATA,
+                                       (loff_t)count, &got);
+                /* 必须检查 *got 含 EXCL: powerfs_get_caps 1.5s 后
+                 * 降级放行, *got 不含 EXCL 也返回 0. */
+                if (err == 0 && (got & POWERFS_CAP_FILE_EXCL))
+                    break;
+
+                /* 降级放行或错误: 释放已拿到的部分引用, 退避后重试 */
+                if (got) {
+                    powerfs_cap_put_refs(pi, got);
+                    got = 0;
+                }
+                if (err == -ERESTARTSYS) {
+                    pr_warn("powerfs: O_APPEND ino=%lu interrupted by signal\n",
+                            inode->i_ino);
+                    return err;
+                }
+                if (append_retries < max_append_retries)
+                    usleep_range(5000, 10000);  /* 5-10ms 退避 */
+            }
+            if (!(got & POWERFS_CAP_FILE_EXCL)) {
+                pr_warn("powerfs: O_APPEND ino=%lu cannot acquire FILE_EXCL "
+                        "after %d retries (got=0x%x), returning -EAGAIN\n",
+                        inode->i_ino, max_append_retries, got);
+                return -EAGAIN;
+            }
+        }
+
+        /* 持有 EXCL cap 后 getattr, 其他客户端无法在此期间写入 */
+        int gerr = powerfs_net_getattr(inode->i_ino,
+                                       NULL, NULL, NULL,   /* mode, uid, gid */
+                                       &remote_size,        /* size ← authoritative */
+                                       NULL,                /* nlink */
+                                       NULL, NULL, NULL,   /* mtime, atime, ctime */
+                                       NULL, NULL, NULL,   /* volume_id, file_key, layout */
+                                       NULL, NULL, NULL,   /* rbytes, rfiles, rsubdirs */
+                                       NULL, NULL);         /* rctime_sec, rctime_nsec */
+        if (gerr == 0) {
+            spin_lock(&inode->i_lock);
+            /* MAX(remote, local): 防止 writeback 未提交时 remote < local
+             * 导致 i_size 回退 (ROOT42) */
+            if ((loff_t)remote_size > i_size_read(inode))
+                i_size_write(inode, (loff_t)remote_size);
+            isz = i_size_read(inode);
+            spin_unlock(&inode->i_lock);
+        } else {
+            /* getattr 失败: 回退到本地 size (best-effort). */
+            isz = i_size_read(inode);
+        }
         iocb->ki_pos = isz;
         file->f_pos = isz;
-        pr_debug("powerfs: write_iter ino=%lu O_APPEND -> ki_pos=f_pos=%lld\n",
-                 inode->i_ino, (long long)isz);
+        offset = iocb->ki_pos;
+        pr_debug("powerfs: write_iter ino=%lu O_APPEND -> ki_pos=%lld (remote=%llu)\n",
+                 inode->i_ino, (long long)isz, remote_size);
+    } else {
+        offset = iocb->ki_pos;
     }
-    offset = iocb->ki_pos;
 
-    /* 对齐  page_mkwrite (addr.c L2087):
-     *   need = FILE_WR, want = FILE_WR|FILE_EXCL (BUFFER).
-     * write_begin 内部还会 try_get_caps 作为快速路径, 这里在 i_rwsem 外
-     * 提前阻塞获取, 避免 write_begin 内循环 EAGAIN 重试开销. */
-    if (S_ISREG(inode->i_mode) && count > 0) {
+    /* 非 O_APPEND 路径, 或 O_APPEND cap 获取失败时的重试 */
+    if (!got && S_ISREG(inode->i_mode) && count > 0) {
         err = powerfs_get_caps(inode, file,
                                POWERFS_CAP_FILE_WR,
                                POWERFS_CAP_WR_DATA,
@@ -551,7 +639,6 @@ static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
             pr_debug("powerfs: write_iter ensure_lease ino=%lu off=%lld ret=%d, continuing without lease\n",
                      inode->i_ino, offset, lease_ret);
     }
-
     ret = generic_file_write_iter(iocb, from);
 
     /* 写入成功后标记 cap WR dirty (对齐 __xxx_mark_dirty_caps 在 write_end),
@@ -1127,31 +1214,93 @@ static ssize_t powerfs_copy_file_range(struct file *src_file, loff_t src_off,
 }
 
 /* ========== File Locking (POSIX record locks + BSD flock) ==========
- * 设计决策 (同  xxx_lock.c 的初版架构):
- *   先做**单机一致性锁**: 委托 VFS 通用框架 (posix_lock_file / locks_lock_inode_wait)
- *   在内存 inode 内维护锁冲突链表和阻塞队列. 多客户端场景下, 跨节点锁仲裁
- *   需 Filer 侧新增 LOCK/UNLOCK 协议帧, 路线图:
- *     Phase 1 (本地, 当前): 单机多进程/多线程正确互斥. 覆盖 90% 单机使用场景.
- *     Phase 2 (分布式): wrapper 内先本地冲突检测, 再发 Filer LOCK RPC 仲裁.
+ * P1-3: 跨 VM 集群锁 — 先 Filer lock_arbiter 仲裁, 再本地 VFS 锁.
  *
- * 为什么不返回 -ENOSYS (P0 修复前的行为):
- *   大量应用 (SQLite, PostgreSQL, Maildir, Python fcntl.flock, git) 依赖
- *   fcntl(F_SETLK) / flock() == 0 的成功路径; -ENOSYS 会直接 panic 应用.
+ * 设计:
+ *   1. LOCK_SH/F_RDLCK → Filer rdlock(Posix) + 本地 posix_lock_file
+ *   2. LOCK_EX/F_WRLCK → Filer wrlock(Posix) + 本地 posix_lock_file
+ *   3. LOCK_UN/F_UNLCK → 本地解锁 + Filer posix_unlock
+ *   4. 非阻塞 (LOCK_NB / F_SETLK): Filer denied → 直接 -EAGAIN
+ *   5. 阻塞 (F_SETLKW): Filer denied → 轮询 100ms 重试, 信号可中断
+ *
+ * 本地 VFS posix_lock_file 继续处理同 VM 内多进程互斥.
+ * Filer lock_arbiter Posix lock type (SimpleLock class) 处理跨 VM 互斥.
  */
+
+static int powerfs_filer_lock_mode(int fl_type)
+{
+    switch (fl_type) {
+    case F_RDLCK: return POWERFS_NET_FILE_LOCK_MODE_RD;
+    case F_WRLCK: return POWERFS_NET_FILE_LOCK_MODE_WR;
+    case F_UNLCK: return POWERFS_NET_FILE_LOCK_MODE_UNLOCK;
+    default: return -EINVAL;
+    }
+}
+
+static int powerfs_filer_file_lock(struct inode *inode, int fl_type, int blocking)
+{
+    struct powerfs_client *cli = POWERFS_SB_INFO(inode->i_sb)->client;
+    int filer_mode, ret;
+    __u8 granted = 0;
+
+    if (!cli || !cli->client_id[0])
+        return -ENOTCONN;
+
+    filer_mode = powerfs_filer_lock_mode(fl_type);
+    if (filer_mode < 0)
+        return filer_mode;
+
+    ret = powerfs_net_file_lock_request(inode->i_ino,
+                                         cli->client_id, cli->client_id_len,
+                                         filer_mode, 0, &granted);
+    if (ret < 0)
+        return ret;
+
+    if (filer_mode == POWERFS_NET_FILE_LOCK_MODE_UNLOCK)
+        return 0;
+
+    if (!granted) {
+        if (!blocking)
+            return -EAGAIN;
+        for (;;) {
+            if (signal_pending(current))
+                return -ERESTARTSYS;
+            msleep_interruptible(100);
+            ret = powerfs_net_file_lock_request(inode->i_ino,
+                                                 cli->client_id, cli->client_id_len,
+                                                 filer_mode, 0, &granted);
+            if (ret < 0)
+                return ret;
+            if (granted)
+                break;
+        }
+    }
+    return 0;
+}
+
+static void powerfs_filer_file_unlock(struct inode *inode)
+{
+    struct powerfs_client *cli = POWERFS_SB_INFO(inode->i_sb)->client;
+    __u8 granted;
+    if (!cli || !cli->client_id[0])
+        return;
+    powerfs_net_file_lock_request(inode->i_ino,
+                                   cli->client_id, cli->client_id_len,
+                                   POWERFS_NET_FILE_LOCK_MODE_UNLOCK,
+                                   0, &granted);
+}
 
 /*
  * powerfs_lock — POSIX 记录锁 (fcntl(2) F_SETLK/F_SETLKW/F_GETLK/F_OFD_*).
  *
- * VFS 层传 cmd: F_SETLK (非阻塞), F_SETLKW (阻塞), F_GETLK (查询冲突锁),
- * 以及 OFD 版本 (F_OFD_SETLK etc). struct file_lock *fl 含锁类型/范围/owner.
- * 直接用 VFS 通用 posix_lock_file 实现, 内核已维护冲突检测 + 文件锁阻塞队列
- * (fl->fl_blocked 链表 + wake_up). 此函数 EXPORT_SYMBOL.
+ * P1-3: SETLK/SETLKW 先发 Filer FileLockRequest 仲裁跨 VM 冲突,
+ * 再调 VFS posix_lock_file 处理本地进程互斥. GETLK 仅查本地.
  */
 int powerfs_lock(struct file *filp, int cmd, struct file_lock *fl)
 {
     struct inode *inode = file_inode(filp);
     struct powerfs_inode_info *pi = POWERFS_I(inode);
-    int err;
+    int err, blocking;
 
     if (unlikely(!pi || pi->shutdown))
         return -ENOTCONN;
@@ -1159,49 +1308,66 @@ int powerfs_lock(struct file *filp, int cmd, struct file_lock *fl)
     pr_debug("powerfs: lock ino=%lu cmd=%d type=%d pid=%d\n",
              inode->i_ino, cmd, fl->c.flc_type, current->pid);
 
-    /* P0 单机 VFS 通用锁表:
-     *   posix_lock_file(file, fl, conflock) ——
-     *     [in] file: 目标文件
-     *     [in] fl:   新锁请求 (类型/范围/owner)
-     *     [out] conflock: GETLK 场景返回首个冲突锁; SET/UNLOCK 传 NULL
-     *   内核内部已实现冲突检测、阻塞等待 (SETLKW)、信号唤醒.
-     *   此函数 EXPORT_SYMBOL (fs/locks.c:1404). */
+    if (cmd == F_GETLK || cmd == F_OFD_GETLK) {
+        posix_test_lock(filp, fl);  /* sets fl to F_UNLCK or conflict */
+        return 0;
+    }
+
+    blocking = (cmd == F_SETLKW || cmd == F_OFD_SETLKW);
+
+    if (fl->c.flc_type != F_UNLCK) {
+        err = powerfs_filer_file_lock(inode, fl->c.flc_type, blocking);
+        if (err)
+            return err;
+    }
+
     err = posix_lock_file(filp, fl, NULL);
 
-    if (err < 0)
-        pr_debug_ratelimited("powerfs: lock ino=%lu failed: %d\n",
-                             inode->i_ino, err);
+    if (err < 0 && fl->c.flc_type != F_UNLCK)
+        powerfs_filer_file_unlock(inode);
+
+    if (!err && fl->c.flc_type == F_UNLCK)
+        powerfs_filer_file_unlock(inode);
+
     return err;
 }
 
 /*
  * powerfs_flock — BSD 风格 flock(2).
  *
- * VFS 把 LOCK_SH/LOCK_EX/LOCK_UN (+ LOCK_NB) 转换成 file_lock 结构 (fl_type
- * F_RDLCK/F_WRLCK/F_UNLCK, fl_flags |= FL_FLOCK 标记) 后传入.
- * 通用入口 locks_lock_inode_wait 内部按 FL_FLOCK 分派到 flock_lock_inode_wait
- * 处理冲突检测 + 等待. 此函数 EXPORT_SYMBOL.
+ * P1-3: 先发 Filer FileLockRequest 仲裁跨 VM 冲突,
+ * 再调 VFS locks_lock_inode_wait 处理本地进程互斥.
  */
 int powerfs_flock(struct file *filp, int cmd, struct file_lock *fl)
 {
     struct inode *inode = file_inode(filp);
     struct powerfs_inode_info *pi = POWERFS_I(inode);
-    int err;
+    int err, blocking;
 
     if (unlikely(!pi || pi->shutdown))
         return -ENOTCONN;
 
-    /* flock 锁的 fl_flags 需要 FL_FLOCK: VFS 传进来时通常已设置, 但为了
-     * 兜底 (lockf 共享路径) 我们显式标记. */
     fl->c.flc_flags |= FL_FLOCK;
 
     pr_debug("powerfs: flock ino=%lu cmd=%d type=%d pid=%d\n",
              inode->i_ino, cmd, fl->c.flc_type, current->pid);
 
+    blocking = !(cmd & LOCK_NB);
+
+    if (fl->c.flc_type != F_UNLCK) {
+        err = powerfs_filer_file_lock(inode, fl->c.flc_type, blocking);
+        if (err)
+            return err;
+    }
+
     err = locks_lock_inode_wait(inode, fl);
-    if (err < 0)
-        pr_debug_ratelimited("powerfs: flock ino=%lu failed: %d\n",
-                             inode->i_ino, err);
+
+    if (err < 0 && fl->c.flc_type != F_UNLCK)
+        powerfs_filer_file_unlock(inode);
+
+    if (!err && fl->c.flc_type == F_UNLCK)
+        powerfs_filer_file_unlock(inode);
+
     return err;
 }
 

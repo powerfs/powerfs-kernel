@@ -36,6 +36,7 @@
 #include <linux/splice.h>       /* splice_copy_file_range (P2-5) */
 #include <linux/utsname.h>      /* init_utsname() 主机名 */
 #include <linux/jiffies.h>      /* jiffies_64 时间戳 */
+#include <linux/shrinker.h>     /* register_shrinker (P2-2) */
 
 #include "powerfs.h"
 #include "powerfs_comm.h"
@@ -542,6 +543,7 @@ static int cap_send_recall_ack(struct powerfs_inode_info *pi, struct powerfs_cap
     size_t cid_len;
     size_t token_len;
     int ret;
+    __u8 piggyback_caps = 0;
 
     if (!cap)
         return -EINVAL;
@@ -555,12 +557,24 @@ static int cap_send_recall_ack(struct powerfs_inode_info *pi, struct powerfs_cap
     cid_len = get_mount_client_id(sb, cid, sizeof(cid));
 
     ret = powerfs_net_cap_recall_ack(pi->netfs.inode.i_ino, cid,
-                                     cap->token, token_len);
+                                     cap->token, token_len,
+                                     &piggyback_caps);
     if (ret < 0) {
         pr_warn_ratelimited("powerfs: cap_recall_ack ino=%lu ret=%d (服务端可能已完成 recall)\n",
                             pi->netfs.inode.i_ino, ret);
+        return ret;
     }
-    return ret;
+
+    /* P2-1: 应用 piggyback CapSet (省 1 次 CapUpgradeNotify RTT) */
+    if (piggyback_caps != 0) {
+        unsigned int k_issued = wire_capset_to_kernel_bits(piggyback_caps);
+        spin_lock(&pi->i_lock);
+        powerfs_cap_issue(pi, cap, k_issued);
+        spin_unlock(&pi->i_lock);
+        pr_debug("powerfs: recall_ack piggyback applied ino=%lu wire=0x%02x kernel=0x%x\n",
+                 pi->netfs.inode.i_ino, piggyback_caps, k_issued);
+    }
+    return 0;
 }
 
 /* §13.4 场景 3: 主动 CapRelease (close 时). 返回 HasUpgrade 结果,
@@ -1005,6 +1019,55 @@ void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
         pi->dir_complete = false;
     }
 
+    /* 4b. ROOT44: 当 FILE_WR 或 FILE_EXCL 被撤销时, 说明其他客户端即将
+     * 获得写权限. 对于 Inline 文件, 本地 inline_data 副本和 page cache
+     * 即将过期 (其他客户端写入后会更新 filer 端 inline_data).
+     *
+     * 必须在此处:
+     *   a) 释放 pi->inline_data (设为 NULL) — 标记为 stale, 防止后续
+     *      issue_read 从旧副本读取 (issue_read 在 inline_data 为 NULL 时
+     *      返回 0 字节 + HIT_EOF, 不会读到错误数据);
+     *   b) 失效 page cache (invalidate_mapping_pages) — 丢弃本地写入
+     *      的 page cache, 强制下次 read 触发 issue_read;
+     *   c) 触发 refresh_work (powerfs_invalidate_one) — 异步 getattr
+     *      拉取最新 inline_data, refresh_work 完成后 pi->inline_data
+     *      被更新, 后续 read 能读到最新数据.
+     *
+     * 时序保证:
+     *   - cap_flush 已在步骤 2 完成, dirty 数据已同步到 filer
+     *   - ACK 在步骤 5 发送, filer 收到 ACK 后才将 EXCL 授予其他客户端
+     *   - 其他客户端写入后 filer 广播 Invalidate, VM 收到后再次 refresh
+     *   - 即使 NOTIFY 丢失, recall 后的第一次 read 可能读到 0 字节,
+     *     但 refresh_work 完成后第二次 read 能读到最新数据 */
+    if (revoking & (POWERFS_CAP_FILE_WR | POWERFS_CAP_FILE_EXCL)) {
+        if (pi->placement == POWERFS_PLACEMENT_INLINE) {
+            u8 *old_inline;
+
+            pr_info("powerfs: cap_revoke INLINE ino=%lu revoking=0x%x — "
+                    "release inline_data + invalidate pagecache\n",
+                    inode->i_ino, revoking);
+
+            /* a) 释放 inline_data, 标记为 stale */
+            old_inline = pi->inline_data;
+            pi->inline_data = NULL;
+            pi->inline_len = 0;
+            pi->inline_dirty = false;
+            spin_unlock(&pi->i_lock);
+            kfree(old_inline);
+
+            /* b) 失效 page cache (非阻塞, 跳过 dirty/locked pages) */
+            invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
+
+            /* c) 触发 refresh_work 异步拉取最新 inline_data.
+             * powerfs_invalidate_one 是非阻塞的, 只排队 work.
+             * 注意: 不能同步等待 refresh_work, 因为当前就在
+             * powerfs_refresh_wq 中运行, 同步等待会死锁. */
+            powerfs_invalidate_one(inode->i_ino);
+
+            spin_lock(&pi->i_lock);
+        }
+    }
+
     /* 5. §13.4.2: 发 CapRecallAck 到 Filer, 证明 flush 完成 + issued 已降级.
      *    服务端收到 ACK 才会完成 recall 流程, 将 EXCLUSIVE 权限授予新申请者.
      *    注意: RPC 不能在 spinlock 下执行, 临时释放 i_lock (此时已无 shared
@@ -1023,16 +1086,32 @@ void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
  * 对齐  xxx_flush_dirty_caps + __send_cap.
  *
  * 流程:
- *   1. 分配 powerfs_cap_flush 记录, 挂到 i_cap_flush_list + 全局 cap_flush_list
+ *   0. 预先在锁外分配 cf (避免持 spinlock + kmem_cache_alloc 的 GFP_* 触发睡眠
+ *      → preempt_count > 0 时的 "sleeping function called from invalid context" BUG).
+ *      cf_alloc == NULL 且无预分配槽时, 进入锁内用 GFP_ATOMIC 最后手段 (不睡眠).
+ *   1. 取得 powerfs_cap_flush 记录, 挂到 i_cap_flush_list + 全局 cap_flush_list
  *   2. 将 dirty_caps 移到 flushing_caps
  *   3. 发送 CapFlush RPC 到 Filer (TODO: 接入 powerfs_net 层)
  *   4. 等待 i_cap_wq 唤醒 (ACK 回调唤醒)
  *
- * 调用方不持锁. */
+ * 调用方不持锁.
+ *
+ * P0-0 修复 (vm1 ×1 GFP BUG): 原实现在 L1079-L1092 持 pi->i_lock (spin_lock) 期间
+ * 执行 kmem_cache_alloc(GFP_NOFS). 尽管 GFP_NOFS 比 GFP_KERNEL 更严, 但在
+ * PREEMPT_DYNAMIC + 持 spin_lock (preempt_count ≥ 1) 的上下文中, slab allocator
+ * 仍可能进入 direct reclaim / compaction 路径而调用 might_sleep(), 触发
+ * `BUG: sleeping function called from invalid context at mm.h:321`
+ * (preempt_count=1, in_atomic=1, kmem_cache_alloc 偏移 0x53b).
+ * 修复方式严格遵循 "持锁不分配, 分配不持锁":
+ *   ① 在 spin_lock_irqsave 前尝试 GFP_KERNEL (1st alloc, 无竞态安全可睡眠);
+ *   ② 锁内先取预分配槽 i_prealloc_cap_flush;
+ *   ③ 1st 分配 NULL 且无预分配 → GFP_ATOMIC (持锁内最后手段, 保证不睡眠);
+ *   ④ 仍失败 → 回滚脏位 + 返回 -ENOMEM, 下次重试 (宁可重复推送不丢脏). */
 int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
 {
     struct inode *inode = &pi->netfs.inode;
     struct powerfs_cap_flush *cf;
+    struct powerfs_cap_flush *cf_prealloc = NULL;  /* 锁外 GFP_KERNEL 预分配 */
     struct powerfs_sb_info *sbi;
     unsigned int flushing;
     unsigned int need_data_flush = 0;
@@ -1043,12 +1122,29 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
 
     sbi = POWERFS_SB_INFO(inode->i_sb);
 
+    /* === Step 0: 锁外 1st 分配 (GFP_KERNEL, 允许睡眠, 不在 atomic context) ===
+     * 绝大多数情况这里直接拿到对象, 后续锁内只是 "取指针 or 退栈 GFP_ATOMIC".
+     * 分配失败不致命: 进入锁内优先用 inode 预分配槽, 仍空再 GFP_ATOMIC. */
+    if (sbi && sbi->cap_flush_cachep) {
+        cf_prealloc = kmem_cache_alloc(sbi->cap_flush_cachep, GFP_KERNEL);
+        /* cf_prealloc == NULL 正常进入, 不在此做失败分支 */
+    }
+
     spin_lock(&pi->i_lock);
 
     /* 取 dirty_caps 与 mask 的交集 (需要 flush 的位) */
     flushing = pi->i_dirty_caps & mask;
     if (!flushing) {
         spin_unlock(&pi->i_lock);
+        /* 无 flush 工作 → 锁外预分配若成功 → 作为 inode 预分配槽缓存 (下一次命中) */
+        if (cf_prealloc) {
+            spin_lock(&pi->i_lock);
+            if (!pi->i_prealloc_cap_flush)
+                pi->i_prealloc_cap_flush = cf_prealloc;
+            else
+                kmem_cache_free(sbi->cap_flush_cachep, cf_prealloc);
+            spin_unlock(&pi->i_lock);
+        }
         return 0;
     }
 
@@ -1076,12 +1172,32 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
     pi->i_dirty_caps &= ~flushing;
     pi->i_flushing_caps |= flushing;
 
-    /* 分配 flush 记录 (优先用预分配槽) */
+    /* --- 分配 cf: 优先级 ① inode 预分配槽 → ② 锁外 GFP_KERNEL → ③ GFP_ATOMIC 最后手段 ---
+     * 所有分配都在持 spin_lock 期间不会触发任何可能睡眠的路径:
+     *   - ① inode 槽: 只是取指针, 0 分配开销
+     *   - ② cf_prealloc: 已在锁外完成分配, 此处只引用
+     *   - ③ GFP_ATOMIC: 明确 __GFP_DIRECT_RECLAIM 清空, 保证不睡眠
+     *                     (在 preempt_count ≥ 1 下安全) */
     if (pi->i_prealloc_cap_flush) {
         cf = pi->i_prealloc_cap_flush;
         pi->i_prealloc_cap_flush = NULL;
+        /* 消耗了 inode 预分配槽 → 若 ② cf_prealloc 存在则把它补到预分配槽,
+         * 让下一次 cap_flush 在 ① 直接命中, 省一次 slab 开销. */
+        if (cf_prealloc) {
+            pi->i_prealloc_cap_flush = cf_prealloc;
+            cf_prealloc = NULL;
+        }
+    } else if (cf_prealloc) {
+        /* inode 槽空, 但锁外 1st 分配已拿到 → 直接使用, 零持锁内分配. */
+        cf = cf_prealloc;
+        cf_prealloc = NULL;
     } else {
-        cf = kmem_cache_alloc(sbi->cap_flush_cachep, GFP_NOFS);
+        /* 极端路径: ① ② 都没有 → GFP_ATOMIC 最后手段.
+         * 注意 kmem_cache_alloc(GFP_ATOMIC) 在内存压力非常高时可能失败,
+         * 此时我们回滚 flushing → dirty, 让下一次 recall/fsync 再试.
+         * 在 preempt_count ≥ 1 下, GFP_ATOMIC 绝对不会触发 might_sleep(). */
+        BUILD_BUG_ON(!(GFP_ATOMIC & __GFP_HIGH));
+        cf = kmem_cache_alloc(sbi->cap_flush_cachep, GFP_ATOMIC);
         if (!cf) {
             /* 内存不足: 回滚, dirty 保留, 下次再推 (宁可推两遍也不丢脏). */
             pi->i_dirty_caps |= flushing;
@@ -1089,6 +1205,12 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
             spin_unlock(&pi->i_lock);
             return -ENOMEM;
         }
+    }
+    /* cf_prealloc 若到此处仍非 NULL (理论上不会, 已在优先级①中消耗补槽):
+     * 安全起见释放回 slab, 不泄漏. */
+    if (unlikely(cf_prealloc)) {
+        kmem_cache_free(sbi->cap_flush_cachep, cf_prealloc);
+        cf_prealloc = NULL;
     }
 
     cf->tid = atomic64_inc_return(&pi->i_release_count);
@@ -1449,11 +1571,86 @@ void powerfs_check_caps(struct powerfs_inode_info *pi, int flags)
         return;
     }
 
-    /* TODO: 接入 net 层后, 根据 wanted vs issued 决定:
-     *   - wanted & ~issued → 发送 AcquireCap RPC
-     *   - issued & ~wanted & ~used → 发送 ReleaseCap RPC
-     *   - revoking & ~dirty → 发送 CapAck 确认降级
-     * 当前阶段仅日志, 不实际发送. */
+    /* P0-1: wanted > issued → 发送 AcquireCap RPC 请求升级.
+     * wanted & ~issued 计算出需要增量请求的内核 cap 位.
+     * 转换到 wire 3-bit CapSet 后发 AcquireCap(0x96) RPC.
+     * RPC 可阻塞 → 必须先释放 i_lock, RPC 完成后在 i_lock 内 cap_issue.
+     *
+     * 防止重复 RPC: i_flushing_caps 非空时说明上一轮 flush 正在走,
+     * 等 flush 完成后再 check_caps (flush 结束 wake_up_all 会重新调 check_caps). */
+    {
+        unsigned int need_acquire = wanted & ~issued;
+        unsigned int k_issued;
+        __u8 wire_wanted, wire_granted = 0;
+        __u64 new_epoch = 0, new_sn = 0, new_dur = 0;
+        char grant_token[64];
+        size_t grant_toklen = sizeof(grant_token);
+        char cid[64];
+        size_t cid_len;
+        size_t cur_toklen;
+        int acq_ret;
+        struct powerfs_cap *cap = pi->i_auth_cap;
+
+        if (need_acquire && cap && !pi->i_flushing_caps) {
+            /* 有 cap 且非 flushing → 转换 wanted 到 wire 格式发 RPC */
+            wire_wanted = kernel_bits_to_wire_capset(need_acquire);
+            if (wire_wanted == 0) {
+                /* 无 wire 映射的位 (如 PIN) → 不发 RPC, 直接解锁返回 */
+                spin_unlock(&pi->i_lock);
+                return;
+            }
+            cur_toklen = strlen(cap->token);
+            cid_len = get_mount_client_id(inode->i_sb, cid, sizeof(cid));
+
+            pr_debug("powerfs: check_caps ACQUIRE ino=%lu want_k=0x%x wire_w=0x%02x "
+                     "issued=0x%x token_len=%zu\n",
+                     inode->i_ino, need_acquire, wire_wanted,
+                     issued, cur_toklen);
+
+            /* 释放 i_lock (RPC 可阻塞) */
+            spin_unlock(&pi->i_lock);
+
+            acq_ret = powerfs_net_cap_acquire(inode->i_ino, cid,
+                                               cap->token, cur_toklen,
+                                               wire_wanted,
+                                               grant_token, &grant_toklen,
+                                               &wire_granted, &new_epoch,
+                                               &new_sn, &new_dur);
+
+            if (acq_ret == 0) {
+                /* 成功: 在 i_lock 内更新 cap + cap_issue */
+                spin_lock(&pi->i_lock);
+                /* 升级 token (Filer 可能换了 token) */
+                if (grant_toklen > 0 && grant_toklen < sizeof(cap->token)) {
+                    memcpy(cap->token, grant_token, grant_toklen);
+                    cap->token[grant_toklen] = '\0';
+                }
+                cap->epoch = new_epoch;
+                cap->seq = new_sn;
+                cap->issue_seq = new_sn;
+                if (new_dur > 0)
+                    cap->expire_jiffies = jiffies + msecs_to_jiffies(new_dur);
+                else
+                    cap->expire_jiffies = jiffies + POWERFS_LEASE_DURATION;
+
+                k_issued = wire_capset_to_kernel_bits(wire_granted);
+                powerfs_cap_issue(pi, cap, k_issued);
+                spin_unlock(&pi->i_lock);
+                wake_up_all(&pi->i_cap_wq);
+
+                pr_debug("powerfs: check_caps ACQUIRE ok ino=%lu wire_g=0x%02x "
+                         "kernel=0x%x epoch=%llu sn=%llu\n",
+                         inode->i_ino, wire_granted, k_issued,
+                         (unsigned long long)new_epoch,
+                         (unsigned long long)new_sn);
+                return;
+            } else {
+                pr_debug("powerfs: check_caps ACQUIRE ino=%lu ret=%d (will retry)\n",
+                         inode->i_ino, acq_ret);
+                return;
+            }
+        }
+    }
 
     spin_unlock(&pi->i_lock);
 }
@@ -1633,3 +1830,254 @@ int powerfs_get_caps(struct inode *inode, struct file *filp,
         remove_wait_queue(&pi->i_cap_wq, &wait);
     }
 }
+
+/* ========== P2-2: Cap Shrinker — 低内存时主动释放 cap + invalidate page cache ========== */
+
+static unsigned long powerfs_cap_shrinker_count(struct shrinker *shrink,
+                                                 struct shrink_control *sc)
+{
+    struct powerfs_client *cli = shrink->private_data;
+    unsigned long count;
+
+    spin_lock(&cli->cap_lru_lock);
+    count = cli->cap_lru_list.next == &cli->cap_lru_list ? 0 : 1;
+    /* Use list length estimate: count items in the list */
+    if (count) {
+        struct powerfs_cap *cap;
+        count = 0;
+        list_for_each_entry(cap, &cli->cap_lru_list, lru_item)
+            count++;
+    }
+    spin_unlock(&cli->cap_lru_lock);
+
+    return count;
+}
+
+static unsigned long powerfs_cap_shrinker_scan(struct shrinker *shrink,
+                                                struct shrink_control *sc)
+{
+    struct powerfs_client *cli = shrink->private_data;
+    unsigned long freed = 0;
+    unsigned long nr_to_scan = sc->nr_to_scan;
+    LIST_HEAD(dispose);
+
+    /* Phase 1: collect candidate caps (no dirty, no writeback).
+     *
+     * 设计说明 (并发安全):
+     *   - cap 没有 refcount, cap 的生命周期由 inode evict 管理
+     *     (powerfs_evict_inode 清理 cap_tree).
+     *   - 若 shrinker 在此释放 cap (rb_erase + kfree), close 路径
+     *     (powerfs_file_release) 在持锁拿 auth_cap → 释放锁 → 调
+     *     cap_send_release(auth_cap) 之间存在 use-after-free 窗口.
+     *   - 因此 shrinker 仅 invalidate page cache, 不释放 cap 本身.
+     *     cap 从 LRU 移除避免重复处理, 但仍留在 cap_tree 供其他路径
+     *     正常使用, 直至 inode evict 时统一释放.
+     */
+    spin_lock(&cli->cap_lru_lock);
+    while (freed < nr_to_scan && !list_empty(&cli->cap_lru_list)) {
+        struct powerfs_cap *cap = list_first_entry(&cli->cap_lru_list,
+                                                     struct powerfs_cap,
+                                                     lru_item);
+        struct powerfs_inode_info *pi = cap->ci;
+        struct inode *inode;
+
+        if (!pi) {
+            list_del_init(&cap->lru_item);
+            continue;
+        }
+
+        inode = &pi->netfs.inode;
+
+        /* Skip caps with dirty pages or writeback in progress */
+        if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+            mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK)) {
+            /* Move to tail — give it another chance */
+            list_move_tail(&cap->lru_item, &cli->cap_lru_list);
+            continue;
+        }
+
+        /* Skip if token is empty (never granted) */
+        if (cap->token[0] == '\0') {
+            list_del_init(&cap->lru_item);
+            continue;
+        }
+
+        /* Try to grab inode reference */
+        if (!igrab(inode)) {
+            list_del_init(&cap->lru_item);
+            continue;
+        }
+
+        /* Remove from LRU (避免 scan 时无限循环) and move to dispose list.
+         * cap 仍在 pi->i_caps rbtree 中, 不影响其他路径使用. */
+        list_del_init(&cap->lru_item);
+        list_add(&cap->lru_item, &dispose);
+        freed++;
+    }
+    spin_unlock(&cli->cap_lru_lock);
+
+    /* Phase 2: invalidate page cache outside the lock.
+     * 不发 cap_release RPC (cap 仍有效), 不 rb_erase, 不 kfree. */
+    while (!list_empty(&dispose)) {
+        struct powerfs_cap *cap = list_first_entry(&dispose,
+                                                     struct powerfs_cap,
+                                                     lru_item);
+        struct powerfs_inode_info *pi = cap->ci;
+        struct inode *inode = &pi->netfs.inode;
+
+        list_del_init(&cap->lru_item);
+
+        /* Invalidate clean page cache for this inode.
+         * 只回收 clean pages, dirty/writeback 已在 Phase 1 跳过. */
+        invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
+
+        iput(inode);
+    }
+
+    pr_debug_ratelimited("powerfs: cap shrinker invalidated %lu inodes page cache\n", freed);
+    return freed;
+}
+
+static struct shrinker *powerfs_cap_shrinker_alloc(struct powerfs_client *cli)
+{
+    struct shrinker *s = shrinker_alloc(0, "powerfs-cap-shrinker");
+    if (!s)
+        return NULL;
+    s->count_objects = powerfs_cap_shrinker_count;
+    s->scan_objects = powerfs_cap_shrinker_scan;
+    s->private_data = cli;
+    return s;
+}
+
+int powerfs_cap_shrinker_init(struct powerfs_client *cli)
+{
+    cli->cap_shrinker = powerfs_cap_shrinker_alloc(cli);
+    if (!cli->cap_shrinker)
+        return -ENOMEM;
+    /* 6.17 API: shrinker_alloc + shrinker_register + shrinker_free.
+     * 旧 API register_shrinker/unregister_shrinker 在 6.17 已移除,
+     * shrinker_free 会同步完成 unregister + free. */
+    shrinker_register(cli->cap_shrinker);
+    pr_info("powerfs: cap shrinker registered\n");
+    return 0;
+}
+
+void powerfs_cap_shrinker_destroy(struct powerfs_client *cli)
+{
+    if (cli->cap_shrinker) {
+        /* shrinker_free 会内部调用 unregister + kfree. */
+        shrinker_free(cli->cap_shrinker);
+        cli->cap_shrinker = NULL;
+    }
+}
+
+/* ========== P2-4: Quiesce 接口 (热迁移 / Filer balancer) ==========
+ *
+ * powerfs_quiesce_all - 让客户端 "静默": sync dirty + release cap +
+ * invalidate page cache. 供 Filer balancer 迁移 inode 前调用.
+ *
+ * 语义 (对齐 Ceph MDS quiesce):
+ *   1. sync_inodes_sb — 等待所有 dirty pages 写回完成 (含 RDMA 写)
+ *   2. 遍历所有 inode, 对有 cap 且无活跃 fd 的 inode:
+ *      a. cap_send_release — 通知 Filer "本客户端不再使用此 cap"
+ *      b. invalidate_mapping_pages — 清除本地 page cache
+ *      c. 从 cap_lru_list 移除 (避免 shrinker 重复处理)
+ *   3. 返回释放的 inode 数量
+ *
+ * 并发安全 (与 shrinker 相同设计):
+ *   cap 不 rb_erase/kfree, 仍在 cap_tree 中由 evict_inode 统一释放.
+ *   避免 close 路径 use-after-free.
+ *
+ * 跳过条件:
+ *   - 有活跃 fd (i_nr_by_mode[RD]+[WR] > 0) — 不能释放
+ *   - 有 dirty/writeback pages — 正在 I/O, 不能释放
+ */
+int powerfs_quiesce_all(struct super_block *sb, unsigned long *released)
+{
+    struct powerfs_client *client = POWERFS_SB_INFO(sb)->client;
+    struct inode *inode;
+    unsigned long count = 0;
+    LIST_HEAD(dispose);
+
+    if (!client)
+        return -EINVAL;
+
+    pr_info("powerfs: quiesce_all starting...\n");
+
+    /* 1. sync 所有 dirty pages (等待写回完成, 含 RDMA) */
+    sync_inodes_sb(sb);
+
+    /* 2. 遍历所有 inode, 收集可 quiesce 的 cap */
+    spin_lock(&sb->s_inode_list_lock);
+    list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+        struct powerfs_inode_info *pi;
+        struct powerfs_cap *cap;
+
+        if (!igrab(inode))
+            continue;
+        spin_unlock(&sb->s_inode_list_lock);
+
+        pi = POWERFS_I(inode);
+        spin_lock(&pi->i_lock);
+        cap = pi->i_auth_cap;
+        if (!cap || cap->token[0] == '\0') {
+            spin_unlock(&pi->i_lock);
+            iput(inode);
+            spin_lock(&sb->s_inode_list_lock);
+            continue;
+        }
+        spin_unlock(&pi->i_lock);
+
+        /* 跳过有活跃 fd 的 inode */
+        if (pi->i_nr_by_mode[POWERFS_FILE_MODE_RD] > 0 ||
+            pi->i_nr_by_mode[POWERFS_FILE_MODE_WR] > 0) {
+            iput(inode);
+            spin_lock(&sb->s_inode_list_lock);
+            continue;
+        }
+
+        /* 跳过有 dirty/writeback 的 inode */
+        if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+            mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK)) {
+            iput(inode);
+            spin_lock(&sb->s_inode_list_lock);
+            continue;
+        }
+
+        /* 从 LRU 移除 (避免 shrinker 重复) */
+        spin_lock(&client->cap_lru_lock);
+        list_del_init(&cap->lru_item);
+        spin_unlock(&client->cap_lru_lock);
+
+        list_add(&cap->lru_item, &dispose);
+        count++;
+        /* 不 iput 这里, dispose 阶段统一处理 */
+
+        spin_lock(&sb->s_inode_list_lock);
+    }
+    spin_unlock(&sb->s_inode_list_lock);
+
+    /* 3. 释放 cap + invalidate page cache */
+    while (!list_empty(&dispose)) {
+        struct powerfs_cap *cap = list_first_entry(&dispose,
+                                                     struct powerfs_cap,
+                                                     lru_item);
+        struct powerfs_inode_info *pi = cap->ci;
+        struct inode *inode = &pi->netfs.inode;
+
+        list_del_init(&cap->lru_item);
+
+        /* 通知 Filer 释放 cap (同步 RPC) */
+        cap_send_release(pi, cap);
+
+        /* 清除本地 page cache */
+        invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
+
+        iput(inode);
+    }
+
+    *released = count;
+    pr_info("powerfs: quiesce_all done, released %lu inodes\n", count);
+    return 0;
+}
+

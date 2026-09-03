@@ -124,7 +124,13 @@ int powerfs_conn_do_handshake(struct socket *sock,
     req.channel = (conn->type == POWERFS_NET_SERVER_VOLUME_META)
                   ? POWERFS_NET_CHANNEL_META : POWERFS_NET_CHANNEL_DATA;
     req.reserved = 0;
-    client_id = atomic_read(&conn->seq_counter) + 1000000;
+    /* ROOT40: 使用 master 签发的 assigned_client_id (经 cert 验证) 作为
+     * filer handshake client_id. g_pool.hb_assigned_client_id 由
+     * powerfs_net_update_heartbeat_id() 在 RegisterClient 成功后设置.
+     * 缺失时回退到 seq_counter+1000000 (仅单客户端 dev 场景可用). */
+    client_id = g_pool.hb_assigned_client_id;
+    if (client_id == 0)
+        client_id = atomic_read(&conn->seq_counter) + 1000000;
     req.client_id = cpu_to_le64(client_id);
     req.features = 0;
 

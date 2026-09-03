@@ -486,7 +486,10 @@ int powerfs_net_do_handshake(struct socket *sock)
     req.client_type = POWERFS_NET_CLIENT_KERNEL;
     req.channel = POWERFS_NET_CHANNEL_DATA;
     req.reserved = 0;
-    client_id = atomic_inc_return(&g_discover_seq) + 1000000;
+    /* ROOT40: 与 filer 连接 handshake 一致, 使用 master 签发的 assigned_client_id. */
+    client_id = g_pool.hb_assigned_client_id;
+    if (client_id == 0)
+        client_id = atomic_inc_return(&g_discover_seq) + 1000000;
     req.client_id = cpu_to_le64(client_id);
     req.features = 0;
 

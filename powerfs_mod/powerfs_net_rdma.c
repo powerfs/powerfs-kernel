@@ -1096,7 +1096,12 @@ int powerfs_rdma_connect(struct powerfs_net_server_conn *conn)
         hs_req.channel = (conn->type == POWERFS_NET_SERVER_VOLUME_META)
                          ? POWERFS_NET_CHANNEL_META : POWERFS_NET_CHANNEL_DATA;
         hs_req.reserved    = 0;
-        client_id          = atomic_read(&conn->seq_counter) + 1000000;
+        /* ROOT40: 与 TCP 路径一致, 使用 master 签发的 assigned_client_id.
+         * g_pool.hb_assigned_client_id 由 powerfs_net_update_heartbeat_id()
+         * 设置. 缺失时回退到 seq_counter+1000000. */
+        client_id          = g_pool.hb_assigned_client_id;
+        if (client_id == 0)
+            client_id = atomic_read(&conn->seq_counter) + 1000000;
         hs_req.client_id   = cpu_to_le64(client_id);
         hs_req.features    = 0;
 

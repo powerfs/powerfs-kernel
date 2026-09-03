@@ -40,6 +40,7 @@
 #include "powerfs.h"
 #include "powerfs_comm.h"
 #include "powerfs_net.h"
+#include "powerfs_net_internal.h"
 #include "powerfs_flow.h"
 
 #include "powerfs_vfs.h"
@@ -909,8 +910,9 @@ static int powerfs_debugfs_caps_show(struct seq_file *s, void *p)
     struct powerfs_client *client = POWERFS_SB_INFO(sb)->client;
     struct inode *inode;
 
-    seq_printf(s, "ino              issued           implemented      dirty           flushing        refs\n");
-    seq_printf(s, "------------------------------------------------------------------------------------------\n");
+    /* P2-3: 增强 cap dump — 增加 wanted/epoch/sn/holders 列 */
+    seq_printf(s, "ino              issued     wanted     dirty     flushing   epoch     seq        pin_refs  rd_refs  wr_refs\n");
+    seq_printf(s, "-----------------------------------------------------------------------------------------------------------\n");
 
     if (!client) {
         seq_puts(s, "(client not initialized)\n");
@@ -931,13 +933,17 @@ static int powerfs_debugfs_caps_show(struct seq_file *s, void *p)
 
         spin_lock(&pi->i_lock);
         if (pi->i_auth_cap || pi->i_dirty_caps || pi->i_flushing_caps) {
-            seq_printf(s, "%-16lu%-17x%-17x%-17x%-17x%-4d\n",
+            seq_printf(s, "%-16lu%-11x%-11x%-11x%-11x%-10llu%-11llu%-11d%-9d%-9d\n",
                        inode->i_ino,
                        pi->i_auth_cap ? pi->i_auth_cap->issued : 0,
-                       pi->i_auth_cap ? pi->i_auth_cap->implemented : 0,
+                       pi->i_auth_cap ? pi->i_auth_cap->wanted : 0,
                        pi->i_dirty_caps,
                        pi->i_flushing_caps,
-                       pi->i_pin_ref);
+                       pi->i_auth_cap ? (unsigned long long)pi->i_auth_cap->epoch : 0ULL,
+                       pi->i_auth_cap ? (unsigned long long)pi->i_auth_cap->seq : 0ULL,
+                       pi->i_pin_ref,
+                       pi->i_nr_by_mode[POWERFS_FILE_MODE_RD],
+                       pi->i_nr_by_mode[POWERFS_FILE_MODE_WR]);
         }
         spin_unlock(&pi->i_lock);
 
@@ -971,6 +977,71 @@ static int powerfs_debugfs_caps_show(struct seq_file *s, void *p)
 
         seq_printf(s, "cap_flush_list: %d\n", flush_count);
     }
+
+    return 0;
+}
+
+/*
+ * powerfs_debugfs_locks_show - P2-3: 输出 per-inode cap 锁等待状态
+ *
+ * 用于定位 recall hang: 若 dirty_caps 非零但 pin_ref 很高,
+ * 说明有线程等待 cap flush ACK, 可能 Filer 端 recall 卡住.
+ *
+ * 对齐 Ceph 的 /sys/kernel/debug/ceph/mdsc/locks:
+ *   ino, dirty, flushing, pin_refs, cap_gen, token, expire_jiffies
+ */
+static int powerfs_debugfs_locks_show(struct seq_file *s, void *p)
+{
+    struct super_block *sb = s->private;
+    struct inode *inode;
+
+    seq_printf(s, "ino              dirty     flushing   pin_refs  cap_gen  token                         epoch     expire_ms\n");
+    seq_printf(s, "----------------------------------------------------------------------------------------------------------\n");
+
+    spin_lock(&sb->s_inode_list_lock);
+    list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+        struct powerfs_inode_info *pi = POWERFS_I(inode);
+        struct powerfs_cap *cap;
+
+        if (!pi)
+            continue;
+
+        if (!igrab(inode))
+            continue;
+        spin_unlock(&sb->s_inode_list_lock);
+
+        spin_lock(&pi->i_lock);
+        /* 只输出有 cap 或有 dirty/flushing 的 inode */
+        if (pi->i_auth_cap || pi->i_dirty_caps || pi->i_flushing_caps) {
+            cap = pi->i_auth_cap;
+            if (cap) {
+                unsigned long expire_ms = 0;
+                if (cap->expire_jiffies)
+                    expire_ms = jiffies_to_msecs(cap->expire_jiffies - jiffies);
+                seq_printf(s, "%-16lu%-11x%-11x%-11d%-10u%-31s%-10llu%-11lu\n",
+                           inode->i_ino,
+                           pi->i_dirty_caps,
+                           pi->i_flushing_caps,
+                           pi->i_pin_ref,
+                           cap->cap_gen,
+                           cap->token[0] ? cap->token : "(none)",
+                           (unsigned long long)cap->epoch,
+                           expire_ms);
+            } else {
+                seq_printf(s, "%-16lu%-11x%-11x%-11d%-10s%-31s%-10s%-11s\n",
+                           inode->i_ino,
+                           pi->i_dirty_caps,
+                           pi->i_flushing_caps,
+                           pi->i_pin_ref,
+                           "-", "(no_cap)", "-", "-");
+            }
+        }
+        spin_unlock(&pi->i_lock);
+
+        iput(inode);
+        spin_lock(&sb->s_inode_list_lock);
+    }
+    spin_unlock(&sb->s_inode_list_lock);
 
     return 0;
 }
@@ -1105,16 +1176,51 @@ static int powerfs_debugfs_leases_show(struct seq_file *s, void *p)
 
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_status);
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_caps);
+DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_locks);
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_inodes);
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_dentries);
 DEFINE_SHOW_ATTRIBUTE(powerfs_debugfs_leases);
+
+/*
+ * powerfs_debugfs_quiesce_write - P2-4: 用户态触发 quiesce (热迁移测试入口)
+ *
+ * 用法: echo 1 > /sys/kernel/debug/sb-XXX/quiesce
+ *
+ * 语义: 触发 powerfs_quiesce_all — sync 脏页 + 释放 cap + invalidate page cache.
+ * 用于 Filer balancer 迁移 inode 前的客户端静默, 也可用于压力测试.
+ * 返回写入的字节数 (始终等于 len, 表示成功).
+ */
+static ssize_t powerfs_debugfs_quiesce_write(struct file *f, const char __user *buf,
+                                             size_t len, loff_t *ppos)
+{
+    struct super_block *sb = file_inode(f)->i_private;
+    unsigned long released = 0;
+    int ret;
+
+    if (!sb)
+        return -EINVAL;
+
+    ret = powerfs_quiesce_all(sb, &released);
+    if (ret < 0)
+        return ret;
+
+    pr_info("powerfs: quiesce triggered via debugfs, released=%lu\n", released);
+    return len;
+}
+
+static const struct file_operations powerfs_debugfs_quiesce_fops = {
+    .owner   = THIS_MODULE,
+    .write   = powerfs_debugfs_quiesce_write,
+    .llseek  = noop_llseek,
+};
 
 /*
  * powerfs_debugfs_init - 在 fill_super 中调用, 创建 debugfs 目录和文件.
  *
  * 目录结构: /sys/kernel/debug/powerfs/<sb_id>/
  *   status    - 挂载状态总览
- *   caps      - 所有 inode cap 状态
+ *   caps      - 所有 inode cap 状态 (P2-3: issued/wanted/dirty/epoch/sn/holders)
+ *   locks     - per-inode cap 锁等待状态 (P2-3: dirty/flushing/pin_refs/cap_gen/token/expire)
  *   inodes    - 所有 inode 关键属性
  *   dentries  - dentry lease 列表
  *   leases    - 目录 lease 状态
@@ -1136,9 +1242,12 @@ static void powerfs_debugfs_init(struct super_block *sb)
 
     debugfs_create_file("status",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_status_fops);
     debugfs_create_file("caps",     0400, sbi->debugfs_dir, sb, &powerfs_debugfs_caps_fops);
+    debugfs_create_file("locks",    0400, sbi->debugfs_dir, sb, &powerfs_debugfs_locks_fops);
     debugfs_create_file("inodes",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_inodes_fops);
     debugfs_create_file("dentries", 0400, sbi->debugfs_dir, sb, &powerfs_debugfs_dentries_fops);
     debugfs_create_file("leases",   0400, sbi->debugfs_dir, sb, &powerfs_debugfs_leases_fops);
+    /* P2-4: quiesce 写入口 — echo 1 > quiesce 触发客户端静默 */
+    debugfs_create_file("quiesce",  0200, sbi->debugfs_dir, sb, &powerfs_debugfs_quiesce_fops);
 
     pr_info("powerfs: debugfs entries at /sys/kernel/debug/%s/\n", name);
 }
@@ -1527,6 +1636,16 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     }
     pr_info("powerfs: client allocated, client_id=%s\n", sbi->client->client_id);
 
+    /* P2-2: Register cap shrinker for memory pressure handling */
+    ret = powerfs_cap_shrinker_init(sbi->client);
+    if (ret) {
+        pr_err("powerfs: cap shrinker init failed: %d\n", ret);
+        kfree(sbi->client);
+        sbi->client = NULL;
+        kfree(sbi);
+        return ret;
+    }
+
     /* 设置超级块 (覆盖 sb->s_fs_info, 之前指向已释放的 ctx) */
     sb->s_fs_info = sbi;
     sb->s_op = &powerfs_super_ops;
@@ -1537,6 +1656,12 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     sb->s_blocksize_bits = 12;
     sb->s_maxbytes = MAX_LFS_FILESIZE;
     sb->s_time_gran = 1;
+    /* SB_NOSEC: 允许 VFS 为无 xattr 的 inode 设置 S_NOSEC,
+     * 跳过每次 write 都触发 security_inode_need_killpriv →
+     * powerfs_xattr_handler_get → net getxattr 的网络往返 (~1ms/次).
+     * PowerFS 不依赖 VFS 默认的 setuid/capability xattr 管理,
+     * 权限由 Filer 端 Raft 强一致仲裁. */
+    sb->s_flags |= SB_NOSEC;
 
     /* Stage C: 设置 BDI 支持 writeback.
      *
@@ -1771,6 +1896,12 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
                 return -EPERM;
             }
             sbi->client->assigned_client_id = assigned_id;
+            /* 将 master 签发的 assigned_id 写入 g_pool, 供 filer/volume
+             * handshake (TCP + RDMA) 和 heartbeat 使用. 缺失此调用会导致
+             * handshake 回退到 seq_counter+1000000 (恒为 1000001), 多客户端
+             * 连同一 filer 时 session id 冲突 → 第二连接踢掉第一个 → mount
+             * auto-deregister. (ROOT40) */
+            powerfs_net_update_heartbeat_id(assigned_id);
             /* Cap RPC (open_grant / recall_ack / release) 发送 STRING
              * holder 给 filer lock_arbiter 作为 session key. 将 master
              * 分配的 numeric id 字符串化后写入 client_id[], 确保 cap
@@ -1997,9 +2128,23 @@ void powerfs_kill_sb_super(struct super_block *sb)
 
         /* 4. 关闭所有连接 (g_pool 会被清零) */
         powerfs_net_pool_cleanup();
-    } else if (sbi) {
-        pr_warn("powerfs: kill_sb skip global pool cleanup (pool_initialized=false)\n");
+    } else if (sbi && g_pool_initialized) {
+        /* ROOT41: pool init 部分完成 (g_pool_initialized=true 但
+         * sbi->pool_initialized=false): filer 连接已创建 (带 reconnect
+         * workqueue) 但 30s 内未连上 → fill_super 返回错误 → kill_sb.
+         * 若不清理, reconnect workqueue 永远运行 → rmmod 失败 → 下次
+         * mount 复用 stale 连接 → use-after-free.
+         * powerfs_net_pool_cleanup 内部检查 g_pool_initialized 后执行
+         * powerfs_conn_pool_exit 取消所有 delayed_work + 断开连接. */
+        pr_warn("powerfs: kill_sb cleaning up partially-initialized pool "
+                "(filer_count=%d)\n", g_pool.filer_count);
+        powerfs_net_set_stopping();
+        powerfs_net_pool_cleanup();
     }
+
+    /* P2-2: Unregister cap shrinker before evict_inodes (prevent race) */
+    if (sbi && sbi->client)
+        powerfs_cap_shrinker_destroy(sbi->client);
 
     /* 5. kill_anon_super → generic_shutdown_super:
      *    a) shrink_dcache_for_umount — 释放所有 dentry (d_release → call_rcu)
