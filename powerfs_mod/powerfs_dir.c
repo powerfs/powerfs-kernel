@@ -1923,6 +1923,13 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
     struct powerfs_dir_entry *entry, *tmp;
     loff_t pos = 0;
 
+    /* #47 硬化: transport=rdma 且所有 filer 断连时, 拒绝服务 stale
+     * dir_entries (inline dir 的 local 链表副本). 静默服务会导致
+     * 跨客户端目录内容不一致. */
+    if (POWERFS_SB_INFO(dir->i_sb)->transport_type == POWERFS_TRANSPORT_RDMA &&
+        !powerfs_net_any_filer_connected())
+        return -ENOTCONN;
+
     pr_debug("powerfs: readdir ENTER dir_ino=%lu ctx_pos=%lld "
              "dir_complete=%d lease_expire=%ld lease_epoch=%u\n",
              dir->i_ino, (s64)ctx->pos,

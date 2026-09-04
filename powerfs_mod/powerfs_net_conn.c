@@ -58,6 +58,29 @@ bool powerfs_net_is_connected(void)
     return g_pool.filer_count > 0 && !atomic_read(&g_pool.stopping);
 }
 
+/**
+ * powerfs_net_any_filer_connected - 检查是否有任何 filer 处于 CONNECTED 状态.
+ *
+ * #47 硬化: 当 transport=rdma 且 filer 全部断连时, IO 不应静默服务
+ * stale local cache (inline_data / page cache), 而应返回 -ENOTCONN
+ * 让用户感知 RDMA 链路中断. 此函数供 read_iter / readdir 等 IO 路径
+ * 在 transport=rdma 模式下做 stale cache 守卫.
+ */
+bool powerfs_net_any_filer_connected(void)
+{
+    int i;
+
+    if (g_pool.filer_count == 0 || atomic_read(&g_pool.stopping))
+        return false;
+
+    for (i = 0; i < g_pool.filer_count; i++) {
+        if (g_pool.filers[i].state == CONN_CONNECTED)
+            return true;
+    }
+    return false;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_any_filer_connected);
+
 /* Phase 1: 最近断连窗口检查.
  * 返回 true 表示最近 window_ms 内发生过断连 (lookup/readdir 应使用短超时).
  * 实现: 读取 g_pool.last_disconnect_jiffies, 与 jiffies 比对.
@@ -2805,6 +2828,17 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 sha
     }
 
     pr_warn("powerfs: no filer connected within 30s\n");
+    /* #47 硬化: transport=rdma 时给出明确诊断, 提示用户检查 Filer
+     * 是否以 --features rdma 编译 (require_rdma 配置). */
+    if (g_pool.transport_type == POWERFS_TRANSPORT_RDMA) {
+        pr_err("powerfs: transport=rdma mount failed — no filer RDMA "
+               "connection established. Check:\n"
+               "  1. Filer binary compiled with: cargo build --release "
+               "--features rdma\n"
+               "  2. Filer config transport='auto' or 'rdma' (not 'tcp')\n"
+               "  3. RDMA device active: cat /sys/class/infiniband/*/state\n"
+               "  4. Filer RDMA listener log: 'listening on ... (rdma_cm)'\n");
+    }
     return -ENOTCONN;
 }
 EXPORT_SYMBOL_GPL(powerfs_conn_pool_init);

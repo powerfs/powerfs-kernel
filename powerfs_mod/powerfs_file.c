@@ -411,12 +411,25 @@ static ssize_t powerfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
     struct file *file = iocb->ki_filp;
     struct inode *inode = file->f_inode;
     struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct powerfs_sb_info *sbi = POWERFS_SB_INFO(inode->i_sb);
     unsigned int got = 0;
     int err;
     ssize_t ret;
     ktime_t __metric_start = ktime_get();
 
     powerfs_flow_admit_wait(POWERFS_FLOW_OP_READ, 2000);
+
+    /* #47 硬化: transport=rdma 且所有 filer 连接断开时, 拒绝服务
+     * stale local cache (page cache / inline_data). 静默服务 stale
+     * cache 会导致跨客户端文件内容不一致 (filer 重启后 RDMA listener
+     * 缺失, 客户端各自服务本地缓存). 返回 -ENOTCONN 让用户感知. */
+    if (sbi->transport_type == POWERFS_TRANSPORT_RDMA &&
+        !powerfs_net_any_filer_connected()) {
+        pr_warn_ratelimited("powerfs: read_iter ino=%lu blocked: "
+                            "transport=rdma but no filer connected "
+                            "(stale cache guard)\n", inode->i_ino);
+        return -ENOTCONN;
+    }
 
     /* 对齐  filemap_fault (addr.c L1982):
      *   need = FILE_SHARED (读必须位), want = FILE_SHARED|FILE_CACHE
@@ -469,6 +482,11 @@ static ssize_t powerfs_splice_read(struct file *in, loff_t *ppos,
 
     /* umount 期间跳过网络同步 */
     if (powerfs_net_is_stopping())
+        return -ENOTCONN;
+
+    /* #47 硬化: transport=rdma 且所有 filer 断连时, 拒绝 stale cache. */
+    if (POWERFS_SB_INFO(inode->i_sb)->transport_type == POWERFS_TRANSPORT_RDMA &&
+        !powerfs_net_any_filer_connected())
         return -ENOTCONN;
 
     /* 拿 cap refs: need=FILE_SHARED (读必须), want=FILE_CACHE (page cache 信任) */

@@ -1179,6 +1179,10 @@ int powerfs_net_set_volume(const char *addr, __u16 port);
 /* 连接状态检查 (新架构: 检查 g_pool 是否有可用 filer 连接) */
 bool powerfs_net_is_connected(void);
 
+/* #47 硬化: 检查是否有任何 filer 处于 CONN_CONNECTED 状态.
+ * 供 transport=rdma 模式下 IO 路径做 stale cache 守卫. */
+bool powerfs_net_any_filer_connected(void);
+
 /* 检查最近是否发生过断连 (窗口内 lookup/readdir 用短超时, 见 powerfs.h).
  * window_ms: 窗口大小 (ms), 返回 true 表示窗口内有过断连. */
 bool powerfs_net_recently_disconnected(unsigned int window_ms);
