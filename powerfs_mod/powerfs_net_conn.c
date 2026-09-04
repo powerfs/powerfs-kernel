@@ -1926,33 +1926,64 @@ int powerfs_conn_connect_one(struct powerfs_net_server_conn *conn)
     /* RDMA 路径: 走 transport ops (cm_id + QP + RTS), 不创建 socket.
      * handshake 在 ops->connect 内部或后续 send_frame/recv_frame 层完成.
      * 当前 Phase 2: 仅建立 RDMA 连接, 验证传输层正确性.
-     * TODO: handshake 接入 (需通过 transport->send_frame/recv_frame 收发). */
-    if (conn->transport_type == POWERFS_TRANSPORT_RDMA && conn->transport) {
+     * TODO: handshake 接入 (需通过 transport->send_frame/recv_frame 收发).
+     *
+     * #47: transport=auto 也走此路径, 但 RDMA 失败时回退 TCP 而非报错. */
+    if ((conn->transport_type == POWERFS_TRANSPORT_RDMA ||
+         conn->transport_type == POWERFS_TRANSPORT_AUTO) && conn->transport) {
         const struct powerfs_transport_ops *ops = conn->transport;
+        bool rdma_ok = false;
 
         /* init_conn: 分配 conn->rdma (cm_id/CQ/QP 容器) */
         ret = ops->init_conn(conn);
         if (ret) {
-            pr_err("powerfs: rdma init_conn %s:%u failed: %d\n",
-                   conn->addr, conn->port, ret);
-            powerfs_conn_set_state(conn, CONN_RECONNECTING);
-            return ret;
+            if (conn->transport_type == POWERFS_TRANSPORT_AUTO) {
+                pr_info("powerfs: auto: rdma init_conn %s:%u failed (%d), falling back to TCP\n",
+                        conn->addr, conn->port, ret);
+            } else {
+                pr_err("powerfs: rdma init_conn %s:%u failed: %d\n",
+                       conn->addr, conn->port, ret);
+                powerfs_conn_set_state(conn, CONN_RECONNECTING);
+                return ret;
+            }
+        } else {
+            /* connect: addr/route resolve → PD/CQ/QP → RTS → CONNECTED 事件 */
+            ret = ops->connect(conn);
+            if (ret) {
+                if (conn->transport_type == POWERFS_TRANSPORT_AUTO) {
+                    pr_info("powerfs: auto: rdma connect %s:%u failed (%d), falling back to TCP\n",
+                            conn->addr, conn->port, ret);
+                    ops->fini_conn(conn);
+                } else {
+                    pr_err("powerfs: rdma connect %s:%u failed: %d\n",
+                           conn->addr, conn->port, ret);
+                    ops->fini_conn(conn);
+                    powerfs_conn_set_state(conn, CONN_RECONNECTING);
+                    return ret;
+                }
+            } else {
+                rdma_ok = true;
+            }
         }
-        /* connect: addr/route resolve → PD/CQ/QP → RTS → CONNECTED 事件 */
-        ret = ops->connect(conn);
-        if (ret) {
-            pr_err("powerfs: rdma connect %s:%u failed: %d\n",
-                   conn->addr, conn->port, ret);
-            ops->fini_conn(conn);
-            powerfs_conn_set_state(conn, CONN_RECONNECTING);
-            return ret;
+
+        if (rdma_ok) {
+            powerfs_conn_set_state(conn, CONN_CONNECTED);
+            conn->reconnect_count = 0;
+            conn->reconnect_delay = 0;
+            atomic_set(&conn->consecutive_timeouts, 0);
+            pr_info("powerfs: %s filer %s:%u connected\n",
+                    conn->transport_type == POWERFS_TRANSPORT_AUTO ? "auto(rdma)" : "rdma",
+                    conn->addr, conn->port);
+            return 0;
         }
-        powerfs_conn_set_state(conn, CONN_CONNECTED);
-        conn->reconnect_count = 0;
-        conn->reconnect_delay = 0;
-        atomic_set(&conn->consecutive_timeouts, 0);
-        pr_info("powerfs: rdma filer %s:%u connected\n", conn->addr, conn->port);
-        return 0;
+        /* AUTO + RDMA failed: fall through to TCP path below.
+         * Switch conn transport to TCP for subsequent send/recv. */
+        if (conn->transport_type == POWERFS_TRANSPORT_AUTO) {
+            conn->transport = powerfs_transport_pick_ops(POWERFS_TRANSPORT_TCP);
+            conn->transport_type = POWERFS_TRANSPORT_TCP;
+            pr_info("powerfs: auto: %s:%u switched to TCP transport\n",
+                    conn->addr, conn->port);
+        }
     }
 #endif /* CONFIG_INFINIBAND */
 

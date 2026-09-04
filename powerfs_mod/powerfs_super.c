@@ -332,7 +332,8 @@ static int powerfs_show_options(struct seq_file *m, struct dentry *root)
     seq_printf(m, ",master_addr=%s", sbi->master_addr);
     seq_printf(m, ",master_port=%u", sbi->master_port);
     seq_printf(m, ",transport=%s",
-               sbi->transport_type == POWERFS_TRANSPORT_RDMA ? "rdma" : "tcp");
+               sbi->transport_type == POWERFS_TRANSPORT_RDMA ? "rdma" :
+               sbi->transport_type == POWERFS_TRANSPORT_AUTO ? "auto" : "tcp");
 
     return 0;
 }
@@ -1519,8 +1520,8 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->client_crt[sizeof(sbi->client_crt) - 1]     = '\0';
         sbi->client_key[sizeof(sbi->client_key) - 1]     = '\0';
 
-        /* transport: 解析 "tcp"/"rdma" → sbi->transport_type.
-         * parse_param 已校验只接受 tcp/rdma, 这里防御性二次校验. */
+        /* transport: 解析 "tcp"/"rdma"/"auto" → sbi->transport_type.
+         * parse_param 已校验只接受 tcp/rdma/auto, 这里防御性二次校验. */
         if (strcmp(ctx->transport, "rdma") == 0) {
 #ifndef CONFIG_INFINIBAND
             pr_err("powerfs: transport=rdma requires CONFIG_INFINIBAND=y\n");
@@ -1530,6 +1531,16 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
             return -EINVAL;
 #else
             sbi->transport_type = POWERFS_TRANSPORT_RDMA;
+#endif
+        } else if (strcmp(ctx->transport, "auto") == 0) {
+            /* transport=auto: RDMA 优先, 连接失败时回退 TCP (#47).
+             * 非 INFINIBAND 编译退化为纯 TCP. */
+#ifdef CONFIG_INFINIBAND
+            sbi->transport_type = POWERFS_TRANSPORT_AUTO;
+            pr_info("powerfs: transport=auto (RDMA with TCP fallback)\n");
+#else
+            sbi->transport_type = POWERFS_TRANSPORT_TCP;
+            pr_info("powerfs: transport=auto resolved to TCP (no CONFIG_INFINIBAND)\n");
 #endif
         } else {
             /* 空字符串或 "tcp" 都默认 TCP (兼容旧 mount 命令不传 transport). */

@@ -240,10 +240,11 @@ static int powerfs_parse_param(struct fs_context *fc, struct fs_parameter *param
         if (param->string) {
             strncpy(ctx->transport, param->string, sizeof(ctx->transport) - 1);
             ctx->transport[sizeof(ctx->transport) - 1] = '\0';
-            /* 校验: 只接受 "tcp" 或 "rdma", 其他值拒绝挂载避免静默走错路径. */
+            /* 校验: 只接受 "tcp", "rdma" 或 "auto". */
             if (strcmp(ctx->transport, "tcp") != 0 &&
-                strcmp(ctx->transport, "rdma") != 0) {
-                pr_err("powerfs: invalid transport='%s' (must be tcp or rdma)\n",
+                strcmp(ctx->transport, "rdma") != 0 &&
+                strcmp(ctx->transport, "auto") != 0) {
+                pr_err("powerfs: invalid transport='%s' (must be tcp, rdma, or auto)\n",
                        ctx->transport);
                 return -EINVAL;
             }

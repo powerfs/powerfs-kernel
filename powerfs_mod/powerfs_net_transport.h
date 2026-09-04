@@ -28,6 +28,7 @@ struct powerfs_request;
 enum powerfs_transport_type {
     POWERFS_TRANSPORT_TCP  = 0,   /* 内核 TCP socket (现有路径) */
     POWERFS_TRANSPORT_RDMA = 1,   /* RDMA RC QP (后续 Phase 接入) */
+    POWERFS_TRANSPORT_AUTO = 2,   /* RDMA 优先, 失败回退 TCP (#47) */
 };
 
 /**
@@ -92,12 +93,13 @@ extern const struct powerfs_transport_ops powerfs_tcp_ops;
 extern const struct powerfs_transport_ops powerfs_rdma_ops;
 #endif
 
-/* 按 transport_type 选择 ops. 未启用 INFINIBAND 时 rdma 退化为 tcp (防御). */
+/* 按 transport_type 选择 ops. 未启用 INFINIBAND 时 rdma/auto 退化为 tcp (防御).
+ * #47: AUTO 在连接时先尝试 RDMA ops, 失败后由 net_conn.c 回退 TCP. */
 static inline const struct powerfs_transport_ops *
 powerfs_transport_pick_ops(enum powerfs_transport_type type)
 {
 #ifdef CONFIG_INFINIBAND
-    if (type == POWERFS_TRANSPORT_RDMA)
+    if (type == POWERFS_TRANSPORT_RDMA || type == POWERFS_TRANSPORT_AUTO)
         return &powerfs_rdma_ops;
 #endif
     return &powerfs_tcp_ops;
