@@ -4,6 +4,11 @@
 
 set -e
 
+# Ensure core tools (qemu-img, qemu-system-x86_64, ip, sudo) resolve even when
+# invoked via sudo/nohup from a stripped or caller-supplied PATH
+# (GitHub Actions runner env, systemd transient units).
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:${PATH}
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_DIR="${SCRIPT_DIR}/output"
 KERNEL_IMAGE="${OUTPUT_DIR}/bzImage"
