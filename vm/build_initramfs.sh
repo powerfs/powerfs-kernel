@@ -208,13 +208,13 @@ if [ -f "${BUSYBOX_PATH}" ]; then
     # 创建符号链接 (常用命令)
     for cmd in ash cat ls cp mv rm mkdir mount umount ps echo cat grep chmod chown \
                ln sleep kill sh bash date dd df du free killall more ping rmdir \
-               stat sync top true false yes env env find halt init insmod \
+               stat sync top true false yes env env find fallocate halt init insmod \
                ip lsmod modprobe netstat poweroff reboot rmmod route \
                stty swapoff swapon telnet test uname uptime watch wc wget \
                whoami xargs yes zcat chroot clear cmp comm cut diff dirname \
                head less sed tail tr uniq awk basename cal dir expr factor \
                groups id printenv printf seq sleep tee time timeout tty \
-               wc wget which who xxd strings strace ltrace \
+               wc wget which who xxd strings strace ltrace truncate \
                sha256sum sha1sum sha512sum md5sum; do
         if bin/busybox | grep -q "${cmd}"; then
             ln -sf busybox bin/${cmd} 2>/dev/null || true
@@ -906,6 +906,7 @@ if [ -n "${BASH_BIN}" ] && [ -f "${BASH_BIN}" ]; then
         /usr/bin/stat    /bin/stat
         /usr/bin/dd      /bin/dd
         /usr/bin/truncate
+        /usr/bin/fallocate
         /usr/bin/chmod   /bin/chmod
         /usr/bin/chown   /bin/chown
         /usr/bin/awk     /bin/awk
