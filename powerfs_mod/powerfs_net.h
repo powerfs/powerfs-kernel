@@ -477,6 +477,12 @@ enum powerfs_net_field_id {
     /* ClientCertSignature (bytes, TLV 0xD5, reserved): 客户端证书对请求体
      * 的 HMAC/签名, 留作未来重放保护; 当前未使用, 预留字段位. */
     POWERFS_NET_FLD_CLIENT_CERT_SIGNATURE = 0xD5,
+    /* DesiredMode (u8, TLV 0xD6): MigrateInlineAlloc 请求中客户端携带的
+     * 期望分配模式. 0=Flat (默认/老协议兼容), 1=Stripe. 由客户端首次写入
+     * Empty 状态文件时检测内容 (magic number / printable ratio) 决定:
+     * 二进制内容 → Stripe (多卷并行), 文本内容 → Flat (单卷).
+     * 与 Rust FieldId::DesiredMode=0xD6 严格对齐. */
+    POWERFS_NET_FLD_DESIRED_MODE = 0xD6,
 };
 
 /* ========== 帧头结构 (28 字节, packed) ========== */
@@ -1252,6 +1258,30 @@ struct powerfs_net_dir_entry {
     __u32 nlink;
 };
 
+/* MIGRATE_INLINE_ALLOC 结果. Filer 根据 desired_stripe 决定分配方式:
+ *   Flat:   分配 1 个 (volume_id, needle_id), 文件后续走 Flat writeback
+ *   Stripe: 分配 N 个 (volume_id, needle_id), 后续按 stripe_size 分块写多卷
+ *
+ * 调用方拿到结果后:
+ *   - Flat:   pi->placement=FLAT, pi->volume_id/file_key
+ *   - Stripe: pi->placement=STRIPE, pi->stripe_size/stripe_count/volume_ids[]
+ * 两条路径均清空 pi->inline_data 并 re-dirty 所有页, 后续走对应 writeback.
+ *
+ * 注意: allocations 数组所有权归调用方, 需在设置完 inode 字段后 kfree.
+ * stripe_size/stripe_count 仅在 is_stripe=true 时有效; Flat 路径下 stripe_size=0. */
+struct powerfs_migrate_alloc_result {
+    bool is_stripe;          /* true=Stripe 多卷, false=Flat 单卷 */
+    /* Flat 路径 (is_stripe=false 时有效) */
+    __u64 volume_id;         /* 分配的 volume_id */
+    __u64 file_key;          /* 分配的 needle_id (base) */
+    /* Stripe 路径 (is_stripe=true 时有效) */
+    __u64 stripe_size;       /* 单个 stripe unit 大小 (字节) */
+    __u32 stripe_count;      /* 条带卷数 */
+    __u32 alloc_count;       /* 实际分配数量 (通常 == stripe_count) */
+    __u64 *allocs;           /* [alloc_count] pairs: {volume_id, needle_id},
+                               * 由本函数内 kmalloc, 调用方 kfree */
+};
+
 /* GETATTR (返回完整属性含时间戳 + volume_id/file_key 用于数据直连) */
 struct powerfs_file_layout;  /* 定义在 powerfs.h */
 struct powerfs_chunk_map;   /* 定义在 powerfs.h */
@@ -1336,28 +1366,36 @@ int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
                                          const __u8 *inline_data,
                                          __u32 inline_len);
 
-/* K2-6: MIGRATE_INLINE_ALLOC — Inline → Flat 迁移分配.
+/* K2-6: MIGRATE_INLINE_ALLOC — Inline → Flat/Stripe 迁移分配.
  *
- * 对齐 FUSE migrate_inline_alloc (powerfs-fuse/src/fuse.rs L3469) 和
- * Filer handle_migrate_inline_alloc (net_handler.rs L1832).
+ * 对齐 FUSE migrate_inline_alloc (powerfs-fuse/src/fuse.rs) 和
+ * Filer handle_migrate_inline_alloc (net_handler.rs).
  *
  * 客户端 write 累计超 max_size×1.5 时调用. Filer 仅分配 (volume_id,
  * needle_id), 不修改 inode 元数据 (保留 inline_data 用于 crash safety).
  * 客户端拿到分配后同步写 Volume Server, close 时 UPDATE_INODE_SIZE_CHUNKS
- * 原子完成 Inline→Flat 切换.
+ * 原子完成 Inline→Flat/Stripe 切换.
  *
- * Request TLV:  ShardId(0x70) + Ino(0x07)
- * Response TLV: VolumeId(0x10) + FileKey(0x11) / Name=error
+ * Empty-state 内容感知: 当 desired_stripe=true (客户端检测到二进制内容)
+ * 时, Filer 分配 N 个 (volume_id, needle_id), 文件走 Stripe 多卷并行写;
+ * desired_stripe=false 时, 退化为 Flat 单卷分配 (老协议兼容).
+ *
+ * Request TLV:  ShardId(0x70) + Ino(0x07) + DesiredMode(0xD6, u8, 可选)
+ * Response TLV: Flat → VolumeId + FileKey
+ *              Stripe → StripeCount(0xA9) + StripeSize(0xA8) +
+ *                       [VolumeId + FileKey] × N
  *
  * 参数:
  *   shard_id: 父目录 ino (Filer 路由)
  *   ino: 文件 inode
- *   volume_id: 输出, 分配的 volume_id
- *   file_key: 输出, 分配的 needle_id
+ *   desired_stripe: 客户端内容检测结论, true=请求 Stripe 分配
+ *   out: [输出] 分配结果 (is_stripe/volume_id/file_key 或 Stripe 多卷信息).
+ *        out->allocs 在 Stripe 路径下由本函数 kmalloc, 调用方负责 kfree.
  *
- * 返回 0 成功, 负数错误码. */
+ * 返回 0 成功, 负数错误码. 返回失败时 out->allocs 不会被分配, 调用方无需 kfree. */
 int powerfs_net_migrate_inline_alloc(__u64 shard_id, __u64 ino,
-                                     __u64 *volume_id, __u64 *file_key);
+                                     bool desired_stripe,
+                                     struct powerfs_migrate_alloc_result *out);
 
 /* READDIR (匹配 Filer 协议: ParentIno + Limit + LastName 分页).
  * powerfs_net_readdir 用默认 5s 超时 (兼容旧调用方).

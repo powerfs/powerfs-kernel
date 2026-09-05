@@ -1076,72 +1076,189 @@ int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
 EXPORT_SYMBOL_GPL(powerfs_net_update_inode_size_chunks);
 
 /**
- * powerfs_net_migrate_inline_alloc - K2-6 Inline → Flat 迁移分配
+ * powerfs_net_migrate_inline_alloc - K2-6 Inline → Flat/Stripe 迁移分配
  *
- * 对齐 FUSE migrate_inline_alloc (powerfs-fuse/src/fuse.rs L3469) 和
- * Filer handle_migrate_inline_alloc (net_handler.rs L1832).
+ * 对齐 FUSE migrate_inline_alloc (powerfs-fuse/src/fuse.rs) 和
+ * Filer handle_migrate_inline_alloc (net_handler.rs).
  *
  * 客户端 write 累计超 max_size×1.5 时调用. Filer 仅分配 (volume_id,
  * needle_id), 不修改 inode 元数据 (保留 inline_data 用于 crash safety).
  *
- * Request TLV:  ShardId(0x70) + Ino(0x07)
- * Response TLV: VolumeId(0x92) + FileKey(0x94) / Name(0x02)=error
+ * Empty-state 内容感知: 客户端在调用前对 snap_data 做内容检测
+ * (magic number + NUL 字节 + printable ratio), 检测为二进制 →
+ * desired_stripe=true, Filer 分配 N 个 (volume_id, needle_id) 走 Stripe
+ * 多卷并行写; 文本 → desired_stripe=false, Filer 分配单个 (Flat).
+ *
+ * Request TLV:  ShardId(0x70) + Ino(0x07) + DesiredMode(0xD6, u8)
+ * Response TLV: Flat → VolumeId(0x92) + FileKey(0x94)
+ *               Stripe → StripeCount(0xA9) + StripeSize(0xA8) +
+ *                        [VolumeId + FileKey] × N
  *
  * crash safety: 若客户端在分配后崩溃, Filer 仍有 inline_data, 文件仍可
  * 作为 Inline 读; 分配的 needle_id 泄漏 (可接受, 同 CREATE 失败).
  */
 int powerfs_net_migrate_inline_alloc(__u64 shard_id, __u64 ino,
-                                     __u64 *volume_id, __u64 *file_key)
+                                     bool desired_stripe,
+                                     struct powerfs_migrate_alloc_result *out)
 {
+    /* Stripe 响应最坏: StripeCount(5) + StripeSize(10) + N×(VolumeId 10 + FileKey 10)
+     * N=8 时约 165B, 256B 留余量; 用 kvmalloc 允许 vmalloc 回退 */
+    const size_t resp_cap = 512;
     __u8 body[64];
     struct powerfs_tlv_enc enc;
-    __u8 resp_body[128];
+    __u8 *resp_body;
     size_t resp_body_len = 0;
     struct powerfs_tlv_dec dec;
-    __u64 v_id = 0, f_key = 0;
+    __u32 stripe_count = 0;
+    __u64 stripe_size = 0;
     int ret;
 
-    if (!volume_id || !file_key)
+    if (!out)
         return -EINVAL;
 
-    *volume_id = 0;
-    *file_key = 0;
+    memset(out, 0, sizeof(*out));
 
+    resp_body = kvmalloc(resp_cap, GFP_KERNEL);
+    if (!resp_body)
+        return -ENOMEM;
+
+    /* 编码请求: ShardId + Ino + DesiredMode (Stripe=1/Flat=0) */
     powerfs_tlv_enc_init(&enc, body, sizeof(body));
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SHARD_ID, shard_id);
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, ino);
+    powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_DESIRED_MODE,
+                       desired_stripe ? 1 : 0);
 
     ret = powerfs_net_send_request(POWERFS_NET_MSG_MIGRATE_INLINE_ALLOC, ino,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    resp_body, sizeof(resp_body),
+                                    resp_body, resp_cap,
                                     NULL, 0, POWERFS_META_TIMEOUT_MS,
                                     &resp_body_len, NULL);
-    if (ret < 0)
+    if (ret < 0) {
+        kvfree(resp_body);
         return ret;
-    if (ret > 0)
+    }
+    if (ret > 0) {
+        kvfree(resp_body);
         return net_status_to_errno((__u16)ret);
+    }
 
-    /* 解析响应: VolumeId + FileKey */
+    /* 先尝试解析 Stripe 响应 (StripeCount 优先, 对齐 Filer 编码顺序) */
     powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
-    if (powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_VOLUME_ID, &v_id) != 0) {
-        pr_warn("powerfs: MIGRATE_INLINE_ALLOC ino=%llu missing VolumeId in response\n",
-                (unsigned long long)ino);
-        return -EPROTO;
-    }
-    if (powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_FILE_KEY, &f_key) != 0) {
-        pr_warn("powerfs: MIGRATE_INLINE_ALLOC ino=%llu missing FileKey in response\n",
-                (unsigned long long)ino);
-        return -EPROTO;
+    if (powerfs_tlv_dec_find_u32(&dec, POWERFS_NET_FLD_STRIPE_COUNT,
+                                 &stripe_count) == 0 && stripe_count > 0) {
+        __u64 *allocs;
+        __u32 got = 0;
+        __u64 vid = 0, nkey = 0;
+        __u8 cur_field;
+        size_t cur_len;
+
+        /* 容量保护: stripe_count 上限 16 (默认配置 4-8) */
+        if (stripe_count > 16) {
+            pr_warn("powerfs: MIGRATE_INLINE_ALLOC ino=%llu unreasonably large stripe_count=%u\n",
+                    (unsigned long long)ino, stripe_count);
+            kvfree(resp_body);
+            return -EPROTO;
+        }
+
+        /* StripeSize (可选, 默认 0 → 后续走 chunk_size 兜底) */
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_STRIPE_SIZE,
+                                 &stripe_size);
+
+        allocs = kmalloc_array(stripe_count, 2 * sizeof(__u64), GFP_KERNEL);
+        if (!allocs) {
+            kvfree(resp_body);
+            return -ENOMEM;
+        }
+
+        /* 从头顺序遍历 TLV: dec_next 读 field+length (推进 5B 头),
+         * 随后 dec->pos 指向 data. 直接读 8B u64 再推进 length.
+         * 收集 (VolumeId, FileKey) 配对, 出现顺序与 Filer 编码一致. */
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        while (!powerfs_tlv_dec_is_empty(&dec) && got < stripe_count) {
+            __u64 u64val = 0;
+            int i;
+
+            ret = powerfs_tlv_dec_next(&dec, &cur_field, &cur_len);
+            if (ret < 0)
+                break;
+
+            /* 仅处理 8 字节 u64 字段 (VolumeId/FileKey) */
+            if (cur_len == 8 &&
+                (cur_field == POWERFS_NET_FLD_VOLUME_ID ||
+                 cur_field == POWERFS_NET_FLD_FILE_KEY)) {
+                for (i = 0; i < 8; i++)
+                    u64val |= (__u64)dec.buf[dec.pos + i] << (i * 8);
+
+                if (cur_field == POWERFS_NET_FLD_VOLUME_ID) {
+                    vid = u64val;
+                } else {
+                    nkey = u64val;
+                    /* 收集一对 (volume_id, needle_id) */
+                    allocs[got * 2] = vid;
+                    allocs[got * 2 + 1] = nkey;
+                    got++;
+                    vid = 0;
+                    nkey = 0;
+                }
+            }
+            /* 推进到下一个字段 (跳过 data 部分) */
+            dec.pos += cur_len;
+        }
+
+        if (got != stripe_count) {
+            pr_warn("powerfs: MIGRATE_INLINE_ALLOC ino=%llu stripe_count=%u but got %u pairs\n",
+                    (unsigned long long)ino, stripe_count, got);
+            kfree(allocs);
+            kvfree(resp_body);
+            return -EPROTO;
+        }
+
+        out->is_stripe = true;
+        out->stripe_size = stripe_size;
+        out->stripe_count = stripe_count;
+        out->alloc_count = got;
+        out->allocs = allocs;
+
+        pr_info("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → Stripe count=%u size=%llu\n",
+                (unsigned long long)ino, stripe_count,
+                (unsigned long long)stripe_size);
+        kvfree(resp_body);
+        return 0;
     }
 
-    *volume_id = v_id;
-    *file_key = f_key;
+    /* Flat 路径: 解析单个 VolumeId + FileKey */
+    {
+        __u64 v_id = 0, f_key = 0;
 
-    pr_info("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → volume_id=%llu file_key=%#llx\n",
-            (unsigned long long)ino, (unsigned long long)v_id,
-            (unsigned long long)f_key);
-    return 0;
+        powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+        if (powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_VOLUME_ID,
+                                      &v_id) != 0) {
+            pr_warn("powerfs: MIGRATE_INLINE_ALLOC ino=%llu missing VolumeId in response\n",
+                    (unsigned long long)ino);
+            kvfree(resp_body);
+            return -EPROTO;
+        }
+        if (powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_FILE_KEY,
+                                      &f_key) != 0) {
+            pr_warn("powerfs: MIGRATE_INLINE_ALLOC ino=%llu missing FileKey in response\n",
+                    (unsigned long long)ino);
+            kvfree(resp_body);
+            return -EPROTO;
+        }
+
+        out->is_stripe = false;
+        out->volume_id = v_id;
+        out->file_key = f_key;
+
+        pr_info("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → Flat volume_id=%llu file_key=%#llx\n",
+                (unsigned long long)ino, (unsigned long long)v_id,
+                (unsigned long long)f_key);
+        kvfree(resp_body);
+        return 0;
+    }
 }
 EXPORT_SYMBOL_GPL(powerfs_net_migrate_inline_alloc);
 

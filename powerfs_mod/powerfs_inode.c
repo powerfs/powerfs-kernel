@@ -246,7 +246,7 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
      * 修复: inode 有 inline_dirty 时, 不从 getattr 覆盖 placement.
      *
      * K2-8: Also protect against Flat→INLINE regression after migration.
-     * After powerfs_migrate_inline_to_flat sets placement=Flat + volume_id +
+     * After powerfs_migrate_inline_out sets placement=Flat + volume_id +
      * file_key, the Filer may still report placement=INLINE (close hasn't
      * synced the new layout yet). Allowing placement to revert to INLINE
      * causes writeback to use the INLINE path (inline_data=NULL → data loss)

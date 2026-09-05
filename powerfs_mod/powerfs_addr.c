@@ -1481,20 +1481,144 @@ int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 }
 
 /*
- * powerfs_migrate_inline_to_flat - K2-7 Inline → Flat 自动迁移
+ * powerfs_detect_content_binary - Empty-state 内容感知检测 (K2-7 扩展)
  *
- * 对齐 FUSE write inline migrate (powerfs-fuse/src/fuse.rs L3446):
+ * 对齐 FUSE powerfs_layout::detect_content_type (content_detector.rs):
+ *   1. 已知 magic number (ELF/PNG/JPEG/GZIP/ZIP/PDF/SQLite 等) → Binary
+ *   2. 任何 NUL 字节 → Binary (文本文件不含 NUL)
+ *   3. printable ASCII 比例 < 90% → Binary, 否则 Text
+ *
+ * 调用场景: Inline→Flat/Stripe 迁移时, 对 snap_data 检测决定目标布局:
+ *   Binary → 请求 Stripe 多卷并行写 (避免后续 Inline→Stripe 二次迁移)
+ *   Text  → Flat 单卷写 (配置/脚本/源码通常较小)
+ *
+ * 返回: true=Binary (建议 Stripe), false=Text (建议 Flat).
+ * 空 data 视为 Text (无二进制证据, 对齐 Rust 实现). */
+static bool powerfs_detect_content_binary(const u8 *data, size_t len)
+{
+    /* INSPECT_LEN: 仅检查前 4KB (覆盖所有常见 magic + 足够 sample) */
+    const size_t INSPECT_LEN = 4096;
+    /* PRINTABLE_RATIO_THRESHOLD = 90% — 用整数比例避免浮点 (内核 FPU 受限) */
+    const unsigned int RATIO_THRESHOLD_PCT = 90;
+    size_t sample_len = len < INSPECT_LEN ? len : INSPECT_LEN;
+    size_t i;
+    size_t printable = 0;
+    size_t threshold;
+
+    if (!data || sample_len == 0)
+        return false;
+
+    /* 1. 已知 magic number — 高信号短列表, 覆盖 PowerFS 常见文件类型. */
+    {
+        static const u8 magic_elf[]       = { 0x7f, 'E', 'L', 'F' };
+        static const u8 magic_pe[]        = { 'M', 'Z' };
+        static const u8 magic_macho[]     = { 0xfe, 0xed, 0xfa };
+        static const u8 magic_macho64[]   = { 0xcf, 0xfa, 0xed, 0xfe };
+        static const u8 magic_png[]       = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+        static const u8 magic_jpeg[]      = { 0xff, 0xd8, 0xff };
+        static const u8 magic_gif87[]     = { 'G', 'I', 'F', '8', '7', 'a' };
+        static const u8 magic_gif89[]     = { 'G', 'I', 'F', '8', '9', 'a' };
+        static const u8 magic_bmp[]       = { 'B', 'M' };
+        static const u8 magic_riff[]      = { 'R', 'I', 'F', 'F' };
+        static const u8 magic_tiff_le[]   = { 'I', 'I', '*', 0x00 };
+        static const u8 magic_tiff_be[]   = { 'M', 'M', 0x00, '*' };
+        static const u8 magic_zip[]       = { 'P', 'K', 0x03, 0x04 };
+        static const u8 magic_zip_empty[] = { 'P', 'K', 0x05, 0x06 };
+        static const u8 magic_gzip[]      = { 0x1f, 0x8b };
+        static const u8 magic_xz[]        = { 0xfd, '7', 'z', 'X', 'Z', 0x00 };
+        static const u8 magic_zstd[]      = { 0x28, 0xb5, 0x2f, 0xfd };
+        static const u8 magic_bzip2[]     = { 'B', 'Z', 'h' };
+        static const u8 magic_lz4[]       = { 0x04, 0x22, 0x4d, 0x18 };
+        static const u8 magic_pdf[]       = { '%', 'P', 'D', 'F', '-' };
+        static const u8 magic_sqlite[]   = { 'S','Q','L','i','t','e',' ','f','o','r','m','a','t',' ','3',0x00 };
+        static const u8 magic_ole2[]      = { 0xd0, 0xcf, 0x11, 0xe0 };
+        static const u8 magic_ogg[]       = { 'O', 'g', 'g', 'S' };
+        static const u8 magic_wasm[]      = { 0x00, 'a', 's', 'm' };
+        static const u8 magic_parquet[]   = { 'P', 'A', 'R', '1' };
+
+        /* 每项 (magic, length) — 用数组避免长 if-else 链 */
+        struct { const u8 *m; size_t n; } tbl[] = {
+            { magic_elf,       sizeof(magic_elf) },
+            { magic_pe,        sizeof(magic_pe) },
+            { magic_macho,     sizeof(magic_macho) },
+            { magic_macho64,   sizeof(magic_macho64) },
+            { magic_png,       sizeof(magic_png) },
+            { magic_jpeg,      sizeof(magic_jpeg) },
+            { magic_gif87,     sizeof(magic_gif87) },
+            { magic_gif89,     sizeof(magic_gif89) },
+            { magic_bmp,       sizeof(magic_bmp) },
+            { magic_riff,      sizeof(magic_riff) },
+            { magic_tiff_le,   sizeof(magic_tiff_le) },
+            { magic_tiff_be,   sizeof(magic_tiff_be) },
+            { magic_zip,       sizeof(magic_zip) },
+            { magic_zip_empty, sizeof(magic_zip_empty) },
+            { magic_gzip,      sizeof(magic_gzip) },
+            { magic_xz,        sizeof(magic_xz) },
+            { magic_zstd,      sizeof(magic_zstd) },
+            { magic_bzip2,     sizeof(magic_bzip2) },
+            { magic_lz4,       sizeof(magic_lz4) },
+            { magic_pdf,       sizeof(magic_pdf) },
+            { magic_sqlite,    sizeof(magic_sqlite) },
+            { magic_ole2,      sizeof(magic_ole2) },
+            { magic_ogg,       sizeof(magic_ogg) },
+            { magic_wasm,      sizeof(magic_wasm) },
+            { magic_parquet,    sizeof(magic_parquet) },
+        };
+        size_t k;
+
+        for (k = 0; k < ARRAY_SIZE(tbl); k++) {
+            if (sample_len >= tbl[k].n &&
+                !memcmp(data, tbl[k].m, tbl[k].n))
+                return true;
+        }
+    }
+
+    /* 2. NUL 字节 — 文本文件从不包含 NUL */
+    for (i = 0; i < sample_len; i++) {
+        if (data[i] == 0)
+            return true;
+    }
+
+    /* 3. printable ASCII 比例. 文本至少 90% 字节是
+     *   (0x20..0x7E) 或 \t \n \r.
+     * 高字节 (UTF-8 多字节序列) 不计入 printable — 二进制文件中
+     * 高字节比例高, 阈值 90% 容忍少量 UTF-8 重音字符. */
+    for (i = 0; i < sample_len; i++) {
+        u8 b = data[i];
+        if ((b >= 0x20 && b <= 0x7E) || b == '\t' || b == '\n' || b == '\r')
+            printable++;
+    }
+    /* printable * 100 >= sample_len * 90, 用整数避免浮点 */
+    threshold = (sample_len * RATIO_THRESHOLD_PCT + 99) / 100;
+    return printable < threshold;
+}
+
+/*
+ * powerfs_migrate_inline_out - K2-7 Inline → Flat/Stripe 自动迁移 (内容感知)
+ *
+ * 对齐 FUSE write inline migrate (powerfs-fuse/src/fuse.rs):
  *   1. 快照 inline_data (持 i_lock)
- *   2. 调 Filer MIGRATE_INLINE_ALLOC 分配 (volume_id, needle_id)
- *   3. 同步写 merged_data 到 Volume Server (WriteNeedle, lease_token=NULL)
- *   4. 持锁切换 inode: placement=Flat + volume_id + file_key + 清 inline_data
+ *   2. 对 snap_data 做内容检测 (magic number / printable ratio)
+ *      - Binary → desired_stripe=true, 请求 Filer 分配 N 个 (volume_id, needle_id)
+ *      - Text   → desired_stripe=false, 请求 Filer 分配 1 个 (Flat 单卷)
+ *   3. 同步写 snap_data 到 Volume Server (WriteNeedle, lease_token=NULL)
+ *      - Flat:   写到 (volume_id, file_key)
+ *      - Stripe: snap_data ≤ 8KB < stripe_size, 写到第一个 stripe unit
+ *               (allocs[0].vid, allocs[0].nid), 后续 writeback 按
+ *               powerfs_locate_chunk 路由到其它 stripe unit
+ *   4. 持锁切换 inode:
+ *      - Flat:   placement=FLAT + volume_id + file_key
+ *      - Stripe: placement=STRIPE + volume_ids[] + stripe_size/count +
+ *               file_key=allocs[0].nid (stripe0 base, fallback 路径用)
+ *   5. re-dirty 所有页 (K2-9: 保证后续 writeback 把 inline_data 外的
+ *      数据也写到 Volume Server)
  *
  * crash safety (对齐 FUSE):
  *   - Filer 分配后不修改 inode, 保留 inline_data
  *   - 客户端崩溃后 Filer 仍有 inline_data, 文件仍可作 Inline 读
  *   - 分配的 needle_id 泄漏 (可接受, 同 CREATE 失败)
  *   - 客户端写 Volume Server 成功后, close 时 UPDATE_INODE_SIZE_CHUNKS
- *     原子完成切换 (清除 inline_data + 设 Flat chunks)
+ *     原子完成切换 (清除 inline_data + 设 Flat/Stripe chunks)
  *
  * 注意: 本函数在 write_end 中调用, 持有 folio lock. 网络 I/O 期间
  *       folio lock 被持有, 但 inline 路径已在 write_end 中做 kvmalloc
@@ -1502,13 +1626,15 @@ int powerfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
  *
  * 返回 0 成功, 负数错误码 (网络错误透传, inline_data 保持原状).
  */
-static int powerfs_migrate_inline_to_flat(struct inode *inode,
-                                          struct powerfs_inode_info *pi)
+static int powerfs_migrate_inline_out(struct inode *inode,
+                                       struct powerfs_inode_info *pi)
 {
     u8 *snap_data = NULL;
     u32 snap_len = 0;
     u64 shard_id, ino = inode->i_ino;
-    u64 volume_id = 0, file_key = 0;
+    struct powerfs_migrate_alloc_result alloc_result = {0};
+    bool desired_stripe;
+    u64 write_vid, write_nid;
     int ret;
 
     /* 1. 持锁快照 inline_data (网络 I/O 不能持 spinlock) */
@@ -1537,13 +1663,17 @@ static int powerfs_migrate_inline_to_flat(struct inode *inode,
     }
     spin_unlock(&pi->i_lock);
 
-    pr_info("powerfs: MIGRATE ino=%lu inline_len=%u → triggering Flat migration\n",
-            ino, snap_len);
+    /* 2. 内容检测: 二进制 → Stripe 多卷, 文本 → Flat 单卷.
+     * snap_data 是 inline_data (≤ 8KB) 的快照, 覆盖首字节 magic. */
+    desired_stripe = powerfs_detect_content_binary(snap_data, snap_len);
+    pr_info("powerfs: MIGRATE ino=%lu inline_len=%u → %s migration (content-aware)\n",
+            ino, snap_len, desired_stripe ? "Stripe" : "Flat");
 
-    /* 2. 调 Filer MIGRATE_INLINE_ALLOC 分配 (volume_id, needle_id).
+    /* 3. 调 Filer MIGRATE_INLINE_ALLOC 分配.
      * shard_id = shard_map_route(parent_ino) — 区间路由, 对齐 FUSE ShardMap. */
     shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
-    ret = powerfs_net_migrate_inline_alloc(shard_id, ino, &volume_id, &file_key);
+    ret = powerfs_net_migrate_inline_alloc(shard_id, ino, desired_stripe,
+                                           &alloc_result);
     if (ret < 0) {
         pr_warn("powerfs: MIGRATE ino=%lu alloc failed: %d, inline buffer unmodified\n",
                 ino, ret);
@@ -1551,37 +1681,101 @@ static int powerfs_migrate_inline_to_flat(struct inode *inode,
         return ret;  /* 透传网络错误 (-ENOTCONN/-ETIMEDOUT 等), 非 EFBIG */
     }
 
-    /* 3. 同步写 snap_data 到 Volume Server (WriteNeedle).
-     * lease_token=NULL: Volume Server 不校验 lease (net_handler.rs L92).
-     * ClientId="kernel-client" 必须发送 (write_needle L5934 注释). */
-    ret = powerfs_net_write_needle(volume_id, file_key, ino,
+    /* 4. 同步写 snap_data 到 Volume Server (WriteNeedle).
+     * lease_token=NULL: Volume Server 不校验 lease.
+     * ClientId="kernel-client" 必须发送 (write_needle 注释).
+     * Stripe 路径: snap_data ≤ 8KB < stripe_size, 写到第一个 stripe unit
+     * (allocs[0]); 后续 writeback 按 powerfs_locate_chunk 路由到其它 unit. */
+    if (alloc_result.is_stripe) {
+        write_vid = alloc_result.allocs[0];      /* 第一个 stripe 的 volume_id */
+        write_nid = alloc_result.allocs[1];      /* 第一个 stripe 的 needle_id (base) */
+    } else {
+        write_vid = alloc_result.volume_id;
+        write_nid = alloc_result.file_key;
+    }
+    ret = powerfs_net_write_needle(write_vid, write_nid, ino,
                                     snap_data, snap_len,
                                     NULL, 0);
     if (ret < 0) {
         pr_warn("powerfs: MIGRATE ino=%lu write_needle failed: %d, needle_id=%#llx leaked\n",
-                ino, ret, (unsigned long long)file_key);
+                ino, ret, (unsigned long long)write_nid);
+        kfree(alloc_result.allocs);
         kfree(snap_data);
         return ret;  /* 透传网络错误, 非 EFBIG */
     }
 
-    pr_info("powerfs: MIGRATE ino=%lu write_needle OK volume_id=%llu needle_id=%#llx size=%u\n",
-            ino, (unsigned long long)volume_id,
-            (unsigned long long)file_key, snap_len);
+    pr_info("powerfs: MIGRATE ino=%lu write_needle OK volume_id=%llu needle_id=%#llx size=%u (%s)\n",
+            ino, (unsigned long long)write_vid,
+            (unsigned long long)write_nid, snap_len,
+            alloc_result.is_stripe ? "Stripe" : "Flat");
 
-    /* 4. 持锁切换 inode 到 Flat: 释放 inline_data, 更新布局元数据.
-     * 后续 write 走 Flat writeback 路径, close 时 UPDATE_INODE_SIZE_CHUNKS
-     * 同步 size+chunks 到 Filer (原子清除 inline_data + 设 Flat chunks). */
-    spin_lock(&pi->i_lock);
-    pi->placement = POWERFS_PLACEMENT_FLAT;
-    pi->volume_id = volume_id;
-    pi->file_key = file_key;
-    pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
-    kfree(pi->inline_data);
-    pi->inline_data = NULL;
-    pi->inline_len = 0;
-    pi->inline_dirty = false;
-    spin_unlock(&pi->i_lock);
+    /* 5. 持锁切换 inode: 释放 inline_data, 更新布局元数据.
+     * 后续 write 走对应 writeback 路径, close 时 UPDATE_INODE_SIZE_CHUNKS
+     * 同步 size+chunks 到 Filer (原子清除 inline_data + 设布局 chunks). */
+    if (alloc_result.is_stripe) {
+        /* Stripe 路径: 预分配 volume_ids 数组 (锁外 GFP_KERNEL 可睡眠) */
+        u64 *new_vids = kmalloc_array(alloc_result.stripe_count,
+                                       sizeof(u64), GFP_KERNEL);
+        u64 *old_vids;
+        u32 i;
 
+        if (!new_vids) {
+            /* 分配失败: 数据已写 Volume Server, 但 inode 没切换.
+             * close 时 UPDATE_INODE_SIZE_CHUNKS 仍带 inline_data → 数据不一致.
+             * 退化为 Flat (用 allocs[0] 作 volume_id/file_key), 至少
+             * 后续 writeback 能找到数据. */
+            pr_warn("powerfs: MIGRATE ino=%lu kmalloc volume_ids failed, fall back to Flat\n",
+                    ino);
+            spin_lock(&pi->i_lock);
+            pi->placement = POWERFS_PLACEMENT_FLAT;
+            pi->volume_id = alloc_result.allocs[0];
+            pi->file_key = alloc_result.allocs[1];
+            pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+            kfree(pi->inline_data);
+            pi->inline_data = NULL;
+            pi->inline_len = 0;
+            pi->inline_dirty = false;
+            spin_unlock(&pi->i_lock);
+            goto migrate_done;
+        }
+        for (i = 0; i < alloc_result.stripe_count; i++)
+            new_vids[i] = alloc_result.allocs[i * 2];
+
+        spin_lock(&pi->i_lock);
+        /* 释放旧的 volume_ids (placement 从 Stripe→Stripe 或 Flat→Stripe 时) */
+        old_vids = pi->volume_ids;
+        pi->volume_ids = new_vids;
+        pi->volume_ids_count = alloc_result.stripe_count;
+        pi->placement = POWERFS_PLACEMENT_STRIPE;
+        pi->stripe_size = alloc_result.stripe_size;
+        pi->stripe_count = alloc_result.stripe_count;
+        /* file_key = 第一个 stripe 的 base needle_id (Stripe fallback 路径用) */
+        pi->file_key = alloc_result.allocs[1];
+        /* volume_id = 第一个 stripe 的 volume_id (兼容旧路径) */
+        pi->volume_id = alloc_result.allocs[0];
+        pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+        kfree(pi->inline_data);
+        pi->inline_data = NULL;
+        pi->inline_len = 0;
+        pi->inline_dirty = false;
+        spin_unlock(&pi->i_lock);
+        kfree(old_vids);
+    } else {
+        /* Flat 路径 (原 K2-7 逻辑) */
+        spin_lock(&pi->i_lock);
+        pi->placement = POWERFS_PLACEMENT_FLAT;
+        pi->volume_id = alloc_result.volume_id;
+        pi->file_key = alloc_result.file_key;
+        pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+        kfree(pi->inline_data);
+        pi->inline_data = NULL;
+        pi->inline_len = 0;
+        pi->inline_dirty = false;
+        spin_unlock(&pi->i_lock);
+    }
+
+migrate_done:
+    kfree(alloc_result.allocs);
     kfree(snap_data);
 
     /* K2-9: After migration, the Volume Server only has inline_data (≤8KB).
@@ -1592,7 +1786,7 @@ static int powerfs_migrate_inline_to_flat(struct inode *inode,
      * their data is lost forever.
      *
      * Fix: mark ALL pages in the page cache as dirty. This ensures the
-     * next FLAT writeback will RMW all pages (not just the currently
+     * next FLAT/STRIPE writeback will RMW all pages (not just the currently
      * dirty ones) and produce a complete needle on the Volume Server.
      * The overhead is one writeback of the full file, which is acceptable
      * since migration is a one-time event.
@@ -1632,7 +1826,8 @@ static int powerfs_migrate_inline_to_flat(struct inode *inode,
         }
     }
 
-    pr_info("powerfs: MIGRATE ino=%lu → Flat done, subsequent writes → Volume Server\n", ino);
+    pr_info("powerfs: MIGRATE ino=%lu → %s done, subsequent writes → Volume Server\n",
+            ino, alloc_result.is_stripe ? "Stripe" : "Flat");
     return 0;
 }
 
@@ -1790,7 +1985,7 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                  * (如 8192) 时, migrate_threshold=8192, inline_len 最大也是 8192,
                  * 条件 inline_len > 8192 永远为 false, 迁移不会触发. */
                 if (pi->inline_len >= migrate_threshold) {
-                    int mig_ret = powerfs_migrate_inline_to_flat(inode, pi);
+                    int mig_ret = powerfs_migrate_inline_out(inode, pi);
                     if (mig_ret < 0) {
                         pr_warn("powerfs: WB_END INLINE ino=%lu migrate failed: %d\n",
                                 inode->i_ino, mig_ret);
