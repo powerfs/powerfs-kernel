@@ -1336,6 +1336,12 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
                         __u64 *volume_id_ret, __u64 *file_key_ret,
                         struct powerfs_file_layout *layout);
 
+/* Optimistic local create: batch inode pre-allocation.
+ * Reuses POWERFS_NET_MSG_ALLOC_INODE_BATCH (0x0033).
+ * Returns 0 on success, fills start_ino/end_ino. */
+int powerfs_net_alloc_inode_batch(__u64 shard_id, __u32 count,
+                                   __u64 *start_ino, __u64 *end_ino);
+
 /* UNLINK / RMDIR */
 int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,
                        bool is_dir);

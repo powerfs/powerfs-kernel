@@ -45,6 +45,7 @@ void powerfs_cap_upgrade_notify_handler(u64 ino, const char *lease_token,
                                         size_t token_len, __u8 new_granted,
                                         __u64 epoch, __u64 sn);
 int cap_open_grant_and_issue(struct powerfs_inode_info *pi, bool is_write_open);
+int cap_open_grant_local(struct powerfs_inode_info *pi, bool is_write);
 int cap_send_release(struct powerfs_inode_info *pi, struct powerfs_cap *cap);
 
 /* ---- dentry.c ---- */

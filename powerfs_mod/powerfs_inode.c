@@ -1057,6 +1057,13 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->i_snap_caps = 0;
     pi->i_head_snapc_epoch = 0;
 
+    /* Optimistic local create init */
+    pi->local_cap_granted = false;
+    INIT_LIST_HEAD(&pi->dirty_create_node);
+    spin_lock_init(&pi->dirty_creates_lock);
+    INIT_LIST_HEAD(&pi->dirty_creates);
+    pi->dirty_create_count = 0;
+
     /* Cap 引用计数清零 */
     pi->i_pin_ref = 0;
     pi->i_rd_ref = 0;
@@ -1889,8 +1896,11 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
      * powerfs_net 同步: truncate/fchmod/chown 等必须持久化到 Filer,
      * 否则 remount 后属性丢失. fsync 路径已单独同步 size, 这里覆盖
      * setattr 回调路径 (truncate/ftruncate/chmod/chown/utimes).
+     *
+     * Optimistic local create: skip setattr RPC for locally-created files
+     * (Filer doesn't know about them yet; metadata synced in Phase 2 flush).
      */
-    if (powerfs_net_is_connected()) {
+    if (powerfs_net_is_connected() && !pi->local_cap_granted) {
         __u32 valid = 0;
         __u32 m = 0, u = 0, g = 0;
         __u64 sz = 0, mt = 0, at = 0;

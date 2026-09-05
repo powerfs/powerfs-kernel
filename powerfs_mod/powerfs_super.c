@@ -1574,6 +1574,27 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
              sbi->master_addr, (unsigned)sbi->master_port,
              (unsigned)sbi->shard_count);
 
+    /* Optimistic local create: allocate per-shard inode pools.
+     * Lazily refilled on first create via AllocInodeBatch RPC. */
+    sbi->num_inode_pools = sbi->shard_count;
+    sbi->inode_pools = kcalloc(sbi->num_inode_pools,
+                                sizeof(struct powerfs_inode_pool),
+                                GFP_KERNEL);
+    if (!sbi->inode_pools) {
+        pr_err("powerfs: failed to allocate inode pools\n");
+        kfree(sbi);
+        return -ENOMEM;
+    }
+    {
+        int i;
+        for (i = 0; i < sbi->num_inode_pools; i++) {
+            spin_lock_init(&sbi->inode_pools[i].lock);
+            sbi->inode_pools[i].next_ino = 0;
+            sbi->inode_pools[i].end_ino = 0;
+            sbi->inode_pools[i].remaining = 0;
+        }
+    }
+
     /* 验证并转换 write_batch_kb → write_batch_pages.
      * 范围: 4KB (1 page) ~ 64MB (stripe size, 16384 pages).
      * 越界值 clamp 到合法范围并告警, 不拒绝挂载 (避免配置笔误导致不可用). */
@@ -2205,6 +2226,7 @@ void powerfs_kill_sb_super(struct super_block *sb)
             kfree(sbi->client);
             sbi->client = NULL;
         }
+        kfree(sbi->inode_pools);
         kfree(sbi);
         sb->s_fs_info = NULL;
     }

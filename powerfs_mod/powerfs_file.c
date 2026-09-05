@@ -1226,11 +1226,17 @@ int powerfs_file_open(struct inode *inode, struct file *file)
     unsigned int got = POWERFS_CAP_PIN;
     bool is_write_open = !!(file->f_mode & FMODE_WRITE);
 
-    /* §13.3: 先从 Filer 获取授权 CapOpenGrant (永不阻塞),
-     * 根据响应挂载 cap + 更新 issued 位. 网络失败自动降级 (不阻断 open).
-     * 注意: __block_on 在此处调, 早于 cap_get_refs 拿 refcount, 避免
-     * refcount 先占有后授权位不足导致 try_get_caps 循环等. */
-    cap_open_grant_and_issue(pi, is_write_open);
+    /* Optimistic local create: skip cap_open_grant RPC if the inode was
+     * created locally. We call cap_open_grant_local instead which issues
+     * caps without any network round-trip. The token stays empty, so
+     * cap_send_release on close will also be a no-op. */
+    if (pi->local_cap_granted) {
+        cap_open_grant_local(pi, is_write_open);
+    } else {
+        /* §13.3: 先从 Filer 获取授权 CapOpenGrant (永不阻塞),
+         * 根据响应挂载 cap + 更新 issued 位. 网络失败自动降级 (不阻断 open). */
+        cap_open_grant_and_issue(pi, is_write_open);
+    }
 
     spin_lock(&pi->i_lock);
 

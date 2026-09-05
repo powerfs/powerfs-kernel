@@ -533,6 +533,36 @@ int cap_open_grant_and_issue(struct powerfs_inode_info *pi, bool is_write_open)
     return ret;
 }
 
+/* Optimistic local create: grant caps locally without any network RPC.
+ * Creates i_auth_cap if needed, issues the requested cap bits, and leaves
+ * the token empty so cap_send_release will be a no-op on close.
+ * This is the local equivalent of cap_open_grant_and_issue. */
+int cap_open_grant_local(struct powerfs_inode_info *pi, bool is_write)
+{
+    struct powerfs_cap *cap;
+    unsigned int k_issued;
+
+    spin_lock(&pi->i_lock);
+    cap = pi->i_auth_cap;
+    if (!cap) {
+        cap = add_cap_for_inode_locked(pi, 0);
+        if (!cap) {
+            spin_unlock(&pi->i_lock);
+            return -ENOMEM;
+        }
+    }
+    k_issued = is_write ? (POWERFS_CAP_AUTH_EXCL | POWERFS_CAP_FILE_WR |
+                           POWERFS_CAP_FILE_EXCL)
+                        : (POWERFS_CAP_AUTH_SHARED | POWERFS_CAP_FILE_SHARED |
+                           POWERFS_CAP_FILE_CACHE);
+    powerfs_cap_issue(pi, cap, k_issued);
+    cap->expire_jiffies = jiffies + POWERFS_LEASE_DURATION;
+    cap->content_size = (u64)i_size_read(&pi->netfs.inode);
+    /* token stays "" → cap_send_release no-op */
+    spin_unlock(&pi->i_lock);
+    return 0;
+}
+
 /* §13.4.2 CapRecallAck 包装: 把 cap 的 token + inode + client_id 组装后 ACK 到 Filer.
  * 由 powerfs_cap_revoke() 在 flush 完后调用 (revoke 期间需 ACK).
  * 调用方**不持 pi->i_lock** (RPC 可能阻塞). */

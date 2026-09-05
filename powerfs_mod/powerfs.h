@@ -637,6 +637,13 @@ struct powerfs_inode_info {
      * 落后于 dir_fetch_epoch 的 active 条目说明 Filer 不再返回, 标记 deleted. */
     u64 dir_fetch_epoch;
 
+    /* === Optimistic local create: dirty creates list (Phase 2) ===
+     * List of locally-created inodes pending flush to Filer.
+     * Protected by dirty_creates_lock. Only directory inodes use this. */
+    spinlock_t dirty_creates_lock;
+    struct list_head dirty_creates;
+    int dirty_create_count;
+
     /* === 对齐 : 未 commit 的 async dirop / iop 链表 (Async DIROPS 核心) === */
     struct list_head i_unsafe_dirops;    /* uncommitted mds dir op 链表 */
     struct list_head i_unsafe_iops;      /* uncommitted mds inode op 链表 */
@@ -664,6 +671,16 @@ struct powerfs_inode_info {
 
     /* shutdown 标志 (参考 powerfs_inode_is_shutdown) */
     bool shutdown;
+
+    /* === Optimistic local create ===
+     * local_cap_granted: set true when inode was created locally (fast path).
+     *   - powerfs_file_open skips cap_open_grant_and_issue RPC
+     *   - cap_send_release sees empty token → no release RPC
+     *   - Cleared after the create is flushed to Filer (Phase 2)
+     * dirty_create_node: links this inode into parent dir's dirty_creates list
+     *   for background batch flush (Phase 2). */
+    bool local_cap_granted;
+    struct list_head dirty_create_node;
 
     /* === xattr 存储 (simple_xattr in-memory) ===
      * 使用内核 simple_xattr API, xattrs 存储在内存中 (不持久化到 Filer).
@@ -1001,6 +1018,20 @@ struct powerfs_sb_info {
 
     /* P3-5: /proc/powerfs/<sb_id>/ 入口 */
     struct proc_dir_entry *proc_dir;
+
+    /* === Optimistic local create: inode pre-allocation pool ===
+     * Per-shard pool of pre-allocated inode numbers.
+     * One AllocInodeBatch RPC (count=64) amortizes over 64 creates.
+     * Lock ordering: pool->lock is never held with inode locks. */
+    struct powerfs_inode_pool {
+        spinlock_t lock;
+        u64 next_ino;       /* next available inode */
+        u64 end_ino;         /* end of pre-allocated range */
+        u32 remaining;       /* count remaining */
+    } *inode_pools;
+    int num_inode_pools;
+#define POWERFS_INODE_POOL_BATCH 64
+#define POWERFS_INODE_POOL_INVALID 0  /* 0 is never a valid inode */
 };
 
 #define POWERFS_SB_INFO(sb) ((struct powerfs_sb_info *)(sb)->s_fs_info)

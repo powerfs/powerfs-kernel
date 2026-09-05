@@ -609,6 +609,58 @@ out:
 }
 
 /**
+ * powerfs_net_alloc_inode_batch - Pre-allocate a batch of inode numbers.
+ *
+ * Reuses POWERFS_NET_MSG_ALLOC_INODE_BATCH (0x0033), same protocol as
+ * the two-phase mkdir path. Returns a [start, end] range of inode numbers.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+int powerfs_net_alloc_inode_batch(__u64 shard_id, __u32 count,
+                                   __u64 *start_ino, __u64 *end_ino)
+{
+    __u8 body[256];
+    struct powerfs_tlv_enc enc;
+    __u8 resp[128];
+    size_t resp_len = 0;
+    int ret;
+
+    powerfs_tlv_enc_init(&enc, body, sizeof(body));
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SHARD_ID, shard_id);
+    powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_COUNT, count);
+    powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_CLIENT_ID,
+                           "powerfs-kernel", 15);
+
+    ret = powerfs_net_send_request_shard(
+                POWERFS_NET_MSG_ALLOC_INODE_BATCH, shard_id,
+                body, powerfs_tlv_enc_len(&enc),
+                NULL, 0,
+                resp, sizeof(resp),
+                NULL, 0, POWERFS_META_TIMEOUT_MS,
+                &resp_len, NULL);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return net_status_to_errno((__u16)ret);
+
+    if (resp_len > 0) {
+        struct powerfs_tlv_dec dec;
+        powerfs_tlv_dec_init(&dec, resp, resp_len);
+        if (powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_START_INODE,
+                                      start_ino) != 0 || *start_ino == 0)
+            return -EREMOTEIO;
+        if (end_ino) {
+            powerfs_tlv_dec_init(&dec, resp, resp_len);
+            powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_END_INODE, end_ino);
+        }
+    } else {
+        return -EREMOTEIO;
+    }
+
+    return 0;
+}
+
+/**
  * powerfs_net_create - 创建文件或目录
  *
  * 响应中包含 Filer 自分配的 volume_id + needle_id (file_key),
@@ -809,15 +861,6 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
     powerfs_tlv_enc_init(&enc, body, sizeof(body));
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_PARENT_INO, dir_ino);
     powerfs_tlv_enc_string(&enc, POWERFS_NET_FLD_NAME, name, name_len);
-    /*
-     * 编码必须与 Filer 解码匹配:
-     *   - CREATE: Filer handle_create 用 next_u32 (匹配 FUSE encode_create_req)
-     *   - MKDIR:   Filer handle_mkdir  用 next_u64 (匹配 FUSE encode_mkdir_req)
-     * 若内核 MKDIR 用 u32 编码, Filer next_u64 解码失败 (期望 8 字节, 实际 4),
-     * 游标不前进, 后续字段全部错位, mode 回退默认 0o755 (不含 S_IFDIR),
-     * 导致 readdir 返回的目录项 d_type=DT_UNKNOWN, ls 显示 "?rwxr-xr-x".
-     * 修复: MKDIR 路径用 u64 编码 mode/uid/gid.
-     */
     if (is_dir) {
         powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_MODE, (__u64)mode);
         powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_UID, (__u64)uid);
@@ -829,12 +872,21 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
     }
     powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_IS_DIR, is_dir ? 1 : 0);
 
-    ret = powerfs_net_send_request(msg_type, dir_ino,
-                                    body, powerfs_tlv_enc_len(&enc),
-                                    NULL, 0,
-                                    resp_body, POWERFS_NET_RESP_INLINE_CAP,
-                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
-                                    &resp_body_len, NULL);
+    {
+        u64 _ts0 = ktime_get_ns();
+        ret = powerfs_net_send_request(msg_type, dir_ino,
+                                        body, powerfs_tlv_enc_len(&enc),
+                                        NULL, 0,
+                                        resp_body, POWERFS_NET_RESP_INLINE_CAP,
+                                        NULL, 0, POWERFS_META_TIMEOUT_MS,
+                                        &resp_body_len, NULL);
+        if (!is_dir) {
+            u64 _ms = (ktime_get_ns() - _ts0) / 1000000;
+            if (_ms > 2)
+                pr_info("CREATE_RPC: send_request took %llums (msg=0x%x ino=%llu)\n",
+                        _ms, msg_type, dir_ino);
+        }
+    }
     if (ret < 0)
         goto out;
     if (ret > 0) {
