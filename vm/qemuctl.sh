@@ -65,6 +65,10 @@ QEMU_DISK="${OUTPUT_DIR}/qemu_disk.img"
 QEMU_LOG="${OUTPUT_DIR}/qemu.log"
 QEMU_PID_FILE="${OUTPUT_DIR}/qemu.pid"
 
+# 载入统一地址/集群配置 (single source of truth: master_addr/port/shard_count/
+# transport/证书路径). 可用同名环境变量覆盖.
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
+
 # SSH 配置
 SSH_PORT="2223"
 SSH_USER="root"
@@ -87,10 +91,11 @@ POWERFS_MASTER_PORT="${POWERFS_MASTER_PORT:-9334}"
 #   - 服务地址改为 172.30.0.1 (宿主机 powerfs-br0 IP)
 USE_RDMA="${USE_RDMA:-0}"
 
-# RDMA 模式下的 Master 地址 (host 网络, 单节点)
+# RDMA 模式下的 Master 地址 (host 网络, 单节点).
+# 优先使用统一配置 (share/powerfs.env) / 环境变量; 未设置时才回退旧默认值.
 if [ "${USE_RDMA}" = "1" ]; then
-    POWERFS_MASTER_ADDR="172.30.0.1"
-    POWERFS_MASTER_PORT="9334"
+    POWERFS_MASTER_ADDR="${POWERFS_MASTER_ADDR:-172.30.0.1}"
+    POWERFS_MASTER_PORT="${POWERFS_MASTER_PORT:-9334}"
 fi
 
 # VFIO RDMA 直通开关 (用于内核态 powerfs.ko 的 RDMA 传输测试).
@@ -986,7 +991,7 @@ cmd_mount() {
     local cert_ca="${POWERFS_CA_CRT:-/etc/powerfs/ca.crt}"
     local cert_crt="${POWERFS_CLIENT_CRT:-/etc/powerfs/kernel-client-1.crt}"
     local cert_key="${POWERFS_CLIENT_KEY:-/etc/powerfs/kernel-client-1.key}"
-    local mount_opts="master_addr=${POWERFS_MASTER_ADDR},master_port=${POWERFS_MASTER_PORT},shard_count=3,ca_crt=${cert_ca},client_crt=${cert_crt},client_key=${cert_key}"
+    local mount_opts="master_addr=${POWERFS_MASTER_ADDR},master_port=${POWERFS_MASTER_PORT},shard_count=${POWERFS_SHARD_COUNT:-3},ca_crt=${cert_ca},client_crt=${cert_crt},client_key=${cert_key}"
 
     if [ "${use_rdma}" = "1" ]; then
         mount_opts="${mount_opts},transport=rdma"

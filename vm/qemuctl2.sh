@@ -61,6 +61,10 @@ QEMU_DISK_BASE="${OUTPUT_DIR}/qemu_disk.img"
 SHARE_DIR="${POWERFS_ROOT}/kernel/vm/share"
 SHARE_TAG_BASE="hostshare"
 
+# 载入统一地址/集群配置 (single source of truth: master_addr/port/shard_count/
+# transport/证书路径). 可用同名环境变量覆盖.
+[ -f "${SHARE_DIR}/powerfs.env" ] && . "${SHARE_DIR}/powerfs.env"
+
 # 确认内核 + initramfs 存在
 if [ ! -f "${KERNEL_IMAGE}" ] || [ ! -f "${INITRAMFS}" ]; then
     echo "[ERROR] Missing ${KERNEL_IMAGE} or ${INITRAMFS} — run: ./qemuctl.sh build-all"
@@ -841,9 +845,9 @@ else
   insmod /powerfs.ko 2>/dev/null
 fi
 timeout 35 mount -t powerfs \
-  -o master_addr=172.30.0.1,master_port=9334,shard_count=1 \
+  -o master_addr=${POWERFS_MASTER_ADDR},master_port=${POWERFS_MASTER_PORT},shard_count=${POWERFS_SHARD_COUNT} \
   -o ca_crt=\${CA},client_crt=\${CRT},client_key=\${KEY} \
-  -o transport=rdma powerfs /mnt/powerfs
+  -o transport=${POWERFS_TRANSPORT} powerfs /mnt/powerfs
 RC=\$?
 echo MOUNT_RC=\${RC}
 # RELIABLE check: /proc/mounts powerfs line with transport=rdma must exist

@@ -11,6 +11,10 @@ INITRAMFS_DIR="${OUTPUT_DIR}/initramfs"
 INITRAMFS_IMG="${OUTPUT_DIR}/initramfs.cpio.gz"
 POWERFS_MOD_DIR="${SCRIPT_DIR}/../powerfs_mod"
 
+# 载入统一地址/集群配置 (single source of truth: share/powerfs.env).
+# cmdline 显式参数仍优先; env 仅作为缺省值 (下方 [ -z ] 判断会保留).
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
+
 echo "=== PowerFS initramfs 构建 ==="
 
 # 清理旧的 initramfs (使用 sudo, 因上次构建可能留下 root 所有权文件)

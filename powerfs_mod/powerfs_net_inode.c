@@ -378,7 +378,7 @@ void parse_file_layout(struct powerfs_tlv_dec *dec,
                     memcpy(layout->inline_data, raw + 5, data_len);
                     layout->inline_len = data_len;
                     layout->has_inline_data = true;
-                    pr_info("powerfs: parse_file_layout ChunkLayout InlineData len=%u\n",
+                    pr_debug("powerfs: parse_file_layout ChunkLayout InlineData len=%u\n",
                             data_len);
                 } else {
                     pr_warn("powerfs: ChunkLayout InlineData kmalloc %u failed\n",
@@ -422,7 +422,7 @@ void parse_file_layout(struct powerfs_tlv_dec *dec,
                     layout->ec_chunks = chunks;
                     layout->ec_chunk_count = count;
                     layout->has_ec_chunks = true;
-                    pr_info("powerfs: parse_file_layout ChunkLayout PER_CHUNK count=%u\n",
+                    pr_debug("powerfs: parse_file_layout ChunkLayout PER_CHUNK count=%u\n",
                             count);
                 } else {
                     pr_warn("powerfs: ChunkLayout PER_CHUNK kmalloc %u failed\n",
@@ -1222,7 +1222,7 @@ int powerfs_net_migrate_inline_alloc(__u64 shard_id, __u64 ino,
         out->alloc_count = got;
         out->allocs = allocs;
 
-        pr_info("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → Stripe count=%u size=%llu\n",
+        pr_debug("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → Stripe count=%u size=%llu\n",
                 (unsigned long long)ino, stripe_count,
                 (unsigned long long)stripe_size);
         kvfree(resp_body);
@@ -1253,7 +1253,7 @@ int powerfs_net_migrate_inline_alloc(__u64 shard_id, __u64 ino,
         out->volume_id = v_id;
         out->file_key = f_key;
 
-        pr_info("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → Flat volume_id=%llu file_key=%#llx\n",
+        pr_debug("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → Flat volume_id=%llu file_key=%#llx\n",
                 (unsigned long long)ino, (unsigned long long)v_id,
                 (unsigned long long)f_key);
         kvfree(resp_body);

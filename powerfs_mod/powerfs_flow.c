@@ -126,7 +126,7 @@ int powerfs_flow_admit_wait(enum powerfs_flow_op op, int timeout_ms)
     /* 排队路径: 在 admit_wq 上等待, record_complete 唤醒 */
     global_active = atomic_read(&g_flow.global.active_reqs);
     atomic64_inc(&g_flow.global.queue_count);
-    pr_info_ratelimited("powerfs: flow queue op=%d active=%d max=%u\n",
+    pr_debug_ratelimited("powerfs: flow queue op=%d active=%d max=%u\n",
                         op, global_active, g_flow.max_active_global);
 
     ret = wait_event_timeout(g_flow.admit_wq,
@@ -145,10 +145,71 @@ int powerfs_flow_admit_wait(enum powerfs_flow_op op, int timeout_ms)
     }
 
     atomic64_inc(&g_flow.global.reject_count);
-    pr_info_ratelimited("powerfs: flow reject op=%d timeout=%dms active=%d\n",
+    pr_debug_ratelimited("powerfs: flow reject op=%d timeout=%dms active=%d\n",
                         op, timeout_ms,
                         atomic_read(&g_flow.global.active_reqs));
     return -EBUSY;  /* 超时仍未准入 */
+}
+
+/*
+ * powerfs_flow_wait_wr_slot - writeback 数据写的 per-conn 在途阻塞限流.
+ *
+ * 背景: writeback 的 async WriteNeedle/WriteNeedleBlob 路径只调
+ * powerfs_flow_record_start/complete (统计在途数), 从不调 admit 准入,
+ * 顺序大块写 (如 fio/ior 100+ 个 1MB chunk) 会在瞬间把整条 volume 连接的
+ * 在途请求打到服务端流控硬阈值. 服务端 flow_policy 在 conn_active >=
+ * max_active_per_conn (慢连接减半) 时直接 Reject(ConnFull) 并回
+ * STATUS_ERR_SERVER_ERROR, 内核 write_cb 不重试 → 这些 chunk 静默丢失,
+ * 重读校验读到 0/旧数据 (P0-1 ior-hard-write BW=0 的直接表现之一).
+ *
+ * 修复: async 写提交前在进程上下文 (writeback workqueue, 可睡眠) 阻塞等待,
+ * 把单连接在途写数限制在硬阈值以下. 上限取 max_active_per_conn/2, 与服务端
+ * "慢连接 effective=max/2" 对齐并给同连接的 lease/元数据请求留出余量, 保证
+ * 任何负载下都不触发服务端 ConnFull reject. record_complete 会 wake_up
+ * admit_wq, 写完成即放行排队者.
+ *
+ * 返回 0: 获得槽位 (调用方接着 record_start + do_send);
+ *       -EBUSY: 超时 (极端情况, 调用方按提交失败处理, 页映射错误而非丢数据).
+ */
+int powerfs_flow_wait_wr_slot(int flow_idx, int timeout_ms)
+{
+    struct powerfs_flow_conn_stats *stats;
+    int cap;
+    long ret;
+
+    stats = flow_get_stats(flow_idx);
+    if (!stats)
+        return 0;  /* 无统计 (兼容/未初始化): 不限流, 安全默认 */
+
+    /* 上限取 max_active_per_conn/4. 服务端流控在连接被标记 SLOW 时
+     * effective_per_conn = max/2 (=32 @ max=64), 且 conn_active >= 该值即
+     * Reject(slow_conn). 客户端 active 与服务端 active 计数存在口径/时序差,
+     * 同连接还混有 lease/元数据请求, 故取服务端最严阈值的一半 (16) 留足余量,
+     * 保证任何负载 (含 slow) 下服务端 active 都到不了 reject 临界点.
+     * 16 个 1MB 在途写对 RDMA 带宽已绰绰有余 (远未达网络/磁盘上限). */
+    cap = g_flow.max_active_per_conn / 4;
+    if (cap < 1)
+        cap = 1;
+
+    /* 快速路径 */
+    if (atomic_read(&stats->active_reqs) < cap)
+        return 0;
+
+    atomic64_inc(&g_flow.global.queue_count);
+    pr_debug_ratelimited("powerfs: flow wr-slot wait conn=%d active=%d cap=%d\n",
+                        flow_idx, atomic_read(&stats->active_reqs), cap);
+
+    ret = wait_event_timeout(g_flow.admit_wq,
+        atomic_read(&stats->active_reqs) < cap,
+        msecs_to_jiffies(timeout_ms));
+
+    if (ret > 0 || atomic_read(&stats->active_reqs) < cap) {
+        atomic64_inc(&g_flow.global.queue_wakeups);
+        return 0;
+    }
+
+    atomic64_inc(&g_flow.global.reject_count);
+    return -EBUSY;
 }
 
 int powerfs_flow_init(void)

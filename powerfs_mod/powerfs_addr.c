@@ -736,7 +736,7 @@ static int powerfs_wb_write_cb(struct powerfs_request *req)
     struct inode *inode = wpw->inode;
     int err = 0;
 
-    pr_info("powerfs: WB_WRITE_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d)\n",
+    pr_debug("powerfs: WB_WRITE_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d)\n",
             inode->i_ino, (unsigned long long)ctx->needle_id,
             req->error, req->resp_status,
             ctx->needle_start_idx, ctx->needle_end_idx);
@@ -802,7 +802,7 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
     __u64 group_needle_id = 0;
     __u64 group_volume_id = 0;
 
-    pr_info("powerfs: WP_START ino=%lu npages=%d\n",
+    pr_debug("powerfs: WP_START ino=%lu npages=%d\n",
             inode->i_ino, wpw->num_pages);
 
     if (powerfs_net_is_stopping())
@@ -1121,7 +1121,7 @@ int powerfs_writepages(struct address_space *mapping,
     int batch_pages = sbi->write_batch_pages;
     int ret = 0;
 
-    pr_info("powerfs: WPAGES ino=%lu range=%llu-%llu nr_to_write=%ld sync_mode=%d placement=%u\n",
+    pr_debug("powerfs: WPAGES ino=%lu range=%llu-%llu nr_to_write=%ld sync_mode=%d placement=%u\n",
             inode->i_ino, wbc->range_start, wbc->range_end, wbc->nr_to_write,
             wbc->sync_mode, pi->placement);
 
@@ -1233,7 +1233,7 @@ int powerfs_writepages(struct address_space *mapping,
                                       / POWERFS_CHUNK_SIZE;
                 if (cur_needle_idx != prev_needle_idx) {
                     /* needle 边界变化: 提交当前 batch */
-                    pr_info("powerfs: WPAGES SUBMIT ino=%lu batch npages=%d needle_idx=%llu offset=%lld-%lld\n",
+                    pr_debug("powerfs: WPAGES SUBMIT ino=%lu batch npages=%d needle_idx=%llu offset=%lld-%lld\n",
                             inode->i_ino, batch->num_pages, prev_needle_idx,
                             batch->offsets[0],
                             batch->offsets[batch->num_pages - 1] + batch->counts[batch->num_pages - 1]);
@@ -1288,7 +1288,7 @@ int powerfs_writepages(struct address_space *mapping,
 
             /* batch 满了，提交到 workqueue */
             if (batch->num_pages >= batch_pages) {
-                pr_info("powerfs: WPAGES FULL ino=%lu batch npages=%d offset=%lld-%lld\n",
+                pr_debug("powerfs: WPAGES FULL ino=%lu batch npages=%d offset=%lld-%lld\n",
                         inode->i_ino, batch->num_pages,
                         batch->offsets[0],
                         batch->offsets[batch->num_pages - 1] + batch->counts[batch->num_pages - 1]);
@@ -1666,7 +1666,7 @@ static int powerfs_migrate_inline_out(struct inode *inode,
     /* 2. 内容检测: 二进制 → Stripe 多卷, 文本 → Flat 单卷.
      * snap_data 是 inline_data (≤ 8KB) 的快照, 覆盖首字节 magic. */
     desired_stripe = powerfs_detect_content_binary(snap_data, snap_len);
-    pr_info("powerfs: MIGRATE ino=%lu inline_len=%u → %s migration (content-aware)\n",
+    pr_debug("powerfs: MIGRATE ino=%lu inline_len=%u → %s migration (content-aware)\n",
             ino, snap_len, desired_stripe ? "Stripe" : "Flat");
 
     /* 3. 调 Filer MIGRATE_INLINE_ALLOC 分配.
@@ -1704,7 +1704,7 @@ static int powerfs_migrate_inline_out(struct inode *inode,
         return ret;  /* 透传网络错误, 非 EFBIG */
     }
 
-    pr_info("powerfs: MIGRATE ino=%lu write_needle OK volume_id=%llu needle_id=%#llx size=%u (%s)\n",
+    pr_debug("powerfs: MIGRATE ino=%lu write_needle OK volume_id=%llu needle_id=%#llx size=%u (%s)\n",
             ino, (unsigned long long)write_vid,
             (unsigned long long)write_nid, snap_len,
             alloc_result.is_stripe ? "Stripe" : "Flat");
@@ -1713,24 +1713,36 @@ static int powerfs_migrate_inline_out(struct inode *inode,
      * 后续 write 走对应 writeback 路径, close 时 UPDATE_INODE_SIZE_CHUNKS
      * 同步 size+chunks 到 Filer (原子清除 inline_data + 设布局 chunks). */
     if (alloc_result.is_stripe) {
-        /* Stripe 路径: 预分配 volume_ids 数组 (锁外 GFP_KERNEL 可睡眠) */
+        /* Stripe 路径: 预分配 volume_ids + stripe_needle_keys 数组 (锁外 GFP_KERNEL 可睡眠).
+         * Filer 为每个 stripe 独立分配 (volume_id, needle_id), 两者都需保存:
+         *   volume_ids[i]        = allocs[2i]
+         *   stripe_needle_keys[i]= allocs[2i+1] (per-stripe base needle) */
         u64 *new_vids = kmalloc_array(alloc_result.stripe_count,
                                        sizeof(u64), GFP_KERNEL);
-        u64 *old_vids;
+        u64 *new_keys = kmalloc_array(alloc_result.stripe_count,
+                                       sizeof(u64), GFP_KERNEL);
+        u64 *old_vids, *old_keys;
         u32 i;
 
-        if (!new_vids) {
+        if (!new_vids || !new_keys) {
             /* 分配失败: 数据已写 Volume Server, 但 inode 没切换.
              * close 时 UPDATE_INODE_SIZE_CHUNKS 仍带 inline_data → 数据不一致.
              * 退化为 Flat (用 allocs[0] 作 volume_id/file_key), 至少
              * 后续 writeback 能找到数据. */
-            pr_warn("powerfs: MIGRATE ino=%lu kmalloc volume_ids failed, fall back to Flat\n",
+            pr_warn("powerfs: MIGRATE ino=%lu kmalloc stripe arrays failed, fall back to Flat\n",
                     ino);
+            kfree(new_vids);
+            kfree(new_keys);
             spin_lock(&pi->i_lock);
             pi->placement = POWERFS_PLACEMENT_FLAT;
             pi->volume_id = alloc_result.allocs[0];
             pi->file_key = alloc_result.allocs[1];
             pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+            kfree(pi->volume_ids);
+            pi->volume_ids = NULL;
+            pi->volume_ids_count = 0;
+            kfree(pi->stripe_needle_keys);
+            pi->stripe_needle_keys = NULL;
             kfree(pi->inline_data);
             pi->inline_data = NULL;
             pi->inline_len = 0;
@@ -1738,20 +1750,23 @@ static int powerfs_migrate_inline_out(struct inode *inode,
             spin_unlock(&pi->i_lock);
             goto migrate_done;
         }
-        for (i = 0; i < alloc_result.stripe_count; i++)
+        for (i = 0; i < alloc_result.stripe_count; i++) {
             new_vids[i] = alloc_result.allocs[i * 2];
+            new_keys[i] = alloc_result.allocs[i * 2 + 1];
+        }
 
         spin_lock(&pi->i_lock);
-        /* 释放旧的 volume_ids (placement 从 Stripe→Stripe 或 Flat→Stripe 时) */
+        /* 释放旧数组 (placement 切换场景) */
         old_vids = pi->volume_ids;
+        old_keys = pi->stripe_needle_keys;
         pi->volume_ids = new_vids;
+        pi->stripe_needle_keys = new_keys;
         pi->volume_ids_count = alloc_result.stripe_count;
         pi->placement = POWERFS_PLACEMENT_STRIPE;
         pi->stripe_size = alloc_result.stripe_size;
         pi->stripe_count = alloc_result.stripe_count;
-        /* file_key = 第一个 stripe 的 base needle_id (Stripe fallback 路径用) */
+        /* file_key/volume_id = 第一个 stripe (兼容 Flat fallback 路径) */
         pi->file_key = alloc_result.allocs[1];
-        /* volume_id = 第一个 stripe 的 volume_id (兼容旧路径) */
         pi->volume_id = alloc_result.allocs[0];
         pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
         kfree(pi->inline_data);
@@ -1760,6 +1775,7 @@ static int powerfs_migrate_inline_out(struct inode *inode,
         pi->inline_dirty = false;
         spin_unlock(&pi->i_lock);
         kfree(old_vids);
+        kfree(old_keys);
     } else {
         /* Flat 路径 (原 K2-7 逻辑) */
         spin_lock(&pi->i_lock);
@@ -1821,12 +1837,12 @@ migrate_done:
             folio_batch_init(&fbatch);
         }
         if (re_dirty_count > 0) {
-            pr_info("powerfs: MIGRATE ino=%lu re-dirtied %d clean pages (data beyond inline_data not on server)\n",
+            pr_debug("powerfs: MIGRATE ino=%lu re-dirtied %d clean pages (data beyond inline_data not on server)\n",
                     ino, re_dirty_count);
         }
     }
 
-    pr_info("powerfs: MIGRATE ino=%lu → %s done, subsequent writes → Volume Server\n",
+    pr_debug("powerfs: MIGRATE ino=%lu → %s done, subsequent writes → Volume Server\n",
             ino, alloc_result.is_stripe ? "Stripe" : "Flat");
     return 0;
 }
@@ -1902,7 +1918,7 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
 
             /* K2: 仅首次写入(pos==0)输出日志, 避免 bs=1 时 8192 条日志淹没 serial */
             if (pos == 0)
-                pr_info("powerfs: WB_END INLINE first write ino=%lu copied=%u end=%zu\n",
+                pr_debug("powerfs: WB_END INLINE first write ino=%lu copied=%u end=%zu\n",
                         inode->i_ino, copied, end_pos);
 
             /* K2-7: 检查是否超出 inline 硬上限 (8KB).

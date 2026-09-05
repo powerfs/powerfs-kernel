@@ -563,16 +563,18 @@ struct powerfs_inode_info {
      *   volume_id = volume_ids[stripe_unit_idx]
      *   needle_id = file_key + chunk_idx_in_unit
      *
-     * 注意: 当前实现假设所有 stripe unit 共享同一 base needle_id (file_key).
-     * FUSE 端 chunks[stripe_unit_idx].needle_id 作为 base, 这里用 file_key
-     * 是因为 Filer CREATE Stripe 响应中各 chunk 的 needle_id 各不相同,
-     * 但 file_key 字段未单独携带. 后续若需要 per-unit needle, 切换到
-     * chunks[] 数组方式 (K3-5 LIST_CHUNKS). */
+     * 每个 stripe unit 独立 base needle_id:
+     *   needle_id = stripe_needle_keys[stripe_unit_idx] + chunk_idx_in_unit
+     * Filer alloc_for_stripe_file() 为每个 stripe 独立 alloc_needle_id()
+     * (zone counter 自增, 各 stripe base 互不相同), 不能共用 file_key.
+     * stripe_needle_keys[] 与 volume_ids[] 一一对应, 同生命周期 (kmalloc,
+     * apply_layout 填充, evict/free 释放). */
     u64 stripe_size;            /* stripe unit 大小 (字节), 默认=layout_chunk_size */
     u32 stripe_count;           /* 条带卷数 */
     u32 start_volume_idx;       /* 起始卷索引 (预留) */
     u64 *volume_ids;            /* volume_ids 数组 (kmalloc), NULL=Flat/Inline */
     u32 volume_ids_count;       /* volume_ids 数组长度 */
+    u64 *stripe_needle_keys;    /* per-stripe base needle_id 数组 (kmalloc), 与 volume_ids 同长 */
 
     /* === K4: 副本 chunk 列表 (读 failover 使用, 从 GETATTR 0xB5 解析) === */
     struct powerfs_chunk_map *replica_chunks;

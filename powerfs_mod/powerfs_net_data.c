@@ -866,9 +866,18 @@ int powerfs_net_write_needle_async(__u64 volume_id, __u64 file_key, __u64 inode,
     if (timeout_ms > 0)
         req->deadline = jiffies + msecs_to_jiffies(timeout_ms);
 
-    /* 流控统计 (与 send_to_volume 一致) */
+    /* per-conn 在途写限流 + 流控统计.
+     * wait_wr_slot 阻塞直到该 volume 连接在途请求低于硬上限, 防止突发
+     * writeback (顺序大块写一次提交上百个 1MB chunk) 打爆服务端单连接流控
+     * 队列 → ConnFull reject (STATUS_ERR_SERVER_ERROR) 且 write_cb 不重试,
+     * 导致部分 chunk 静默丢失. 超时按提交失败处理 (页映射错误, 非丢数据). */
     {
         int flow_idx = pfs_conn_flow_idx(conn);
+        if (powerfs_flow_wait_wr_slot(flow_idx,
+                                      timeout_ms > 0 ? timeout_ms : 30000)) {
+            powerfs_request_free(req);
+            return -EBUSY;
+        }
         powerfs_flow_record_start(flow_idx,
                                   req->req_body_len + req->req_data_len);
     }
@@ -951,8 +960,14 @@ int powerfs_net_write_needle_blob_async(__u64 volume_id, __u64 file_key,
     if (timeout_ms > 0)
         req->deadline = jiffies + msecs_to_jiffies(timeout_ms);
 
+    /* per-conn 在途写限流 (同 write_needle_async, 防 ConnFull 丢写) */
     {
         int flow_idx = pfs_conn_flow_idx(conn);
+        if (powerfs_flow_wait_wr_slot(flow_idx,
+                                      timeout_ms > 0 ? timeout_ms : 30000)) {
+            powerfs_request_free(req);
+            return -EBUSY;
+        }
         powerfs_flow_record_start(flow_idx,
                                   req->req_body_len + req->req_data_len);
     }

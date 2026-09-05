@@ -1,7 +1,9 @@
 # ========== 1. 内核编译自动生成中间文件（你的 .powerfs_mod.o.cmd 在这里）
 # vm/ 目录下的脚本需要跟踪, 只忽略 output/ 和 share/ 产物
 vm/output/
-vm/share/
+vm/share/*
+!vm/share/powerfs.env
+!vm/share/powerfs-mount.sh
 *.o
 *.o.cmd
 *.ko

@@ -242,6 +242,10 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
                      * Stripe 文件在 lookup 时即获取 volume_ids, 无需等待 getattr. */
                     powerfs_apply_layout_to_inode(pi, &lookup_layout);
                     spin_unlock(&pi->i_lock);
+                    /* P0-1 诊断: lookup 新 inode 时的布局状态 */
+                    pr_info("powerfs: do_lookup new '%pd' ino=%llu vid=%llu fkey=%llu placement=%u\n",
+                            dentry, (unsigned long long)ino, volume_id,
+                            (unsigned long long)file_key, pi->placement);
                 }
 
                 unlock_new_inode(inode);
@@ -496,8 +500,10 @@ static struct inode *__powerfs_do_create_core(struct mnt_idmap *idmap,
         spin_lock(&pi->i_lock);
         powerfs_apply_layout_to_inode(pi, &mknod_layout);
         spin_unlock(&pi->i_lock);
-        pr_debug("powerfs: do_create_core '%pd' ino=%lu placement=%u reliability=%u\n",
-                 dentry, inode->i_ino, pi->placement, pi->reliability);
+        /* P0-1 诊断: 创建时的布局状态 */
+        pr_info("powerfs: do_create '%pd' ino=%lu vid=%llu fkey=%llu placement=%u has_layout=%u\n",
+                dentry, inode->i_ino, mknod_volume_id, mknod_file_key,
+                pi->placement, mknod_has_layout);
     } else if (mknod_has_layout && (mknod_layout.volume_ids || mknod_layout.inline_data ||
                                     mknod_layout.replica_chunks || mknod_layout.ec_chunks)) {
         kfree(mknod_layout.volume_ids);

@@ -221,6 +221,17 @@ void powerfs_flow_record_complete(int flow_idx, u64 lat_ns, unsigned int bytes, 
 void powerfs_flow_on_load_factor(int flow_idx, u8 lf);
 
 /*
+ * powerfs_flow_wait_wr_slot - writeback 数据写的 per-conn 在途阻塞限流.
+ *
+ * 在 async WriteNeedle/WriteNeedleBlob 提交前 (进程上下文, 可睡眠) 调用,
+ * 阻塞直到该连接在途请求数低于硬上限 (max_active_per_conn/2), 防止突发
+ * writeback 打爆服务端单连接流控队列导致 ConnFull reject → 写丢失.
+ *
+ * 返回 0 = 获得槽位; -EBUSY = 超时 (调用方按提交失败处理).
+ */
+int powerfs_flow_wait_wr_slot(int flow_idx, int timeout_ms);
+
+/*
  * powerfs_flow_conn_active - 获取 per-conn 在途请求数 (debugfs/日志用)
  */
 int powerfs_flow_conn_active(int flow_idx);

@@ -169,10 +169,13 @@ int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
 
     chunk_idx = (u64)(offset / chunk_size);
 
-    /* K3 多卷路径: chunks 数组存在且 chunk_idx 命中.
-     * 用于 Flat 模式下 GETATTR 返回的显式 chunks 列表.
-     * 对齐 FUSE chunk_map: 使用显式 per-chunk needle_id, 而非 file_key + chunk_idx. */
-    if (pi->chunks && chunk_idx < pi->chunk_count) {
+    /* Flat 显式 chunks 列表: per-chunk needle_id (FUSE chunk_map 对齐).
+     * 仅 Flat 走此路径 — Stripe/WideStripe 的 pi->chunks 是 sparse anchors
+     * (每卷 base 一项, chunk_idx 为 0/64/128...), 用 chunk_idx 作数组下标
+     * 会错位 (把 vol1 base 当成 chunk 1). Stripe 由下方 RAID0 数学路径寻址. */
+    if (pi->chunks && chunk_idx < pi->chunk_count &&
+        pi->placement != POWERFS_PLACEMENT_STRIPE &&
+        pi->placement != POWERFS_PLACEMENT_WIDESTRIPE) {
         struct powerfs_chunk_map *cm = &pi->chunks[chunk_idx];
         if (cm->volume_id != 0 && cm->needle_id != 0) {
             *volume_id_out = cm->volume_id;
@@ -185,32 +188,70 @@ int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
         }
     }
 
-    /* K3 Stripe 多卷路径: volume_ids 数组 + file_key base needle.
+    /* K3 Stripe 多卷路径: volume_ids[] + per-stripe base needle.
      * 对齐 FUSE resolve_stripe_chunk (fuse.rs L462).
-     * stripe_unit_idx 索引 volume_ids[], chunk_idx_in_unit 偏移 needle_id. */
+     * stripe_unit_idx 索引 volume_ids[]/stripe_needle_keys[],
+     * chunk_idx_in_unit 为该 stripe unit 内的 chunk 偏移.
+     * 每个 stripe unit 有独立 base needle_id (Filer alloc_for_stripe_file
+     * 按 stripe 独立分配), 不能共用 file_key. */
     if ((pi->placement == POWERFS_PLACEMENT_STRIPE ||
          pi->placement == POWERFS_PLACEMENT_WIDESTRIPE) &&
         pi->volume_ids && pi->volume_ids_count > 0) {
         u64 stripe_size = pi->stripe_size ? pi->stripe_size : chunk_size;
-        u64 stripe_unit_idx = (u64)(offset / stripe_size);
+        u64 chunks_per_unit = stripe_size / chunk_size;
+        u64 stripe_idx;        /* 全局 stripe unit 号 (文件可跨多轮, 无上限) */
+        u64 vol_rank;          /* stripe 组内的卷 rank (取模回绕) */
+        u64 vol_array_idx;     /* volume_ids[] / stripe_needle_keys[] 下标 */
+        u64 round;             /* 第几轮 stripe (跨 stripe_count 后) */
         u64 chunk_idx_in_unit;
+        u64 vol_chunk_idx;     /* 目标卷上的 chunk 序号 (跨 round 累计) */
+        u64 base_needle;
 
-        if (stripe_unit_idx >= pi->volume_ids_count) {
-            pr_debug("powerfs: locate stripe_unit_idx=%llu >= count=%u (offset=%lld)\n",
-                     stripe_unit_idx, pi->volume_ids_count, offset);
-            return -EINVAL;
-        }
+        if (chunks_per_unit == 0)
+            chunks_per_unit = 1;
+
+        /* RAID0 寻址, 对齐 Placement::locate (powerfs-layout/placement.rs):
+         *   stripe_idx    = offset / stripe_size
+         *   vol_rank      = stripe_idx % stripe_count   (卷回绕)
+         *   vol_idx       = (start_volume_idx + vol_rank) % count
+         *   vol_chunk_idx = (stripe_idx / stripe_count) * chunks_per_unit
+         *                   + (offset % stripe_size) / chunk_size
+         * 文件可超过 stripe_count*stripe_size (如 200MB > 3*64MB): 第 4 个
+         * stripe unit 回到第一个卷, 但卷内偏移推进一个 stripe_size. 旧逻辑
+         * 用 stripe_idx 直接索引 volume_ids[] → 越界 EINVAL → 大文件尾部
+         * chunk 无法定位/写入. */
+        stripe_idx = (u64)(offset / stripe_size);
+        vol_rank = stripe_idx % pi->volume_ids_count;
+        round = stripe_idx / pi->volume_ids_count;
+        vol_array_idx =
+            (pi->start_volume_idx + vol_rank) % pi->volume_ids_count;
 
         chunk_idx_in_unit = (u64)((offset % stripe_size) / chunk_size);
-        *volume_id_out = pi->volume_ids[stripe_unit_idx];
-        *needle_id_out = pi->file_key + chunk_idx_in_unit;
+        vol_chunk_idx = round * chunks_per_unit + chunk_idx_in_unit;
+
+        /* per-volume base needle (stripe_needle_keys 按卷下标, 非全局 unit);
+         * 缺失时回退 file_key (仅理论情况, migrate/apply_layout 均会填充). */
+        base_needle = pi->stripe_needle_keys
+                          ? pi->stripe_needle_keys[vol_array_idx]
+                          : pi->file_key;
+        *volume_id_out = pi->volume_ids[vol_array_idx];
+        *needle_id_out = base_needle + vol_chunk_idx;
         return 0;
     }
 
     /* Flat 模型: file_key + chunk_idx, 单卷.
      * 仅当 pi->chunks 未填充 (无 PER_CHUNK 数据) 时使用此回退路径. */
-    if (!pi->volume_id || !pi->file_key)
+    if (!pi->volume_id || !pi->file_key) {
+        /* P0-1 诊断: FLAT 文件缺 volume_id/file_key 导致 writepage BW=0.
+         * 打印完整 inode 状态帮助定位根因 (创建路径未设? refresh_work 覆盖?). */
+        pr_debug("powerfs: locate EINVAL ino=%lu placement=%u vid=%llu fkey=%llu chunks=%p chunk_count=%u volids=%p vid_count=%u offset=%lld\n",
+                pi->netfs.inode.i_ino, pi->placement,
+                (unsigned long long)pi->volume_id,
+                (unsigned long long)pi->file_key,
+                pi->chunks, pi->chunk_count,
+                pi->volume_ids, pi->volume_ids_count, offset);
         return -EINVAL;
+    }
 
     *volume_id_out = pi->volume_id;
     *needle_id_out = pi->file_key + chunk_idx;
@@ -255,14 +296,41 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
     if (layout->has_placement) {
         if (pi->placement == POWERFS_PLACEMENT_INLINE && pi->inline_dirty &&
             layout->placement != POWERFS_PLACEMENT_INLINE) {
-            pr_info("powerfs: apply_layout skip placement=%u→%u, inline_dirty ino=%lu\n",
+            pr_debug("powerfs: apply_layout skip placement=%u→%u, inline_dirty ino=%lu\n",
                     pi->placement, layout->placement, pi->netfs.inode.i_ino);
+            /* 本地有未提交数据/较新布局, 整个 server layout 均陈旧 (close 尚
+             * 未 sync), 必须整体丢弃不应用 — 否则下方 Stripe/Inline 元数据段
+             * 会用 server 的空 volume_ids/inline_data 覆盖并 kfree 掉本地有效
+             * 状态. layout 的指针字段由调用方 kfree, 不会泄漏. */
+            return;
         } else if (pi->placement != POWERFS_PLACEMENT_INLINE &&
                    (pi->volume_id || pi->file_key) &&
                    layout->placement == POWERFS_PLACEMENT_INLINE) {
-            pr_info("powerfs: apply_layout skip placement=%u→%u (Flat→INLINE regression, has volume_id/file_key) ino=%lu\n",
+            pr_debug("powerfs: apply_layout skip placement=%u→%u (Flat→INLINE regression, has volume_id/file_key) ino=%lu\n",
                     pi->placement, layout->placement, pi->netfs.inode.i_ino);
+            /* 同上: 已迁移到 Flat, server 仍报 INLINE (close 未 sync), 整体丢弃. */
+            return;
+        } else if ((pi->placement == POWERFS_PLACEMENT_STRIPE ||
+                    pi->placement == POWERFS_PLACEMENT_WIDESTRIPE) &&
+                   pi->volume_ids && pi->volume_ids_count > 0 &&
+                   (layout->placement == POWERFS_PLACEMENT_FLAT ||
+                    layout->placement == POWERFS_PLACEMENT_INLINE)) {
+            /* P0-1: GETATTR 返回旧布局 (FLAT/INLINE) 会释放 volume_ids 数组,
+             * 导致 locate_chunk 找不到 volume_id → writeback EINVAL → BW=0,
+             * 且 close release 的 Stripe 分支因 volume_ids==NULL 静默跳过
+             * chunks sync → Filer 停留 Empty → reopen 读全 0.
+             * 迁移到 Stripe 后, 在 close 同步新布局前必须整体丢弃该 layout. */
+            pr_debug("powerfs: apply_layout skip placement=%u→%u (Stripe→Flat/Inline regression, has volume_ids) ino=%lu\n",
+                    pi->placement, layout->placement, pi->netfs.inode.i_ino);
+            return;
         } else {
+            /* P0-1 诊断: placement 变更, 打印前后值 + volume_id/file_key 状态.
+             * 覆盖 INLINE→FLAT 场景: 若 vid=0 会导致 locate EINVAL. */
+            pr_debug("powerfs: apply_layout placement %u→%u ino=%lu vid=%llu fkey=%llu has_vids=%u\n",
+                    pi->placement, layout->placement, pi->netfs.inode.i_ino,
+                    (unsigned long long)pi->volume_id,
+                    (unsigned long long)pi->file_key,
+                    layout->has_placement);
             pi->placement = layout->placement;
         }
     }
@@ -289,7 +357,7 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
         if (pi->inline_dirty) {
             /* 本地有未提交 inline_data, 不能被 server 陈旧数据覆盖.
              * 释放 layout->inline_data 避免泄漏. */
-            pr_info("powerfs: apply_layout skip inline_data overwrite, inline_dirty ino=%lu (local=%u server=%u)\n",
+            pr_debug("powerfs: apply_layout skip inline_data overwrite, inline_dirty ino=%lu (local=%u server=%u)\n",
                     pi->netfs.inode.i_ino, pi->inline_len, layout->inline_len);
             kfree(layout->inline_data);
             layout->inline_data = NULL;
@@ -332,6 +400,14 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
         layout->volume_ids = NULL;       /* 所有权转移, 防止 double-free */
         layout->volume_ids_count = 0;
         kfree(old_vids);
+        pr_debug("powerfs: STRIPE-LAYOUT ino=%lu stripe_sz=%llu count=%u start=%u vids=%u anchors=%u vid0=%llu vid1=%llu vid2=%llu\n",
+                pi->netfs.inode.i_ino,
+                (unsigned long long)pi->stripe_size, pi->stripe_count,
+                pi->start_volume_idx, pi->volume_ids_count,
+                layout->ec_chunk_count,
+                pi->volume_ids_count > 0 ? (unsigned long long)pi->volume_ids[0] : 0,
+                pi->volume_ids_count > 1 ? (unsigned long long)pi->volume_ids[1] : 0,
+                pi->volume_ids_count > 2 ? (unsigned long long)pi->volume_ids[2] : 0);
     } else {
         /* Flat/Inline: 不应持有 volume_ids, 释放误传的数组 */
         kfree(layout->volume_ids);
@@ -342,6 +418,10 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
             kfree(pi->volume_ids);
             pi->volume_ids = NULL;
             pi->volume_ids_count = 0;
+        }
+        if (pi->stripe_needle_keys) {
+            kfree(pi->stripe_needle_keys);
+            pi->stripe_needle_keys = NULL;
         }
         pi->stripe_size = 0;
         pi->stripe_count = 0;
@@ -402,8 +482,69 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
                     pi->chunk_count,
                     (unsigned long long)pi->volume_id,
                     (unsigned long long)pi->file_key);
+        } else if (pi->placement == POWERFS_PLACEMENT_STRIPE ||
+                   pi->placement == POWERFS_PLACEMENT_WIDESTRIPE) {
+            /* Stripe: PER_CHUNK chunks 可能是:
+             *  - sparse anchors (CREATE 预分配 / migrate): stripe_count 项,
+             *    chunk_idx = unit * chunks_per_unit, needle_id = 该 unit base
+             *  - dense chunks (close sync 后 reopen): 每 chunk 一项,
+             *    chunk_idx 为全局索引, needle_id = base + idx_in_unit
+             * 提取每个 stripe unit 的 base needle 到 stripe_needle_keys,
+             * 供 locate_chunk 的 volume_ids 路径使用 (sparse 阶段).
+             * 同时存入 pi->chunks: dense 时 locate 的 chunks[chunk_idx]
+             * 显式路径命中; sparse 时 chunk_idx 越界, 自动回退 volume_ids 路径. */
+            u32 nkeys = pi->volume_ids_count;
+            u64 stripe_sz = pi->stripe_size ? pi->stripe_size
+                                            : (u64)pi->layout_chunk_size;
+            u64 csz = pi->layout_chunk_size ? pi->layout_chunk_size
+                                            : POWERFS_CHUNK_SIZE;
+            u64 chunks_per_unit = (stripe_sz && csz) ? (stripe_sz / csz) : 1;
+
+            if (nkeys > 0 && chunks_per_unit > 0) {
+                /* apply_layout 在持 pi->i_lock (spinlock) 上下文调用, 用 GFP_ATOMIC.
+                 * stripe_count 通常很小 (3-8), 分配易成功; 失败则 locate 回退 file_key. */
+                u64 *new_keys = kcalloc(nkeys, sizeof(u64), GFP_ATOMIC);
+                if (new_keys) {
+                    u32 k;
+                    for (k = 0; k < layout->ec_chunk_count; k++) {
+                        struct powerfs_chunk_map *cm = &layout->ec_chunks[k];
+                        /* 与 locate_chunk 的 RAID0 回绕一致: 按卷 (而非全局
+                         * stripe unit) 反推 base needle. 文件跨多轮时同一卷
+                         * 的多个 stripe unit 反推出相同 base, 只取首个非零. */
+                        u64 s_idx = cm->chunk_idx / chunks_per_unit;
+                        u64 vol_rank = s_idx % nkeys;
+                        u64 vol_idx = (pi->start_volume_idx + vol_rank) % nkeys;
+                        u64 rnd = s_idx / nkeys;
+                        u64 idx_in_unit = cm->chunk_idx % chunks_per_unit;
+                        u64 vol_chunk_idx = rnd * chunks_per_unit + idx_in_unit;
+                        if (new_keys[vol_idx] == 0)
+                            new_keys[vol_idx] = cm->needle_id - vol_chunk_idx;
+                    }
+                    kfree(pi->stripe_needle_keys);
+                    pi->stripe_needle_keys = new_keys;
+                }
+            }
+
+            {
+                /* Stripe 用 stripe_needle_keys[] + volume_ids[] 做 RAID0 数学
+                 * 寻址 (locate_chunk), 不保留 per-chunk 数组. Filer 只下发
+                 * sparse anchors (每卷 base 一项), 已用于上面重建
+                 * stripe_needle_keys; 这里释放 anchors 并清空 pi->chunks,
+                 * 避免 sparse 数组 (chunk_idx=0/64/128) 被 dense 路径按下标
+                 * 误索引. */
+                kfree(layout->ec_chunks);
+                layout->ec_chunks = NULL;
+                layout->ec_chunk_count = 0;
+                kfree(pi->chunks);
+                pi->chunks = NULL;
+                pi->chunk_count = 0;
+            }
+            pr_debug("powerfs: apply_layout STRIPE vids=%u stripe_sz=%llu csz=%llu keys=%p\n",
+                    pi->volume_ids_count,
+                    (unsigned long long)stripe_sz, (unsigned long long)csz,
+                    pi->stripe_needle_keys);
         } else {
-            /* Stripe: 释放, locate_chunk 使用 volume_ids 路径 */
+            /* 其他 (Inline): 释放 */
             kfree(layout->ec_chunks);
             layout->ec_chunks = NULL;
             layout->ec_chunk_count = 0;
@@ -512,6 +653,14 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
                 pi->i_rctime.tv_nsec = (long)rctime_nsec;
             }
             spin_unlock(&pi->i_lock);
+            /* P0-1 诊断: 打印 GETATTR 返回的布局 + apply 后 inode 状态 */
+            pr_debug("powerfs: refresh_work ino=%llu getattr vid=%llu fkey=%llu layout_placement=%u has_placement=%u → pi placement=%u vid=%llu fkey=%llu\n",
+                    rw->ino, (unsigned long long)volume_id,
+                    (unsigned long long)file_key,
+                    layout.placement, layout.has_placement,
+                    pi->placement,
+                    (unsigned long long)pi->volume_id,
+                    (unsigned long long)pi->file_key);
             /* apply 后 layout.volume_ids/inline_data/replica_chunks 已转移到 inode (或已释放).
              * 防御性: 若 apply 异常未消费, 这里释放. */
             kfree(layout.volume_ids);
@@ -659,10 +808,10 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
      * 这样当其他客户端修改 inline 文件后, 即使本地 caps_dirty 为 true,
      * 也能失效 page cache, 避免读到旧数据. */
     if (has_dirty_pages || local_inline_dirty) {
-        pr_info("powerfs: refresh_work ino=%llu skip pagecache invalidate (dirty_pages=%d inline_dirty=%d)\n",
+        pr_debug("powerfs: refresh_work ino=%llu skip pagecache invalidate (dirty_pages=%d inline_dirty=%d)\n",
                 rw->ino, has_dirty_pages, local_inline_dirty);
     } else {
-        pr_info("powerfs: refresh_work ino=%llu invalidate pagecache (caps_dirty=%d, safe to invalidate)\n",
+        pr_debug("powerfs: refresh_work ino=%llu invalidate pagecache (caps_dirty=%d, safe to invalidate)\n",
                 rw->ino, local_caps_dirty);
         invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
     }
@@ -753,7 +902,7 @@ int powerfs_invalidate_one(u64 ino)
     rw->inode = NULL;  /* NULL → work function will do ilookup5 */
     queue_work(powerfs_refresh_wq, &rw->work);
 
-    pr_info("powerfs: invalidate_one ino=%llu queued (lookup deferred to workqueue)\n", ino);
+    pr_debug("powerfs: invalidate_one ino=%llu queued (lookup deferred to workqueue)\n", ino);
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_invalidate_one);
@@ -984,6 +1133,7 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->start_volume_idx = 0;
     pi->volume_ids = NULL;
     pi->volume_ids_count = 0;
+    pi->stripe_needle_keys = NULL;
     pi->replica_chunks = NULL;
     pi->replica_count = 0;
 
@@ -1073,6 +1223,8 @@ void powerfs_free_inode(struct inode *inode)
     kfree(pi->volume_ids);
     pi->volume_ids = NULL;
     pi->volume_ids_count = 0;
+    kfree(pi->stripe_needle_keys);
+    pi->stripe_needle_keys = NULL;
 
     /* K4: 释放副本 chunk 列表 */
     kfree(pi->replica_chunks);
@@ -1219,6 +1371,9 @@ void powerfs_evict_inode(struct inode *inode)
         kfree(pi->volume_ids);
     pi->volume_ids = NULL;
     pi->volume_ids_count = 0;
+    if (pi->stripe_needle_keys && virt_addr_valid(pi->stripe_needle_keys))
+        kfree(pi->stripe_needle_keys);
+    pi->stripe_needle_keys = NULL;
     pi->stripe_size = 0;
     pi->stripe_count = 0;
 

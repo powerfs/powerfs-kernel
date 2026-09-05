@@ -212,6 +212,64 @@ static int powerfs_flush(struct file *file, fl_owner_t id)
                     pr_warn("powerfs: FLUSH FLAT ino=%lu update err=%d "
                             "(release path will retry)\n", ino, sync_ret);
                 }
+            } else if (pi->placement == POWERFS_PLACEMENT_STRIPE ||
+                       pi->placement == POWERFS_PLACEMENT_WIDESTRIPE) {
+                /* Stripe: fsync 时提前同步多卷 chunks 到 Filer (close 路径兜底).
+                 * chunks 跨多 volume, 用 locate_chunk 解析每个 chunk 的 (vid,needle). */
+                loff_t ssz = i_size_read(inode);
+                u64 s_shard;
+                u32 s_csz = pi->layout_chunk_size ? pi->layout_chunk_size
+                                                   : POWERFS_CHUNK_SIZE;
+                u32 s_cnt, si;
+                struct powerfs_chunk_map *sc = NULL;
+
+                spin_lock(&pi->i_lock);
+                if ((u64)ssz == pi->content_size) {
+                    spin_unlock(&pi->i_lock);
+                    goto flush_out;
+                }
+                spin_unlock(&pi->i_lock);
+                if (ssz <= 0)
+                    goto flush_out;
+
+                s_cnt = (u32)div_u64((u64)ssz + s_csz - 1, s_csz);
+                if (s_cnt > 4096)
+                    s_cnt = 4096;
+                sc = kmalloc_array(s_cnt, sizeof(*sc), GFP_KERNEL);
+                if (!sc) {
+                    sync_ret = -ENOMEM;
+                    goto flush_out;
+                }
+                for (si = 0; si < s_cnt; si++) {
+                    u64 coff = (u64)si * s_csz;
+                    u64 cvid = 0, cnid = 0;
+                    int lr;
+                    spin_lock(&pi->i_lock);
+                    lr = powerfs_locate_chunk(pi, (loff_t)coff, &cvid, &cnid);
+                    spin_unlock(&pi->i_lock);
+                    sc[si].chunk_idx = si;
+                    sc[si].needle_id = lr ? 0 : cnid;
+                    sc[si].volume_id  = lr ? 0 : cvid;
+                    sc[si].crc32 = 0;
+                    sc[si].size = (si == s_cnt - 1) ? (u64)ssz - coff : (u64)s_csz;
+                }
+                s_shard = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
+                sync_ret = powerfs_net_update_inode_size_chunks(s_shard, ino,
+                                                                (u64)ssz,
+                                                                "kernel-flush",
+                                                                sc, s_cnt,
+                                                                NULL, 0);
+                kfree(sc);
+                if (sync_ret == 0) {
+                    spin_lock(&pi->i_lock);
+                    pi->content_size = (u64)ssz;
+                    spin_unlock(&pi->i_lock);
+                    pr_debug("powerfs: FLUSH STRIPE ino=%lu size=%lld chunks=%u ok\n",
+                             ino, ssz, s_cnt);
+                } else {
+                    pr_warn("powerfs: FLUSH STRIPE ino=%lu update err=%d "
+                            "(release path will retry)\n", ino, sync_ret);
+                }
             }
         } else {
             pr_debug("powerfs: FLUSH ino=%lu skip metadata sync (dirty remains after flush)\n",
@@ -282,7 +340,8 @@ static loff_t powerfs_llseek(struct file *file, loff_t offset, int whence)
  * powerfs_fsync - 数据同步操作
  *
  * Flat/Stripe: file_write_and_wait_range 触发 writepage→powerfs_net_write 将脏页刷到
- *   volume server, 然后调用 powerfs_net_setattr 同步 i_size.
+ *   volume server, 然后通过 update_inode_size_chunks 同步 size+chunks 到 Filer
+ *   (content_size 闸门避免重复; 失败 fallback 到 setattr size).
  * Inline (K2-5): 脏页已在 write_end 同步到 inline_data, fsync 时若 inline_dirty
  *   则通过 UPDATE_INODE 将 inline_data 提交到 Filer (数据+元数据 Raft 强一致).
  *
@@ -374,9 +433,98 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
         goto out_put;
     }
 
-    /* Flat/Stripe: 同步 i_size 到 Filer */
+    /* Flat/Stripe: 同步 size+chunks 到 Filer.
+     * 对齐 powerfs_file_flush (L160-272) 的 chunks sync 逻辑:
+     *   - 用 content_size 闸门避免重复 sync (i_size == content_size → 已提交)
+     *   - Flat: chunks[i] = (vid, file_key + i)
+     *   - Stripe: chunks[i] = locate_chunk(offset) 跨多卷解析
+     *   - 单次尝试 (release 路径 5 次重试兜底)
+     *   - 成功后 update_inode_size_chunks 同时持久化 size + chunks,
+     *     无需额外 setattr. 失败或 skip 时 fallback 到 setattr. */
     i_size = i_size_read(inode);
     pr_debug("powerfs: fsync after writeback i_size=%lld\n", i_size);
+
+    if (i_size > 0 &&
+        (pi->placement == POWERFS_PLACEMENT_FLAT ||
+         pi->placement == POWERFS_PLACEMENT_STRIPE ||
+         pi->placement == POWERFS_PLACEMENT_WIDESTRIPE)) {
+        u64 local_content_size;
+
+        spin_lock(&pi->i_lock);
+        local_content_size = pi->content_size;
+        spin_unlock(&pi->i_lock);
+
+        /* content_size 未变 → 上次已提交过, 只做 setattr fallback */
+        if ((u64)i_size != local_content_size) {
+            u64 shard_id;
+            u32 chunk_size = pi->layout_chunk_size ? pi->layout_chunk_size
+                                                   : POWERFS_CHUNK_SIZE;
+            u32 chunk_count, ci;
+            struct powerfs_chunk_map *chunks = NULL;
+            bool is_stripe = (pi->placement == POWERFS_PLACEMENT_STRIPE ||
+                             pi->placement == POWERFS_PLACEMENT_WIDESTRIPE);
+
+            /* Stripe 需要 volume_ids 才能 locate_chunk */
+            if (is_stripe && (!pi->volume_ids || pi->volume_ids_count == 0))
+                goto setattr_fallback;
+
+            chunk_count = (u32)div_u64((u64)i_size + chunk_size - 1, chunk_size);
+            if (chunk_count > 4096)
+                chunk_count = 4096;
+
+            chunks = kmalloc_array(chunk_count, sizeof(*chunks), GFP_KERNEL);
+            if (!chunks) {
+                ret = -ENOMEM;
+                goto out_put;
+            }
+
+            for (ci = 0; ci < chunk_count; ci++) {
+                u64 chunk_off = (u64)ci * chunk_size;
+                u64 vid = 0, nid = 0;
+                int lr = 0;
+
+                if (is_stripe) {
+                    spin_lock(&pi->i_lock);
+                    lr = powerfs_locate_chunk(pi, (loff_t)chunk_off, &vid, &nid);
+                    spin_unlock(&pi->i_lock);
+                } else {
+                    /* Flat: file_key + chunk_idx */
+                    vid = pi->volume_id;
+                    nid = pi->file_key + ci;
+                }
+                chunks[ci].chunk_idx = ci;
+                chunks[ci].needle_id = lr ? 0 : nid;
+                chunks[ci].volume_id  = lr ? 0 : vid;
+                chunks[ci].crc32 = 0;
+                chunks[ci].size = (ci == chunk_count - 1)
+                                  ? (u64)i_size - chunk_off
+                                  : (u64)chunk_size;
+            }
+
+            shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino
+                                                      : inode->i_ino);
+            ret = powerfs_net_update_inode_size_chunks(shard_id, inode->i_ino,
+                                                        (u64)i_size,
+                                                        "kernel-fsync",
+                                                        chunks, chunk_count,
+                                                        NULL, 0);
+            kfree(chunks);
+            if (ret == 0) {
+                spin_lock(&pi->i_lock);
+                pi->content_size = (u64)i_size;
+                spin_unlock(&pi->i_lock);
+                pr_debug("powerfs: FSYNC %s ino=%lu size=%lld chunks=%u ok\n",
+                         is_stripe ? "STRIPE" : "FLAT",
+                         inode->i_ino, i_size, chunk_count);
+                goto out_put;
+            }
+            pr_warn("powerfs: FSYNC %s ino=%lu chunks sync err=%d (setattr fallback)\n",
+                    is_stripe ? "STRIPE" : "FLAT", inode->i_ino, ret);
+        }
+    }
+
+setattr_fallback:
+    /* Fallback: 至少同步 size (覆盖 content_size 相同时的幂等路径) */
     if (i_size > 0) {
         int sret = powerfs_net_setattr(inode->i_ino, POWERFS_ATTR_SIZE,
                                         0, 0, 0, (__u64)i_size, 0, 0);
@@ -763,7 +911,7 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
      * Flat 模式: 同步 size+chunks 到 Filer (对齐 FUSE sync_size_chunks_on_close).
      *   不同步的话 Filer 端 chunks 为空, remount/lookup 后 read locate 失败 (-EINVAL). */
     if (pi->placement == POWERFS_PLACEMENT_INLINE && pi->inline_dirty) {
-    pr_info("powerfs: RELEASE INLINE ino=%lu dirty=%d inline_len=%u\n",
+    pr_debug("powerfs: RELEASE INLINE ino=%lu dirty=%d inline_len=%u\n",
             ino, pi->inline_dirty ? 1 : 0, pi->inline_len);
 
     /* 持锁快照 inline_data (网络 I/O 不能持 spinlock) */
@@ -802,7 +950,7 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
         __u32 i, csum = 0;
         for (i = 0; i < snap_len; i++)
             csum += snap_data[i];
-        pr_info("powerfs: RELEASE INLINE ino=%lu snap_len=%u csum=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+        pr_debug("powerfs: RELEASE INLINE ino=%lu snap_len=%u csum=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
                 ino, snap_len, csum,
                 snap_len > 0 ? snap_data[0] : 0, snap_len > 1 ? snap_data[1] : 0,
                 snap_len > 2 ? snap_data[2] : 0, snap_len > 3 ? snap_data[3] : 0,
@@ -821,7 +969,7 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
                                                     snap_data, snap_len);
         if (ret == 0) {
             synced = true;
-            pr_info("powerfs: RELEASE INLINE ino=%lu synced size=%u (attempt %d)\n",
+            pr_debug("powerfs: RELEASE INLINE ino=%lu synced size=%u (attempt %d)\n",
                      ino, snap_len, attempt);
             break;
         }
@@ -873,22 +1021,18 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
          * filemap_write_and_wait_range 触发 writeback, 此时 lease 仍有效,
          * powerfs_get_lease_token 能找到 lease token, 写入快速完成. */
         ensure_lease(inode, 0);
-        pr_info("powerfs: RELEASE FLAT ino=%lu pre-flush i_size=%llu\n", ino, (u64)i_size);
+        pr_debug("powerfs: RELEASE FLAT ino=%lu pre-flush i_size=%llu\n", ino, (u64)i_size);
         flush_ret = filemap_write_and_wait_range(inode->i_mapping, 0, LLONG_MAX);
         if (flush_ret)
             pr_warn("powerfs: RELEASE FLAT ino=%lu filemap_write_and_wait_range: %d\n",
                     ino, flush_ret);
 
-        /* 仅在 i_size 变化时同步 (用 content_size 跟踪上次同步值) */
-        spin_lock(&pi->i_lock);
-        if ((u64)i_size == pi->content_size) {
-            spin_unlock(&pi->i_lock);
-            pr_debug("powerfs: RELEASE FLAT ino=%lu size=%llu unchanged, skip\n",
-                     ino, (u64)i_size);
-            return 0;
-        }
-        spin_unlock(&pi->i_lock);
-
+        /* close (最后一个 fd) 是 chunks 布局持久化的唯一强一致点
+         * (Filer MIGRATE_INLINE_ALLOC 不修改 inode). 必须始终 sync:
+         * content_size 会被 setattr/ftruncate 路径 (powerfs_inode.c) 提前
+         * 设为 i_size, 但那只同步了 size 元数据, chunks 映射从未发送;
+         * 若据此 skip 会导致 Filer 停留 Empty/Inline, reopen 后 locate EINVAL.
+         * read-only close 的冗余 sync 由 Filer chunks_changed 去重 (不写盘). */
         chunk_count = (u32)div_u64(i_size + chunk_size - 1, chunk_size);
         /* 限制最大 chunk_count 避免过大分配 (4096 chunks = 4GB @ 1MB chunk) */
         if (chunk_count > 4096) {
@@ -922,7 +1066,7 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
 
         shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
 
-        pr_info("powerfs: RELEASE FLAT ino=%lu size=%llu chunks=%u vid=%llu fkey=%llu\n",
+        pr_debug("powerfs: RELEASE FLAT ino=%lu size=%llu chunks=%u vid=%llu fkey=%llu\n",
                 ino, (u64)i_size, chunk_count,
                 (unsigned long long)pi->volume_id,
                 (unsigned long long)pi->file_key);
@@ -937,11 +1081,116 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
                 spin_lock(&pi->i_lock);
                 pi->content_size = (u64)i_size;
                 spin_unlock(&pi->i_lock);
-                pr_info("powerfs: RELEASE FLAT ino=%lu synced size=%llu chunks=%u (attempt %d)\n",
+                pr_debug("powerfs: RELEASE FLAT ino=%lu synced size=%llu chunks=%u (attempt %d)\n",
                         ino, (u64)i_size, chunk_count, attempt);
                 break;
             }
             pr_warn("powerfs: RELEASE FLAT ino=%lu attempt %d failed: %d\n",
+                    ino, attempt, ret);
+            if (attempt < 5)
+                msleep(500 * attempt);
+        }
+
+        kfree(chunks);
+        return 0;
+    }
+
+    /* Stripe/WideStripe 模式: close 时同步 size+chunks (多卷) 到 Filer.
+     * migrate_inline_out 后数据直写各 Volume Server, 但 chunks 布局仅在
+     * close 的 UPDATE_INODE_SIZE_CHUNKS 时强一致持久化 (Filer MIGRATE_ALLOC
+     * 不修改 inode). 若不同步, Filer 停留 Empty/Inline, reopen/refresh 的
+     * GETATTR 返回 INLINE vid=0 → writeback locate EINVAL → BW=0 且布局丢失.
+     * chunks 分布在多个 volume, 每个 chunk 的 (vid,needle) 由 locate_chunk
+     * 按 stripe unit 解析; Filer 用 detect_placement_from_chunks 识别 Stripe. */
+    if ((pi->placement == POWERFS_PLACEMENT_STRIPE ||
+         pi->placement == POWERFS_PLACEMENT_WIDESTRIPE) &&
+        pi->volume_ids && pi->volume_ids_count > 0) {
+        loff_t i_size = i_size_read(inode);
+        u64 shard_id;
+        u32 chunk_size = pi->layout_chunk_size ? pi->layout_chunk_size
+                                               : POWERFS_CHUNK_SIZE;
+        u32 chunk_count, i;
+        struct powerfs_chunk_map *chunks = NULL;
+        int flush_ret;
+
+        if (i_size == 0) {
+            pr_debug("powerfs: RELEASE STRIPE ino=%lu size=0, skip\n", ino);
+            return 0;
+        }
+
+        /* flush 脏页到各 Volume Server (在 lease 有效期内完成数据写入). */
+        ensure_lease(inode, 0);
+        pr_debug("powerfs: RELEASE STRIPE ino=%lu pre-flush i_size=%llu stripes=%u\n",
+                ino, (u64)i_size, pi->volume_ids_count);
+        flush_ret = filemap_write_and_wait_range(inode->i_mapping, 0, LLONG_MAX);
+        if (flush_ret)
+            pr_warn("powerfs: RELEASE STRIPE ino=%lu filemap_write_and_wait: %d\n",
+                    ino, flush_ret);
+
+        /* close 必须始终 sync chunks — content_size 会被 ftruncate/setattr
+         * 提前设为 i_size 但 chunks 从未发送, 据此 skip 会丢失 Stripe 布局
+         * (详见 Flat 分支注释). Filer chunks_changed 对幂等 sync 去重. */
+        chunk_count = (u32)div_u64((u64)i_size + chunk_size - 1, chunk_size);
+        if (chunk_count > 4096)
+            chunk_count = 4096;
+
+        chunks = kmalloc_array(chunk_count, sizeof(*chunks), GFP_KERNEL);
+        if (!chunks) {
+            pr_warn("powerfs: RELEASE STRIPE ino=%lu kmalloc %u chunks failed, metadata not synced\n",
+                    ino, chunk_count);
+            return 0;
+        }
+
+        for (i = 0; i < chunk_count; i++) {
+            u64 chunk_off = (u64)i * chunk_size;
+            u64 vid = 0, nid = 0;
+            int loc_ret;
+            /* 持锁快照 locate (volume_ids/stripe_needle_keys 受 i_lock 保护). */
+            spin_lock(&pi->i_lock);
+            loc_ret = powerfs_locate_chunk(pi, (loff_t)chunk_off, &vid, &nid);
+            spin_unlock(&pi->i_lock);
+            chunks[i].chunk_idx = i;
+            chunks[i].needle_id = loc_ret ? 0 : nid;
+            chunks[i].volume_id  = loc_ret ? 0 : vid;
+            chunks[i].crc32 = 0;
+            chunks[i].size = (i == chunk_count - 1)
+                             ? (u64)i_size - chunk_off : (u64)chunk_size;
+            if (loc_ret)
+                pr_warn("powerfs: RELEASE STRIPE ino=%lu chunk %u locate failed: %d\n",
+                        ino, i, loc_ret);
+        }
+
+        /* P0-1 诊断: 打印跨 stripe unit 边界的 chunk 路由 (chunk 0 / 末个 unit0 / 首个 unit1 / 末个). */
+        pr_debug("powerfs: RELEASE STRIPE ino=%lu stripe_size=%llu c0(vid=%llu,nid=%llu) c63(vid=%llu,nid=%llu) c64(vid=%llu,nid=%llu) c%u(vid=%llu,nid=%llu)\n",
+                ino, (unsigned long long)pi->stripe_size,
+                (unsigned long long)chunks[0].volume_id, (unsigned long long)chunks[0].needle_id,
+                chunk_count > 63 ? (unsigned long long)chunks[63].volume_id : 0ULL,
+                chunk_count > 63 ? (unsigned long long)chunks[63].needle_id : 0ULL,
+                chunk_count > 64 ? (unsigned long long)chunks[64].volume_id : 0ULL,
+                chunk_count > 64 ? (unsigned long long)chunks[64].needle_id : 0ULL,
+                chunk_count - 1,
+                (unsigned long long)chunks[chunk_count - 1].volume_id,
+                (unsigned long long)chunks[chunk_count - 1].needle_id);
+
+        shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
+        pr_debug("powerfs: RELEASE STRIPE ino=%lu size=%llu chunks=%u stripes=%u\n",
+                ino, (u64)i_size, chunk_count, pi->volume_ids_count);
+
+        for (attempt = 1; attempt <= 5; attempt++) {
+            ret = powerfs_net_update_inode_size_chunks(shard_id, ino,
+                                                        (__u64)i_size,
+                                                        "kernel",
+                                                        chunks, chunk_count,
+                                                        NULL, 0);
+            if (ret == 0) {
+                spin_lock(&pi->i_lock);
+                pi->content_size = (u64)i_size;
+                spin_unlock(&pi->i_lock);
+                pr_debug("powerfs: RELEASE STRIPE ino=%lu synced size=%llu chunks=%u (attempt %d)\n",
+                        ino, (u64)i_size, chunk_count, attempt);
+                break;
+            }
+            pr_warn("powerfs: RELEASE STRIPE ino=%lu attempt %d failed: %d\n",
                     ino, attempt, ret);
             if (attempt < 5)
                 msleep(500 * attempt);

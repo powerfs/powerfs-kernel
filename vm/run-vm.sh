@@ -11,9 +11,13 @@ set -u
 
 cd "$(dirname "$0")"
 
+# 载入统一地址/集群配置 (single source of truth: share/powerfs.env)
+[ -f "./share/powerfs.env" ] && . "./share/powerfs.env"
+
 # 默认后端: 全部 3 个 filer (docker_powerfs-network IP + powerfs-net 端口)
-# 逗号分隔, 内核 fill_super 会解析并逐个 add_server
-export POWERFS_ADDR="${POWERFS_ADDR:-172.30.0.35,172.30.0.36,172.30.0.37}"
-export POWERFS_PORT="${POWERFS_PORT:-9334}"
+# 逗号分隔, 内核 fill_super 会解析并逐个 add_server.
+# 统一配置生效时回退到 POWERFS_MASTER_ADDR/PORT.
+export POWERFS_ADDR="${POWERFS_ADDR:-${POWERFS_MASTER_ADDR:-172.30.0.35,172.30.0.36,172.30.0.37}}"
+export POWERFS_PORT="${POWERFS_PORT:-${POWERFS_MASTER_PORT:-9334}}"
 
 exec bash run_qemu_kernel_ssh.sh
