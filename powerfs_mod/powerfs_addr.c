@@ -36,6 +36,9 @@
 #include <linux/splice.h>       /* splice_copy_file_range (P2-5) */
 #include <linux/utsname.h>      /* init_utsname() 主机名 */
 #include <linux/jiffies.h>      /* jiffies_64 时间戳 */
+#include <linux/workqueue.h>    /* schedule_work / INIT_WORK (async direct I/O) */
+#include <linux/highmem.h>      /* kmap_local_page (direct I/O user page copy) */
+#include <linux/errno.h>       /* EIOCBQUEUED */
 
 #include "powerfs.h"
 #include "powerfs_comm.h"
@@ -2047,32 +2050,215 @@ sector_t powerfs_bmap(struct address_space *mapping, sector_t block)
 }
 
 /*
- * powerfs_direct_IO - O_DIRECT 回调 (fallback to buffered I/O)
+ * powerfs_direct_IO - O_DIRECT 回调 (async via workqueue for AIO)
  *
- * PowerFS 是基于 netfs/page cache 的网络文件系统, 不支持真正的 direct I/O
- * (DMA 直传用户缓冲区). 但很多应用 (如 LTP read02 测试) 会用 O_DIRECT 打开
- * 文件. 在内核 6.17 中, do_dentry_open() 检查:
- *   if ((f->f_flags & O_DIRECT) && !(f->f_mode & FMODE_CAN_ODIRECT))
- *       return -EINVAL;
- * FMODE_CAN_ODIRECT 仅在 a_ops->direct_IO 非 NULL 时设置 (fs/open.c:978).
+ * 之前 direct_IO 返回 0, generic_file_read_iter 将 O_DIRECT 回退到
+ * filemap_read (buffered I/O). 这导致 libaio io_submit 在调用上下文同步
+ * 执行, 无法利用 AIO 异步性 (sync 377 IOPS vs libaio 395 IOPS, 几乎相同).
  *
- * 若不提供 direct_IO 回调, open(O_DIRECT) 会返回 EINVAL, 导致依赖 O_DIRECT
- * 的测试和应用无法运行.
+ * 新实现:
+ *   1. 同步 kiocb (pread/pwrite): 同步直读, 绕过 page cache, 返回字节数
+ *   2. 异步 kiocb (libaio io_submit): pin 用户页, 提交 workqueue,
+ *      返回 -EIOCBQUEUED. workqueue 内完成 RPC + ki_complete 回调.
+ *      generic_file_read_iter 看到 -EIOCBQUEUED 后立即返回, io_submit 不阻塞.
  *
- * 返回 0 的语义: generic_file_read_iter() 中, direct_IO 返回 0 表示
- * "0 bytes transferred", 随后 fallthrough 到 filemap_read() (buffered I/O):
- *   retval = mapping->a_ops->direct_IO(iocb, iter);  // = 0
- *   if (retval >= 0) { iocb->ki_pos += retval; count -= retval; }  // no-op
- *   if (retval < 0 || !count || IS_DAX(inode)) return retval;     // false
- *   if (iocb->ki_pos >= i_size_read(inode)) return retval;        // false
- *   return filemap_read(iocb, iter, retval);  // ← buffered read
+ * 仅处理 READ; WRITE 返回 0 (回退到 buffered I/O, 由 write_begin/write_end
+ * 处理 chunk 边界和 partial write).
  *
- * 这与 ramfs/tmpfs 不同 (它们不支持 O_DIRECT open), 但与 btrfs 压缩文件
- * 短读 fallback 行为一致 (mm/filemap.c:2898 注释).
+ * VFS 前置: generic_file_read_iter 在调用 direct_IO 前:
+ *   - kiocb_write_and_wait: 刷新脏页 (确保读到最新数据)
+ *   - file_accessed: 更新 atime
+ * 返回 -EIOCBQUEUED 后, VFS 不 revert iov_iter (已由 get_pages_alloc2 advance).
+ *
+ * 参考: fs/nfs/direct.c (iov_iter_get_pages_alloc2 + put_page), fs/bcachefs
+ * (return -EIOCBQUEUED + ki_complete).
  */
+
+/* 异步 direct I/O work 上下文 */
+struct powerfs_dio_work {
+    struct kiocb *iocb;
+    struct inode *inode;
+    loff_t pos;
+    size_t count;
+    struct page **pages;        /* get_user_pages_fast pinned pages */
+    int npages;
+    size_t first_page_offset;   /* 用户缓冲区在首页内的偏移 */
+    struct work_struct work;
+};
+
+/* powerfs_dio_read_worker - workqueue 回调: 执行 RPC 读取并完成 kiocb */
+static void powerfs_dio_read_worker(struct work_struct *work)
+{
+    struct powerfs_dio_work *dw =
+        container_of(work, struct powerfs_dio_work, work);
+    struct inode *inode = dw->inode;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    void *buf = NULL;
+    __u32 read_len = 0;
+    ssize_t result;
+    int err = 0;
+    int i;
+
+    /* 分配内核缓冲区用于 RPC (powerfs_net_read 需要连续缓冲区) */
+    buf = kvmalloc(dw->count, GFP_KERNEL);
+    if (!buf) {
+        result = -ENOMEM;
+        goto done;
+    }
+
+    if (pi->placement == POWERFS_PLACEMENT_INLINE) {
+        /* INLINE: 直接从 inline_data 读取, 不走 Volume Server */
+        spin_lock(&pi->i_lock);
+        if (pi->inline_data && pi->inline_len > 0 &&
+            (u64)dw->pos < pi->inline_len) {
+            read_len = min_t(__u32, dw->count,
+                             pi->inline_len - dw->pos);
+            memcpy(buf, pi->inline_data + dw->pos, read_len);
+        }
+        spin_unlock(&pi->i_lock);
+    } else if (!pi->volume_id && !pi->file_key &&
+               !pi->chunks && !pi->volume_ids) {
+        /* 新建 Flat 文件尚无 chunks (GETATTR 后 placement=Flat 但未分配):
+         * 返回 0 字节 (EOF), 与 netfs_issue_read 一致 */
+        read_len = 0;
+    } else {
+        /* Flat/Stripe/WideStripe: 直连 Volume Server 读取 */
+        err = powerfs_net_read(pi, inode->i_ino, dw->pos, dw->count,
+                               buf, dw->count, &read_len);
+        if (err)
+            read_len = 0;
+    }
+
+    if (err) {
+        result = err;
+    } else {
+        /* 从内核缓冲区拷贝到用户页 (kmap_local_page 在 workqueue 进程上下文安全) */
+        size_t remaining = read_len;
+        size_t off = dw->first_page_offset;
+
+        for (i = 0; i < dw->npages && remaining > 0; i++) {
+            size_t page_off = (i == 0) ? off : 0;
+            size_t chunk = min_t(size_t, remaining,
+                                 PAGE_SIZE - page_off);
+            char *kaddr = kmap_local_page(dw->pages[i]);
+            memcpy(kaddr + page_off,
+                   buf + (read_len - remaining), chunk);
+            kunmap_local(kaddr);
+            remaining -= chunk;
+        }
+        result = read_len;
+    }
+
+    kvfree(buf);
+
+done:
+    /* 释放用户页引用 (iov_iter_get_pages_alloc2 → get_user_pages_fast → put_page) */
+    for (i = 0; i < dw->npages; i++)
+        put_page(dw->pages[i]);
+    kvfree(dw->pages);
+
+    /* 完成 kiocb: AIO 层收到 ret 后唤醒 io_getevents */
+    if (result >= 0)
+        dw->iocb->ki_pos += result;
+    dw->iocb->ki_complete(dw->iocb, result);
+    kfree(dw);
+}
+
 static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 {
-    return 0;
+    struct file *file = iocb->ki_filp;
+    struct inode *inode = file->f_mapping->host;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    loff_t pos = iocb->ki_pos;
+    size_t count = iov_iter_count(iter);
+    ssize_t ret;
+
+    /* 仅处理 READ; WRITE 返回 0 回退到 buffered I/O */
+    if (iov_iter_rw(iter) != READ)
+        return 0;
+
+    if (!count)
+        return 0;
+
+    /* 同步 kiocb (pread): 同步直读, 绕过 page cache */
+    if (is_sync_kiocb(iocb)) {
+        void *buf;
+        __u32 read_len = 0;
+
+        buf = kvmalloc(count, GFP_KERNEL);
+        if (!buf)
+            return -ENOMEM;
+
+        if (pi->placement == POWERFS_PLACEMENT_INLINE) {
+            spin_lock(&pi->i_lock);
+            if (pi->inline_data && pi->inline_len > 0 &&
+                (u64)pos < pi->inline_len) {
+                read_len = min_t(__u32, count, pi->inline_len - pos);
+                memcpy(buf, pi->inline_data + pos, read_len);
+            }
+            spin_unlock(&pi->i_lock);
+        } else if (!pi->volume_id && !pi->file_key &&
+                   !pi->chunks && !pi->volume_ids) {
+            /* 新建文件无 chunks: 返回 0 (EOF) */
+            read_len = 0;
+        } else {
+            ret = powerfs_net_read(pi, inode->i_ino, pos, count,
+                                    buf, count, &read_len);
+            if (ret < 0) {
+                kvfree(buf);
+                return ret;
+            }
+        }
+
+        if (read_len > 0) {
+            if (copy_to_iter(buf, read_len, iter) != read_len) {
+                kvfree(buf);
+                return -EFAULT;
+            }
+        }
+        kvfree(buf);
+        /* 注意: 不要 advance ki_pos, VFS generic_file_read_iter 会做 */
+        return read_len;
+    }
+
+    /* 异步 kiocb (libaio io_submit): pin 用户页, 提交 workqueue, 返回 -EIOCBQUEUED */
+    {
+        struct powerfs_dio_work *dw;
+        struct page **pages = NULL;
+        size_t start;
+        ssize_t mapped;
+
+        mapped = iov_iter_get_pages_alloc2(iter, &pages, count, &start);
+        if (mapped < 0)
+            return mapped;
+        if (mapped == 0) {
+            kvfree(pages);
+            return 0;
+        }
+
+        dw = kzalloc(sizeof(*dw), GFP_KERNEL);
+        if (!dw) {
+            int npages = (mapped + start + PAGE_SIZE - 1) / PAGE_SIZE;
+            int i;
+            for (i = 0; i < npages; i++)
+                put_page(pages[i]);
+            kvfree(pages);
+            return -ENOMEM;
+        }
+
+        dw->iocb = iocb;
+        dw->inode = inode;
+        dw->pos = pos;
+        dw->count = mapped;
+        dw->pages = pages;
+        dw->npages = (mapped + start + PAGE_SIZE - 1) / PAGE_SIZE;
+        dw->first_page_offset = start;
+
+        INIT_WORK(&dw->work, powerfs_dio_read_worker);
+        schedule_work(&dw->work);
+
+        return -EIOCBQUEUED;
+    }
 }
 
 /* 地址空间操作表 - 内核 6.2 netfs 风格
@@ -2136,7 +2322,7 @@ const struct address_space_operations powerfs_aops = {
     .dirty_folio      = powerfs_dirty_folio,  /* P0-7 fix: 脏页同步标 CAP_WR_DATA dirty */
     .invalidate_folio = netfs_invalidate_folio, /* P0-6 fix: truncate/invalidate 清理 netfs folio 资源 */
     .release_folio    = netfs_release_folio,    /* P0-6 fix: shrinker 回收前释放 netfs 资源 */
-    .direct_IO        = powerfs_direct_IO,    /* O_DIRECT fallback to buffered I/O */
+    .direct_IO        = powerfs_direct_IO,    /* O_DIRECT: async via workqueue for AIO, sync for pread */
     .bmap             = powerfs_bmap,
     .migrate_folio    = filemap_migrate_folio, /* P1-4: 支持 NUMA 页迁移 / memory hotplug / CRIU */
 };
