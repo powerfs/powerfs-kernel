@@ -294,16 +294,41 @@ void powerfs_flush_dirty_creates(struct inode *dir)
         }
         pr_debug("powerfs: flushed %u dirty creates in dir=%lu\n",
                  flushed, dir->i_ino);
+        dpi->dirty_create_retries = 0;
     } else {
-        /* Failure: re-queue entries and retry with backoff */
+        /* Failure: re-queue entries and retry with backoff, up to
+         * MAX_RETRIES. After that, drop entries to avoid permanently
+         * blocking the directory (the inodes exist locally but will
+         * need a remount to sync). */
+        dpi->dirty_create_retries++;
+        if (dpi->dirty_create_retries > POWERFS_DIRTY_FLUSH_MAX_RETRIES) {
+            /* Give up: free dirty_create entries to unblock the directory */
+            struct powerfs_dirty_create *dc2;
+            spin_lock(&dpi->dirty_creates_lock);
+            list_splice(&tmp_list, &dpi->dirty_creates);
+            while (!list_empty(&dpi->dirty_creates)) {
+                dc2 = list_first_entry(&dpi->dirty_creates,
+                                      struct powerfs_dirty_create, list);
+                list_del(&dc2->list);
+                kfree(dc2);
+            }
+            dpi->dirty_create_count = 0;
+            dpi->dirty_create_retries = 0;
+            spin_unlock(&dpi->dirty_creates_lock);
+            pr_err("powerfs: batch_create dir=%lu failed after %d retries, "
+                   "dropping %d entries (ino sync lost, remount to recover)\n",
+                   dir->i_ino, POWERFS_DIRTY_FLUSH_MAX_RETRIES, count);
+        } else {
         spin_lock(&dpi->dirty_creates_lock);
         list_splice(&tmp_list, &dpi->dirty_creates);
         dpi->dirty_create_count = count;
         spin_unlock(&dpi->dirty_creates_lock);
-        pr_warn("powerfs: batch_create dir=%lu failed: %d, re-queuing %d\n",
-                dir->i_ino, ret, count);
+        pr_warn("powerfs: batch_create dir=%lu failed: %d, retry %d/%d\n",
+                dir->i_ino, ret, dpi->dirty_create_retries,
+                POWERFS_DIRTY_FLUSH_MAX_RETRIES);
         queue_delayed_work(system_long_wq, &dpi->flush_work,
                            msecs_to_jiffies(POWERFS_DIRTY_FLUSH_RETRY_MS));
+        }
     }
 
     kfree(entries);

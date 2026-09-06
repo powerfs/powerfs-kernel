@@ -671,6 +671,7 @@ struct powerfs_inode_info {
     spinlock_t dirty_creates_lock;
     struct list_head dirty_creates;
     int dirty_create_count;
+    int dirty_create_retries;  /* consecutive flush failure count */
     struct delayed_work flush_work;
 
     /* === 对齐 : 未 commit 的 async dirop / iop 链表 (Async DIROPS 核心) === */
@@ -1072,6 +1073,7 @@ struct powerfs_sb_info {
 #define POWERFS_DIRTY_FLUSH_THRESHOLD 32  /* flush when dirty_count >= this */
 #define POWERFS_DIRTY_FLUSH_TIMEOUT_MS 100  /*兜底 flush interval (ms) */
 #define POWERFS_DIRTY_FLUSH_RETRY_MS 200   /* retry interval on RPC failure */
+#define POWERFS_DIRTY_FLUSH_MAX_RETRIES 10  /* give up after this many failures */
 
 #define POWERFS_SB_INFO(sb) ((struct powerfs_sb_info *)(sb)->s_fs_info)
 
