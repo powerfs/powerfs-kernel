@@ -1249,7 +1249,8 @@ int powerfs_writepages(struct address_space *mapping,
             pr_debug("powerfs: WPAGES page ino=%lu offset=%lld i_size=%lld\n",
                     inode->i_ino, offset, i_size_read(inode));
             if (offset >= i_size_read(inode)) {
-                pr_debug("powerfs: WPAGES offset >= i_size, SKIP page\n");
+                pr_info("powerfs: [FSYNC75] WPAGES SKIP offset=%lld >= i_size=%lld ino=%lu\n",
+                        (long long)offset, (long long)i_size_read(inode), inode->i_ino);
                 unlock_page(page);
                 continue;
             }

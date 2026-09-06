@@ -760,6 +760,58 @@ int powerfs_net_write_needle(__u64 volume_id, __u64 file_key, __u64 inode,
 }
 
 /*
+ * powerfs_net_flush_needles - fsync 耐久性屏障 (FlushNeedles 0x006C)
+ *
+ * 要求 Volume Server 把 coalescer 内给定 needle (文件的 chunks) 强制物化到
+ * 数据文件 + RocksDB 索引并 fsync WAL。返回 0 = 数据已稳定落盘; 不在 coalescer
+ * (已落盘/从未写) 的 needle 在服务端被静默跳过。
+ *
+ * TLV: Ino(volume_id) + Limit(count) + count × FileKey
+ */
+int powerfs_net_flush_needles(__u64 volume_id, const __u64 *file_keys,
+                              __u32 count)
+{
+    __u8 *body;
+    __u8 resp_body[64];
+    struct powerfs_tlv_enc enc;
+    size_t resp_body_len = 0;
+    size_t cap;
+    __u32 i;
+    int ret;
+
+    if (count == 0 || !file_keys)
+        return 0;
+
+    /* 每个 u64 TLV ≈ tag(1)+len(1/3)+value(8) ≈ 12~16B, 预留余量. */
+    cap = 64 + (size_t)count * 16;
+    body = kmalloc(cap, GFP_NOFS);
+    if (!body)
+        return -ENOMEM;
+
+    powerfs_tlv_enc_init(&enc, body, cap);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_INO, volume_id);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_LIMIT, count);
+    for (i = 0; i < count; i++)
+        powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_FILE_KEY, file_keys[i]);
+
+    ret = powerfs_net_send_to_volume(-1, volume_id,
+                                      POWERFS_NET_MSG_FLUSH_NEEDLES,
+                                      body, powerfs_tlv_enc_len(&enc),
+                                      NULL, 0,
+                                      resp_body, sizeof(resp_body),
+                                      NULL, 0, 30000,
+                                      &resp_body_len, NULL);
+    kfree(body);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return net_status_to_errno((__u16)ret);
+
+    return 0;
+}
+EXPORT_SYMBOL_GPL(powerfs_net_flush_needles);
+
+/*
  * powerfs_net_read_needle - 直连 volume 读数据 (ReadNeedle)
  *
  * TLV 编码: Ino(volume_id) + FileKey

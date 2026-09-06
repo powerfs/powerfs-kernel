@@ -231,6 +231,10 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_DELETE_VOLUME = 0x0061,
     POWERFS_NET_MSG_WRITE_NEEDLE = 0x0062,
     POWERFS_NET_MSG_WRITE_NEEDLE_BLOB = 0x006B,
+    /* fsync 耐久性屏障: 强制 volume 把 coalescer 内指定 needle 物化落盘并
+     * fsync RocksDB WAL. TLV: Ino(volume_id) + Limit(count) + count×FileKey.
+     * 与 Rust 端 MsgType::FlushNeedles = 0x006C 一致. */
+    POWERFS_NET_MSG_FLUSH_NEEDLES = 0x006C,
     POWERFS_NET_MSG_READ_NEEDLE = 0x0063,
     POWERFS_NET_MSG_DELETE_NEEDLE = 0x0064,
     POWERFS_NET_MSG_BATCH_WRITE_NEEDLE = 0x0065,
@@ -1556,6 +1560,13 @@ int powerfs_net_send_to_volume(int vol_idx, __u64 volume_id,
 int powerfs_net_write_needle(__u64 volume_id, __u64 file_key, __u64 inode,
                              const __u8 *data, size_t data_len,
                              const char *lease_token, size_t token_len);
+
+/* FlushNeedles (0x006C): fsync 耐久性屏障. 强制 volume 把 coalescer 内给定
+ * needle (文件的 chunks) 物化落盘并 fsync RocksDB WAL.
+ * volume_id: 目标 volume; file_keys/count: 该卷上需刷盘的 needle(file_key) 列表.
+ * 返回 0 = 数据已稳定落盘; <0 = 传输/服务错误 (fsync 必须失败上抛, 不可吞错). */
+int powerfs_net_flush_needles(__u64 volume_id, const __u64 *file_keys,
+                              __u32 count);
 
 /* ReadNeedle: 直连 volume 读数据.
  * volume_id: 目标 volume
