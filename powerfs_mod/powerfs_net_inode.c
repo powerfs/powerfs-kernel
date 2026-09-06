@@ -661,6 +661,84 @@ int powerfs_net_alloc_inode_batch(__u64 shard_id, __u32 count,
 }
 
 /**
+ * powerfs_net_batch_create - Flush N locally-created files to Filer in one RPC.
+ *
+ * Sends POWERFS_NET_MSG_BATCH_CREATE (0x003f). The Filer batches all
+ * CreateInode + AddDirEntry into one propose_many (single Raft commit).
+ * TLV: ShardId + Count + [Entry(Ino+ParentIno+Name+Mode+Uid+Gid)] * Count.
+ *
+ * Returns 0 on success (fills *flushed with count), negative errno on failure.
+ */
+int powerfs_net_batch_create(__u64 shard_id,
+                             const struct powerfs_dirty_create *entries,
+                             __u32 count, __u32 *flushed)
+{
+    /* Body size: ShardId(12) + Count(6) + per-entry(~40 + name_len).
+     * Worst case: 64 × (40 + 255) ≈ 19KB. Use kvmalloc for safety. */
+    size_t body_cap = 64 + (size_t)count * (60 + NAME_MAX + 1);
+    __u8 *body;
+    struct powerfs_tlv_enc enc;
+    __u8 resp[64];
+    size_t resp_len = 0;
+    __u32 i;
+    int ret;
+
+    if (count == 0) {
+        if (flushed)
+            *flushed = 0;
+        return 0;
+    }
+
+    body = kvmalloc(body_cap, GFP_NOFS);
+    if (!body)
+        return -ENOMEM;
+
+    powerfs_tlv_enc_init(&enc, body, body_cap);
+    powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SHARD_ID, shard_id);
+    powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_COUNT, count);
+
+    for (i = 0; i < count; i++) {
+        __u8 entry_buf[60 + NAME_MAX + 1];
+        struct powerfs_tlv_enc eenc;
+
+        powerfs_tlv_enc_init(&eenc, entry_buf, sizeof(entry_buf));
+        powerfs_tlv_enc_u64(&eenc, POWERFS_NET_FLD_INO, entries[i].ino);
+        powerfs_tlv_enc_u64(&eenc, POWERFS_NET_FLD_PARENT_INO,
+                            entries[i].parent_ino);
+        powerfs_tlv_enc_string(&eenc, POWERFS_NET_FLD_NAME,
+                               entries[i].name, entries[i].name_len);
+        powerfs_tlv_enc_u32(&eenc, POWERFS_NET_FLD_MODE, entries[i].mode);
+        powerfs_tlv_enc_u32(&eenc, POWERFS_NET_FLD_UID, entries[i].uid);
+        powerfs_tlv_enc_u32(&eenc, POWERFS_NET_FLD_GID, entries[i].gid);
+        powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_ENTRY,
+                              entry_buf, powerfs_tlv_enc_len(&eenc));
+    }
+
+    ret = powerfs_net_send_request_shard(
+                POWERFS_NET_MSG_BATCH_CREATE, shard_id,
+                body, powerfs_tlv_enc_len(&enc),
+                NULL, 0,
+                resp, sizeof(resp),
+                NULL, 0, POWERFS_META_TIMEOUT_MS,
+                &resp_len, NULL);
+    kvfree(body);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return net_status_to_errno((__u16)ret);
+
+    if (flushed) {
+        struct powerfs_tlv_dec dec;
+        *flushed = count;  /* default: all flushed */
+        if (resp_len > 0) {
+            powerfs_tlv_dec_init(&dec, resp, resp_len);
+            powerfs_tlv_dec_find_u32(&dec, POWERFS_NET_FLD_COUNT, flushed);
+        }
+    }
+    return 0;
+}
+
+/**
  * powerfs_net_create - 创建文件或目录
  *
  * 响应中包含 Filer 自分配的 volume_id + needle_id (file_key),

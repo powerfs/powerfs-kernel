@@ -1657,6 +1657,8 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
     spin_lock_init(&sbi->client->cap_lru_lock);
     INIT_LIST_HEAD(&sbi->client->cap_flush_list);
     spin_lock_init(&sbi->client->cap_flush_lock);
+    INIT_DELAYED_WORK(&sbi->client->cap_renew_work,
+                      powerfs_cap_renew_work_fn);
     mutex_init(&sbi->client->mount_mutex);
     ret = powerfs_metrics_init(&sbi->client->metrics);
     if (ret) {
@@ -1785,6 +1787,11 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         pr_err("powerfs: failed to create lease workqueue\n");
         return -ENOMEM;
     }
+
+    /* Cap 租约续约 sweep: 10s 后首轮, 之后每 10s 扫描 cap_lru_list,
+     * 在 30s TTL 到期前为仍打开/有脏数据的 cap 重发 CapOpenGrant. */
+    queue_delayed_work(sbi->lease_wq, &sbi->client->cap_renew_work,
+                       msecs_to_jiffies(10000));
 
     /* P1-1: 创建 per-sb slab caches (对齐  init_caches() — cap/cap_snap/cap_flush).
      * 注意: inode_cache/dentry_cachep 是模块级全局 (powerfs_init_inode_cache 创建),
@@ -2116,6 +2123,13 @@ void powerfs_kill_sb_super(struct super_block *sb)
     if (sbi)
         sbi->shutting_down = true;
 
+    /* 1c. 停止 cap 租约续约 sweep: work fn 会发网络 RPC 并可能触发
+     *     cap_flush (writeback), 必须在 writeback_wq / lease_wq 销毁
+     *     及关闭网络之前取消. shutting_down 已置位, 运行中的实例
+     *     不会再重新排队. */
+    if (sbi && sbi->client)
+        cancel_delayed_work_sync(&sbi->client->cap_renew_work);
+
     /* 2. 销毁 writeback workqueue (Stage C).
      *    sync_filesystem 已触发 writeback 并等待 PageWriteback 清除,
      *    此时 workqueue 中所有 work 应已完成. destroy_workqueue 会
@@ -2135,6 +2149,8 @@ void powerfs_kill_sb_super(struct super_block *sb)
      *    destroy_workqueue 会 flush 所有 pending delayed_work,
      *    之后 evict_inode 的 cancel_delayed_work_sync 仅取消定时器, 安全. */
     if (sbi && sbi->lease_wq) {
+        /* cap_renew_work 已在 step 1c cancel; destroy lease_wq 会 flush
+         * 剩余 per-inode lease_renew_work. */
         destroy_workqueue(sbi->lease_wq);
         sbi->lease_wq = NULL;
     }

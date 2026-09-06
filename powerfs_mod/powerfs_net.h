@@ -175,6 +175,14 @@ enum powerfs_net_msg_type {
     POWERFS_NET_MSG_ALLOC_INODE_BATCH = 0x0033,
     POWERFS_NET_MSG_MKDIR_PHASE_A     = 0x003c,
     POWERFS_NET_MSG_MKDIR_PHASE_B     = 0x003d,
+    /* Phase 2: Optimistic local create batch flush.
+     * Client batches N locally-created files into one RPC → one Raft
+     * propose_many (CreateInode + AddDirEntry × N). Amortizes ~10ms Raft
+     * commit over N creates → ~0.15ms/create.
+     * Request: ShardId + Count(u32) + [Entry(Ino+ParentIno+Name+Mode+Uid+Gid)]*Count
+     * Response: Status + Count(u32) of successfully flushed entries
+     * Value MUST match powerfs-net/src/protocol.rs MsgType::BatchCreate. */
+    POWERFS_NET_MSG_BATCH_CREATE       = 0x003f,
 
     /* 状态 */
     POWERFS_NET_MSG_STATFS = 0x0040,
@@ -1286,6 +1294,7 @@ struct powerfs_migrate_alloc_result {
 struct powerfs_file_layout;  /* 定义在 powerfs.h */
 struct powerfs_chunk_map;   /* 定义在 powerfs.h */
 struct powerfs_inode_info;  /* 定义在 powerfs.h */
+struct powerfs_dirty_create;/* 定义在 powerfs.h */
 
 /* LOOKUP (返回完整属性含时间戳 + volume_id/file_key 用于数据直连).
  * powerfs_net_lookup 用默认 10s 超时 (兼容旧调用方).
@@ -1341,6 +1350,22 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
  * Returns 0 on success, fills start_ino/end_ino. */
 int powerfs_net_alloc_inode_batch(__u64 shard_id, __u32 count,
                                    __u64 *start_ino, __u64 *end_ino);
+
+/* Phase 2: BatchCreate — flush N locally-created files to Filer in one RPC.
+ *
+ * Sends POWERFS_NET_MSG_BATCH_CREATE (0x003f) with a TLV body containing
+ * ShardId + Count + [Entry(Ino+ParentIno+Name+Mode+Uid+Gid)] * Count.
+ * The Filer batches all CreateInode + AddDirEntry into one propose_many
+ * (single Raft commit cycle for the whole batch).
+ *
+ * @shard_id:   parent directory's shard (all entries share this shard)
+ * @entries:    array of powerfs_dirty_create snapshots
+ * @count:      number of entries
+ * @flushed:    out — number of entries successfully flushed
+ * Returns 0 on success, negative errno on failure. */
+int powerfs_net_batch_create(__u64 shard_id,
+                             const struct powerfs_dirty_create *entries,
+                             __u32 count, __u32 *flushed);
 
 /* UNLINK / RMDIR */
 int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,

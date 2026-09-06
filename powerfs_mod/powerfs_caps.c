@@ -563,6 +563,277 @@ int cap_open_grant_local(struct powerfs_inode_info *pi, bool is_write)
     return 0;
 }
 
+/* Upgrade an optimistically (locally) created inode to Filer-registered
+ * caps before the first operation that needs server-side arbitration:
+ *   - data write (write_iter / page_mkwrite / fallocate)
+ *   - metadata mutation (setattr: truncate / chmod / chown / utimes)
+ *
+ * Fast-path create issues caps purely locally with an empty token and
+ * defers the BatchCreate commit. While the inode is unknown to the Filer
+ * no other client can access it, so speculative local caps are safe. But
+ * once THIS client writes data (or changes metadata), another client may
+ * look the file up after the deferred BatchCreate lands and open it — the
+ * Filer must already know we hold the write cap, otherwise it grants the
+ * reader/writer immediately without recalling us, and the other client
+ * observes stale size=0 / Empty storage (the dirty data only exists in
+ * our page cache / inline_data until close).
+ *
+ * Sequence (process context, may block on RPCs):
+ *   1. Force-flush the parent's pending BatchCreate so the inode exists on
+ *      the Filer. The gated flush skips empty files; here the first write
+ *      has not landed yet (inline_dirty is set later in write_end) so the
+ *      force variant is required.
+ *   2. CapOpenGrant(write_open=true): register the exclusive write cap
+ *      with the lock arbiter and obtain a recall token. Retried a few
+ *      times to cover a Raft election / reconnect blip.
+ *   3. Clear local_cap_granted — from here the inode follows all normal
+ *      grant/recall/release/setattr paths.
+ *
+ * Empty creates (touch: create+close, never mutated) never reach here and
+ * keep the Phase-2/3 batching throughput.
+ *
+ * Returns 0 on success (or no-op when already upgraded). On hard failure
+ * (Filer unreachable) returns -EAGAIN: data-mutating paths must not
+ * proceed against an unregistered lease — the Filer could not protect
+ * other clients from reading our uncommitted state. */
+int powerfs_upgrade_local_create(struct inode *inode, bool is_write)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    bool need_upgrade;
+    int attempt;
+    int ret = 0;
+
+    spin_lock(&pi->i_lock);
+    need_upgrade = pi->local_cap_granted;
+    spin_unlock(&pi->i_lock);
+    if (!need_upgrade)
+        return 0;
+
+    /* 1. Publish the inode to the Filer (BatchCreate) before any cap RPC. */
+    powerfs_flush_pending_create(inode, true /*force*/);
+
+    /* 2. Request real caps + token. cap_open_grant_and_issue degrades to
+     *    token="" on RPC failure (open must not block), but for a data
+     *    mutation that state is exactly what we must not accept — the
+     *    Filer would not know to recall us. Require a non-empty token.
+     *    Note: the force flush above already converts still-open children
+     *    via the BatchCreate post-flush path; if that raced ahead of us
+     *    (marker cleared), there is nothing left to do. */
+    for (attempt = 0; attempt < 3; attempt++) {
+        bool done = false;
+        bool have_token = false;
+
+        spin_lock(&pi->i_lock);
+        if (!pi->local_cap_granted)
+            done = true;
+        else if (pi->i_auth_cap && pi->i_auth_cap->token[0] != '\0')
+            have_token = true;
+        spin_unlock(&pi->i_lock);
+        if (done)
+            return 0;
+
+        if (!have_token) {
+            ret = cap_open_grant_and_issue(pi, is_write);
+            if (ret == 0) {
+                spin_lock(&pi->i_lock);
+                if (!pi->local_cap_granted)
+                    done = true;
+                else if (pi->i_auth_cap &&
+                         pi->i_auth_cap->token[0] != '\0')
+                    have_token = true;
+                spin_unlock(&pi->i_lock);
+            }
+        }
+        if (done)
+            return 0;
+        if (have_token)
+            break;
+        pr_warn_ratelimited("powerfs: upgrade_local_create ino=%lu write=%d "
+                            "attempt %d failed (ret=%d), retrying\n",
+                            inode->i_ino, (int)is_write, attempt + 1, ret);
+        if (attempt < 2)
+            msleep(200);
+    }
+
+    /* 3. On success clear the speculative marker. On failure leave it set:
+     *    the next mutation retries, and close/fsync paths still flush the
+     *    create + sync data defensively. */
+    {
+        bool upgraded = false;
+
+        spin_lock(&pi->i_lock);
+        if (pi->i_auth_cap && pi->i_auth_cap->token[0] != '\0') {
+            pi->local_cap_granted = false;
+            upgraded = true;
+        }
+        spin_unlock(&pi->i_lock);
+
+        if (upgraded) {
+            pr_info("powerfs: upgrade_local_create ino=%lu write=%d — write "
+                    "cap registered with Filer\n",
+                    inode->i_ino, (int)is_write);
+            return 0;
+        }
+    }
+
+    pr_warn("powerfs: upgrade_local_create ino=%lu failed after 3 attempts "
+            "(ret=%d) — returning -EAGAIN\n", inode->i_ino, ret);
+    return -EAGAIN;
+}
+
+/*
+ * Cap lease renewal sweep — client-side counterpart of the Filer arbiter's
+ * 30s holder TTL (DEFAULT_LEASE_DURATION_MS). The arbiter purges holders that
+ * do not reappear on any grant/acquire RPC; once purged, a conflicting open by
+ * another client is granted with recalls=0 (there is nobody to recall) and a
+ * dirty writer is never asked to flush — the reader then observes stale size
+ * / Empty storage even though the writer still holds the data in page cache.
+ *
+ * Every 10s we walk cap_lru_list and, for each regular inode whose auth cap
+ * has a real token and which is still open-for-write or has dirty state,
+ * re-issue CapOpenGrant once the cap enters the last 1/3 of its TTL:
+ *   - same client_id → arbiter find_holder_mut refreshes expire_at and
+ *     returns the (same or new) token;
+ *   - if the holder had already expired (network blip > TTL), the grant
+ *     re-registers us (arbiter recalls anyone granted in the meantime) and we
+ *     proactively flush dirty caps so the rebuilt state carries our data.
+ * Read-only / clean caps are left to expire (no dirty state to protect).
+ */
+#define POWERFS_CAP_RENEW_INTERVAL_MS	10000
+
+void powerfs_cap_renew_work_fn(struct work_struct *work)
+{
+	struct powerfs_client *cli = container_of(to_delayed_work(work),
+						  struct powerfs_client,
+						  cap_renew_work);
+	struct powerfs_sb_info *sbi;
+	struct inode **grab = NULL;
+	struct powerfs_cap *cap;
+	int max, nr = 0, i;
+
+	if (!cli || !cli->sb)
+		return;
+	sbi = POWERFS_SB_INFO(cli->sb);
+	if (!sbi || sbi->shutting_down)
+		return;
+
+	max = (int)atomic64_read(&cli->metrics.total_caps);
+	if (max > 0)
+		grab = kmalloc_array(max + 1, sizeof(struct inode *), GFP_KERNEL);
+	if (grab) {
+		/* igrab under cap_lru_lock: evict removes the cap from this
+		 * list under the same lock and sets I_FREEING before freeing
+		 * it, so a cap observed here is either alive or igrab fails. */
+		spin_lock(&cli->cap_lru_lock);
+		list_for_each_entry(cap, &cli->cap_lru_list, lru_item) {
+			struct inode *inode;
+
+			if (nr >= max)
+				break;
+			if (!cap->ci || cap->ci->i_auth_cap != cap)
+				continue;
+			inode = &cap->ci->netfs.inode;
+			if (!igrab(inode))
+				continue;
+			grab[nr++] = inode;
+		}
+		spin_unlock(&cli->cap_lru_lock);
+
+		for (i = 0; i < nr; i++) {
+			struct inode *inode = grab[i];
+			struct powerfs_inode_info *pi = POWERFS_I(inode);
+			bool open_wr = false, dirty = false;
+			bool was_expired = false, renew_now = false;
+			bool ok;
+
+			if (sbi->shutting_down) {
+				iput(inode);
+				continue;
+			}
+			if (!S_ISREG(inode->i_mode)) {
+				iput(inode);
+				continue;
+			}
+
+			spin_lock(&pi->i_lock);
+			cap = pi->i_auth_cap;
+			if (!cap || cap->token[0] == '\0' ||
+			    cap->cap_gen == 0) {
+				spin_unlock(&pi->i_lock);
+				iput(inode);
+				continue;
+			}
+			open_wr = pi->i_nr_by_mode[POWERFS_FILE_MODE_WR] > 0;
+			dirty = pi->inline_dirty || pi->i_dirty_caps != 0;
+			was_expired = cap->expire_jiffies &&
+				time_after_eq(jiffies, cap->expire_jiffies);
+			/* 进入 TTL 最后 1/3 (或已过期) 才续约. */
+			renew_now = cap->expire_jiffies == 0 ||
+				time_after_eq(jiffies,
+					      cap->expire_jiffies -
+					      (POWERFS_LEASE_DURATION / 3));
+			spin_unlock(&pi->i_lock);
+
+			if (!renew_now) {
+				iput(inode);
+				continue;
+			}
+			if (!open_wr && !dirty) {
+				/* page cache 脏/回写中的页也算 dirty. */
+				if (!mapping_tagged(inode->i_mapping,
+						    PAGECACHE_TAG_DIRTY) &&
+				    !mapping_tagged(inode->i_mapping,
+						    PAGECACHE_TAG_WRITEBACK)) {
+					iput(inode);
+					continue;
+				}
+				dirty = true;
+			}
+
+			pr_info_ratelimited("powerfs: cap_renew ino=%lu write=%d "
+					    "(open_wr=%d dirty=%d expired=%d)\n",
+					    inode->i_ino,
+					    (int)(open_wr || dirty),
+					    (int)open_wr, (int)dirty,
+					    (int)was_expired);
+
+			/* 同 client_id 重发 open_grant: arbiter 命中现有
+			 * holder → 仅刷新 expire_at + 返回 token. */
+			cap_open_grant_and_issue(pi, open_wr || dirty);
+
+			spin_lock(&pi->i_lock);
+			cap = pi->i_auth_cap;
+			ok = cap && cap->token[0] != '\0' &&
+			     powerfs_cap_is_valid(cap);
+			spin_unlock(&pi->i_lock);
+
+			if (!ok) {
+				/* 续约失败: 下次 sweep (10s 后) 重试,
+				 * 仍在 30s TTL 窗口内. */
+				pr_warn_ratelimited("powerfs: cap_renew ino=%lu "
+						    "failed; will retry\n",
+						    inode->i_ino);
+			} else if (was_expired && dirty) {
+				/* TTL 已过才重新注册成功: 服务端在空窗期
+				 * 可能已把 cap 发给别人 (触发 GATHER 收回).
+				 * 立即回写脏数据, 让重建立的状态携带本端
+				 * 数据, 避免读者再看到 Empty/stale. */
+				pr_info("powerfs: cap_renew ino=%lu reacquired "
+					"after expiry — flushing dirty state\n",
+					inode->i_ino);
+				(void)powerfs_cap_flush(pi,
+							POWERFS_CAP_ANY_DIRTY);
+			}
+			iput(inode);
+		}
+		kfree(grab);
+	}
+
+	if (!sbi->shutting_down)
+		queue_delayed_work(sbi->lease_wq, &cli->cap_renew_work,
+				   msecs_to_jiffies(POWERFS_CAP_RENEW_INTERVAL_MS));
+}
+
 /* §13.4.2 CapRecallAck 包装: 把 cap 的 token + inode + client_id 组装后 ACK 到 Filer.
  * 由 powerfs_cap_revoke() 在 flush 完后调用 (revoke 期间需 ACK).
  * 调用方**不持 pi->i_lock** (RPC 可能阻塞). */
@@ -961,8 +1232,14 @@ void powerfs_cap_issue(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
 
     had = powerfs_caps_issued(pi, NULL);
 
-    /* 更新授权位 (单调: issued 只增不减, revoke 时才降) */
-    cap->issued = issued;
+    /* 更新授权位 (单调: issued 只增不减, revoke 时才降).
+     * 必须用 OR 叠加而非赋值: 一个 inode 可能先后收到不同范围的 grant
+     * (例如目录先拿到写授权 AUTH_EXCL, 之后一次 read-grant 或 RPC piggyback
+     * 只带 SHARED 位). 若用赋值, 低权限 grant 会覆盖掉 AUTH_EXCL, 导致 fast
+     * path 误判 has_dir_auth_excl()==false 而在每次 create 都重发一次
+     * cap_open_grant RPC (性能退化), 也违背"授权只增、revoke 才降"的约定.
+     * 权限降级由服务端显式 recall 处理 (cap_revoke: issued &= ~revoking). */
+    cap->issued |= issued;
     /* implemented 取 issued 的超集 (保留本地仍用的位) */
     cap->implemented |= issued;
 
@@ -1020,22 +1297,39 @@ void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
     /* 1. 降级 issued */
     cap->issued &= ~revoking;
 
-    /* 2. 检查是否有脏数据需要 flush */
+    /* 2. 检查是否有脏数据需要 flush.
+     * 注意: 绝不能像早期版本那样在这里预先把 dirty 位移到 i_flushing_caps —
+     * powerfs_cap_flush() 自己负责 "取脏位 (i_dirty_caps & mask) → 移到
+     * flushing → 写回" 的原子流程; 若调用方先清空 i_dirty_caps, cap_flush
+     * 入口 flushing==0 直接 return 0, recall flush 静默变空操作:
+     * inline_data / stripe 脏页从未提交 Filer, 但 ACK 照常发出 →
+     * 被提升的读者读到全零 (静默数据丢失). */
     dirty_to_flush = pi->i_dirty_caps & revoking;
-    if (dirty_to_flush) {
-        /* 将 dirty 位移到 flushing 位, 清除 dirty */
-        pi->i_flushing_caps |= dirty_to_flush;
-        pi->i_dirty_caps &= ~dirty_to_flush;
-        need_flush = true;
-    }
+    need_flush = dirty_to_flush != 0;
 
     pr_debug("powerfs: cap_revoke ino=%lu revoking=0x%x dirty_flush=0x%x need_flush=%d\n",
              inode->i_ino, revoking, dirty_to_flush, need_flush);
 
     if (need_flush) {
-        /* 临时释放锁发 flush RPC (flush 内部自行加锁) */
+        /* 临时释放锁发 flush RPC (flush 内部自行取脏位/移位/加锁) */
         spin_unlock(&pi->i_lock);
         powerfs_cap_flush(pi, dirty_to_flush);
+        spin_lock(&pi->i_lock);
+    }
+
+    /* 2b. Phase 3 (乐观本地 create): 当目录的 AUTH_EXCL 被回收时, 说明另一
+     * 个客户端即将成为该目录的独占写者. 我们必须在 ACK recall 之前, 把所有
+     * 本地乐观创建 (尚未 BatchCreate 到 Filer) 的 dirty creates 同步 flush,
+     * 否则新独占写者会看到缺失/陈旧的目录项, 甚至创建同名文件冲突.
+     *
+     * 先 cancel 后台 flush_work (system_long_wq) 再同步 flush, 避免与后台
+     * worker 竞态. recall work 运行在 powerfs_refresh_wq, 与 flush_work 不同
+     * workqueue, 故 cancel_delayed_work_sync 不会自等死锁.
+     * 空目录项列表时 powerfs_flush_dirty_creates 为 no-op. */
+    if ((revoking & POWERFS_CAP_AUTH_EXCL) && S_ISDIR(inode->i_mode)) {
+        spin_unlock(&pi->i_lock);
+        cancel_delayed_work_sync(&pi->flush_work);
+        powerfs_flush_dirty_creates(inode);
         spin_lock(&pi->i_lock);
     }
 
@@ -1071,21 +1365,30 @@ void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
      *     但 refresh_work 完成后第二次 read 能读到最新数据 */
     if (revoking & (POWERFS_CAP_FILE_WR | POWERFS_CAP_FILE_EXCL)) {
         if (pi->placement == POWERFS_PLACEMENT_INLINE) {
-            u8 *old_inline;
+            u8 *old_inline = NULL;
+            bool discard_local;
 
-            pr_info("powerfs: cap_revoke INLINE ino=%lu revoking=0x%x — "
-                    "release inline_data + invalidate pagecache\n",
-                    inode->i_ino, revoking);
-
-            /* a) 释放 inline_data, 标记为 stale */
-            old_inline = pi->inline_data;
-            pi->inline_data = NULL;
-            pi->inline_len = 0;
-            pi->inline_dirty = false;
+            /* 只有 inline 数据已成功同步 (inline_dirty==false) 时才允许
+             * 释放本地副本; 若 cap_flush 失败 (inline_dirty 仍为 true),
+             * 释放 buffer 会造成唯一副本丢失 — 保留它, 等下次 recall/fsync/
+             * close 重试提交. */
+            discard_local = !pi->inline_dirty;
+            if (discard_local) {
+                pr_info("powerfs: cap_revoke INLINE ino=%lu revoking=0x%x — "
+                        "release inline_data + invalidate pagecache\n",
+                        inode->i_ino, revoking);
+                old_inline = pi->inline_data;
+                pi->inline_data = NULL;
+                pi->inline_len = 0;
+            } else {
+                pr_warn_ratelimited("powerfs: cap_revoke INLINE ino=%lu revoking=0x%x — "
+                        "flush FAILED, keep dirty inline_data for retry\n",
+                        inode->i_ino, revoking);
+            }
             spin_unlock(&pi->i_lock);
             kfree(old_inline);
 
-            /* b) 失效 page cache (非阻塞, 跳过 dirty/locked pages) */
+            /* b) 失效 page cache (非阻塞, 自动跳过 dirty/locked pages) */
             invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
 
             /* c) 触发 refresh_work 异步拉取最新 inline_data.
@@ -1280,6 +1583,26 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
             pi->i_flushing_caps &= ~need_data_flush;
             spin_unlock(&pi->i_lock);
             ret = err;
+        } else if (pi->placement == POWERFS_PLACEMENT_FLAT ||
+                   pi->placement == POWERFS_PLACEMENT_STRIPE ||
+                   pi->placement == POWERFS_PLACEMENT_WIDESTRIPE) {
+            /* Writeback only landed data on Volume Servers; the Filer still
+             * has storage_mode=Empty with no chunk map. Commit size+chunks
+             * (strong Raft) before the recall ACK promotes another client,
+             * otherwise that client reads size=0 / cannot locate chunks.
+             * Mirrors FUSE flush_and_sync → sync_size_chunks_on_close.
+             * Inline files are handled below by need_inline_flush. */
+            int cerr = powerfs_sync_inode_size_chunks(inode,
+                                                      "kernel-capflush", 5);
+            if (cerr < 0) {
+                pr_warn_ratelimited("powerfs: cap_flush chunks ino=%lu failed: %d, will retry\n",
+                                    inode->i_ino, cerr);
+                spin_lock(&pi->i_lock);
+                pi->i_dirty_caps    |= need_data_flush;
+                pi->i_flushing_caps &= ~need_data_flush;
+                spin_unlock(&pi->i_lock);
+                ret = cerr;
+            }
         }
     }
 

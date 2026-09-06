@@ -84,7 +84,14 @@ static int pool_refill(struct powerfs_sb_info *sbi, u64 shard_id)
         spin_lock(&pool->lock);
         pool->next_ino = start;
         pool->end_ino = end;
-        pool->remaining = (u32)(end - start + 1);
+        /* Filer returns a HALF-OPEN range [start, end): the valid inodes are
+         * start..end-1 (count = end-start), and `end` is the first inode of
+         * the NEXT batch. Using end-start+1 here over-counts by one and hands
+         * out `end` — which collides with the next batch's first inode. That
+         * made two adjacent files share one inode: the loser's BatchCreate
+         * was rejected as "inode exists" (file name vanished → ENOENT) and
+         * the winner's inline data got cross-written. Keep it end-start. */
+        pool->remaining = (u32)(end - start);
         spin_unlock(&pool->lock);
     }
     pr_debug("powerfs: pool_refill shard=%llu start=%llu end=%llu remaining=%u\n",
@@ -131,6 +138,275 @@ static bool has_dir_auth_excl(struct powerfs_inode_info *pi)
     return ret;
 }
 
+
+/* ========== Optimistic local create: dirty create flush (Phase 2) ========== */
+
+/* Cancel a dirty create by name. Called from unlink when the file was
+ * locally created but not yet flushed to Filer. Returns true if a dirty
+ * create was found and removed (caller skips the net_unlink RPC). */
+static bool powerfs_cancel_dirty_create(struct inode *dir, const char *name)
+{
+    struct powerfs_inode_info *dpi = POWERFS_I(dir);
+    struct powerfs_dirty_create *dc, *tmp;
+    bool found = false;
+
+    spin_lock(&dpi->dirty_creates_lock);
+    list_for_each_entry_safe(dc, tmp, &dpi->dirty_creates, list) {
+        if (strcmp(dc->name, name) == 0) {
+            list_del(&dc->list);
+            dpi->dirty_create_count--;
+            kfree(dc);
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&dpi->dirty_creates_lock);
+    return found;
+}
+
+/* Check whether @name is a locally-optimistic create still pending flush
+ * (present in the directory's dirty_creates list but not yet known to the
+ * Filer). Used by the lookup path to close the read-your-writes window:
+ * a create() followed immediately by a cross-process lookup can miss the
+ * dcache and hit the Filer before the background BatchCreate has run, which
+ * would transiently return ENOENT to the file's own creator. */
+static bool powerfs_has_pending_dirty_create(struct inode *dir, const char *name)
+{
+    struct powerfs_inode_info *dpi = POWERFS_I(dir);
+    struct powerfs_dirty_create *dc;
+    bool found = false;
+
+    if (!S_ISDIR(dir->i_mode) || dpi->dirty_create_count == 0)
+        return false;
+
+    spin_lock(&dpi->dirty_creates_lock);
+    list_for_each_entry(dc, &dpi->dirty_creates, list) {
+        if (strcmp(dc->name, name) == 0) {
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&dpi->dirty_creates_lock);
+    return found;
+}
+
+/* Flush all dirty creates from a directory to Filer via one BatchCreate RPC.
+ * Called from the delayed_work worker, on evict_inode (sync), and on
+ * fsync(dir). Safe to call with an empty list (no-op). */
+void powerfs_flush_dirty_creates(struct inode *dir)
+{
+    struct powerfs_inode_info *dpi = POWERFS_I(dir);
+    struct powerfs_dirty_create *dc, *tmp;
+    LIST_HEAD(tmp_list);
+    int count;
+    struct powerfs_dirty_create *entries;
+    u64 shard_id;
+    u32 flushed = 0;
+    int i = 0;
+    int ret;
+
+    /* 1. Collect dirty creates (lock, move list, unlock) */
+    spin_lock(&dpi->dirty_creates_lock);
+    if (dpi->dirty_create_count == 0) {
+        spin_unlock(&dpi->dirty_creates_lock);
+        return;
+    }
+    count = dpi->dirty_create_count;
+    list_replace_init(&dpi->dirty_creates, &tmp_list);
+    dpi->dirty_create_count = 0;
+    spin_unlock(&dpi->dirty_creates_lock);
+
+    /* 2. Build array for RPC (copy snapshots from list nodes) */
+    entries = kmalloc_array(count, sizeof(*entries), GFP_NOFS);
+    if (!entries) {
+        /* OOM: re-queue all entries for retry */
+        spin_lock(&dpi->dirty_creates_lock);
+        list_splice(&tmp_list, &dpi->dirty_creates);
+        dpi->dirty_create_count = count;
+        spin_unlock(&dpi->dirty_creates_lock);
+        queue_delayed_work(system_long_wq, &dpi->flush_work,
+                           msecs_to_jiffies(POWERFS_DIRTY_FLUSH_RETRY_MS));
+        return;
+    }
+
+    list_for_each_entry(dc, &tmp_list, list)
+        entries[i++] = *dc;
+
+    /* 3. Send BatchCreate RPC (one Raft commit for all entries) */
+    shard_id = shard_map_route(dir->i_ino);
+    ret = powerfs_net_batch_create(shard_id, entries, count, &flushed);
+
+    if (ret == 0) {
+        /* Success: the inodes are now visible on the Filer, so other
+         * clients can look them up and open them. Retire the speculative
+         * local caps (empty token) of the children we just published:
+         *  - still open (or dirty): convert to a real Filer grant now, so
+         *    conflicting access triggers CapRecall → flush → ACK instead
+         *    of the Filer granting against an unregistered holder (stale
+         *    reads / lost writes);
+         *  - closed and clean: just clear the marker — the next open uses
+         *    the normal cap_open_grant RPC path (no extra RPC here; this
+         *    preserves the empty-touch batch throughput).
+         * On grant degradation (RPC failure, empty token) the marker is
+         * left set so the next write/setattr retries the upgrade. */
+        list_for_each_entry_safe(dc, tmp, &tmp_list, list) {
+            struct inode *child = ilookup(dir->i_sb, dc->ino);
+
+            if (child) {
+                struct powerfs_inode_info *cpi = POWERFS_I(child);
+                bool open_wr = false, open_rd = false, dirty = false;
+                bool need_grant, is_write;
+
+                spin_lock(&cpi->i_lock);
+                if (cpi->local_cap_granted) {
+                    open_wr = cpi->i_nr_by_mode[POWERFS_FILE_MODE_WR] > 0;
+                    open_rd = cpi->i_nr_by_mode[POWERFS_FILE_MODE_RD] > 0;
+                    dirty = cpi->inline_dirty;
+                    spin_unlock(&cpi->i_lock);
+                    dirty = dirty ||
+                            mapping_tagged(child->i_mapping,
+                                           PAGECACHE_TAG_DIRTY);
+                    need_grant = open_wr || open_rd || dirty;
+                    is_write = open_wr || dirty;
+
+                    if (need_grant) {
+                        cap_open_grant_and_issue(cpi, is_write);
+                        spin_lock(&cpi->i_lock);
+                        if (cpi->i_auth_cap &&
+                            cpi->i_auth_cap->token[0] != '\0')
+                            cpi->local_cap_granted = false;
+                        spin_unlock(&cpi->i_lock);
+                        pr_debug("powerfs: post-flush grant child ino=%lu "
+                                 "write=%d\n", dc->ino, (int)is_write);
+                    } else {
+                        spin_lock(&cpi->i_lock);
+                        cpi->local_cap_granted = false;
+                        spin_unlock(&cpi->i_lock);
+                    }
+                } else {
+                    spin_unlock(&cpi->i_lock);
+                }
+                iput(child);
+            }
+
+            list_del(&dc->list);
+            kfree(dc);
+        }
+        pr_debug("powerfs: flushed %u dirty creates in dir=%lu\n",
+                 flushed, dir->i_ino);
+    } else {
+        /* Failure: re-queue entries and retry with backoff */
+        spin_lock(&dpi->dirty_creates_lock);
+        list_splice(&tmp_list, &dpi->dirty_creates);
+        dpi->dirty_create_count = count;
+        spin_unlock(&dpi->dirty_creates_lock);
+        pr_warn("powerfs: batch_create dir=%lu failed: %d, re-queuing %d\n",
+                dir->i_ino, ret, count);
+        queue_delayed_work(system_long_wq, &dpi->flush_work,
+                           msecs_to_jiffies(POWERFS_DIRTY_FLUSH_RETRY_MS));
+    }
+
+    kfree(entries);
+}
+
+/* Workqueue callback for delayed flush */
+void powerfs_flush_dirty_creates_work_fn(struct work_struct *work)
+{
+    struct delayed_work *dw = to_delayed_work(work);
+    struct powerfs_inode_info *pi =
+        container_of(dw, struct powerfs_inode_info, flush_work);
+    struct inode *inode = &pi->netfs.inode;
+
+    if (!S_ISDIR(inode->i_mode))
+        return;
+
+    powerfs_flush_dirty_creates(inode);
+}
+
+/* Schedule a flush check after a fast-path create. Triggers immediately
+ * when dirty_count >= THRESHOLD, otherwise defers to the 100ms timer. */
+void powerfs_check_dirty_flush(struct inode *dir)
+{
+    struct powerfs_inode_info *dpi = POWERFS_I(dir);
+    bool need_immediate = false;
+
+    if (!S_ISDIR(dir->i_mode))
+        return;
+
+    spin_lock(&dpi->dirty_creates_lock);
+    if (dpi->dirty_create_count >= POWERFS_DIRTY_FLUSH_THRESHOLD)
+        need_immediate = true;
+    spin_unlock(&dpi->dirty_creates_lock);
+
+    if (need_immediate)
+        queue_delayed_work(system_long_wq, &dpi->flush_work, 0);
+    else
+        queue_delayed_work(system_long_wq, &dpi->flush_work,
+                           msecs_to_jiffies(POWERFS_DIRTY_FLUSH_TIMEOUT_MS));
+}
+
+/* Ensure an optimistically-created file's metadata has been committed to
+ * the Filer before any data sync (inline_data update or chunks layout
+ * update) targets that inode.
+ *
+ * Rationale: the fast path defers the BatchCreate metadata commit by up
+ * to ~100ms, but close()/fsync() push inline_data / chunks via
+ * update_inode_size_chunks immediately. If that data RPC reaches the
+ * Filer before the BatchCreate, it targets an inode the Filer doesn't
+ * know yet and the written data is silently lost. Flushing the parent's
+ * pending batch first closes this window.
+ *
+ * @force: when false, only flush if the file has data to push (inline_dirty
+ * or a volume layout) — this preserves Phase-2 batching throughput for
+ * empty touch files. When true, flush unconditionally: used by the
+ * write-cap upgrade path (powerfs_upgrade_local_create), where the first
+ * write has not landed yet (inline_dirty is set later in write_end) but
+ * the CapOpenGrant RPC already needs the inode to exist on the Filer.
+ *
+ * Safe no-op when: file was not optimistically created (local_cap_granted
+ * false), has no parent, parent already evicted (evict_inode flushed its
+ * batch), or the batch is empty (already flushed). Called in process
+ * context (release/fsync/write) — may block on the BatchCreate RPC. */
+void powerfs_flush_pending_create(struct inode *inode, bool force)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    struct inode *dir;
+    bool has_data;
+
+    if (!pi->local_cap_granted || pi->parent_ino == 0)
+        return;
+
+    /* Only force the metadata commit when this close/fsync/migrate actually
+     * has data to push. An empty file (e.g. touch) has inline_dirty==0 and
+     * no volume layout, so there is no data RPC that could race the deferred
+     * BatchCreate — letting it ride the 100ms background batch preserves
+     * Phase-2 batching throughput (otherwise every close() synchronously
+     * flushes its own single-entry batch: ~4ms × N files). */
+    if (!force) {
+        spin_lock(&pi->i_lock);
+        has_data = pi->inline_dirty ||
+                   (pi->placement != POWERFS_PLACEMENT_INLINE &&
+                    pi->volume_id != 0);
+        spin_unlock(&pi->i_lock);
+        if (!has_data)
+            return;
+    }
+
+    dir = ilookup(inode->i_sb, pi->parent_ino);
+    if (!dir) {
+        /* Parent not in cache — it was evicted, and evict_inode already
+         * synchronously flushed its dirty creates. Nothing to do. */
+        return;
+    }
+
+    if (S_ISDIR(dir->i_mode) && POWERFS_I(dir)->dirty_create_count > 0) {
+        pr_debug("powerfs: pre-data-sync flush dir=%lu for child ino=%lu\n",
+                 dir->i_ino, inode->i_ino);
+        cancel_delayed_work_sync(&POWERFS_I(dir)->flush_work);
+        powerfs_flush_dirty_creates(dir);
+    }
+    iput(dir);
+}
 
 /*
  * powerfs_new_inode - 创建新的 inode
@@ -260,6 +536,35 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
                                           &lookup_layout,
                                           timeout_ms);
         net_dur_us = div_u64(ktime_get_ns() - ts_net, 1000);
+
+        /* Phase 3 read-your-writes: if the Filer reports ENOENT but the
+         * name is a locally optimistic create still pending in our
+         * dirty_creates batch (the background BatchCreate hasn't fired
+         * yet), synchronously flush the batch and retry the lookup once.
+         * This guarantees that a client which successfully create()d a
+         * file never transiently observes ENOENT for it inside the
+         * deferred-flush window. On retry success the found-path below
+         * runs; on persistent ENOENT the negative (uncached) path runs.
+         * Safe under dir i_rwsem read lock: flush only takes
+         * dirty_creates_lock + a BatchCreate RPC, never i_rwsem, so it
+         * cannot deadlock against the cancelled flush_work. */
+        if (err == -ENOENT &&
+            powerfs_has_pending_dirty_create(dir, dentry->d_name.name)) {
+            pr_info_ratelimited("powerfs: lookup '%pd' enoent but pending local create; flush+retry\n",
+                                dentry);
+            cancel_delayed_work_sync(&POWERFS_I(dir)->flush_work);
+            powerfs_flush_dirty_creates(dir);
+            ts_net = ktime_get_ns();
+            err = powerfs_net_lookup_timeout(dir->i_ino, dentry->d_name.name,
+                                              strlen(dentry->d_name.name),
+                                              &ino, &mode, &uid, &gid,
+                                              &size, &nlink,
+                                              &mtime, &atime, &ctime,
+                                              &volume_id, &file_key,
+                                              &lookup_layout,
+                                              timeout_ms);
+            net_dur_us = div_u64(ktime_get_ns() - ts_net, 1000);
+        }
 
         /* 断连/重连期间超时或网络不可达, 返回 -EAGAIN 让 VFS/应用层重试.
          * - ETIMEDOUT: 2s 内未收到响应 (filer 不可达或繁忙)
@@ -538,26 +843,48 @@ static struct inode *__powerfs_do_create_core(struct mnt_idmap *idmap,
     /* === Fast Path: Optimistic local create ===
      * Prerequisites:
      *   1. Regular file only (S_ISREG)
-     *   2. Inode pool has available inodes (or can be refilled)
+     *   2. Parent directory holds AUTH_EXCL cap (exclusive metadata write)
+     *   3. Inode pool has available inodes (or can be refilled)
      *
-     * Phase 1: No AUTH_EXCL check — VFS holds i_rwsem on parent dir,
-     * so single-client concurrent creates are serialized. Multi-client
-     * safety via AUTH_EXCL will be added in Phase 3.
+     * Phase 3 multi-client safety:
+     *   Fast path requires the parent dir to hold AUTH_EXCL. If absent,
+     *   we issue one cap_open_grant(write) RPC. When this client is the
+     *   sole writer the Filer's lock arbiter enters LONER state and grants
+     *   CAP_X (mapped to AUTH_EXCL); the create then proceeds locally.
+     *   Under contention (another client is writing) the Filer is in
+     *   GATHER state and returns CAP_NONE (or CAP_R only); we then fall
+     *   back to the synchronous slow path which serializes through Filer
+     *   Raft safely. When the other holder releases, the Filer recalls its
+     *   AUTH_EXCL — powerfs_cap_revoke() flushes our dirty creates before
+     *   ACKing, so the new exclusive holder never sees a stale directory.
      *
      * Benefits:
      *   - Skip CREATE RPC (saves ~2ms Raft round-trip)
-     *   - Skip cap_open_grant RPC (saves ~4ms)
+     *   - Skip cap_open_grant RPC for the child (saves ~4ms)
      *   - Skip cap_send_release RPC on close (token empty → no-op)
-     *   - File created locally in <0.1ms
+     *   - File created locally in <0.1ms; only the first create per dir
+     *     pays the one-time AUTH_EXCL grant RPC (~4ms, amortized).
      *
      * Correctness:
      *   - Inode number from pre-allocated batch (Filer guarantees uniqueness)
      *   - Inline placement set locally (same as Filer would return)
-     *   - Metadata flushed to Filer in Phase 2 (batch flush)
+     *   - Metadata flushed to Filer via background BatchCreate (Phase 2),
+     *     synchronously on fsync/evict/AUTH_EXCL recall
      *   - If file is written, existing migrate + close sync path handles it
      */
     if (S_ISREG(mode)) {
         u64 shard_id = shard_map_route(dir->i_ino);
+
+        /* Phase 3: acquire exclusive AUTH_EXCL on the parent directory.
+         * cap_open_grant_and_issue() never blocks the VFS — on network
+         * failure or contention it degrades to CAP_NONE and we fall back
+         * to the slow path. Re-check after the RPC: only proceed locally
+         * when AUTH_EXCL is actually held. */
+        if (!has_dir_auth_excl(parent_pi)) {
+            cap_open_grant_and_issue(parent_pi, true /*is_write_open*/);
+            if (!has_dir_auth_excl(parent_pi))
+                goto slow_path;
+        }
 
         /* Try to take an inode from the pool */
         new_ino = pool_take_inode(sbi, shard_id);
@@ -588,6 +915,39 @@ static struct inode *__powerfs_do_create_core(struct mnt_idmap *idmap,
             pi->local_cap_granted = true;
             pi->content_size = 0;
             spin_unlock(&pi->i_lock);
+
+            /* Phase 2: snapshot metadata for background batch flush.
+             * The dirty_create struct holds a self-contained copy of the
+             * file's metadata so the flush worker can send it to the Filer
+             * even if this child inode has been evicted from the cache. */
+            {
+                struct powerfs_dirty_create *dc;
+                struct powerfs_inode_info *dpi = POWERFS_I(dir);
+
+                dc = kzalloc(sizeof(*dc), GFP_NOFS);
+                if (dc) {
+                    dc->ino = new_ino;
+                    dc->parent_ino = dir->i_ino;
+                    dc->mode = mode;
+                    dc->uid = from_kuid(&init_user_ns,
+                                        current_fsuid());
+                    dc->gid = from_kgid(&init_user_ns,
+                                        current_fsgid());
+                    dc->name_len = min_t(unsigned int,
+                                         dentry->d_name.len, NAME_MAX);
+                    memcpy(dc->name, dentry->d_name.name, dc->name_len);
+                    dc->name[dc->name_len] = '\0';
+
+                    spin_lock(&dpi->dirty_creates_lock);
+                    list_add_tail(&dc->list, &dpi->dirty_creates);
+                    dpi->dirty_create_count++;
+                    spin_unlock(&dpi->dirty_creates_lock);
+                }
+            }
+
+            /* Schedule background flush (immediate if >= threshold,
+             * otherwise 100ms timer). */
+            powerfs_check_dirty_flush(dir);
 
             return inode;
         }
@@ -678,18 +1038,15 @@ int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
     u64 new_ino;
     int type;
     int ret;
-    u64 _ts0, _ts1;
 
     pr_debug("powerfs: mknod '%pd' mode=%o in dir=%lu\n",
              dentry, mode, dir->i_ino);
 
-    _ts0 = ktime_get_ns();
     ret = powerfs_quota_check_max_files(dir);
     if (ret)
         return ret;
 
     inode = __powerfs_do_create_core(idmap, dir, dentry, mode, dev);
-    _ts1 = ktime_get_ns();
     if (IS_ERR(inode)) {
         int rerr = PTR_ERR(inode);
         pr_warn("powerfs: mknod '%pd' do_create_core failed: %d\n", dentry, rerr);
@@ -720,16 +1077,6 @@ int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
     powerfs_add_dir_entry(dir, new_ino, type, dentry->d_name.name);
 
     powerfs_invalidate_dir_lease(dir);
-
-    {
-        u64 _ts2 = ktime_get_ns();
-        u64 _ms_core = (_ts1 - _ts0) / 1000000;
-        u64 _ms_post = (_ts2 - _ts1) / 1000000;
-        u64 _ms_total = (_ts2 - _ts0) / 1000000;
-        if (_ms_total > 2)
-            pr_info("MKNOD_TIME: '%pd' core=%llums post=%llums total=%llums\n",
-                    dentry, _ms_core, _ms_post, _ms_total);
-    }
 
     pr_debug("powerfs: mknod '%pd' success, ino=%llu\n",
              dentry, new_ino);
@@ -1163,17 +1510,27 @@ int powerfs_unlink(struct inode *dir, struct dentry *dentry)
         return -ENOENT;
     }
 
-    /*
-     * 先向 filer 发 UNLINK 持久化删除, 成功后才改本地数据结构.
-     * 断连时 powerfs_net_unlink 返回 -ENOTCONN, 操作失败, 本地不变.
-     * -ENOENT 视为幂等成功 (文件已在 filer 端删除).
-     * 之前是"先改本地再发网络", 断连时本地已改但 filer 未删 → 不一致.
-     */
-    rerr = powerfs_net_unlink(dir->i_ino, dentry->d_name.name,
-                               dentry->d_name.len, false);
-    if (rerr && rerr != -ENOENT) {
-        pr_warn("powerfs: net_unlink '%pd' failed: %d\n", dentry, rerr);
-        return rerr;
+    /* Phase 2: If the file was locally created (optimistic create) but
+     * not yet flushed to Filer, cancel the dirty create instead of
+     * sending an unlink RPC. The Filer doesn't know about this file
+     * yet, so an unlink RPC would return ENOENT (wasteful) and the
+     * pending BatchCreate would re-create it (data corruption). */
+    if (powerfs_cancel_dirty_create(dir, dentry->d_name.name)) {
+        pr_debug("powerfs: unlink cancelled dirty create '%pd'\n", dentry);
+        rerr = 0;
+    } else {
+        /*
+         * 先向 filer 发 UNLINK 持久化删除, 成功后才改本地数据结构.
+         * 断连时 powerfs_net_unlink 返回 -ENOTCONN, 操作失败, 本地不变.
+         * -ENOENT 视为幂等成功 (文件已在 filer 端删除).
+         * 之前是"先改本地再发网络", 断连时本地已改但 filer 未删 → 不一致.
+         */
+        rerr = powerfs_net_unlink(dir->i_ino, dentry->d_name.name,
+                                   dentry->d_name.len, false);
+        if (rerr && rerr != -ENOENT) {
+            pr_warn("powerfs: net_unlink '%pd' failed: %d\n", dentry, rerr);
+            return rerr;
+        }
     }
 
     /* === 以下操作仅在 filer 删除成功后执行 === */
@@ -1522,6 +1879,19 @@ int powerfs_rename(struct mnt_idmap *idmap,
 
     old_dpi = POWERFS_I(old_dir);
     new_dpi = POWERFS_I(new_dir);
+
+    /* Phase 2: Flush dirty creates in old_dir (and new_dir if different)
+     * before rename. A locally-created file being renamed must exist on
+     * the Filer first, otherwise the rename RPC would fail with ENOENT
+     * and the dirty create with the old name would be orphaned. */
+    if (old_dpi->dirty_create_count > 0) {
+        cancel_delayed_work_sync(&old_dpi->flush_work);
+        powerfs_flush_dirty_creates(old_dir);
+    }
+    if (new_dir != old_dir && new_dpi->dirty_create_count > 0) {
+        cancel_delayed_work_sync(&new_dpi->flush_work);
+        powerfs_flush_dirty_creates(new_dir);
+    }
 
     /*
      * 保存旧/新名称 (VFS 会在 rename 返回后调用 d_move 改变 dentry 名称)

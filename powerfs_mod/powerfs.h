@@ -438,6 +438,27 @@ struct powerfs_file_layout {
     bool has_ec_chunks;     /* 响应中是否包含 EC chunks (PER_CHUNK) */
 };
 
+/* powerfs_dirty_create — snapshot of a locally-created file's metadata.
+ *
+ * When the fast path creates a file locally (optimistic create), the
+ * metadata is not yet persisted to the Filer. This struct holds a
+ * self-contained snapshot (ino, parent, name, mode, uid, gid) so the
+ * flush worker can send it to the Filer even if the child inode has
+ * already been evicted from the inode cache.
+ *
+ * Linked into the parent directory inode's `dirty_creates` list.
+ * Freed after successful BatchCreate RPC (or on cancel/unlink). */
+struct powerfs_dirty_create {
+    __u64 ino;
+    __u64 parent_ino;
+    __u32 mode;
+    __u32 uid;
+    __u32 gid;
+    __u32 name_len;
+    char name[NAME_MAX + 1];
+    struct list_head list;  /* -> parent dir's dirty_creates */
+};
+
 struct powerfs_inode_info {
     struct netfs_inode netfs;          /* 内含 struct inode，必须第一个字段 */
 
@@ -638,11 +659,14 @@ struct powerfs_inode_info {
     u64 dir_fetch_epoch;
 
     /* === Optimistic local create: dirty creates list (Phase 2) ===
-     * List of locally-created inodes pending flush to Filer.
-     * Protected by dirty_creates_lock. Only directory inodes use this. */
+     * List of powerfs_dirty_create snapshots pending flush to Filer.
+     * Protected by dirty_creates_lock. Only directory inodes use this.
+     * flush_work: delayed_work for background batch flush (threshold=32
+     *   or 100ms timeout). Also flushed synchronously on evict/fsync. */
     spinlock_t dirty_creates_lock;
     struct list_head dirty_creates;
     int dirty_create_count;
+    struct delayed_work flush_work;
 
     /* === 对齐 : 未 commit 的 async dirop / iop 链表 (Async DIROPS 核心) === */
     struct list_head i_unsafe_dirops;    /* uncommitted mds dir op 链表 */
@@ -926,6 +950,11 @@ struct powerfs_client {
     struct list_head cap_flush_list;
     spinlock_t cap_flush_lock;
 
+    /* Cap 租约周期续约: 扫描 cap_lru_list, 对仍打开/有脏数据的 inode
+     * 在 TTL 到期前重发 CapOpenGrant 刷新 Filer arbiter holder expire_at.
+     * 跑在 sbi->lease_wq 上. */
+    struct delayed_work cap_renew_work;
+
     /* P3-5: 全局性能计数 (对齐  powerfs_client_metric) */
     struct powerfs_metrics metrics;
 
@@ -1033,6 +1062,11 @@ struct powerfs_sb_info {
 #define POWERFS_INODE_POOL_BATCH 64
 #define POWERFS_INODE_POOL_INVALID 0  /* 0 is never a valid inode */
 };
+
+/* === Optimistic local create: flush thresholds (Phase 2) === */
+#define POWERFS_DIRTY_FLUSH_THRESHOLD 32  /* flush when dirty_count >= this */
+#define POWERFS_DIRTY_FLUSH_TIMEOUT_MS 100  /*兜底 flush interval (ms) */
+#define POWERFS_DIRTY_FLUSH_RETRY_MS 200   /* retry interval on RPC failure */
 
 #define POWERFS_SB_INFO(sb) ((struct powerfs_sb_info *)(sb)->s_fs_info)
 

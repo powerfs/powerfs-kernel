@@ -1063,6 +1063,7 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     spin_lock_init(&pi->dirty_creates_lock);
     INIT_LIST_HEAD(&pi->dirty_creates);
     pi->dirty_create_count = 0;
+    INIT_DELAYED_WORK(&pi->flush_work, powerfs_flush_dirty_creates_work_fn);
 
     /* Cap 引用计数清零 */
     pi->i_pin_ref = 0;
@@ -1278,6 +1279,36 @@ void powerfs_evict_inode(struct inode *inode)
      *    参考 xxx_evict_inode: cancel_writeback 是在 clear_inode 之前 */
     cancel_delayed_work_sync(&pi->lease_renew_work);
     cancel_work_sync(&pi->setattr_work);
+
+    /* Phase 2: For directory inodes, cancel any pending dirty-create
+     * flush work and flush remaining entries synchronously. This
+     * prevents data loss when the directory is evicted before the
+     * background flush timer fires. Must be before clear_inode —
+     * the flush RPC needs a live inode.
+     * If the flush fails (Filer unreachable), the dirty_create structs
+     * are freed (data loss, same as ext4 data=writeback on crash).
+     * Phase 3 will add igrab-based pinning to prevent eviction while
+     * dirty creates are pending. */
+    if (S_ISDIR(inode->i_mode) && pi->dirty_create_count > 0) {
+        cancel_delayed_work_sync(&pi->flush_work);
+        powerfs_flush_dirty_creates(inode);
+        /* If flush failed, free remaining dirty_create structs to
+         * avoid memory leak (slab reuse after inode free). */
+        if (pi->dirty_create_count > 0) {
+            struct powerfs_dirty_create *dc, *tmp;
+            pr_warn("powerfs: evict_inode dir=%lu: %d dirty creates lost (Filer unreachable)\n",
+                    inode->i_ino, pi->dirty_create_count);
+            spin_lock(&pi->dirty_creates_lock);
+            list_for_each_entry_safe(dc, tmp, &pi->dirty_creates, list) {
+                list_del(&dc->list);
+                kfree(dc);
+            }
+            pi->dirty_create_count = 0;
+            spin_unlock(&pi->dirty_creates_lock);
+        }
+    } else if (S_ISDIR(inode->i_mode)) {
+        cancel_delayed_work_sync(&pi->flush_work);
+    }
 
     /* 3. 释放所有 lease (通知 volume server, 必须在 clear_inode 之前) */
     release_all_leases(inode);
@@ -1667,6 +1698,19 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
     err = setattr_prepare(idmap, dentry, attr);
     if (err)
         return err;
+
+    /* Phase 3: truncate/chmod/chown/utimes on an optimistically-created
+     * file must upgrade to Filer-registered caps before mutating state:
+     * the Filer cannot recall/arbitrate a holder it doesn't know, and
+     * with only local caps (empty token) the changed metadata would stay
+     * invisible to other clients until close while size/data semantics
+     * already diverged. */
+    if (ia_valid & (ATTR_SIZE | ATTR_MODE | ATTR_UID | ATTR_GID |
+                    ATTR_ATIME | ATTR_MTIME)) {
+        err = powerfs_upgrade_local_create(inode, true /*is_write*/);
+        if (err < 0)
+            return err;
+    }
 
     /* 处理文件大小变更
      *

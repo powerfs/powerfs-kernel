@@ -374,6 +374,11 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
     if (got & POWERFS_CAP_WR_DATA)
         (void)powerfs_cap_flush(pi, POWERFS_CAP_ANY_DIRTY);
 
+    /* Phase 3: optimistically-created files must have their BatchCreate
+     * metadata committed before the inline_data / chunks sync below,
+     * otherwise those data RPCs target an inode the Filer doesn't know. */
+    powerfs_flush_pending_create(inode, false);
+
     /* 触发脏页写回 (Flat: writepage→powerfs_net_write; Inline: 仅清脏标) */
     ret = file_write_and_wait_range(file, start, end);
     if (ret < 0) {
@@ -674,6 +679,23 @@ static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
 
     powerfs_flow_admit_wait(POWERFS_FLOW_OP_WRITE, 2000);
 
+    /* Phase 3: a file created by the optimistic fast path holds caps that
+     * were issued purely locally (empty token, Filer unaware). Before the
+     * first real data write, upgrade to a Filer-registered write lease:
+     * force-commit the pending BatchCreate and obtain a real cap token so
+     * conflicting access from other clients triggers CapRecall → dirty
+     * flush → ACK. Without this, another client reads stale size=0/Empty
+     * while our fd stays open (data only in page cache / inline_data).
+     * Empty touches (count==0) never reach here. */
+    if (S_ISREG(inode->i_mode) && count > 0) {
+        err = powerfs_upgrade_local_create(inode, true /*is_write*/);
+        if (err < 0) {
+            pr_warn("powerfs: write_iter ino=%lu local-create upgrade failed: %d\n",
+                    inode->i_ino, err);
+            return err;
+        }
+    }
+
     /* § O_APPEND 语义: 每次 write syscall 写入 offset 强制 = i_size.
      * VFS generic_file_write_iter 不主动处理 O_APPEND, 必须由 FS
      * 在 ->write_iter 入口把 iocb->ki_pos 重置到 i_size (对齐
@@ -906,6 +928,14 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
             }
         }
     }
+
+    /* Phase 3: for optimistically-created files, make sure the BatchCreate
+     * metadata commit has reached the Filer before pushing inline_data or
+     * chunks below. Otherwise the data RPC (update_inode_size_chunks)
+     * targets an inode the Filer doesn't know yet (the deferred batch
+     * hasn't fired) and the written data is silently lost. No-op for
+     * normally-created files or when the batch is already flushed. */
+    powerfs_flush_pending_create(inode, false);
 
     /* Inline 模式 + dirty: 同步 inline_data 到 Filer (K2-5).
      * Flat 模式: 同步 size+chunks 到 Filer (对齐 FUSE sync_size_chunks_on_close).
@@ -1205,6 +1235,115 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+/* Commit size + chunk layout of a Flat/Stripe file to the Filer via
+ * UpdateInodeSizeChunks (one strong Raft commit).
+ *
+ * Page writeback only pushes data to Volume Servers; the Filer keeps
+ * storage_mode=Empty with no chunk map until this RPC lands. close() and
+ * fsync() always did this; the cap-recall flush path (powerfs_cap_flush
+ * on CapRecall of FILE_WR/FILE_EXCL) was missing it — a writer whose
+ * write cap is recalled while the fd stays open would ACK the recall
+ * with data sitting on Volume Servers but an Empty/layout-less inode on
+ * the Filer, so the promoted reader still saw size=0 / could not locate
+ * any chunk. Mirrors the FUSE client's flush_and_sync →
+ * sync_size_chunks_on_close (fuse.rs).
+ *
+ * Layout resolution:
+ *   - Flat:   chunks[i] = (volume_id, file_key + i)
+ *   - Stripe: chunks[i] = powerfs_locate_chunk(offset) across volumes
+ *
+ * @max_attempts: retry count with 500ms×attempt backoff (5 for
+ * close/recall, 1 for fsync). Caller must have completed page writeback.
+ * Returns 0 on success / nothing-to-do, negative errno on failure. */
+int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
+                                   int max_attempts)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    loff_t i_size;
+    u64 shard_id;
+    u32 chunk_size, chunk_count, ci;
+    struct powerfs_chunk_map *chunks = NULL;
+    bool is_stripe;
+    int attempt, ret = -EIO;
+
+    if (pi->placement != POWERFS_PLACEMENT_FLAT &&
+        pi->placement != POWERFS_PLACEMENT_STRIPE &&
+        pi->placement != POWERFS_PLACEMENT_WIDESTRIPE)
+        return 0;
+
+    is_stripe = (pi->placement == POWERFS_PLACEMENT_STRIPE ||
+                 pi->placement == POWERFS_PLACEMENT_WIDESTRIPE);
+
+    i_size = i_size_read(inode);
+    if (i_size == 0)
+        return 0;
+    if (is_stripe) {
+        if (!pi->volume_ids || pi->volume_ids_count == 0)
+            return 0;
+    } else if (!pi->volume_id || !pi->file_key) {
+        return 0;
+    }
+
+    chunk_size = pi->layout_chunk_size ? pi->layout_chunk_size
+                                       : POWERFS_CHUNK_SIZE;
+    chunk_count = (u32)div_u64((u64)i_size + chunk_size - 1, chunk_size);
+    if (chunk_count > 4096)
+        chunk_count = 4096;
+
+    chunks = kmalloc_array(chunk_count, sizeof(*chunks), GFP_KERNEL);
+    if (!chunks)
+        return -ENOMEM;
+
+    for (ci = 0; ci < chunk_count; ci++) {
+        u64 chunk_off = (u64)ci * chunk_size;
+        u64 vid = 0, nid = 0;
+        int loc_ret = 0;
+
+        if (is_stripe) {
+            spin_lock(&pi->i_lock);
+            loc_ret = powerfs_locate_chunk(pi, (loff_t)chunk_off, &vid, &nid);
+            spin_unlock(&pi->i_lock);
+        } else {
+            vid = pi->volume_id;
+            nid = pi->file_key + ci;
+        }
+        chunks[ci].chunk_idx = ci;
+        chunks[ci].needle_id = loc_ret ? 0 : nid;
+        chunks[ci].volume_id  = loc_ret ? 0 : vid;
+        chunks[ci].crc32 = 0;
+        chunks[ci].size = (ci == chunk_count - 1)
+                         ? (u64)i_size - chunk_off : (u64)chunk_size;
+        if (loc_ret)
+            pr_warn("powerfs: sync_size_chunks(%s) ino=%lu chunk %u locate failed: %d\n",
+                    source, inode->i_ino, ci, loc_ret);
+    }
+
+    shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : inode->i_ino);
+
+    for (attempt = 1; attempt <= max_attempts; attempt++) {
+        ret = powerfs_net_update_inode_size_chunks(shard_id, inode->i_ino,
+                                                    (u64)i_size, source,
+                                                    chunks, chunk_count,
+                                                    NULL, 0);
+        if (ret == 0) {
+            spin_lock(&pi->i_lock);
+            pi->content_size = (u64)i_size;
+            spin_unlock(&pi->i_lock);
+            pr_debug("powerfs: sync_size_chunks(%s) ino=%lu size=%lld chunks=%u "
+                     "ok (attempt %d)\n", source, inode->i_ino,
+                     (long long)i_size, chunk_count, attempt);
+            break;
+        }
+        pr_warn("powerfs: sync_size_chunks(%s) ino=%lu attempt %d failed: %d\n",
+                source, inode->i_ino, attempt, ret);
+        if (attempt < max_attempts)
+            msleep(500 * attempt);
+    }
+
+    kfree(chunks);
+    return ret;
+}
+
 /* Forward declaration — defined below */
 static long powerfs_fallocate(struct file *file, int mode,
                               loff_t offset, loff_t len);
@@ -1345,6 +1484,16 @@ static vm_fault_t powerfs_page_mkwrite(struct vm_fault *vmf)
     else
         len = (size_t)((long long)size - (long long)off);
     endoff = off + (loff_t)len;
+
+    /* Phase 3: mmap write fault on an optimistically-created file must
+     * upgrade to a Filer-registered write cap before dirtying the page
+     * (same rationale as write_iter). SIGBUS on hard failure. */
+    err = powerfs_upgrade_local_create(inode, true /*is_write*/);
+    if (err < 0) {
+        pr_warn("powerfs: page_mkwrite ino=%lu local-create upgrade failed: %d\n",
+                inode->i_ino, err);
+        goto out_nocaps;
+    }
 
     /* 对齐  page_mkwrite (addr.c L2087):
      *   need = FILE_WR, want = FILE_WR|FILE_EXCL.
@@ -1667,6 +1816,14 @@ int powerfs_dir_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 
     pr_debug("powerfs: dir_fsync ino=%lu\n", inode->i_ino);
 
+    /* Phase 2: Flush all pending dirty creates synchronously before
+     * syncing dir attributes. fsync(dir) must guarantee that all
+     * create() calls before the fsync are durable on the Filer. */
+    if (pi->dirty_create_count > 0) {
+        cancel_delayed_work_sync(&pi->flush_work);
+        powerfs_flush_dirty_creates(inode);
+    }
+
     /* Step 1: 同步 inode 属性 (mode/mtime etc.) 到后端 (super write_inode).
      * 第二参数 wait=1: 阻塞直到 write_inode 完成 (真正发 net_setattr). */
     err = write_inode_now(inode, 1);
@@ -1815,6 +1972,15 @@ static long powerfs_fallocate(struct file *file, int mode,
 
     if (offset < 0 || len <= 0)
         return -EINVAL;
+
+    /* Phase 3: fallocate mutates data/size of an optimistically-created
+     * file — upgrade to a Filer-registered write cap first. */
+    ret = powerfs_upgrade_local_create(inode, true /*is_write*/);
+    if (ret < 0) {
+        pr_warn("powerfs: fallocate ino=%lu local-create upgrade failed: %d\n",
+                inode->i_ino, ret);
+        return ret;
+    }
 
     /* 对齐  fallocate: 需持有 FILE_EXCL (改 size/hole) + AUTH_EXCL (改 attrs).
      * i_rwsem 会在 inode_lock 获取, 此处先在锁外阻塞拿 cap, 避免持有锁时网络阻塞. */

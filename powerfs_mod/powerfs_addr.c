@@ -1672,6 +1672,11 @@ static int powerfs_migrate_inline_out(struct inode *inode,
     /* 3. 调 Filer MIGRATE_INLINE_ALLOC 分配.
      * shard_id = shard_map_route(parent_ino) — 区间路由, 对齐 FUSE ShardMap. */
     shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
+    /* Phase 3: for an optimistically-created file, commit the deferred
+     * BatchCreate metadata first — otherwise the Filer doesn't know this
+     * inode yet and migrate_inline_alloc fails with ENOENT (-2), which
+     * would drop the whole write (file stays size 0). No-op otherwise. */
+    powerfs_flush_pending_create(inode, false);
     ret = powerfs_net_migrate_inline_alloc(shard_id, ino, desired_stripe,
                                            &alloc_result);
     if (ret < 0) {

@@ -47,6 +47,7 @@ void powerfs_cap_upgrade_notify_handler(u64 ino, const char *lease_token,
 int cap_open_grant_and_issue(struct powerfs_inode_info *pi, bool is_write_open);
 int cap_open_grant_local(struct powerfs_inode_info *pi, bool is_write);
 int cap_send_release(struct powerfs_inode_info *pi, struct powerfs_cap *cap);
+void powerfs_cap_renew_work_fn(struct work_struct *work);
 
 /* ---- dentry.c ---- */
 void powerfs_fill_dentry_lease(struct dentry *dentry, struct inode *dir,
@@ -74,8 +75,30 @@ int powerfs_remove_dir_entry(struct inode *dir, const char *name);
 void powerfs_clear_dir_entries(struct inode *dir);
 void powerfs_invalidate_dir_lease(struct inode *dir);
 
+/* ---- dirty create flush (Phase 2) ---- */
+void powerfs_flush_dirty_creates(struct inode *dir);
+void powerfs_check_dirty_flush(struct inode *dir);
+void powerfs_flush_dirty_creates_work_fn(struct work_struct *work);
+/* Phase 3: flush an optimistic file's BatchCreate metadata before any
+ * close()/fsync() data sync, so the data RPC targets a known inode.
+ * force=true flushes even without dirty data (used by the write-cap
+ * upgrade path before the first write lands). */
+void powerfs_flush_pending_create(struct inode *inode, bool force);
+/* Phase 3: upgrade a locally-created inode to Filer-registered caps before
+ * the first data write / metadata mutation: force-flush the pending
+ * BatchCreate, issue a real CapOpenGrant (write lease + recall token),
+ * then clear local_cap_granted. Returns 0 on success, -EAGAIN after
+ * retries when the Filer cannot be reached. */
+int powerfs_upgrade_local_create(struct inode *inode, bool is_write);
+
 /* ---- file.c ---- */
 int powerfs_file_open(struct inode *inode, struct file *file);
+/* Commit size + chunk layout of a Flat/Stripe file to the Filer via
+ * UpdateInodeSizeChunks (strong consistency). Shared by release, fsync and
+ * the cap-recall flush path — a recalled dirty file must leave its layout
+ * committed before the recall ACK promotes another client. */
+int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
+                                   int max_attempts);
 int powerfs_lock(struct file *filp, int cmd, struct file_lock *fl);
 int powerfs_flock(struct file *filp, int cmd, struct file_lock *fl);
 int powerfs_dir_fsync(struct file *file, loff_t start, loff_t end, int datasync);
