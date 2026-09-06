@@ -36,6 +36,7 @@
 #include <linux/splice.h>       /* splice_copy_file_range (P2-5) */
 #include <linux/utsname.h>      /* init_utsname() 主机名 */
 #include <linux/jiffies.h>      /* jiffies_64 时间戳 */
+#include <linux/workqueue.h>    /* queue_work / system_unbound_wq (async netfs read) */
 
 #include "powerfs.h"
 #include "powerfs_comm.h"
@@ -51,6 +52,81 @@ static void powerfs_debugfs_init(struct super_block *sb);
 static void powerfs_debugfs_cleanup(struct super_block *sb);
 static void powerfs_proc_init(struct super_block *sb);
 static void powerfs_proc_cleanup(struct super_block *sb);
+
+/* 异步 netfs read work: 将 Volume Server RPC 移出 readahead 上下文,
+ * 允许多个 subrequest 并行执行 READ_NEEDLE RPC, 提升读路径吞吐.
+ *
+ * netfs_readahead 为连续 folio 创建多个 subrequest 并依次调用
+ * issue_read. 若 issue_read 同步完成 (当前行为), 多个 RPC 串行执行,
+ * 每个耗时 ~2ms, 吞吐受限. 异步化后, 多个 subrequest 可同时在
+ * system_unbound_wq 上执行, RPC 并行.
+ *
+ * 安全性: rreq 在所有 subreq 完成前不会被释放, 因此 subreq 和 rreq
+ * 在 workqueue worker 中安全可访问. inode 由 rreq->inode 持有,
+ * folio 在 xarray 中保持 inode 活跃. */
+struct powerfs_netfs_read_work {
+    struct netfs_io_subrequest *subreq;
+    struct work_struct work;
+};
+
+static void powerfs_netfs_read_worker(struct work_struct *work)
+{
+    struct powerfs_netfs_read_work *rw =
+        container_of(work, struct powerfs_netfs_read_work, work);
+    struct netfs_io_subrequest *subreq = rw->subreq;
+    struct netfs_io_request *rreq = subreq->rreq;
+    struct inode *inode = rreq->inode;
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    size_t len = subreq->len;
+    loff_t start = subreq->start;
+    struct iov_iter iter;
+    void *buf;
+    __u32 read_len = 0;
+    int err;
+
+    /* 超出文件大小的部分: 由 netfs 处理 */
+    if (start >= rreq->i_size) {
+        subreq->transferred = 0;
+        __set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
+        netfs_read_subreq_terminated(subreq);
+        kfree(rw);
+        return;
+    }
+    if (start + len > rreq->i_size)
+        len = rreq->i_size - start;
+
+    buf = kvmalloc(len, GFP_KERNEL);
+    if (!buf) {
+        subreq->error = -ENOMEM;
+        netfs_read_subreq_terminated(subreq);
+        kfree(rw);
+        return;
+    }
+
+    err = powerfs_net_read(pi, inode->i_ino, start, len, buf, len, &read_len);
+    if (err) {
+        pr_warn("powerfs: async netfs_read ino=%lu start=%llu len=%zu failed: %d\n",
+                inode->i_ino, (unsigned long long)start, len, err);
+        kvfree(buf);
+        subreq->error = err;
+        netfs_read_subreq_terminated(subreq);
+        kfree(rw);
+        return;
+    }
+
+    if (read_len > 0) {
+        iov_iter_xarray(&iter, ITER_DEST, &rreq->mapping->i_pages,
+                        start, read_len);
+        copy_to_iter(buf, read_len, &iter);
+    }
+
+    kvfree(buf);
+    subreq->transferred = read_len;
+    if (read_len < len)
+        __set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
+    netfs_read_subreq_terminated(subreq);
+    kfree(rw);
+}
 
 static void powerfs_netfs_issue_read(struct netfs_io_subrequest *subreq)
 {
@@ -175,47 +251,25 @@ static void powerfs_netfs_issue_read(struct netfs_io_subrequest *subreq)
         return;
     }
 
-    /* 基本功能阶段: 同步读取到临时 buffer, 再拷贝到 xarray 中的 folio.
-     * 后续优化: 直接从 xarray 映射 folio, 避免额外拷贝 (参照 xxx).
-     * GFP_NOFS: 避免 FS 回调递归 (netfs readahead 上下文). */
-    buf = kvmalloc(len, GFP_NOFS);
-    if (!buf) {
-        subreq->error = -ENOMEM;
-        netfs_read_subreq_terminated(subreq);
-        return;
-    }
-
-    err = powerfs_net_read(pi, inode->i_ino, start, len, buf, len, &read_len);
+    /* Flat/Stripe/WideStripe: 异步提交到 workqueue, 允许多个 subrequest
+     * 的 READ_NEEDLE RPC 并行执行, 提升读路径吞吐.
+     *
+     * Inline 和 no-chunks 路径已在上方同步处理 (内存操作, 无 RPC).
+     * 此处仅剩 volume server 读取路径, 提交到 system_unbound_wq. */
     {
-        __u8 *b = (__u8 *)buf;
-        pr_debug("powerfs: issue_read powerfs_net_read ret=%d read_len=%u buf[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                err, read_len,
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
-    }
-    if (err) {
-        pr_warn("powerfs: netfs_issue_read ino=%lu start=%llu len=%zu failed: %d\n",
-                inode->i_ino, (unsigned long long)start, len, err);
-        kvfree(buf);
-        subreq->error = err;
-        netfs_read_subreq_terminated(subreq);
-        return;
-    }
+        struct powerfs_netfs_read_work *rw;
 
-    /* 拷贝到 xarray 中的 folio (netfs 已预先分配并锁定 folio) */
-    if (read_len > 0) {
-        iov_iter_xarray(&iter, ITER_DEST, &rreq->mapping->i_pages,
-                        start, read_len);
-        copy_to_iter(buf, read_len, &iter);
-        pr_debug("powerfs: issue_read copied %u bytes to folio\n", read_len);
-    }
+        rw = kzalloc(sizeof(*rw), GFP_NOFS);
+        if (!rw) {
+            subreq->error = -ENOMEM;
+            netfs_read_subreq_terminated(subreq);
+            return;
+        }
 
-    kvfree(buf);
-    subreq->transferred = read_len;
-    /* 部分读取 (read_len < len): volume 数据不足请求长度, 即 EOF.
-     * 必须设置 HIT_EOF, 否则 netfs_read_collect 将 short read 转为 -ENODATA. */
-    if (read_len < len)
-        __set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
-    netfs_read_subreq_terminated(subreq);
+        rw->subreq = subreq;
+        INIT_WORK(&rw->work, powerfs_netfs_read_worker);
+        queue_work(system_unbound_wq, &rw->work);
+    }
 }
 
 const struct netfs_request_ops powerfs_netfs_ops = {
