@@ -1623,14 +1623,11 @@ int powerfs_cap_flush(struct powerfs_inode_info *pi, unsigned int mask)
         uid  = i_uid_read(inode);
         gid  = i_gid_read(inode);
         size = i_size_read(inode);
-        {
-            struct timespec64 ts = inode_get_mtime(inode);
-            mtime = (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
-        }
-        {
-            struct timespec64 ts = inode_get_atime(inode);
-            atime = (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
-        }
+        /* mtime/atime in unix seconds — matches filer setattr RPC,
+         * BatchCreate entry, and powerfs_net_setattr encoding.
+         * (Previously used ns, producing dates like year 58000.) */
+        mtime = (__u64)inode_get_mtime(inode).tv_sec;
+        atime = (__u64)inode_get_atime(inode).tv_sec;
         /* valid 表示哪些字段要推 (POWERFS_ATTR_* 协议 bit 枚举, 见 powerfs_net.h):
          *   AUTH_EXCL 意味着属性可能变更, 为保守全量推 mode/uid/gid/size/mtime.
          *   atime 只有在显式修改时才脏, 但我们不细区分, 一起推 (对 RPC 性能影响小) */

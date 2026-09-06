@@ -455,6 +455,11 @@ struct powerfs_dirty_create {
     __u32 uid;
     __u32 gid;
     __u32 name_len;
+    /* mtime/atime snapshot (unix seconds) from utimensat/touch applied
+     * while the create was still local; published with BatchCreate.
+     * 0 = Filer assigns the server current time. */
+    __u64 mtime;
+    __u64 atime;
     char name[NAME_MAX + 1];
     struct list_head list;  /* -> parent dir's dirty_creates */
 };

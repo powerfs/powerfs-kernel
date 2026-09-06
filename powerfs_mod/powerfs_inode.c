@@ -1292,6 +1292,13 @@ void powerfs_evict_inode(struct inode *inode)
     if (S_ISDIR(inode->i_mode) && pi->dirty_create_count > 0) {
         cancel_delayed_work_sync(&pi->flush_work);
         powerfs_flush_dirty_creates(inode);
+        /* powerfs_flush_dirty_creates() RE-ARMS flush_work on RPC failure
+         * (200ms retry). We are tearing the inode down, so cancel the
+         * re-armed timer before the entries/inode are freed — otherwise it
+         * fires into freed slab memory, and after rmmod the work->func
+         * pointer lands in unmapped module text (events_long worker fetch
+         * fault → panic, observed on remount with a wedged batch). */
+        cancel_delayed_work_sync(&pi->flush_work);
         /* If flush failed, free remaining dirty_create structs to
          * avoid memory leak (slab reuse after inode free). */
         if (pi->dirty_create_count > 0) {
@@ -1676,6 +1683,10 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     int err;
     unsigned int ia_valid;
+    /* True when this is a pure-timestamp setattr (utimensat/touch) on an
+     * optimistically-created file: times merge into the pending BatchCreate
+     * instead of force-upgrading caps (see gate below). */
+    bool merge_utimes = false;
 
     (void)idmap;
 
@@ -1699,17 +1710,30 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
     if (err)
         return err;
 
-    /* Phase 3: truncate/chmod/chown/utimes on an optimistically-created
-     * file must upgrade to Filer-registered caps before mutating state:
-     * the Filer cannot recall/arbitrate a holder it doesn't know, and
-     * with only local caps (empty token) the changed metadata would stay
-     * invisible to other clients until close while size/data semantics
-     * already diverged. */
-    if (ia_valid & (ATTR_SIZE | ATTR_MODE | ATTR_UID | ATTR_GID |
-                    ATTR_ATIME | ATTR_MTIME)) {
+    /* Phase 3: metadata mutation on an optimistically-created file.
+     *
+     * SIZE/MODE/UID/GID (truncate/chmod/chown) must upgrade to
+     * Filer-registered caps before mutating state: the Filer cannot
+     * recall/arbitrate a holder it doesn't know, and with only local caps
+     * (empty token) the changed metadata/size would stay invisible to
+     * other clients while semantics already diverged.
+     *
+     * Pure ATTR_ATIME/ATTR_MTIME (utimensat/touch) needs NO arbitration:
+     * until BatchCreate lands the inode is invisible to other clients, so
+     * the timestamps can be published atomically with the create. Upgrading
+     * here force-flushed the parent's whole pending batch for every touch
+     * (touch is create+close+utimensat) and registered a write cap — 6
+     * synchronous RPCs per empty file, capping empty-create throughput at
+     * ~190 ops/s. Merge the times into the dirty-create entry after
+     * setattr_copy (where final inode times are known); if the batch
+     * already flushed concurrently, fall back to the full upgrade. */
+    if (ia_valid & (ATTR_SIZE | ATTR_MODE | ATTR_UID | ATTR_GID)) {
         err = powerfs_upgrade_local_create(inode, true /*is_write*/);
         if (err < 0)
             return err;
+    } else if (pi->local_cap_granted &&
+               (ia_valid & (ATTR_ATIME | ATTR_MTIME))) {
+        merge_utimes = true;
     }
 
     /* 处理文件大小变更
@@ -1924,6 +1948,29 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
     }
     setattr_copy(idmap, inode, attr);
     mark_inode_dirty(inode);
+
+    /* Optimistic-create fast path for utimensat/touch: merge the final
+     * timestamps into the pending dirty-create entry so they publish with
+     * the deferred BatchCreate (no force flush, no cap-grant/setattr RPCs).
+     * If the batch already flushed concurrently (entry gone), upgrade to
+     * real caps so the normal setattr RPC below persists the times. */
+    if (merge_utimes) {
+        struct inode *parent;
+        bool merged = false;
+
+        parent = pi->parent_ino ? ilookup(inode->i_sb, pi->parent_ino) : NULL;
+        if (parent) {
+            merged = powerfs_dirty_create_update_times(parent, inode->i_ino,
+                            inode_get_mtime(inode).tv_sec,
+                            inode_get_atime(inode).tv_sec);
+            iput(parent);
+        }
+        if (!merged) {
+            err = powerfs_upgrade_local_create(inode, true /*is_write*/);
+            if (err < 0)
+                return err;
+        }
+    }
 
     /* 标记 AUTH_EXCL cap dirty — setattr 修改了 inode 元数据 (size/mode/uid/...).
      * 对齐  xxx_setattr → __xxx_mark_caps_dirty(CEPH_CAP_AUTH_EXCL).

@@ -673,9 +673,9 @@ int powerfs_net_batch_create(__u64 shard_id,
                              const struct powerfs_dirty_create *entries,
                              __u32 count, __u32 *flushed)
 {
-    /* Body size: ShardId(12) + Count(6) + per-entry(~40 + name_len).
-     * Worst case: 64 × (40 + 255) ≈ 19KB. Use kvmalloc for safety. */
-    size_t body_cap = 64 + (size_t)count * (60 + NAME_MAX + 1);
+    /* Body size: ShardId(12) + Count(6) + per-entry(~40 + name_len + 2×time).
+     * Worst case: 64 × (80 + 255) ≈ 21KB. Use kvmalloc for safety. */
+    size_t body_cap = 64 + (size_t)count * (80 + NAME_MAX + 1);
     __u8 *body;
     struct powerfs_tlv_enc enc;
     __u8 resp[64];
@@ -698,7 +698,7 @@ int powerfs_net_batch_create(__u64 shard_id,
     powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_COUNT, count);
 
     for (i = 0; i < count; i++) {
-        __u8 entry_buf[60 + NAME_MAX + 1];
+        __u8 entry_buf[80 + NAME_MAX + 1];
         struct powerfs_tlv_enc eenc;
 
         powerfs_tlv_enc_init(&eenc, entry_buf, sizeof(entry_buf));
@@ -710,6 +710,13 @@ int powerfs_net_batch_create(__u64 shard_id,
         powerfs_tlv_enc_u32(&eenc, POWERFS_NET_FLD_MODE, entries[i].mode);
         powerfs_tlv_enc_u32(&eenc, POWERFS_NET_FLD_UID, entries[i].uid);
         powerfs_tlv_enc_u32(&eenc, POWERFS_NET_FLD_GID, entries[i].gid);
+        /* Optional timestamps (utimensat/touch merged into the create). */
+        if (entries[i].mtime)
+            powerfs_tlv_enc_u64(&eenc, POWERFS_NET_FLD_MTIME,
+                                entries[i].mtime);
+        if (entries[i].atime)
+            powerfs_tlv_enc_u64(&eenc, POWERFS_NET_FLD_ATIME,
+                                entries[i].atime);
         powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_ENTRY,
                               entry_buf, powerfs_tlv_enc_len(&eenc));
     }

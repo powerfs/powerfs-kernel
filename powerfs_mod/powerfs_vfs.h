@@ -84,6 +84,11 @@ void powerfs_flush_dirty_creates_work_fn(struct work_struct *work);
  * force=true flushes even without dirty data (used by the write-cap
  * upgrade path before the first write lands). */
 void powerfs_flush_pending_create(struct inode *inode, bool force);
+/* Merge mtime/atime (unix seconds, 0 = leave) into a pending dirty-create
+ * entry; returns true if found (times ride the deferred BatchCreate).
+ * Used by setattr(utimes/touch) to avoid force-flushing the parent batch. */
+bool powerfs_dirty_create_update_times(struct inode *dir, u64 ino,
+                                       u64 mtime, u64 atime);
 /* Phase 3: upgrade a locally-created inode to Filer-registered caps before
  * the first data write / metadata mutation: force-flush the pending
  * BatchCreate, issue a real CapOpenGrant (write lease + recall token),

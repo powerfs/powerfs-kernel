@@ -345,6 +345,42 @@ void powerfs_check_dirty_flush(struct inode *dir)
                            msecs_to_jiffies(POWERFS_DIRTY_FLUSH_TIMEOUT_MS));
 }
 
+/* Merge an mtime/atime update into a pending optimistic-create entry so it
+ * publishes atomically with the deferred BatchCreate, instead of
+ * force-flushing the whole parent batch (and registering a real write cap)
+ * per file. This is the setattr(utimes/touch) fast path: touch calls
+ * utimensat() immediately after create+close, so without merging every
+ * empty touch costs ~6 synchronous RPCs and batching never accumulates.
+ *
+ * @mtime/@atime: unix seconds; 0 means "leave unchanged" (Filer will use
+ * its current time for fields never set). Returns true when the entry was
+ * found; false means the batch already flushed (caller falls back to the
+ * normal synchronous setattr/upgrade path). */
+bool powerfs_dirty_create_update_times(struct inode *dir, u64 ino,
+                                       u64 mtime, u64 atime)
+{
+    struct powerfs_inode_info *dpi = POWERFS_I(dir);
+    struct powerfs_dirty_create *dc;
+    bool found = false;
+
+    if (!S_ISDIR(dir->i_mode))
+        return false;
+
+    spin_lock(&dpi->dirty_creates_lock);
+    list_for_each_entry(dc, &dpi->dirty_creates, list) {
+        if (dc->ino == ino) {
+            if (mtime)
+                dc->mtime = mtime;
+            if (atime)
+                dc->atime = atime;
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&dpi->dirty_creates_lock);
+    return found;
+}
+
 /* Ensure an optimistically-created file's metadata has been committed to
  * the Filer before any data sync (inline_data update or chunks layout
  * update) targets that inode.
