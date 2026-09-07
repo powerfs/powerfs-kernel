@@ -2195,10 +2195,39 @@ static void powerfs_dio_write_worker(struct work_struct *work)
                page_address(dw->pages[i]) + off, this);
     }
 
-    /* INLINE / 无 placement: 无法异步直写 */
-    if (pi->placement == POWERFS_PLACEMENT_INLINE ||
-        (!pi->volume_id && !pi->file_key &&
-         !pi->chunks && !pi->volume_ids)) {
+    /* 无 volume 映射: 直写前需获取 volume_id/file_key (同步路径同款逻辑).
+     * workqueue 进程上下文可睡眠, 网络 RPC 安全. */
+    if (!pi->volume_id && !pi->file_key &&
+        !pi->chunks && !pi->volume_ids) {
+        if (pi->placement == POWERFS_PLACEMENT_INLINE &&
+            pi->inline_data && pi->inline_len > 0) {
+            result = powerfs_migrate_inline_out(inode, pi);
+        } else {
+            struct powerfs_migrate_alloc_result alloc = {0};
+            __u64 shard_id =
+                shard_map_route(pi->parent_ino ? pi->parent_ino : inode->i_ino);
+
+            powerfs_flush_pending_create(inode, false);
+            result = powerfs_net_migrate_inline_alloc(shard_id, inode->i_ino,
+                                                      false, &alloc);
+            if (result >= 0) {
+                spin_lock(&pi->i_lock);
+                pi->placement = POWERFS_PLACEMENT_FLAT;
+                pi->volume_id = alloc.volume_id;
+                pi->file_key = alloc.file_key;
+                pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+                spin_unlock(&pi->i_lock);
+                kfree(alloc.allocs);
+            }
+        }
+        if (result < 0) {
+            kvfree(buf);
+            goto free_pages;
+        }
+    }
+
+    if (!pi->volume_id && !pi->file_key &&
+        !pi->chunks && !pi->volume_ids) {
         result = -EINVAL;
         kvfree(buf);
         goto free_pages;
@@ -2272,20 +2301,46 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
                 return -EFAULT;
             }
 
-            /* INLINE 文件: 返回 -EINVAL 让 VFS 回退 buffered I/O.
-             * 原因: INLINE 直写需判断是否溢出到 Flat, 涉及 placement 升级
-             * (powerfs_net_migrate_inline_alloc), 逻辑复杂, 第一版不支持. */
-            if (pi->placement == POWERFS_PLACEMENT_INLINE) {
-                kvfree(buf);
-                /* 文件可能刚创建无 placement 信息 (GETATTR 后才填充).
-                 * 若 volume_id/file_key 为空, 也无法直写. */
-                kvfree(buf);
-                return -EINVAL;
+            /* 无 volume 映射 (INLINE 或 FLAT 但未分配): 直写前需获取
+             * volume_id/file_key.
+             *   - INLINE 有 inline_data: 调用 powerfs_migrate_inline_out (内容感知
+             *     迁移, 写 snap_data 到 Volume Server 后切换 placement).
+             *   - 其他 (INLINE 无 inline_data / FLAT 未分配): 向 Filer 申请 Flat 布局.
+             * 失败透传错误码, 不回退 buffered I/O. */
+            if (!pi->volume_id && !pi->file_key &&
+                !pi->chunks && !pi->volume_ids) {
+                if (pi->placement == POWERFS_PLACEMENT_INLINE &&
+                    pi->inline_data && pi->inline_len > 0) {
+                    ret = powerfs_migrate_inline_out(inode, pi);
+                    if (ret < 0) {
+                        kvfree(buf);
+                        return ret;
+                    }
+                } else {
+                    struct powerfs_migrate_alloc_result alloc = {0};
+                    __u64 shard_id =
+                        shard_map_route(pi->parent_ino ? pi->parent_ino : inode->i_ino);
+
+                    powerfs_flush_pending_create(inode, false);
+                    ret = powerfs_net_migrate_inline_alloc(shard_id, inode->i_ino,
+                                                           false, &alloc);
+                    if (ret < 0) {
+                        kvfree(buf);
+                        return ret;
+                    }
+                    spin_lock(&pi->i_lock);
+                    pi->placement = POWERFS_PLACEMENT_FLAT;
+                    pi->volume_id = alloc.volume_id;
+                    pi->file_key = alloc.file_key;
+                    pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+                    spin_unlock(&pi->i_lock);
+                    kfree(alloc.allocs);
+                }
             }
 
             if (!pi->volume_id && !pi->file_key &&
                 !pi->chunks && !pi->volume_ids) {
-                /* 新建 Flat 文件无 chunks: 无法直写, 返回 -EINVAL */
+                /* 仍无 volume 映射 (迁移/分配失败): 无法直写 */
                 kvfree(buf);
                 return -EINVAL;
             }
