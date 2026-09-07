@@ -2748,17 +2748,16 @@ int powerfs_conn_pool_init(const char *master_addr, __u16 master_port, __u16 sha
         conn->port = srv->port;
         conn->type = srv->type;
         conn->in_use = true;
-        /* Volume connections ALWAYS use TCP regardless of mount -o transport=xxx.
-         * volume.toml comment documents: "内核 vol_route 仅支持TCP, volume需
-         * TCP listener".  transport=rdma mount-opt controls ONLY the filer
-         * metadata channel. BUG: using g_pool.transport_type here propagated
-         * RDMA ops into the OSD volume path → immediate EOF on TCP volume
-         * listener → ret=-107 (ENOTCONN) on every MIGRATE WriteNeedle. */
-        conn->transport = powerfs_transport_pick_ops(POWERFS_TRANSPORT_TCP);
-        conn->transport_type = POWERFS_TRANSPORT_TCP;
-        pr_info("powerfs: volume[%d] conn %s:%u init transport=tcp (forced, global transport_type=%s per mount)\n",
+        /* Volume connections inherit mount transport type:
+         *   tcp  → TCP only
+         *   rdma → RDMA only (fails hard, no TCP fallback)
+         *   auto → RDMA first, TCP fallback on failure */
+        conn->transport = powerfs_transport_pick_ops(g_pool.transport_type);
+        conn->transport_type = g_pool.transport_type;
+        pr_info("powerfs: volume[%d] conn %s:%u init transport=%s (per mount)\n",
                 g_pool.volume_count, conn->addr, conn->port,
-                (g_pool.transport_type == POWERFS_TRANSPORT_RDMA) ? "rdma" : "tcp");
+                conn->transport_type == POWERFS_TRANSPORT_RDMA ? "rdma" :
+                conn->transport_type == POWERFS_TRANSPORT_AUTO ? "auto(rdma+tcp)" : "tcp");
         conn->sock = NULL;
         conn->state = CONN_INIT;
         atomic_set(&conn->seq_counter, 1);
