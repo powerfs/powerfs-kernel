@@ -468,14 +468,12 @@ fi
 # 等待网络就绪
 sleep 1
 
-# 限制 page cache 脏页比例, 防止大量 buffered 写撑爆内存触发 OOM killer.
-# powerfs 内核模块无 page cache 上限, 默认 dirty_ratio=20 在 4GB VM 上
-# 会让 Cached 撑到 3.8GB, 最终 OOM kill sshd/mount 进程.
-# 配合 gfp_mask 里的 __GFP_NORETRY, 双重保护:
-#   1. dirty_ratio=10 → dirty 页占内存 10% 时开始 writeback
-#   2. dirty_background_ratio=5 → 后台 writeback 阈值
-echo 10 > /proc/sys/vm/dirty_ratio 2>/dev/null || true
-echo 5 > /proc/sys/vm/dirty_background_ratio 2>/dev/null || true
+# OOM 防御: gfp_mask (__GFP_NORETRY | __GFP_NOMEMALLOC) 在 powerfs_inode.c
+# 已让 page cache 分配在内存紧张时返回 -ENOMEM 而非 OOM kill.
+# dirty_ratio 保持内核默认值 20 (不限制), 因为:
+#   - dirty_ratio=10 会过早触发 writeback, 严重降低写吞吐 (57 MB/s vs 4349 MB/s)
+#   - __GFP_NORETRY 足以防止 OOM (2GB 写入测试 OOM=0, SSH 不断)
+#   - dirty_background_ratio=10 让后台 writeback 在 10% 时开始 (平衡)
 
 # 创建 InfiniBand 用户态设备节点 (/dev/infiniband/uverbs0 等).
 # 内核注册 IB 设备后, /sys/class/infiniband_verbs/uverbsN/dev 给出 "major:minor",
