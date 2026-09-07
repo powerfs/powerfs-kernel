@@ -2075,6 +2075,43 @@ sector_t powerfs_bmap(struct address_space *mapping, sector_t block)
  * (return -EIOCBQUEUED + ki_complete).
  */
 
+/* powerfs_dio_write_can_skip_read - 判断 O_DIRECT write 是否可走 fast path
+ *
+ * Fast path: 跳过 read-modify-write 的 read 步骤, 直接调用
+ * powerfs_net_write_needle 整体覆盖 needle, 把 4K 写的网络放大从
+ * (1MB read + 1MB write) = 2MB 降到 (count write) = count.
+ *
+ * 安全条件 (同时满足):
+ *   1. 写起点对齐 needle 起点 (pos % POWERFS_CHUNK_SIZE == 0)
+ *   2. 写范围不跨 needle 边界 (count <= POWERFS_CHUNK_SIZE)
+ *   3. 写范围覆盖整个 needle (count == POWERFS_CHUNK_SIZE),
+ *      或写范围延伸到/超过 i_size (pos + count >= i_size_read(inode))
+ *
+ * 条件 3 的原因: powerfs_net_write_needle 用 data_len 作为 needle 新长度,
+ * 若 needle 原本在 [count, old_len) 范围有数据, 直接覆盖会丢失.
+ * 只有写覆盖整个 needle, 或写范围延伸到/超过 EOF (此 needle 之后无数据) 时
+ * 直接覆盖才安全. 假设不变式: needle 长度 <= i_size - needle_start_offset
+ * (truncate 会同步更新 needle).
+ *
+ * 不满足条件时调用方应回退到 powerfs_net_write (read-modify-write).
+ *
+ * 并发安全: VFS generic_file_write_iter 对 O_DIRECT write 持有 i_rwsem 独占锁,
+ * 同 inode 的并发 write 已串行化, 此处无需额外加锁.
+ */
+static bool powerfs_dio_write_can_skip_read(struct inode *inode,
+                                             loff_t pos, size_t count)
+{
+    if (pos % POWERFS_CHUNK_SIZE != 0)
+        return false;
+    if (count > POWERFS_CHUNK_SIZE)
+        return false;
+    if (count == POWERFS_CHUNK_SIZE)
+        return true;
+    if (pos + count >= i_size_read(inode))
+        return true;
+    return false;
+}
+
 /* 异步 direct I/O work 上下文 */
 struct powerfs_dio_work {
     struct kiocb *iocb;
@@ -2233,8 +2270,22 @@ static void powerfs_dio_write_worker(struct work_struct *work)
         goto free_pages;
     }
 
-    result = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
-                                dw->pos, buf, dw->count, &written);
+    /* Fast path: needle 对齐 + 全覆盖/超 EOF → 直接 powerfs_net_write_needle
+     * (整体覆盖, 跳过 read 步骤). 与同步路径同款判断.
+     * Slow path: powerfs_net_write (read-modify-write). */
+    if (powerfs_dio_write_can_skip_read(inode, dw->pos, dw->count)) {
+        __u64 needle_id = pi->file_key + dw->pos / POWERFS_CHUNK_SIZE;
+
+        result = powerfs_net_write_needle(pi->volume_id, needle_id,
+                                           inode->i_ino,
+                                           buf, dw->count, NULL, 0);
+        if (result == 0) {
+            written = dw->count;
+        }
+    } else {
+        result = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
+                                    dw->pos, buf, dw->count, &written);
+    }
     kvfree(buf);
 
     if (result >= 0) {
@@ -2346,11 +2397,28 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
             }
 
             /* Flat/Stripe: 直写 Volume Server.
-             * powerfs_net_write_needle 是整体覆盖 (不 read-modify-write),
-             * 调用方需保证写范围不跨 needle 边界. 跨边界由调用方拆分.
-             * 这里用 powerfs_net_write (read-modify-write) 处理任意位置. */
-            ret = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
-                                     pos, buf, count, &chunk_written);
+             *
+             * Fast path (needle 对齐 + 全覆盖/超 EOF): powerfs_net_write_needle
+             *   整体覆盖 needle, 跳过 read 步骤. 网络放大从 2× CHUNK (read+write)
+             *   降到 1× count. 1M O_DIRECT seqwrite / append 走此路径.
+             *
+             * Slow path (其他): powerfs_net_write (read-modify-write)
+             *   4K O_DIRECT randwrite 在非 needle 对齐时走此路径,
+             *   每次 4K 触发 1MB read + 1MB write, 网络放大 512×.
+             *   这是 needle 模型 (整体覆盖) 与小粒度 O_DIRECT 写的根本矛盾,
+             *   需上层聚合或 buffered I/O 兜底. */
+            if (powerfs_dio_write_can_skip_read(inode, pos, count)) {
+                __u64 needle_id = pi->file_key + pos / POWERFS_CHUNK_SIZE;
+
+                ret = powerfs_net_write_needle(pi->volume_id, needle_id,
+                                                inode->i_ino,
+                                                buf, count, NULL, 0);
+                if (ret == 0)
+                    chunk_written = count;
+            } else {
+                ret = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
+                                         pos, buf, count, &chunk_written);
+            }
             kvfree(buf);
 
             if (ret < 0) {
