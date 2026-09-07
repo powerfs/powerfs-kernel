@@ -72,20 +72,16 @@ if [ -f /etc/passwd ] && sudo [ -f /etc/shadow ]; then
     #   所以在构建阶段直接替换密码字段，避免 init 阶段 chpasswd 因 NSS/chpasswd
     #   不存在或失败导致 SSH 永远 root 拒登。
     # 密码明文: powerfs
-    # 选择 $1$ (MD5-based DES 扩展) 的原因：
-    #   1. sshd_config 指定 UsePAM=no (参见 init 阶段 cat > /etc/ssh/sshd_config 段)，
-    #      因此 OpenSSH 使用内部 xcrypt() = libcrypt.so 的 crypt(3) 接口校验密码，
-    #      完全绕过 pam_unix.so 的 yescrypt/sha512 强制算法白名单。
-    #   2. libcrypt1 (libcrypt.so.1.1.0) 兼容性层对 $1$ 有完整支持 (无论宿主 pam
-    #      配置如何)，宿主环境 + initramfs 环境 100% 通过。
-    #   3. 相比之前的 SHA-512 $6$ (2025/2/5 pam_unix 白名单可能缺)，
-    #      MD5 $1$ 在 crypt(3) 层面上永不被删，保证开发 SSH 通道稳定可用。
-    # 生成命令: openssl passwd -1 -salt powerfs_ powerfs
-    ROOT_HASH='$1\$powerfs_\$DplPRhW0J6Z10oMgessGW0'
-    # Fix: 上面单引号里 \$ 保留了反斜杠 → 变成 "\$1\$powerfs_"，
-    # 传给 shadow 是错的。正确做法是完全不用反斜杠转义 (单引号原样保留 $)，
-    # 再用 awk -v HASH= 安全传递 (避免 bash 在 sed 双引号内重解释 $powerfs_ 为空)。
-    ROOT_HASH='$1$powerfs_$DplPRhW0J6Z10oMgessGW0'
+    # 选择 $6$ (SHA-512) 的原因:
+    #   1. Ubuntu 22.04+ 的 libcrypt1 (1:4.4.10+) 默认禁用了 $1$ (MD5) 算法
+    #      (在 crypt(3) 层面返回 "*0" feature disabled)。
+    #      sshd_config 指定 UsePAM=no，OpenSSH 用 libcrypt 的 crypt(3) 直接校验，
+    #      所以 MD5 hash 会被 libcrypt 拒绝，导致 SSH "Failed password"。
+    #   2. SHA-512 ($6$) 是 libcrypt1 永久支持的标准算法，宿主 + initramfs 100% 通过。
+    #   3. salt 只能包含 [a-zA-Z0-9./] (不能有下划线, 否则 crypt 截断 salt)。
+    # 生成命令 (Python libcrypt 调用):
+    #   python3 -c "import crypt; print(crypt.crypt('powerfs', '\$6\$powerfspw'))"
+    ROOT_HASH='$6$powerfspw$vAaxpInbU4g6am9KhSUhsahATUSUjldgbXCOWraxbjPHiquxLEB7Y4nEBW7y4RAxtpuzrzlWLNXnqVjUYy3AE0'
     export PW_HASH
     PW_HASH="${ROOT_HASH}"
     if sudo grep -q '^root:' etc/shadow; then
@@ -284,6 +280,7 @@ CMDLINE=$(cat /proc/cmdline 2>/dev/null)
 POWERFS_MASTER_ADDR=$(echo "$CMDLINE" | grep -o 'powerfs_master_addr=[^ ]*' | head -1 | cut -d= -f2)
 POWERFS_MASTER_PORT=$(echo "$CMDLINE" | grep -o 'powerfs_master_port=[^ ]*' | head -1 | cut -d= -f2)
 VM_IP=$(echo "$CMDLINE" | grep -o 'vm_ip=[^ ]*' | head -1 | cut -d= -f2)
+IB_IP=$(echo "$CMDLINE" | grep -o 'ib_ip=[^ ]*' | head -1 | cut -d= -f2)
 echo "内核命令行: $CMDLINE"
 
 # 如果未指定，使用默认值
@@ -300,6 +297,29 @@ if [ -z "$VM_IP" ]; then
     VM_IP="172.30.0.100"
 fi
 echo "[INFO] VM IP: ${VM_IP} (通过 vm_ip= 内核参数配置)"
+
+# IB_IP: IPoIB 地址, 与 VM_IP 对应 (VM1->192.168.100.100, VM2->192.168.100.101)
+# 由 QEMU -append ib_ip= 参数传递, 默认根据 VM_IP 末段派生
+if [ -z "$IB_IP" ]; then
+    case "$VM_IP" in
+        *100) IB_IP="192.168.100.100" ;;
+        *101) IB_IP="192.168.100.101" ;;
+        *)    IB_IP="192.168.100.${VM_IP##*.}" ;;
+    esac
+fi
+echo "[INFO] IB IP: ${IB_IP} (IPoIB RDMA, 通过 ib_ip= 内核参数配置)"
+
+# 设置主机名: OpenMPI 4.x 拒绝含特殊字符 (如括号) 的主机名,
+# 默认 "(none)" 会导致 mpirun 报 "illegal character in node name" 错误.
+# 根据 VM_IP 末段派生稳定主机名 (vm1 -> powerfs-vm1, vm2 -> powerfs-vm2).
+case "$VM_IP" in
+    *100) HOSTNAME_VM="powerfs-vm1" ;;
+    *101) HOSTNAME_VM="powerfs-vm2" ;;
+    *)    HOSTNAME_VM="powerfs-vm${VM_IP##*.}" ;;
+esac
+hostname "$HOSTNAME_VM" 2>/dev/null || true
+echo "$HOSTNAME_VM" > /etc/hostname
+echo "[INFO] 主机名: $(hostname)"
 
 echo "[INFO] PowerFS 后端:"
 echo "  Master:            ${POWERFS_MASTER_ADDR}:${POWERFS_MASTER_PORT}"
@@ -401,6 +421,12 @@ stty raw -echo < /dev/console 2>/dev/null
 # tap0/tap1 已由 setup_network.sh 桥接到 br-xxx (172.30.0.1).
 echo "配置网络..."
 if [ -x /bin/ip ]; then
+    # lo: 回环接口 (OpenMPI 4.x OOB/PMIx 通信需要 lo 配置 127.0.0.1/8;
+    # 否则 orted 与 io500 之间 TCP 连接会因缺少本地路由而 hang 在 SYN_SENT)
+    ip link set lo up 2>/dev/null || true
+    ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+    ip -6 addr add ::1/128 dev lo 2>/dev/null || true
+
     # eth0: TAP 网络 (用于访问 Docker 容器, 必须与 powerfs-network 同网段)
     ip link set eth0 up 2>/dev/null || true
     ip addr add ${VM_IP}/16 dev eth0 2>/dev/null || true
@@ -410,6 +436,8 @@ if [ -x /bin/ip ]; then
     ip route add default via 172.30.0.1 dev eth0 2>/dev/null || true
 
     # 打印网络配置
+    echo "  lo (loopback):"
+    ip addr show lo 2>/dev/null | grep inet || echo "    未配置"
     echo "  eth0 (TAP -> powerfs-network):"
     ip addr show eth0 2>/dev/null | grep inet || echo "    未配置"
 
@@ -420,10 +448,34 @@ if [ -x /bin/ip ]; then
     ip addr add 10.0.2.15/24 dev eth1 2>/dev/null || true
     echo "  eth1 (QEMU user-net -> SSH forward):"
     ip addr show eth1 2>/dev/null | grep inet || echo "    未配置"
+
+    # ib0: IPoIB RDMA 通道 (用于内核 powerfs RDMA transport 和 MPI 通信)
+    # VFIO-pci 直通的 mlx5_1 VF 被内核注册为 ib0,
+    # IB_IP 从内核命令行 ib_ip= 参数解析 (默认 192.168.100.100/101).
+    # 192.168.100.0/24 网段走 ib0 (metric 10, 优先级高于 eth0).
+    if [ -d /sys/class/infiniband/ib0 ] || [ -e /sys/class/infiniband/ib0 ]; then
+        ip link set ib0 up 2>/dev/null || true
+        ip addr add ${IB_IP}/24 dev ib0 2>/dev/null || true
+        ip route add 192.168.100.0/24 dev ib0 proto kernel scope link src ${IB_IP} metric 10 2>/dev/null || true
+        echo "  ib0 (IPoIB RDMA):"
+        ip addr show ib0 2>/dev/null | grep inet || echo "    未配置"
+        echo "  IB route 192.168.100.0/24 via ib0 metric=10"
+    else
+        echo "  ib0 未发现 (无 VFIO RDMA 设备), 跳过 IPoIB 配置"
+    fi
 fi
 
 # 等待网络就绪
 sleep 1
+
+# 限制 page cache 脏页比例, 防止大量 buffered 写撑爆内存触发 OOM killer.
+# powerfs 内核模块无 page cache 上限, 默认 dirty_ratio=20 在 4GB VM 上
+# 会让 Cached 撑到 3.8GB, 最终 OOM kill sshd/mount 进程.
+# 配合 gfp_mask 里的 __GFP_NORETRY, 双重保护:
+#   1. dirty_ratio=10 → dirty 页占内存 10% 时开始 writeback
+#   2. dirty_background_ratio=5 → 后台 writeback 阈值
+echo 10 > /proc/sys/vm/dirty_ratio 2>/dev/null || true
+echo 5 > /proc/sys/vm/dirty_background_ratio 2>/dev/null || true
 
 # 创建 InfiniBand 用户态设备节点 (/dev/infiniband/uverbs0 等).
 # 内核注册 IB 设备后, /sys/class/infiniband_verbs/uverbsN/dev 给出 "major:minor",
@@ -555,21 +607,19 @@ echo ""
 echo "内核模块:"
 lsmod 2>/dev/null || echo "(lsmod 不可用)"
 
-# 设置 root 密码 (用于密码登录)。
-# 先解锁 root: 从 /etc/shadow 拷贝 /etc/shadow- 备份移除 "!" lock 前缀，
-# 再调用 chpasswd，避免宿主 shadow 中 root:!: 导致 pam 拒绝登录。
+# 设置 root 密码 (用于密码登录).
+# shadow 密码已在构建阶段写入 (SHA-512 $6$ 哈希, 见构建脚本 ROOT_HASH).
+# 不再调用 chpasswd: 它会覆盖构建时哈希为 yescrypt/SHA512 (依赖宿主 PAM 配置),
+# 兜底 sed 又会写入无效 MD5 哈希. 二者都会破坏 sshd (UsePAM=no) 通过 libcrypt
+# 校验密码. 直接信任构建阶段写入的 $6$ SHA-512 哈希.
+# 仅做防御性检查: 若 root 条目仍为锁定状态 (! 或 *), 才写兜底 SHA-512 哈希.
 if [ -f /etc/shadow ]; then
-    # 移除 root 条目的密码锁 ('!' 或 '*')，解锁后才能通过 SSH 密码登录
-    sed -i -e 's/^root:!:/root::/' -e 's/^root:\*:/root::/' /etc/shadow 2>/dev/null || true
-fi
-if [ -x /usr/sbin/chpasswd ] || [ -x /sbin/chpasswd ] || command -v chpasswd >/dev/null 2>&1; then
-    echo "root:powerfs" | chpasswd 2>/dev/null
-fi
-# chpasswd 失败兜底：直接写 DES/MD5 哈希到 shadow (兼容 busybox)
-RC=$?
-if [ ${RC:-1} -ne 0 ] && [ -f /etc/shadow ]; then
-    # root:$1$powerfs$abcdefghijklmnopqrstuv (MD5, salt=powerfs)
-    sed -i 's|^root:[^:]*:|root:$1$powerfs$abcdefghijklmnopqrstuv:|' /etc/shadow 2>/dev/null || true
+    case "$(grep '^root:' /etc/shadow 2>/dev/null | cut -d: -f2)" in
+        ''|'*'|'!'*)
+            # root 密码锁定或为空, 写入已知 SHA-512 哈希
+            sed -i 's|^root:[^:]*:|root:$6$powerfspw$vAaxpInbU4g6am9KhSUhsahATUSUjldgbXCOWraxbjPHiquxLEB7Y4nEBW7y4RAxtpuzrzlWLNXnqVjUYy3AE0:|' /etc/shadow 2>/dev/null || true
+            ;;
+    esac
 fi
 
 # 启动 OpenSSH SSH 服务器
@@ -635,7 +685,7 @@ echo "后端服务器: ${POWERFS_ADDR}:${POWERFS_PORT}"
 echo ""
 # init 阶段尝试自动挂载 powerfs (路径对齐 FUSE 容器 /mnt/powerfs),
 # 失败则由用户手工调用 mount_powerfs。
-AUTO_MOUNT_OPTS="master_addr=${POWERFS_MASTER_ADDR},master_port=${POWERFS_MASTER_PORT},shard_count=${POWERFS_SHARD_COUNT:-3}"
+AUTO_MOUNT_OPTS="master_addr=${POWERFS_MASTER_ADDR},master_port=${POWERFS_MASTER_PORT},shard_count=${POWERFS_SHARD_COUNT:-3},transport=${POWERFS_TRANSPORT:-auto}"
 if [ -f /etc/powerfs/ca.crt ]; then
     AUTO_MOUNT_OPTS="${AUTO_MOUNT_OPTS},ca_crt=/etc/powerfs/ca.crt"
 fi
@@ -1135,7 +1185,7 @@ cat > bin/mount_powerfs << 'MEOF'
 # 参数全通过 mount -o 传递 (master_addr/master_port/shard_count 不再是
 # 全局 module_param), 避免多个 mount point 之间互相污染.
 
-POWERFS_MOUNT_OPTS="${POWERFS_MOUNT_OPTS:-master_addr=${POWERFS_MASTER_ADDR:-172.30.0.11,172.30.0.12,172.30.0.13},master_port=${POWERFS_MASTER_PORT:-9334},shard_count=${POWERFS_SHARD_COUNT:-3}}"
+POWERFS_MOUNT_OPTS="${POWERFS_MOUNT_OPTS:-master_addr=${POWERFS_MASTER_ADDR:-172.30.0.11,172.30.0.12,172.30.0.13},master_port=${POWERFS_MASTER_PORT:-9334},shard_count=${POWERFS_SHARD_COUNT:-3},transport=${POWERFS_TRANSPORT:-auto}}"
 
 # 证书 opts: 如果环境变量指定了证书路径, 追加到 mount opts。
 # master 有 CA manager 时必填, 否则 RegisterClient 会被 PERMISSION_DENIED 拒绝。
@@ -1301,6 +1351,35 @@ fi
 echo "检查关键文件权限:"
 ls -la "${INITRAMFS_DIR}/etc/passwd" "${INITRAMFS_DIR}/etc/shadow" "${INITRAMFS_DIR}/etc/group" 2>&1
 ls -la "${INITRAMFS_DIR}/etc/ssh/" 2>&1
+echo ""
+
+# === 注入 OpenMPI + PMIx (IO500 需要 MPI 运行时) ===
+# busybox initramfs 无 apt; 用 apt download + dpkg-deb -x 把 openmpi 及依赖
+# 解包到 initramfs rootfs, 让 openmpi 在标准路径 (/usr/lib, /usr/bin, /usr/share)
+# 这样 MCA 组件 / help 文件 / orted 都在 openmpi 默认查找路径, 无需符号链接.
+echo "=== 注入 OpenMPI + PMIx (IO500 MPI 运行时) ==="
+OMP_DEB_DIR="$(mktemp -d)"
+OMP_PKGS="openmpi-bin openmpi-common libopenmpi3 libopenmpi-dev libpmix2 libhwloc15 \
+          libevent-2.1-7 libevent-pthreads-2.1-7 libltdl7 libudev1 \
+          libzstd1 liblzma5 libnl-3-200 libnl-route-3-200 libpci3 \
+          libnuma1 libtinfo6"
+(cd "$OMP_DEB_DIR" && apt-get download $OMP_PKGS 2>/dev/null) || \
+    echo "[WARN] apt download 部分包失败 (可能缺包名), 继续解包已下载的"
+for deb in "$OMP_DEB_DIR"/*.deb; do
+    [ -f "$deb" ] || continue
+    sudo dpkg-deb -x "$deb" "${INITRAMFS_DIR}" 2>/dev/null || \
+        echo "[WARN] 解包失败: $(basename "$deb")"
+done
+rm -rf "$OMP_DEB_DIR"
+# 修复 openmpi MCA 组件权限 (dpkg-deb 解包后可能丢失执行位)
+sudo chmod -R a+rX "${INITRAMFS_DIR}/usr/lib/x86_64-linux-gnu/openmpi" 2>/dev/null || true
+sudo chmod -R a+rX "${INITRAMFS_DIR}/usr/lib/x86_64-linux-gnu/pmix" 2>/dev/null || true
+# 创建 mpirun/mpiexec 符号链接 (IO500 直接调用 mpirun，不调用 mpirun.openmpi)
+sudo ln -sf mpirun.openmpi "${INITRAMFS_DIR}/usr/bin/mpirun" 2>/dev/null || true
+sudo ln -sf mpiexec.openmpi "${INITRAMFS_DIR}/usr/bin/mpiexec" 2>/dev/null || true
+# /dev/shm 目录 (openmpi opal_shmem 需要)
+sudo mkdir -p "${INITRAMFS_DIR}/dev/shm"
+echo "OpenMPI 注入完成: orted=$(ls ${INITRAMFS_DIR}/usr/bin/orted 2>/dev/null && echo OK || echo MISSING) help-files=$(ls ${INITRAMFS_DIR}/usr/share/openmpi/help-plm-rsh.txt 2>/dev/null && echo OK || echo MISSING) mpirun=$(ls -la ${INITRAMFS_DIR}/usr/bin/mpirun 2>/dev/null | head -1)"
 echo ""
 
 # 打包 initramfs

@@ -925,9 +925,20 @@ int powerfs_init_inode(struct inode *inode, umode_t mode,
     /* 初始化所有者和权限 */
     inode_init_owner(&nop_mnt_idmap, inode, NULL, mode);
 
-    /* 设置 page cache 操作 */
+    /* 设置 page cache 操作
+     *
+     * gfp_mask: GFP_KERNEL 基础 + __GFP_NORETRY | __GFP_NOMEMALLOC 防 OOM killer.
+     * 原因: 4GB VM 上 buffered 写会把 page cache 撑满, GFP_HIGHUSER 允许
+     * 分配器 reclaim/compaction, 等待后仍失败就 OOM kill 进程 (包括 sshd),
+     * 导致 SSH 断连/mount 失败. __GFP_NORETRY 让分配器在内存紧张时直接
+     * 返回 -ENOMEM, 由上层 (generic_file_write_iter) 正确传递给用户,
+     * SSH/mount 不受影响.
+     *
+     * 注意: __GFP_NORETRY 只影响 page cache page 分配; 其他内核分配
+     * (如 kvmalloc in direct_IO) 仍用 GFP_KERNEL 正常等待. */
     inode->i_mapping->a_ops = &powerfs_aops;
-    mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
+    mapping_set_gfp_mask(inode->i_mapping,
+                         GFP_KERNEL | __GFP_NORETRY | __GFP_NOMEMALLOC);
     mapping_set_unevictable(inode->i_mapping);
 
     /* 设置时间戳 */
