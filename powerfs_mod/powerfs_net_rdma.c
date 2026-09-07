@@ -703,11 +703,12 @@ int powerfs_rdma_cm_event_handler(struct rdma_cm_id *cm_id,
 /* ============= Pre-post RECV ============= */
 
 /**
- * powerfs_rdma_post_recv - 从 ctrl 池取一个 MR, post 一个 RECV WR
+ * powerfs_rdma_post_recv - 从 data 池取一个 MR, post 一个 RECV WR
  *
- * RECV 缓冲必须足够大以容纳最大可能的入站帧 (HDR + body + data).
- * ctrl 池 64KB 只够装小帧; 大帧 (write_needle 1MB data) 不会被 RECV,
- * 而是走单独的 RDMA READ 流程 (后续 Phase). 当前 Phase 1 仅支持控制帧.
+ * [#79] RECV 从 data_pool (2MB) 投递, 因为服务端响应 (如 read_needle)
+ * 可达 2MB, ctrl_pool (64KB) 的 RECV buffer 无法容纳大帧 →
+ * IBV_WC_REM_INV_REQ (status 5). 小帧在 2MB buffer 中也能正常接收
+ * (wc.byte_len 标记实际数据长度).
  */
 int powerfs_rdma_post_recv(struct powerfs_rdma_conn *rdma)
 {
@@ -717,13 +718,11 @@ int powerfs_rdma_post_recv(struct powerfs_rdma_conn *rdma)
     const struct ib_recv_wr *bad;
     int ret;
 
-    e = powerfs_rdma_mr_pool_acquire(&rdma->ctrl_pool, GFP_ATOMIC);
+    e = powerfs_rdma_mr_pool_acquire(&rdma->data_pool, GFP_ATOMIC);
     if (!e)
         return -ENOMEM;
 
-    /* 单条 SGE 覆盖整个 ctrl 池缓冲, 对端可发不超过该长度的帧.
-     * lkey = pd->local_dma_lkey (PA-mode full access 共用),
-     * e->mr 已废弃为 NULL. */
+    /* 单条 SGE 覆盖整个 data 池缓冲 (2MB), 对端可发不超过该长度的帧. */
     sge.addr   = e->dma;
     sge.length = e->size;
     sge.lkey   = rdma->pd->local_dma_lkey;
@@ -1023,8 +1022,8 @@ int powerfs_rdma_connect(struct powerfs_net_server_conn *conn)
      * 这样 post 完 32 条挂 HCA RQ 后, pool 仍有 128-32=96 空闲条给 meta
      * RPC SEND 路径 acquire (SEND 也占同 ctrl_pool entry!). 老设计 32==32
      * 导致 pre-post 后 pool.free=0 → send_frame EAGAIN 永远. */
-    pr_info("powerfs_rdma: pre-post %d RECV (ctrl_pool entries=%d) to qp_num=%u\n",
-            PFS_RDMA_MAX_RECV_WR, PFS_RDMA_CTRL_BUF_NUM,
+    pr_info("powerfs_rdma: pre-post %d RECV (data_pool entries=%d) to qp_num=%u\n",
+            PFS_RDMA_MAX_RECV_WR, PFS_RDMA_DATA_BUF_NUM,
             rdma->qp ? rdma->qp->qp_num : 0);
     for (i = 0; i < PFS_RDMA_MAX_RECV_WR; i++) {
         ret = powerfs_rdma_post_recv(rdma);
@@ -1553,16 +1552,13 @@ int powerfs_rdma_send_frame(struct powerfs_net_server_conn *conn,
         return -EMSGSIZE;
     }
 
-    /* Phase 1: 仅支持 <= ctrl_pool 缓冲 (64KB) 的控制帧.
-     * 大数据帧 (write_needle 1MB) 需 RDMA READ 流程 (后续 Phase 实现),
-     * 当前 RECV 缓冲仅 64KB, 发送 >64KB 会导致对端 IB_WC_LOC_LEN_ERR. */
-    if (total > PFS_RDMA_CTRL_BUF_SIZE) {
-        pr_warn_ratelimited("powerfs_rdma: frame %zu > ctrl buf %d, "
-                            "large frames require RDMA READ (not yet impl)\n",
-                            total, PFS_RDMA_CTRL_BUF_SIZE);
-        return -EOPNOTSUPP;
-    }
-    pool = &rdma->ctrl_pool;
+    /* [#79] 支持 >64KB 的大帧 SEND: 选 data_pool (2MB) 而非 ctrl_pool (64KB).
+     * 原先 Phase 1 限制: 大帧直接返回 -EOPNOTSUPP, 导致 write_needle 大块
+     * 数据无法发送, volume 数据面不通. 现在使用 data_pool 发送大帧. */
+    if (total > PFS_RDMA_CTRL_BUF_SIZE)
+        pool = &rdma->data_pool;
+    else
+        pool = &rdma->ctrl_pool;
 
     /* 防御: 确保帧不超过所选池的缓冲大小 */
     if (total > pool->buf_size) {

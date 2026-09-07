@@ -30,13 +30,15 @@
 #define PFS_RDMA_MAX_SGE        3       /* hdr + body + data */
 #define PFS_RDMA_MAX_INLINE     64      /* 28B header 可 inline */
 
-/* MR 池: 控制帧缓冲 (64KB, 足够覆盖 256KB body 的多数情况) */
+/* MR 池: 控制帧缓冲 (64KB) — 用于小帧 SEND (≤64KB) */
 #define PFS_RDMA_CTRL_BUF_SIZE  65536   /* 64KB */
-#define PFS_RDMA_CTRL_BUF_NUM   128     /* 128 个: 32 RECV posted + 64 SEND inflight + 32 slack */
+#define PFS_RDMA_CTRL_BUF_NUM   128     /* 128: 64 SEND inflight + 64 slack */
 
-/* MR 池: 大数据帧缓冲 (2MB, 对齐 POWERFS_NET_MAX_DATA) */
+/* MR 池: 大数据帧缓冲 (2MB) — 用于 RECV (接收服务端响应) + 大帧 SEND */
 #define PFS_RDMA_DATA_BUF_SIZE  (2 * 1024 * 1024)  /* 2MB */
-#define PFS_RDMA_DATA_BUF_NUM   4                  /* 4 个数据缓冲 */
+/* [#79] RECV 从 data_pool 投递 (服务端响应可达 2MB).
+ * 48 = 32 RECV (MAX_RECV_WR) + 16 SEND (大帧 write_needle) */
+#define PFS_RDMA_DATA_BUF_NUM   48
 
 /* 连接超时 */
 #define PFS_RDMA_ADDR_TIMEOUT   5000    /* ms */
