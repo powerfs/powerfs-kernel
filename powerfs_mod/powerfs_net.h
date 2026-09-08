@@ -1546,6 +1546,19 @@ struct powerfs_net_server_conn *powerfs_net_get_volume_conn(int idx);
  * is_meta=true 返回 meta conn (lease), false 返回 data conn (needle). */
 struct powerfs_net_server_conn *powerfs_net_find_volume_conn(__u64 volume_id, bool is_meta);
 
+/* A-X1 (§4.3): RDMA MR 池占用感知的 readahead 上限.
+ * 根据所有已连接 RDMA volume conn 的 data MR 池空闲量, 裁剪 ML/规则引擎
+ * 下发的 readahead MB, 避免预取压垮 MR 池导致 RNR. 非 RDMA 构建为内联
+ * 桩, 原样返回 (不裁剪). 定义在 powerfs_net_rdma.c. */
+#ifdef CONFIG_INFINIBAND
+u32 powerfs_rdma_cap_readahead_mb(u32 requested_mb);
+#else
+static inline u32 powerfs_rdma_cap_readahead_mb(u32 requested_mb)
+{
+    return requested_mb;
+}
+#endif
+
 /* 发送请求直连到 volume server (bypass shard routing).
  * vol_idx: volume 连接索引 (-1 = 按 volume_id 自动查找)
  * volume_id: 用于路由查找 (vol_idx < 0 时使用)

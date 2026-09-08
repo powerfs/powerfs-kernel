@@ -296,6 +296,88 @@ void powerfs_rdma_mr_pool_release(struct powerfs_rdma_mr_pool *pool,
     atomic_inc(&pool->free);
 }
 
+/* ============= A-X1: RDMA MR 池占用感知的 readahead 上限 (§4.3) ============= */
+
+/*
+ * 背景: data_pool 共 PFS_RDMA_DATA_BUF_NUM(48) 个 2MB MR, 其中 32 个在
+ * 建链时 pre-post 到 RQ 作为 RECV (idle 时 free≈16), 余量 ~16 个用于大帧
+ * SEND (write_needle) 及超额并发读. readahead 会让 netfs 一次性发起多个
+ * 并发读 (16MB readahead = 最多 8 个 2MB 帧 in-flight), 若 MR 池已被
+ * 占满 (free→0), 新读拿不到 MR → EAGAIN/RNR, 反而拖慢 demand read.
+ *
+ * 策略 (§4.3): effective_readahead = min(ML建议值, 剩余可容纳帧数 × 2MB),
+ * 并为 demand read 预留 RESERVE 个 MR. 仅在 RDMA 传输下生效; TCP 或无
+ * 已连接 RDMA volume conn 时不裁剪 (返回原值).
+ */
+#define PFS_RA_MR_RESERVE       4       /* 为 demand read 预留的 2MB MR 数 */
+#define PFS_RA_MR_FRAME_MB      2       /* 每个 data MR 帧大小 (MB) */
+
+/*
+ * powerfs_rdma_cap_readahead_mb - 根据 RDMA data MR 池空闲量裁剪 readahead
+ * @requested_mb: ML/规则引擎下发的 readahead 值 (MB)
+ *
+ * 返回: 实际可安全使用的 readahead MB (≤ requested_mb).
+ *   - requested_mb == 0: 直接返回 0 (关闭预取, 无需 MR)
+ *   - 非 RDMA / 无已连接 RDMA volume conn: 返回 requested_mb (不裁剪)
+ *   - RDMA: 取所有已连接 volume conn 中最小的 data_pool.free 作为瓶颈,
+ *     扣除 PFS_RA_MR_RESERVE 后按 2MB/帧折算上限.
+ */
+u32 powerfs_rdma_cap_readahead_mb(u32 requested_mb)
+{
+    int vol_count, i;
+    int min_free = INT_MAX;
+    bool found_rdma = false;
+
+    if (requested_mb == 0)
+        return 0;
+
+    vol_count = powerfs_net_get_volume_count();
+    for (i = 0; i < vol_count; i++) {
+        struct powerfs_net_server_conn *conn = powerfs_net_get_volume_conn(i);
+        int free_mrs;
+
+        if (!conn || !conn->in_use)
+            continue;
+        if (conn->transport_type != POWERFS_TRANSPORT_RDMA)
+            continue;
+        /* TCP fallback / 未建链: rdma 为 NULL */
+        if (!conn->rdma)
+            continue;
+        if (READ_ONCE(conn->state) != CONN_CONNECTED)
+            continue;
+
+        found_rdma = true;
+        free_mrs = atomic_read(&conn->rdma->data_pool.free);
+        if (free_mrs < min_free)
+            min_free = free_mrs;
+    }
+
+    if (!found_rdma)
+        return requested_mb;   /* TCP 或无 RDMA volume: 不裁剪 */
+
+    {
+        int spare = min_free - PFS_RA_MR_RESERVE;
+        u32 cap_frames, cap_mb;
+
+        if (spare <= 0) {
+            pr_info_ratelimited("powerfs_rdma: readahead capped to 0 (min_free=%d <= reserve=%d)\n",
+                                min_free, PFS_RA_MR_RESERVE);
+            return 0;
+        }
+
+        cap_frames = (u32)spare;
+        cap_mb = cap_frames * PFS_RA_MR_FRAME_MB;
+
+        if (cap_mb < requested_mb) {
+            pr_info_ratelimited("powerfs_rdma: readahead capped %uMB -> %uMB (min_free=%d)\n",
+                                requested_mb, cap_mb, min_free);
+            return cap_mb;
+        }
+    }
+
+    return requested_mb;
+}
+
 /* ============= CQ 完成回调 (RC15: 标准 ib_cqe->done 模式) ============= */
 
 /* [前向声明] powerfs_rdma_process_wc 在本文件后面 L400+ 定义;

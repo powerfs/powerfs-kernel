@@ -197,9 +197,16 @@ int powerfs_readahead_apply(struct file *file, struct inode *inode)
      * readahead_mb = 0 → ra_pages = 0 关闭预取 (random 工作负载, 关键收益点)
      * readahead_mb = N → ra_pages = N * 1024 / PAGE_SIZE (对齐 RDMA 2MB 帧)
      *
+     * A-X1 (§4.3): RDMA MR 池占用感知. data_pool 仅 48 个 2MB MR (32 个
+     * pre-post RECV), 预取一次性发起多个并发读可能占满 MR → RNR. 根据当前
+     * 空闲 MR 数裁剪 mb (仅 RDMA 传输生效, TCP 原样返回).
+     *
      * 注意: file->f_ra 是 per-file descriptor, 不是 per-inode,
      * 多个 open 同一 inode 各自的 f_ra 独立, 此处改的是当前 file.
      */
+    if (mb > 0)
+        mb = powerfs_rdma_cap_readahead_mb(mb);
+
     if (mb == 0) {
         file->f_ra.ra_pages = 0;
     } else {
