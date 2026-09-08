@@ -184,6 +184,15 @@ enum powerfs_net_msg_type {
      * Value MUST match powerfs-net/src/protocol.rs MsgType::BatchCreate. */
     POWERFS_NET_MSG_BATCH_CREATE       = 0x003f,
 
+    /* Phase A-1.1: ML readahead IO trace push (kernel → filer).
+     * Kernel 批量上报 per-inode IO 访问模式, filer 端聚合后供 NN 训练.
+     * Request: ShardId(u64) + Count(u32) + [TraceEntry]*Count
+     * TraceEntry: Ino(u64)+Placement(u8)+FileSize(u64)+Offsets[16](u16)+
+     *             Kinds[16](u8)+SeqRun(u16)+RandRun(u16)
+     * Response: Status only.
+     * Value MUST match powerfs-net/src/protocol.rs MsgType::PushIoTrace. */
+    POWERFS_NET_MSG_PUSH_IO_TRACE      = 0x0041,
+
     /* 状态 */
     POWERFS_NET_MSG_STATFS = 0x0040,
 

@@ -557,6 +557,15 @@ static ssize_t powerfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
         got = 0;
     }
 
+    /* ML 自适应预取 (Phase A-0): 在 generic_file_read_iter 之前调整
+     * file->f_ra.ra_pages, 影响 VFS readahead window 决策.
+     * 详见 powerfs_readahead.h / docs/ml-prefetch-kernel-rdma-plan.md §4.5
+     * 失败 best-effort: 不阻塞 I/O, 用 VFS 默认 ra_pages. */
+    powerfs_readahead_apply(file, inode);
+
+    /* A-1.1: IO trace 采集 (1/100 采样, best-effort, 不阻塞 I/O) */
+    powerfs_io_trace_record(inode, iocb->ki_pos, POWERFS_IO_TRACE_READ);
+
     ret = generic_file_read_iter(iocb, to);
 
     if (got)
@@ -785,6 +794,10 @@ static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
             pr_debug("powerfs: write_iter ensure_lease ino=%lu off=%lld ret=%d, continuing without lease\n",
                      inode->i_ino, offset, lease_ret);
     }
+
+    /* A-1.1: IO trace 采集 (1/100 采样, best-effort, 不阻塞 I/O) */
+    powerfs_io_trace_record(inode, offset, POWERFS_IO_TRACE_WRITE);
+
     ret = generic_file_write_iter(iocb, from);
 
     /* 写入成功后标记 cap WR dirty (对齐 __xxx_mark_dirty_caps 在 write_end),

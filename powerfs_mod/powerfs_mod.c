@@ -41,6 +41,7 @@ enum powerfs_param {
     Opt_client_crt,
     Opt_client_key,
     Opt_transport,
+    Opt_readahead,
 };
 
 static const struct fs_parameter_spec powerfs_fs_parameters[] = {
@@ -52,6 +53,7 @@ static const struct fs_parameter_spec powerfs_fs_parameters[] = {
     fsparam_string("client_crt",   Opt_client_crt),
     fsparam_string("client_key",   Opt_client_key),
     fsparam_string("transport",    Opt_transport),
+    fsparam_string("readahead",    Opt_readahead),
     {}
 };
 
@@ -76,6 +78,11 @@ struct powerfs_ctx {
      * 由 mount -o transport=tcp|rdma 传入. fill_super 解析为 transport_type
      * 存入 sbi->transport_type 并传播到 g_pool.transport_type. */
     char transport[8];
+    /* ML 自适应预取开关: "auto" (默认) 或 "off".
+     * auto: 查 xattr user.powerfs.readahead_policy 决定 per-file readahead
+     * off:  全局禁用 ML, 用 VFS 默认 ra_pages
+     * fill_super 解析后存入 sbi->readahead_mode. */
+    char readahead[8];
 };
 
 /* ========== 外部函数声明 (在 powerfs_fs.c 中定义) ========== */
@@ -251,6 +258,20 @@ static int powerfs_parse_param(struct fs_context *fc, struct fs_parameter *param
             pr_info("powerfs: transport = %s\n", ctx->transport);
         }
         break;
+    case Opt_readahead:
+        if (param->string) {
+            strncpy(ctx->readahead, param->string, sizeof(ctx->readahead) - 1);
+            ctx->readahead[sizeof(ctx->readahead) - 1] = '\0';
+            /* 校验: 只接受 "auto" 或 "off". */
+            if (strcmp(ctx->readahead, "auto") != 0 &&
+                strcmp(ctx->readahead, "off") != 0) {
+                pr_err("powerfs: invalid readahead='%s' (must be auto or off)\n",
+                       ctx->readahead);
+                return -EINVAL;
+            }
+            pr_info("powerfs: readahead = %s\n", ctx->readahead);
+        }
+        break;
     }
 
     return 0;
@@ -354,6 +375,12 @@ static int __init powerfs_init(void)
         pr_warn("powerfs: comm device init failed (continuing): %d\n", ret);
     }
 
+    /* A-1.1: 初始化 IO trace flush workqueue */
+    ret = powerfs_io_trace_flush_init();
+    if (ret) {
+        pr_warn("powerfs: io_trace flush init failed (continuing): %d\n", ret);
+    }
+
     /* 注册文件系统 */
     ret = register_filesystem(&powerfs_fs_type);
     if (ret) {
@@ -379,6 +406,9 @@ static void __exit powerfs_exit(void)
     unregister_filesystem(&powerfs_fs_type);
     powerfs_comm_exit();
     powerfs_flow_exit();
+
+    /* A-1.1: 停止 IO trace flush workqueue */
+    powerfs_io_trace_flush_exit();
 
     /* 等待所有 pending RCU 回调完成, 确保 kill_sb 期间排队的
      * call_rcu (dentry_info 释放等) 在 slab 缓存销毁前执行完毕.

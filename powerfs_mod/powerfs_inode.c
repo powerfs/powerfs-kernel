@@ -620,6 +620,14 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
         goto out_iput;
     }
 
+    /* A-1.4: 失效 readahead 策略缓存.
+     *
+     * Filer 推送 Invalidate(inode, version) 意味着 inode 元数据可能变化
+     * (包括 readahead_policy xattr, 由 filer 规则引擎/ML 更新).
+     * 标记 cached=false, 下次 read_iter 会重新查 xattr 获取最新策略.
+     * 与 getattr/属性更新解耦: 即使 getattr 失败, 策略也应失效重查. */
+    powerfs_readahead_invalidate(inode);
+
     /* Mark need_refresh: signals concurrent readers that a refresh is in flight.
      * (Previously set in powerfs_invalidate_one before scheduling, but now
      * the inode lookup is deferred to this work function.) */
@@ -1075,6 +1083,9 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     INIT_LIST_HEAD(&pi->dirty_creates);
     pi->dirty_create_count = 0;
     INIT_DELAYED_WORK(&pi->flush_work, powerfs_flush_dirty_creates_work_fn);
+
+    /* ML 自适应预取初始化 (Phase A-0): cached=false, mb=0, version=0 */
+    powerfs_readahead_inode_init(pi);
 
     /* Cap 引用计数清零 */
     pi->i_pin_ref = 0;

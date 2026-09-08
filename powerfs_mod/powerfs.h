@@ -21,6 +21,7 @@
 #include "powerfs_lock.h"  /* MDLock 独立锁对象 */
 #endif /* DEAD_CODE */
 #include "powerfs_net_transport.h"  /* enum powerfs_transport_type + transport_ops */
+#include "powerfs_readahead.h"   /* ML 自适应预取 (Phase A-0/A-1) */
 
 /* ========== 常量定义 ========== */
 
@@ -750,6 +751,28 @@ struct powerfs_inode_info {
     struct powerfs_mdlock i_locks[POWERFS_NUM_LOCK_TYPES];
     wait_queue_head_t i_mdlock_wq;   /* GATHER 全局等待队列 (跨锁类型) */
 #endif /* DEAD_CODE */
+
+    /* ==============================================================
+     * === ML 自适应预取策略缓存 (Phase A-0/A-1, 详见 powerfs_readahead.h) ===
+     * ============================================================== */
+    u32 readahead_mb;                 /* 下发的 readahead 值 (0=random关闭, N=N MB) */
+    bool readahead_policy_cached;     /* xattr 已查过, readahead_mb 有效 */
+    bool readahead_policy_disabled;   /* per-inode 禁用 (A-1 invalidation 用, A-0 不用) */
+    u64 readahead_policy_version;     /* filer 下发版本号 (A-1 ML 更新时比对, A-0 不用) */
+
+    /* ==============================================================
+     * === A-1.1 IO trace 采集 (per-inode ring buffer, 详见 powerfs_readahead.h) ===
+     * 采样 1/100, 仅记最近 16 次访问模式, 供 filer 端 ML 二分类.
+     * ============================================================== */
+    u16 io_trace_offsets[16];        /* 最近 16 次 offset (高 16 位, 4GB 粒度) */
+    u8  io_trace_kinds[16];          /* 0=read, 1=write */
+    u8  io_trace_idx;                /* ring buffer 写指针 (0..15) */
+    u16 io_trace_seq_run;            /* 当前连续顺序访问计数 */
+    u16 io_trace_rand_run;           /* 当前连续跳跃访问计数 */
+    u32 io_trace_sample_counter;     /* 1/100 采样控制 */
+    u64 io_trace_last_off;           /* 上一次采样的实际 offset (顺序判断用) */
+    u8  io_trace_last_valid;         /* io_trace_last_off 是否有效 */
+    u8  io_trace_dirty;              /* 有新 trace 待 flush */
 };
 
 /* 获取 inode 扩展结构 */
@@ -1009,6 +1032,12 @@ struct powerfs_sb_info {
 
     /* inode 号分配器 */
     atomic_t next_ino;
+
+    /* ML 自适应预取全局开关 (mount -o readahead=auto|off)
+     * AUTO: 默认, 查 xattr 决定 per-file readahead (A-0/A-1)
+     * OFF:  全局禁用 ML 预取, 用 VFS 默认 ra_pages
+     * 详见 powerfs_readahead.h */
+    enum powerfs_readahead_mount_mode readahead_mode;
 
     /* 是否初始化完成 (兼容旧代码, 新代码用 client->mount_state) */
     bool initialized;

@@ -388,6 +388,8 @@ static int powerfs_show_options(struct seq_file *m, struct dentry *root)
     seq_printf(m, ",transport=%s",
                sbi->transport_type == POWERFS_TRANSPORT_RDMA ? "rdma" :
                sbi->transport_type == POWERFS_TRANSPORT_AUTO ? "auto" : "tcp");
+    seq_printf(m, ",readahead=%s",
+               sbi->readahead_mode == POWERFS_READAHEAD_OFF ? "off" : "auto");
 
     return 0;
 }
@@ -1540,6 +1542,7 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
         char client_crt[512];
         char client_key[512];
         char transport[8];   /* "tcp" (默认) 或 "rdma" */
+        char readahead[8];   /* "auto" (默认) 或 "off" */
     };
     /* 注意: sget_fc() 会将 fc->s_fs_info 转移到 sb->s_fs_info, 然后将
      * fc->s_fs_info 置 NULL. 因此必须从 sb->s_fs_info 获取 ctx, 而不是
@@ -1600,6 +1603,19 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
             /* 空字符串或 "tcp" 都默认 TCP (兼容旧 mount 命令不传 transport). */
             sbi->transport_type = POWERFS_TRANSPORT_TCP;
         }
+
+        /* readahead: 解析 "auto"/"off" → sbi->readahead_mode.
+         * parse_param 已校验只接受 auto/off, 这里防御性二次校验.
+         * 空 = 默认 auto (查 xattr 决定 per-file readahead). */
+        if (strcmp(ctx->readahead, "off") == 0) {
+            sbi->readahead_mode = POWERFS_READAHEAD_OFF;
+            pr_info("powerfs: readahead=off (ML disabled, use VFS default)\n");
+        } else {
+            sbi->readahead_mode = POWERFS_READAHEAD_AUTO;
+            if (ctx->readahead[0] != '\0')
+                pr_info("powerfs: readahead=auto (per-file xattr-driven)\n");
+        }
+
         /* 释放 init_fs_context 分配的 ctx, 释放后 sb->s_fs_info 仍指向已释放内存,
          * 必须清除以避免 kill_sb 访问悬空指针 (fill_super 早期失败时 VFS 仍会
          * 调用 kill_sb). 下方 sb->s_fs_info = sbi 会重新设置. */

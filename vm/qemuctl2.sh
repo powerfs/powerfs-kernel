@@ -847,7 +847,7 @@ fi
 timeout 35 mount -t powerfs \
   -o master_addr=${POWERFS_MASTER_ADDR},master_port=${POWERFS_MASTER_PORT},shard_count=${POWERFS_SHARD_COUNT} \
   -o ca_crt=\${CA},client_crt=\${CRT},client_key=\${KEY} \
-  -o transport=${POWERFS_TRANSPORT} powerfs /mnt/powerfs
+  -o transport=${POWERFS_TRANSPORT},readahead=${POWERFS_READAHEAD:-auto} powerfs /mnt/powerfs
 RC=\$?
 echo MOUNT_RC=\${RC}
 # RELIABLE check: /proc/mounts powerfs line with transport=rdma must exist
