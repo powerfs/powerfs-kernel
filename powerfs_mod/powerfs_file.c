@@ -43,6 +43,8 @@
 #include "powerfs_flow.h"
 
 #include "powerfs_vfs.h"
+#include "powerfs_write_predict.h"
+#include <linux/crc32.h>        /* crc32_le (写预测指纹计算) */
 
 /* ========== 文件操作 ========== */
 
@@ -798,8 +800,65 @@ static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
     /* A-1.1: IO trace 采集 (1/100 采样, best-effort, 不阻塞 I/O) */
     powerfs_io_trace_record(inode, offset, POWERFS_IO_TRACE_WRITE);
 
+    /* C-1.5: 写预测指纹去重 — buffered write 路径.
+     * 仅在整文件覆盖写 (pos==0) 且 Flat placement 时尝试.
+     * Match/Recoverable → 用匹配到的 needle_id/volume_id, 跳过 generic_file_write_iter,
+     *   直接 sync_size_chunks 同步引用到 filer (零数据传输).
+     * NoMatch → 正常走 generic_file_write_iter, writeback 时 record 指纹.
+     * should_dedup=false (xattr off/missing) 或 RPC 失败 → 正常写. */
+    if (offset == 0 && count > 0 &&
+        pi->placement == POWERFS_PLACEMENT_FLAT &&
+        pi->volume_id && pi->file_key &&
+        powerfs_write_predict_should_dedup(inode)) {
+        char *data_buf;
+        data_buf = kvmalloc(count, GFP_KERNEL);
+        if (data_buf) {
+            if (copy_from_iter(data_buf, count, from) == count) {
+                __u64 dedup_nid = 0;
+                __u64 dedup_vid = 0;
+                __u32 dedup_crc = 0;
+                int dedup_ret;
+
+                dedup_ret = powerfs_write_predict_dedup(inode, offset,
+                                                         data_buf, count,
+                                                         &dedup_nid, &dedup_vid,
+                                                         &dedup_crc);
+                if (dedup_ret > 0) {
+                    /* 去重命中: 用匹配到的 needle, 跳过 generic_file_write_iter */
+                    ssize_t written = count;
+                    struct timespec64 now = current_time(inode);
+                    pi->volume_id = dedup_vid;
+                    pi->file_key = dedup_nid;
+                    i_size_write(inode, offset + written);
+                    inode_set_mtime(inode, now.tv_sec, now.tv_nsec);
+                    inode_set_ctime(inode, now.tv_sec, now.tv_nsec);
+                    mark_inode_dirty(inode);
+                    powerfs_cap_mark_dirty(pi, POWERFS_CAP_WR_DATA);
+                    iocb->ki_pos += written;
+                    kvfree(data_buf);
+                    ret = written;
+                    goto write_iter_done;
+                }
+                /* NoMatch: record 指纹 (best-effort). buffered write 的数据
+                 * 在 page cache 中, writeback 时才写 volume. 这里先 record 指纹
+                 * 供后续去重. */
+                {
+                    __u32 crc = crc32_le(0, data_buf, count);
+                    powerfs_write_predict_record(inode, pi->file_key,
+                                                  pi->volume_id, crc,
+                                                  data_buf, count);
+                }
+                /* 回退 iov_iter: generic_file_write_iter 需要重新读数据 */
+                iov_iter_revert(from, count);
+            }
+            kvfree(data_buf);
+        }
+        /* dedup 未命中或失败 → 正常走 generic_file_write_iter */
+    }
+
     ret = generic_file_write_iter(iocb, from);
 
+write_iter_done:
     /* 写入成功后标记 cap WR dirty (对齐 __xxx_mark_dirty_caps 在 write_end),
      * 供 revoke/flush 时感知有脏数据需要同步回服务端. */
     if (ret > 0)

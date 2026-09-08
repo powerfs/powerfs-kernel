@@ -315,8 +315,8 @@ int powerfs_write_predict_dedup(struct inode *inode, loff_t offset,
 
     /* Match or Recoverable: parse needle_id, volume_id, crc32 */
     if (match_kind == POWERFS_FP_LOOKUP_MATCH) {
-        /* 1 + needle_id(8) + volume_id(8) + crc32(4) + data_size(8) + refcount(4) = 34 */
-        if (resp_len < 34) {
+        /* 1 + needle_id(8) + volume_id(8) + crc32(4) + data_size(8) + refcount(4) = 33 */
+        if (resp_len < 33) {
             pr_warn_ratelimited("powerfs: write_predict Match resp too short %zu\n",
                                 resp_len);
             return -EIO;
@@ -333,8 +333,8 @@ int powerfs_write_predict_dedup(struct inode *inode, loff_t offset,
     }
 
     if (match_kind == POWERFS_FP_LOOKUP_RECOVERABLE) {
-        /* 1 + needle_id(8) + volume_id(8) + crc32(4) + data_size(8) = 30 */
-        if (resp_len < 30) {
+        /* 1 + needle_id(8) + volume_id(8) + crc32(4) + data_size(8) = 29 */
+        if (resp_len < 29) {
             pr_warn_ratelimited("powerfs: write_predict Recoverable resp too short %zu\n",
                                 resp_len);
             return -EIO;

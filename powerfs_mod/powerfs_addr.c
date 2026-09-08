@@ -2448,12 +2448,49 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
              *   需上层聚合或 buffered I/O 兜底. */
             if (powerfs_dio_write_can_skip_read(inode, pos, count)) {
                 __u64 needle_id = pi->file_key + pos / POWERFS_CHUNK_SIZE;
+                bool dedup_hit = false;
 
-                ret = powerfs_net_write_needle(pi->volume_id, needle_id,
-                                                inode->i_ino,
-                                                buf, count, NULL, 0);
-                if (ret == 0)
-                    chunk_written = count;
+                /* C-1.5: 同步 DIO 路径写预测指纹去重 (与异步 worker 对齐).
+                 * 仅在写整文件 (offset=0, 全量覆盖) 时尝试去重.
+                 * Match/Recoverable → 用匹配到的 needle_id/volume_id, 跳过 volume 写.
+                 * NoMatch → 正常写, 之后 record 指纹. */
+                if (pos == 0 && powerfs_write_predict_should_dedup(inode)) {
+                    __u64 dedup_nid = 0;
+                    __u64 dedup_vid = 0;
+                    __u32 dedup_crc = 0;
+                    int dedup_ret;
+
+                    dedup_ret = powerfs_write_predict_dedup(inode, pos,
+                                                             buf, count,
+                                                             &dedup_nid, &dedup_vid,
+                                                             &dedup_crc);
+                    if (dedup_ret > 0) {
+                        /* 去重成功: 用匹配到的 needle_id/volume_id, 跳过 volume 写 */
+                        pi->volume_id = dedup_vid;
+                        pi->file_key = dedup_nid;
+                        chunk_written = count;
+                        dedup_hit = true;
+                        ret = 0;
+                    }
+                    /* dedup_ret <= 0: NoMatch 或错误, 继续正常写 */
+                }
+
+                if (!dedup_hit) {
+                    /* 正常写路径 (未去重或去重失败) */
+                    ret = powerfs_net_write_needle(pi->volume_id, needle_id,
+                                                    inode->i_ino,
+                                                    buf, count, NULL, 0);
+                    if (ret == 0) {
+                        chunk_written = count;
+                        /* C-1.5: 记录指纹供后续去重 (best-effort, 仅整文件写) */
+                        if (pos == 0 && powerfs_write_predict_should_dedup(inode)) {
+                            __u32 crc = crc32_le(0, buf, count);
+                            powerfs_write_predict_record(inode, needle_id,
+                                                          pi->volume_id, crc,
+                                                          buf, count);
+                        }
+                    }
+                }
             } else {
                 ret = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
                                          pos, buf, count, &chunk_written);

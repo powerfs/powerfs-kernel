@@ -796,7 +796,7 @@ mount_vm() {
     fi
     local iip
     iip="$(vm_val "${vid}" IIP)"
-    info "Mount PowerFS on $(vm_val "${vid}" NAME) with transport=rdma (ib0=${iip})"
+    info "Mount PowerFS on $(vm_val "${vid}" NAME) with transport=${POWERFS_TRANSPORT} (ib0=${iip})"
     ssh_vm "${vid}" "
 set +e
 CA=/etc/powerfs/ca.crt
@@ -808,8 +808,8 @@ ip addr flush dev ib0 2>/dev/null
 ip addr add ${iip}/24 dev ib0
 ip route del 192.168.100.0/24 table main 2>/dev/null
 ip route add 192.168.100.0/24 dev ib0 proto kernel scope link src ${iip} metric 10 2>/dev/null
-# Sanity check RDMA link pingable via ib0
-if ! ping -c 2 -W 1 -I ib0 192.168.100.3 >/dev/null 2>&1; then
+# Sanity check RDMA link pingable via ib0 (only required for rdma transport)
+if [ \"${POWERFS_TRANSPORT}\" = \"rdma\" ] && ! ping -c 2 -W 1 -I ib0 192.168.100.3 >/dev/null 2>&1; then
   echo 'IB_UNREACHABLE: cannot ping 192.168.100.3 via ib0'
   echo 'current route:'; ip route get 192.168.100.3
   exit 2
@@ -850,13 +850,13 @@ timeout 35 mount -t powerfs \
   -o transport=${POWERFS_TRANSPORT},readahead=${POWERFS_READAHEAD:-auto} powerfs /mnt/powerfs
 RC=\$?
 echo MOUNT_RC=\${RC}
-# RELIABLE check: /proc/mounts powerfs line with transport=rdma must exist
-grep -E '^powerfs /mnt/powerfs powerfs .*transport=rdma' /proc/mounts >/dev/null 2>&1 &&
+# RELIABLE check: /proc/mounts powerfs line with transport=\${POWERFS_TRANSPORT} must exist
+grep -E '^powerfs /mnt/powerfs powerfs .*transport='"${POWERFS_TRANSPORT}" /proc/mounts >/dev/null 2>&1 &&
   ( echo 'PROC_MOUNTS_CHECK=PASS'
     mount | grep powerfs
     # sanity readdir (timeout 5s avoids hanging on stale session)
     timeout 5 ls /mnt/powerfs ) ||
-  ( echo 'PROC_MOUNTS_CHECK=FAIL (transport=rdma not actually mounted)'
+  ( echo 'PROC_MOUNTS_CHECK=FAIL (transport=${POWERFS_TRANSPORT} not actually mounted)'
     dmesg | tail -6 )
 " 2>&1
 }
