@@ -8,6 +8,7 @@
 #include <linux/dcache.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/crc32.h>
 #include <linux/uaccess.h>
 #include <linux/time.h>
 #include <linux/atomic.h>
@@ -44,6 +45,7 @@
 #include "powerfs_comm.h"
 #include "powerfs_net.h"
 #include "powerfs_flow.h"
+#include "powerfs_write_predict.h"
 
 #include "powerfs_vfs.h"
 
@@ -2276,16 +2278,53 @@ static void powerfs_dio_write_worker(struct work_struct *work)
     if (powerfs_dio_write_can_skip_read(inode, dw->pos, dw->count)) {
         __u64 needle_id = pi->file_key + dw->pos / POWERFS_CHUNK_SIZE;
 
+        /* C-1.5: 写预测指纹去重 — 在写 volume 之前查 filer 是否已有相同内容.
+         * 仅在写整文件 (offset=0, 全量覆盖) 时尝试去重, 避免修改 pi->file_key
+         * 影响其他 chunk 的 needle 引用.
+         * Match/Recoverable → 用匹配到的 needle_id/volume_id 替换 pi 字段,
+         *   跳过 volume 写, sync_size_chunks 同步新引用.
+         * NoMatch → 正常写, 之后 record 指纹供后续去重.
+         * should_dedup=false (xattr off/missing) 或 RPC 失败 → 正常写. */
+        if (dw->pos == 0 && powerfs_write_predict_should_dedup(inode)) {
+            __u64 dedup_nid = 0;
+            __u64 dedup_vid = 0;
+            __u32 dedup_crc = 0;
+            int dedup_ret;
+
+            dedup_ret = powerfs_write_predict_dedup(inode, dw->pos,
+                                                     buf, dw->count,
+                                                     &dedup_nid, &dedup_vid,
+                                                     &dedup_crc);
+            if (dedup_ret > 0) {
+                /* 去重成功: 用匹配到的 needle_id/volume_id 替换 pi 字段,
+                 * 跳过 volume 写. sync_size_chunks 同步新引用到 filer. */
+                pi->volume_id = dedup_vid;
+                pi->file_key = dedup_nid;
+                result = 0;
+                written = dw->count;
+                goto dio_write_done;
+            }
+            /* dedup_ret <= 0: NoMatch 或错误, 继续正常写 */
+        }
+
         result = powerfs_net_write_needle(pi->volume_id, needle_id,
                                            inode->i_ino,
                                            buf, dw->count, NULL, 0);
         if (result == 0) {
             written = dw->count;
+            /* C-1.5: 记录指纹供后续去重 (best-effort, 仅整文件写) */
+            if (dw->pos == 0 && powerfs_write_predict_should_dedup(inode)) {
+                __u32 crc = crc32_le(0, buf, dw->count);
+                powerfs_write_predict_record(inode, needle_id,
+                                              pi->volume_id, crc,
+                                              buf, dw->count);
+            }
         }
     } else {
         result = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
                                     dw->pos, buf, dw->count, &written);
     }
+dio_write_done:
     kvfree(buf);
 
     if (result >= 0) {

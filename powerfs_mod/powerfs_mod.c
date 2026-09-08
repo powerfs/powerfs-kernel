@@ -19,6 +19,8 @@
 #include <linux/seq_file.h>
 
 #include "powerfs.h"
+#include "powerfs_readahead.h"
+#include "powerfs_write_predict.h"
 
 /* ========== fs_context 参数解析 ==========
  *
@@ -381,6 +383,12 @@ static int __init powerfs_init(void)
         pr_warn("powerfs: io_trace flush init failed (continuing): %d\n", ret);
     }
 
+    /* C-1.5: 初始化写预测 SHA-256 transform */
+    ret = powerfs_write_predict_init();
+    if (ret) {
+        pr_warn("powerfs: write predict init failed (continuing): %d\n", ret);
+    }
+
     /* 注册文件系统 */
     ret = register_filesystem(&powerfs_fs_type);
     if (ret) {
@@ -409,6 +417,9 @@ static void __exit powerfs_exit(void)
 
     /* A-1.1: 停止 IO trace flush workqueue */
     powerfs_io_trace_flush_exit();
+
+    /* C-1.5: 释放写预测 SHA-256 transform */
+    powerfs_write_predict_exit();
 
     /* 等待所有 pending RCU 回调完成, 确保 kill_sb 期间排队的
      * call_rcu (dentry_info 释放等) 在 slab 缓存销毁前执行完毕.

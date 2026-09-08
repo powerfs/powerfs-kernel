@@ -40,7 +40,8 @@ $(MODULE_NAME)-objs := \
     powerfs_flow.o \
     powerfs_ec.o \
     page_cache.o \
-    powerfs_readahead.o
+    powerfs_readahead.o \
+    powerfs_write_predict.o
 
 # RDMA 传输 (CONFIG_INFINIBAND=y 时编译)
 ifdef CONFIG_INFINIBAND

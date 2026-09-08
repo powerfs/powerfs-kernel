@@ -773,6 +773,13 @@ struct powerfs_inode_info {
     u64 io_trace_last_off;           /* 上一次采样的实际 offset (顺序判断用) */
     u8  io_trace_last_valid;         /* io_trace_last_off 是否有效 */
     u8  io_trace_dirty;              /* 有新 trace 待 flush */
+
+    /* ==============================================================
+     * === 写预测 + 内容指纹去重 (Phase C-1, 详见 powerfs_write_predict.h) ===
+     * 缓存 xattr user.powerfs.write_predict_policy 的解析结果.
+     * ============================================================== */
+    bool write_predict_enabled;      /* xattr 阈值>0, 启用指纹去重 */
+    bool write_predict_cached;       /* xattr 已查过, write_predict_enabled 有效 */
 };
 
 /* 获取 inode 扩展结构 */

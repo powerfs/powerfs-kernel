@@ -41,6 +41,8 @@
 #include "powerfs_comm.h"
 #include "powerfs_net.h"
 #include "powerfs_flow.h"
+#include "powerfs_readahead.h"
+#include "powerfs_write_predict.h"
 
 #include "powerfs_vfs.h"
 
@@ -628,6 +630,11 @@ static void powerfs_refresh_inode_work(struct work_struct *work)
      * 与 getattr/属性更新解耦: 即使 getattr 失败, 策略也应失效重查. */
     powerfs_readahead_invalidate(inode);
 
+    /* C-1.5: 同步失效写预测策略缓存 (write_predict_policy xattr).
+     * Filer 端 ML 训练后通过 PushDelta 更新策略, 此处失效促使下次写
+     * 重新查 xattr 获取最新阈值. */
+    powerfs_write_predict_invalidate(inode);
+
     /* Mark need_refresh: signals concurrent readers that a refresh is in flight.
      * (Previously set in powerfs_invalidate_one before scheduling, but now
      * the inode lookup is deferred to this work function.) */
@@ -1086,6 +1093,9 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
 
     /* ML 自适应预取初始化 (Phase A-0): cached=false, mb=0, version=0 */
     powerfs_readahead_inode_init(pi);
+
+    /* 写预测 + 指纹去重初始化 (Phase C-1.5): enabled=false, cached=false */
+    powerfs_write_predict_inode_init(pi);
 
     /* Cap 引用计数清零 */
     pi->i_pin_ref = 0;

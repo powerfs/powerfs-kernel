@@ -193,6 +193,16 @@ enum powerfs_net_msg_type {
      * Value MUST match powerfs-net/src/protocol.rs MsgType::PushIoTrace. */
     POWERFS_NET_MSG_PUSH_IO_TRACE      = 0x0041,
 
+    /* Phase C-1.5: Write prediction fingerprint dedup (kernel → filer).
+     * Raw body (non-TLV): fp[32] + data_size[8] + prefix[64] + ino[8] + offset[8]
+     * Response: match[u8] + optional needle_id/vol/crc/size/refcount
+     * Value MUST match powerfs-net/src/protocol.rs MsgType::FingerprintLookup. */
+    POWERFS_NET_MSG_FINGERPRINT_LOOKUP   = 0x0042,
+    /* Phase C-1.5: Record fingerprint after writing new needle.
+     * Raw body: fp[32] + needle_id[8] + volume_id[8] + crc32[4] + data_size[8] + prefix[64]
+     * Value MUST match powerfs-net/src/protocol.rs MsgType::FingerprintRecord. */
+    POWERFS_NET_MSG_FINGERPRINT_RECORD   = 0x0043,
+
     /* 状态 */
     POWERFS_NET_MSG_STATFS = 0x0040,
 
