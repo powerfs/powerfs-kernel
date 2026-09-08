@@ -809,7 +809,10 @@ static ssize_t powerfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
     if (offset == 0 && count > 0 &&
         pi->placement == POWERFS_PLACEMENT_FLAT &&
         pi->volume_id && pi->file_key &&
-        powerfs_write_predict_should_dedup(inode)) {
+        powerfs_write_predict_should_dedup(inode,
+                                            iocb->ki_filp ?
+                                                iocb->ki_filp->f_path.dentry :
+                                                NULL)) {
         char *data_buf;
         data_buf = kvmalloc(count, GFP_KERNEL);
         if (data_buf) {

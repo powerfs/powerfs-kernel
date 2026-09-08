@@ -151,7 +151,8 @@ static bool parse_policy_threshold(const u8 *value, size_t value_len)
  * 缓存策略: 首次调用查 xattr RPC, 结果缓存在 pi->write_predict_enabled.
  * 后续直接读缓存. PushDelta 失效后重新查.
  */
-bool powerfs_write_predict_should_dedup(struct inode *inode)
+bool powerfs_write_predict_should_dedup(struct inode *inode,
+                                          struct dentry *dentry)
 {
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     bool cached_val;
@@ -180,8 +181,41 @@ bool powerfs_write_predict_should_dedup(struct inode *inode)
                                     xattr_val, sizeof(xattr_val),
                                     &xattr_len);
         if (ret == -ENODATA || ret < 0) {
-            /* xattr not set or RPC failed → disable (safe fallback) */
+            /* xattr not set on file → try parent directory inheritance.
+             * 目录级继承: 在父目录上设一次 xattr, 所有子文件自动继承.
+             * 递归向上查 (最多 10 层, 防止循环). */
+            struct dentry *parent = dentry;
+            int depth;
+
             enabled = false;
+            for (depth = 0; depth < 10 && parent; depth++) {
+                struct dentry *p = parent->d_parent;
+
+                if (p == parent || p == NULL)
+                    break;  /* root */
+
+                {
+                    struct inode *p_inode = d_inode(p);
+
+                    if (p_inode && p_inode != inode) {
+                        u64 p_shard = powerfs_calc_shard_id(p_inode->i_ino);
+                        int p_ret;
+
+                        p_ret = powerfs_net_getxattr(p_shard, p_inode->i_ino,
+                                                     POWERFS_WRITE_PREDICT_XATTR_NAME,
+                                                     strlen(POWERFS_WRITE_PREDICT_XATTR_NAME),
+                                                     xattr_val, sizeof(xattr_val),
+                                                     &xattr_len);
+                        if (p_ret >= 0 && xattr_len > 0) {
+                            enabled = parse_policy_threshold(xattr_val, xattr_len);
+                            pr_debug_ratelimited("powerfs: write_predict ino=%lu inherited from parent ino=%lu enabled=%d\n",
+                                                 inode->i_ino, p_inode->i_ino, enabled);
+                            break;
+                        }
+                    }
+                }
+                parent = p;
+            }
         } else {
             enabled = parse_policy_threshold(xattr_val, xattr_len);
         }

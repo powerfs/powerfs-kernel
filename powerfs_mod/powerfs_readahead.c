@@ -103,8 +103,15 @@ static int powerfs_readahead_parse_xattr(const u8 *value, size_t value_len,
  *       (L1 simple_xattr cache → cache miss 时 net RPC → 回填 L1)
  *       不直接调 powerfs_net_getxattr (绕过 L1 会导致 setfattr 后读不到)
  *
+ * 目录级继承 (与 write_predict 对称):
+ *   - 先查文件自身 xattr
+ *   - 未命中 (-ENODATA / 空 / RPC 失败) → 递归查父目录 xattr (最多 10 层)
+ *   - 父目录命中 → 用父目录策略缓存到 pi (子文件批量继承)
+ *   - 全链路未命中 → VFS 默认
+ *   - 文件级 xattr 优先于父目录 (可在单个文件上覆盖目录策略)
+ *
  * 返回 0 = 成功缓存 (pi->readahead_mb 已更新, cached=true)
- *        -ENODATA = xattr 不存在 (VFS 默认, cached=false, 不再重试)
+ *        -ENODATA = xattr 全链路不存在 (VFS 默认, cached=false, 不再重试)
  *        -EINVAL = 解析失败 (同上, 不重试)
  *        <0 = RPC 失败 (cached=false, 下次 read_iter 会重试)
  */
@@ -118,15 +125,42 @@ static int powerfs_readahead_load_from_filer(struct file *file,
     ssize_t value_len;
     u32 mb = 0;
     int ret;
+    struct dentry *cur;
+    int depth;
 
+    /* 1. 先查文件自身 xattr */
     value_len = __vfs_getxattr(file->f_path.dentry, inode,
                                 POWERFS_READAHEAD_XATTR_NAME,
                                 value_buf, sizeof(value_buf) - 1);
-    if (value_len < 0)
-        return value_len;  /* -ENODATA / -ERANGE / -其他 */
 
-    /* value_len=0 = 空 xattr (filer 端写空值), 视为未设置 */
-    if (value_len == 0)
+    /* 2. 文件无 xattr (未设置/空值/RPC 失败) → 递归查父目录继承.
+     *    与 powerfs_write_predict_should_dedup 对称: 最多 10 层, 遇 root 停止. */
+    if (value_len <= 0) {
+        cur = file->f_path.dentry;
+        for (depth = 0; depth < 10; depth++) {
+            struct dentry *p = cur->d_parent;
+            struct inode *p_inode;
+
+            if (p == cur || !p)
+                break;  /* root */
+
+            p_inode = d_inode(p);
+            if (p_inode && p_inode != inode) {
+                value_len = __vfs_getxattr(p, p_inode,
+                                            POWERFS_READAHEAD_XATTR_NAME,
+                                            value_buf, sizeof(value_buf) - 1);
+                if (value_len > 0) {
+                    pr_debug_ratelimited("powerfs: readahead ino=%lu inherited from parent ino=%lu\n",
+                                         inode->i_ino, p_inode->i_ino);
+                    break;
+                }
+            }
+            cur = p;
+        }
+    }
+
+    /* 全链路未命中 → VFS 默认 */
+    if (value_len <= 0)
         return -ENODATA;
 
     /* 解析失败 = xattr 值格式错, 不缓存 (让 VFS 默认 + dmesg 警告) */
@@ -426,9 +460,9 @@ void powerfs_io_trace_flush_now(void)
                                     NULL, 0, NULL, 0,
                                     500, NULL, NULL);
     if (ret < 0)
-        pr_info_ratelimited("powerfs: io_trace flush failed: %d (count=%d)\n", ret, count);
+        pr_debug_ratelimited("powerfs: io_trace flush failed: %d (count=%d)\n", ret, count);
     else
-        pr_info_ratelimited("powerfs: io_trace flushed %d entries\n", count);
+        pr_debug_ratelimited("powerfs: io_trace flushed %d entries\n", count);
 
     kfree(body);
 }

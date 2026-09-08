@@ -46,16 +46,18 @@ struct powerfs_inode_info;
  * 查询 xattr user.powerfs.write_predict_policy:
  *   - "off" 或 阈值≤0 → 返回 false (跳过去重)
  *   - "NN:<float>" 或 "RULE:<float>" → 阈值>0 返回 true
- *   - 缺失 → 返回 false (冷启动, 无 ML 数据)
+ *   - 缺失 → 查父目录 xattr (目录级继承, 递归向上)
  *
  * 结果缓存在 pi->write_predict_enabled 中, 避免每次写都查 xattr.
  * Filer PushDelta 通知时通过 powerfs_write_predict_invalidate 失效.
  *
  * @inode: 文件 inode
+ * @dentry: 文件 dentry (用于查父目录 xattr 继承, 可为 NULL)
  *
  * 返回: true=启用去重, false=跳过 (正常写)
  */
-bool powerfs_write_predict_should_dedup(struct inode *inode);
+bool powerfs_write_predict_should_dedup(struct inode *inode,
+                                          struct dentry *dentry);
 
 /**
  * powerfs_write_predict_dedup - 对一段写数据执行指纹去重.

@@ -4,7 +4,12 @@
  * 详见 docs/ml-prefetch-kernel-rdma-plan.md §4.5-4.8:
  *   - 独立模块 (per-inode 策略缓存 + xattr 加载)
  *   - 三状态语义 (readahead_policy_cached / disabled)
- *   - xattr 协议 user.powerfs.readahead_policy = <MB 数>
+ * xattr 协议 user.powerfs.readahead_policy = <MB 数>
+ *
+ * 目录级继承 (与 write_predict 对称):
+ *   - 文件无 xattr 时递归查父目录 (最多 10 层), 命中则继承父目录策略
+ *   - 文件级 xattr 优先于父目录 (可在单个文件上覆盖目录策略)
+ *   - 在数据目录设一次 xattr, 所有子文件批量继承, 避免逐文件设置
  *
  * Phase A-0 (本文件): 手工基线, xattr 由 setfattr 设置, 无 ML
  * Phase A-1: filer 端 NN 训练 + 自动下发 (通过 version 字段失效)

@@ -2118,6 +2118,7 @@ static bool powerfs_dio_write_can_skip_read(struct inode *inode,
 struct powerfs_dio_work {
     struct kiocb *iocb;
     struct inode *inode;
+    struct dentry *dentry;     /* 用于 write_predict 目录级 xattr 继承 */
     loff_t pos;
     size_t count;
     struct page **pages;        /* get_user_pages_fast pinned pages */
@@ -2285,7 +2286,7 @@ static void powerfs_dio_write_worker(struct work_struct *work)
          *   跳过 volume 写, sync_size_chunks 同步新引用.
          * NoMatch → 正常写, 之后 record 指纹供后续去重.
          * should_dedup=false (xattr off/missing) 或 RPC 失败 → 正常写. */
-        if (dw->pos == 0 && powerfs_write_predict_should_dedup(inode)) {
+        if (dw->pos == 0 && powerfs_write_predict_should_dedup(inode, dw->dentry)) {
             __u64 dedup_nid = 0;
             __u64 dedup_vid = 0;
             __u32 dedup_crc = 0;
@@ -2313,7 +2314,7 @@ static void powerfs_dio_write_worker(struct work_struct *work)
         if (result == 0) {
             written = dw->count;
             /* C-1.5: 记录指纹供后续去重 (best-effort, 仅整文件写) */
-            if (dw->pos == 0 && powerfs_write_predict_should_dedup(inode)) {
+            if (dw->pos == 0 && powerfs_write_predict_should_dedup(inode, dw->dentry)) {
                 __u32 crc = crc32_le(0, buf, dw->count);
                 powerfs_write_predict_record(inode, needle_id,
                                               pi->volume_id, crc,
@@ -2454,7 +2455,7 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
                  * 仅在写整文件 (offset=0, 全量覆盖) 时尝试去重.
                  * Match/Recoverable → 用匹配到的 needle_id/volume_id, 跳过 volume 写.
                  * NoMatch → 正常写, 之后 record 指纹. */
-                if (pos == 0 && powerfs_write_predict_should_dedup(inode)) {
+                if (pos == 0 && powerfs_write_predict_should_dedup(inode, file->f_path.dentry)) {
                     __u64 dedup_nid = 0;
                     __u64 dedup_vid = 0;
                     __u32 dedup_crc = 0;
@@ -2483,7 +2484,7 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
                     if (ret == 0) {
                         chunk_written = count;
                         /* C-1.5: 记录指纹供后续去重 (best-effort, 仅整文件写) */
-                        if (pos == 0 && powerfs_write_predict_should_dedup(inode)) {
+                        if (pos == 0 && powerfs_write_predict_should_dedup(inode, file->f_path.dentry)) {
                             __u32 crc = crc32_le(0, buf, count);
                             powerfs_write_predict_record(inode, needle_id,
                                                           pi->volume_id, crc,
@@ -2548,6 +2549,7 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 
             dw->iocb = iocb;
             dw->inode = inode;
+            dw->dentry = iocb->ki_filp ? iocb->ki_filp->f_path.dentry : NULL;
             dw->pos = pos;
             dw->count = mapped;
             dw->pages = pages;
