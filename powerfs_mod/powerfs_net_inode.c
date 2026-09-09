@@ -71,9 +71,13 @@ int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
     struct powerfs_tlv_dec dec;
     int ret;
 
-    /* K2: Inline 文件的 LOOKUP 响应携带 inline_data (最大 8KB),
-     * 栈上 512B 缓冲区会被截断 (RX_TRUNCATE → -E2BIG). 用 kvmalloc 动态分配. */
-    resp_body = kvmalloc(POWERFS_NET_RESP_INLINE_CAP, GFP_NOFS);
+    /* LOOKUP 响应可能携带:
+     *  - Inline 文件: inline_data (最大 8KB)
+     *  - Flat/EC 文件: PER_CHUNK chunks 列表 (44B/chunk, 随文件大小增长)
+     * 缓冲必须覆盖连接层 body 段上限 (POWERFS_NET_RESP_META_CAP=256KB),
+     * 否则大文件响应被 RX_TRUNCATE 检测截断 → -E2BIG, 文件无法
+     * lookup/stat/unlink. 栈上分配不安全, 用 kvmalloc 动态分配. */
+    resp_body = kvmalloc(POWERFS_NET_RESP_META_CAP, GFP_NOFS);
     if (!resp_body)
         return -ENOMEM;
 
@@ -85,7 +89,7 @@ int powerfs_net_lookup_timeout(__u64 dir_ino, const char *name, size_t name_len,
     ret = powerfs_net_send_request(POWERFS_NET_MSG_LOOKUP, dir_ino,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    resp_body, POWERFS_NET_RESP_INLINE_CAP,
+                                    resp_body, POWERFS_NET_RESP_META_CAP,
                                     NULL, 0, timeout_ms,
                                     &resp_body_len, NULL);
     if (ret < 0)
@@ -539,8 +543,11 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
     struct powerfs_tlv_dec dec;
     int ret;
 
-    /* K2: Inline 文件的 GETATTR 响应携带 inline_data (最大 8KB). */
-    resp_body = kvmalloc(POWERFS_NET_RESP_INLINE_CAP, GFP_NOFS);
+    /* GETATTR 响应与 LOOKUP 相同: Inline 文件携带 inline_data (≤8KB),
+     * Flat/EC 文件携带 PER_CHUNK chunks 列表 (44B/chunk, 随文件增长).
+     * 缓冲须覆盖连接层 body 上限 (POWERFS_NET_RESP_META_CAP=256KB),
+     * 否则大文件 getattr 返回 -E2BIG (refresh_inode/打开失败). */
+    resp_body = kvmalloc(POWERFS_NET_RESP_META_CAP, GFP_NOFS);
     if (!resp_body)
         return -ENOMEM;
 
@@ -550,7 +557,7 @@ int powerfs_net_getattr(__u64 ino, __u32 *mode, __u32 *uid, __u32 *gid,
     ret = powerfs_net_send_request(POWERFS_NET_MSG_GETATTR, ino,
                                     body, powerfs_tlv_enc_len(&enc),
                                     NULL, 0,
-                                    resp_body, POWERFS_NET_RESP_INLINE_CAP,
+                                    resp_body, POWERFS_NET_RESP_META_CAP,
                                     NULL, 0, 10000,
                                     &resp_body_len, NULL);
     if (ret < 0)

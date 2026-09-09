@@ -54,6 +54,16 @@ struct powerfs_rdma_conn;
 #define POWERFS_NET_MAX_BODY    (256 * 1024)  /* 256KB body (容 netfs 128KB 预读响应) */
 #define POWERFS_NET_MAX_DATA    (2 * 1024 * 1024)  /* 2MB data (容 POWERFS_CHUNK_SIZE read_needle 响应) */
 
+/* 元数据 RPC (LOOKUP/GETATTR) 响应缓冲容量.
+ * 响应除 inline_data (≤8KB) 外, Flat/EC 文件还携带 PER_CHUNK chunks 列表
+ * (ChunkLayout 字段内 44B/chunk; chunk=1MB → 每 GB 文件约 45KB).
+ * 缓冲必须覆盖连接层 body 段上限 (POWERFS_NET_MAX_BODY): 过小会触发
+ * RX_TRUNCATE 检测 → -E2BIG, 使大文件无法 lookup/getattr (stat/unlink
+ * 报 "Argument list too long").
+ * 注意: CREATE 响应只含新文件 (Empty/Inline) layout, 无 chunks,
+ * 仍用 POWERFS_NET_RESP_INLINE_CAP 即可. */
+#define POWERFS_NET_RESP_META_CAP  POWERFS_NET_MAX_BODY
+
 /* 连接超时 (ms) */
 #define POWERFS_NET_CONNECT_TIMEOUT  5000   /* connect: 5s (容器重启后网络需时间稳定) */
 #define POWERFS_NET_SEND_TIMEOUT     10000  /* post-connect send timeout: 10s */
