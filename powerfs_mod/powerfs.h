@@ -1078,11 +1078,21 @@ struct powerfs_sb_info {
      * 默认 16 (64KB), ROCE 可设为 256 (1MB) ~ 16384 (64MB stripe). */
     int write_batch_pages;
 
-    /* writeback 并发限制: 防止过多 work item 同时阻塞在网络 I/O,
-     * 导致内存回收停滞 (mm_percpu_wq lockup).
-     * 每个 work item 占用 2MB needle_buf, 限制为 2 个并发 = 最多 4MB. */
+    /* writeback 并发限制 (in-flight batch 计数, 每个 batch ≈ 1 个 needle).
+     *
+     * 历史背景: 早期 writepage_work 在 workqueue 线程内同步 wait_for_completion
+     * 等网络响应 (最长 30s), 并发过高会导致 workqueue 线程池锁死, 故限制为 2.
+     * 现在写路径已改为全异步提交 (work_fn 只做 locate/组装/非阻塞入队, 响应
+     * 由 RX 调度器回调完成), 真正的网络在途数由 flow 层限流
+     * (per-conn max_active_per_conn/4=16, global max_active_global=256) 兜底.
+     *
+     * 若此处上限远小于 flow 在途容量, writepages 入口闸门会形成 "全有全无"
+     * 洪泛: 一次灌入上百 batch 后 in_flight 长期 >= 上限, 后续 writepages
+     * 全部早退, 脏页回写呈 ~4-5s 停顿/爆发, 吞吐被压到 25-45 MiB/s.
+     * 取值与全局 flow 容量同量级 (256) 并留有安全余量; 每个 batch 最坏占用
+     * 1MB needle_buf (全覆盖直写) 或更小的 blob extent 缓冲. */
     atomic_t wb_in_flight;
-#define POWERFS_WB_MAX_IN_FLIGHT  2
+#define POWERFS_WB_MAX_IN_FLIGHT  128
 
     /* P3-4: debugfs 根目录 (/sys/kernel/debug/powerfs/<sb_id>/) */
     struct dentry *debugfs_dir;

@@ -1814,10 +1814,12 @@ int powerfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
     /* Stage C: 创建 writeback 异步 workqueue.
      * 使用 WQ_UNBOUND 提高扩展性 (work 不绑定到特定 CPU).
-     * max_active=4 限制并发: powerfs_net_write 是同步网络调用, 过多并发
-     * worker 会压垮单连接 (256 页 1MB 文件曾导致 132 个 worker 线程锁死). */
+     * max_active=32: work_fn 为全异步提交 (不等待网络响应, 响应由 RX 回调
+     * 完成), 只做 locate/组装/非阻塞入队, 可以高并发运行; 网络在途数由
+     * flow 层 (per-conn 16 / global 256) 限流. max_active=4 是同步写时代
+     * 的遗留, 会让洪泛 batch 在 wq 内部排队串行化. */
     sbi->writeback_wq = alloc_workqueue("powerfs_wb",
-                                        WQ_UNBOUND | WQ_MEM_RECLAIM, 4);
+                                        WQ_UNBOUND | WQ_MEM_RECLAIM, 32);
     if (!sbi->writeback_wq) {
         pr_err("powerfs: failed to create writeback workqueue\n");
         /* 注意: 此处不清理, kill_sb 会处理. */

@@ -2208,6 +2208,7 @@ static unsigned long powerfs_cap_shrinker_scan(struct shrinker *shrink,
 {
     struct powerfs_client *cli = shrink->private_data;
     unsigned long freed = 0;
+    unsigned long scanned = 0;
     unsigned long nr_to_scan = sc->nr_to_scan;
     LIST_HEAD(dispose);
 
@@ -2224,17 +2225,35 @@ static unsigned long powerfs_cap_shrinker_scan(struct shrinker *shrink,
      *     正常使用, 直至 inode evict 时统一释放.
      */
     spin_lock(&cli->cap_lru_lock);
-    while (freed < nr_to_scan && !list_empty(&cli->cap_lru_list)) {
-        struct powerfs_cap *cap = list_first_entry(&cli->cap_lru_list,
-                                                     struct powerfs_cap,
-                                                     lru_item);
-        struct powerfs_inode_info *pi = cap->ci;
-        struct inode *inode;
+    {
+        /* 单轮遍历预算: 进入时 LRU 的长度.
+         *
+         * BUG 修正 (softlockup): dirty/writeback 的 cap 只能 list_move_tail
+         * 跳过, freed 不增长. 若 LRU 中所有 cap 都处于脏页/回写状态
+         * (持续写压力下的常态), 旧循环 `while (freed < nr_to_scan)` 永远
+         * 不终止, 持 cap_lru_lock 无限旋转 —— 所有走 shrinker_count 的
+         * 回收路径在锁上自旋, 最终 softlockup panic (22s stuck in
+         * queued_spin_lock_slowpath <- powerfs_cap_shrinker_count).
+         * 限定每轮最多检查一遍 LRU, 跳过的条目留给下一次 shrink 调用. */
+        unsigned long pass_budget = 0;
+        struct powerfs_cap *tmp;
+        list_for_each_entry(tmp, &cli->cap_lru_list, lru_item)
+            pass_budget++;
 
-        if (!pi) {
-            list_del_init(&cap->lru_item);
-            continue;
-        }
+        while (freed < nr_to_scan && scanned < pass_budget &&
+               !list_empty(&cli->cap_lru_list)) {
+            struct powerfs_cap *cap = list_first_entry(&cli->cap_lru_list,
+                                                         struct powerfs_cap,
+                                                         lru_item);
+            struct powerfs_inode_info *pi = cap->ci;
+            struct inode *inode;
+
+            scanned++;
+
+            if (!pi) {
+                list_del_init(&cap->lru_item);
+                continue;
+            }
 
         inode = &pi->netfs.inode;
 
@@ -2262,7 +2281,8 @@ static unsigned long powerfs_cap_shrinker_scan(struct shrinker *shrink,
          * cap 仍在 pi->i_caps rbtree 中, 不影响其他路径使用. */
         list_del_init(&cap->lru_item);
         list_add(&cap->lru_item, &dispose);
-        freed++;
+            freed++;
+        }
     }
     spin_unlock(&cli->cap_lru_lock);
 

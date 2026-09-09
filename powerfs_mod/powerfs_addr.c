@@ -1183,8 +1183,11 @@ int powerfs_writepages(struct address_space *mapping,
         return 0;
     }
 
-    /* 并发限制: 防止过多 work item 同时阻塞在网络 I/O 导致 workqueue lockup.
-     * 如果已有太多 in-flight work item, 让 VFS 稍后重试. */
+    /* 并发限制: 控制在途 writeback batch 数. work_fn 已全部异步化 (不阻塞
+     * 等待网络), 网络在途由 flow 层 (per-conn 16 / global 256) 限流;
+     * 此处上限与全局 flow 容量同量级, 主要作用是限制 needle_buf 等内存占用。
+     * 循环内每个 needle 边界/batch 满提交点也会检查该上限并提前结束本轮,
+     * 避免单轮 writepages 灌入全部脏页形成洪泛. 若已达上限, 让 VFS 稍后重试. */
     if (atomic_read(&sbi->wb_in_flight) >= POWERFS_WB_MAX_IN_FLIGHT) {
         pr_debug("powerfs: WPAGES throttled ino=%lu in_flight=%d\n",
                 inode->i_ino, atomic_read(&sbi->wb_in_flight));
@@ -1245,6 +1248,17 @@ int powerfs_writepages(struct address_space *mapping,
                     atomic_inc(&sbi->wb_in_flight);
                     queue_work(sbi->writeback_wq, &batch->work);
                     batch = NULL;
+                    if (atomic_read(&sbi->wb_in_flight) >=
+                        POWERFS_WB_MAX_IN_FLIGHT) {
+                        /* 已达在途上限: 当前页已 clear dirty 但尚未入 batch,
+                         * 重新标记脏页并解锁; 其余脏页保留 DIRTY tag, 由下一轮
+                         * writepages 继续。避免单轮 writepages 一次性灌入全部
+                         * 脏页 (in_flight 瞬间上百), 随后长期占满闸门导致
+                         * 回写呈 "洪泛-停顿" 周期性停顿。 */
+                        redirty_page_for_writepage(wbc, page);
+                        unlock_page(page);
+                        goto done;
+                    }
                 }
             }
 
@@ -1301,6 +1315,9 @@ int powerfs_writepages(struct address_space *mapping,
                 atomic_inc(&sbi->wb_in_flight);
                 queue_work(sbi->writeback_wq, &batch->work);
                 batch = NULL;
+                if (atomic_read(&sbi->wb_in_flight) >=
+                    POWERFS_WB_MAX_IN_FLIGHT)
+                    goto done;
             }
 
             wbc->nr_to_write--;

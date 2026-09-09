@@ -954,7 +954,13 @@ int powerfs_init_inode(struct inode *inode, umode_t mode,
     inode->i_mapping->a_ops = &powerfs_aops;
     mapping_set_gfp_mask(inode->i_mapping,
                          GFP_KERNEL | __GFP_NORETRY | __GFP_NOMEMALLOC);
-    mapping_set_unevictable(inode->i_mapping);
+    /* 不调用 mapping_set_unevictable():
+     * 那是 ramfs (无后端存储, 页不可回写/不可重新拉取) 的做法.
+     * PowerFS 是网络文件系统 (类 NFS/Ceph/netfs): 脏页可经 writepages
+     * 回写服务端, 干净页回收后可在读时重新拉取. 若标记 unevictable,
+     * page cache 永远不可被 MM 回收 (只能靠 cap shrinker 显式
+     * invalidate), buffered 写持续消耗内存直至 order:0 分配失败
+     * (netfs_write_begin -ENOMEM, fio 写入中止). */
 
     /* 设置时间戳 */
     {
