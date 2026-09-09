@@ -1163,6 +1163,8 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
 
     pi->chunks = NULL;
     pi->chunk_count = 0;
+    pi->dedup_chunks = NULL;
+    pi->dedup_chunk_count = 0;
     pi->content_size = 0;
     pi->volume_id = 0;
     pi->file_key = 0;
@@ -1258,6 +1260,8 @@ void powerfs_free_inode(struct inode *inode)
     /* 释放 chunk 映射 */
     kfree(pi->chunks);
     pi->chunks = NULL;
+    kfree(pi->dedup_chunks);
+    pi->dedup_chunks = NULL;
 
     /* K2: 释放 Inline 数据缓冲 */
     kfree(pi->inline_data);
@@ -1448,6 +1452,10 @@ void powerfs_evict_inode(struct inode *inode)
         kfree(pi->chunks);
     pi->chunks = NULL;
     pi->chunk_count = 0;
+    if (pi->dedup_chunks && virt_addr_valid(pi->dedup_chunks))
+        kfree(pi->dedup_chunks);
+    pi->dedup_chunks = NULL;
+    pi->dedup_chunk_count = 0;
 
     /* K3-1: 释放 Stripe volume_ids 数组 (evict 时释放, 避免 slab 重分配后悬挂) */
     if (pi->volume_ids && virt_addr_valid(pi->volume_ids))

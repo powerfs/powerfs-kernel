@@ -554,6 +554,14 @@ struct powerfs_inode_info {
     /* Chunk 映射 (open/getattr 时从 Filer 获取) */
     struct powerfs_chunk_map *chunks;
     u32 chunk_count;
+
+    /* 写预测指纹去重: 命中的 chunk 覆盖表.
+     * writeback 整 needle 覆盖写前查 filer 指纹索引, 命中则跳过 volume 写,
+     * 把 (matched needle_id, matched volume_id) 记入此表, sync_size_chunks
+     * 构建 chunks[] 时优先查此表, 将去重后的引用持久化到 Filer.
+     * 由 i_lock 保护; evict_inode/free_inode 释放. */
+    struct powerfs_chunk_map *dedup_chunks;
+    u32 dedup_chunk_count;
     u64 content_size;
     u64 volume_id;
     u64 file_key;   /* needle_id (base, chunk N = file_key + N), from Filer Create or GetAttr */
@@ -780,6 +788,7 @@ struct powerfs_inode_info {
      * ============================================================== */
     bool write_predict_enabled;      /* xattr 阈值>0, 启用指纹去重 */
     bool write_predict_cached;       /* xattr 已查过, write_predict_enabled 有效 */
+    bool write_predict_querying;     /* slow path 进行中, 防止并发 xattr RPC 惊群 */
 };
 
 /* 获取 inode 扩展结构 */

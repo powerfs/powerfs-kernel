@@ -73,6 +73,23 @@ bool powerfs_write_predict_should_dedup(struct inode *inode,
                                           struct dentry *dentry);
 
 /**
+ * powerfs_write_predict_is_enabled - 快速检查 inode 是否启用写预测去重.
+ *
+ * 仅读 pi->write_predict_cached && pi->write_predict_enabled (持 i_lock),
+ * 不查 xattr, 不需要 dentry. 用于 writeback 热路径 (wb_submit_write_direct /
+ * write_cb), 避免 d_find_any_alias + xattr 查询的性能开销.
+ *
+ * 缓存由 write_iter 中 should_dedup 预热 (用户进程上下文可同步查 xattr).
+ * 若缓存未预热 (cached==false), 返回 false — 本次写不走 dedup, 下次
+ * write_iter 预热后生效.
+ *
+ * @pi: powerfs inode info
+ *
+ * 返回: true=启用去重, false=跳过
+ */
+bool powerfs_write_predict_is_enabled(struct powerfs_inode_info *pi);
+
+/**
  * powerfs_write_predict_dedup - 对一段写数据执行指纹去重.
  *
  * 流程:
@@ -117,6 +134,41 @@ void powerfs_write_predict_record(struct inode *inode,
                                    const __u8 *data, size_t data_len);
 
 /**
+ * powerfs_write_predict_store_dedup - 记录某 chunk 去重命中的 needle 引用.
+ *
+ * writeback 整 needle 覆盖写时, 若 FingerprintLookup 命中已有 needle,
+ * 调用此函数把 (chunk_idx, matched needle_id, matched volume_id) 记入
+ * pi->dedup_chunks. sync_size_chunks 构建 chunks[] 时优先查此表,
+ * 将去重后的引用持久化到 Filer (跳过 volume 写, 零数据传输).
+ *
+ * @inode: 文件 inode
+ * @chunk_idx: chunk 索引 (offset / POWERFS_CHUNK_SIZE)
+ * @matched_needle_id: 匹配到的已有 needle_id
+ * @matched_volume_id: 匹配到的 volume_id
+ *
+ * 返回: 0 成功, <0 失败 (调用方回退到正常写 volume)
+ */
+int powerfs_write_predict_store_dedup(struct inode *inode, u32 chunk_idx,
+                                      __u64 matched_needle_id,
+                                      __u64 matched_volume_id);
+
+/**
+ * powerfs_write_predict_record_async - 异步记录指纹 (write_cb 安全版本).
+ *
+ * write_cb 在 RDMA CQ 回调上下文, 不能执行同步 RPC. 此函数拷贝数据并
+ * schedule_work, 由 worker 线程调用 powerfs_write_predict_record.
+ *
+ * @inode: 文件 inode (内部 igrab, worker 结束后 iput)
+ * @needle_id: 新写入的 needle_id
+ * @volume_id: volume_id
+ * @data: needle 数据 (内部 memcpy)
+ * @data_len: 数据长度
+ */
+void powerfs_write_predict_record_async(struct inode *inode,
+                                        __u64 needle_id, __u64 volume_id,
+                                        const __u8 *data, size_t data_len);
+
+/**
  * powerfs_write_predict_invalidate - 标记 per-inode 策略缓存失效.
  *
  * Filer PushDelta 通知策略更新时调用, 促使下次 should_dedup 重新查 xattr.
@@ -148,6 +200,11 @@ static inline bool powerfs_write_predict_should_dedup(struct inode *inode,
     return false;
 }
 
+static inline bool powerfs_write_predict_is_enabled(struct powerfs_inode_info *pi)
+{
+    return false;
+}
+
 static inline int powerfs_write_predict_dedup(struct inode *inode, loff_t offset,
                                               const __u8 *data, size_t data_len,
                                               __u64 *out_needle_id,
@@ -161,6 +218,22 @@ static inline void powerfs_write_predict_record(struct inode *inode,
                                                 __u64 needle_id, __u64 volume_id,
                                                 __u32 crc32,
                                                 const __u8 *data, size_t data_len)
+{
+}
+
+static inline int powerfs_write_predict_store_dedup(struct inode *inode,
+                                                    u32 chunk_idx,
+                                                    __u64 matched_needle_id,
+                                                    __u64 matched_volume_id)
+{
+    return -ENOSYS;  /* 未启用 → 回退正常写 */
+}
+
+static inline void powerfs_write_predict_record_async(struct inode *inode,
+                                                      __u64 needle_id,
+                                                      __u64 volume_id,
+                                                      const __u8 *data,
+                                                      size_t data_len)
 {
 }
 
