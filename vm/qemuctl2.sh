@@ -799,9 +799,11 @@ mount_vm() {
     info "Mount PowerFS on $(vm_val "${vid}" NAME) with transport=${POWERFS_TRANSPORT} (ib0=${iip})"
     ssh_vm "${vid}" "
 set +e
+# host 端先算好 _idx (vm1→1, vm2→2), 嵌入到 VM 脚本的证书路径
+_idx=\"${vid##vm}\"
 CA=/etc/powerfs/ca.crt
-CRT=/etc/powerfs/kernel-client-1.crt
-KEY=/etc/powerfs/kernel-client-1.key
+CRT=/etc/powerfs/kernel-client-\${_idx}.crt
+KEY=/etc/powerfs/kernel-client-\${_idx}.key
 # Ensure IB net config: flush → addr → route (same priority rule as start_single)
 ip link set ib0 up 2>/dev/null
 ip addr flush dev ib0 2>/dev/null
@@ -837,6 +839,20 @@ if [ ! -f /mnt/host/powerfs.ko ]; then
     fi
     umount /mnt/host 2>/dev/null
   done
+fi
+# --- 证书自动同步 (P3 fix): 每次 mount 从 9p share 拉最新证书 ---
+# master CA 可能重新签发 (service restart 后 ca.crt 变), initramfs 里打包的
+# 旧证书必然不匹配. 这里强制覆盖 /etc/powerfs/ 下所有 leaf 证书.
+# _idx 已在上方 L803 由 host 端赋值为 1/2, 这里直接用 (VM 内变量 \${_idx}).
+mkdir -p /etc/powerfs
+if [ -f /mnt/host/ca.crt ]; then
+  cp -f /mnt/host/ca.crt /etc/powerfs/ca.crt
+  echo 'CERT_SYNC: ca.crt <- /mnt/host'
+fi
+if [ -f "/mnt/host/kernel-client-\${_idx}.crt" ]; then
+  cp -f "/mnt/host/kernel-client-\${_idx}.crt" "/etc/powerfs/kernel-client-\${_idx}.crt"
+  cp -f "/mnt/host/kernel-client-\${_idx}.key" "/etc/powerfs/kernel-client-\${_idx}.key"
+  echo "CERT_SYNC: kernel-client-\${_idx}.crt <- /mnt/host"
 fi
 if [ -f /mnt/host/powerfs.ko ]; then
   insmod /mnt/host/powerfs.ko && echo 'INSMOD_OK: /mnt/host/powerfs.ko'

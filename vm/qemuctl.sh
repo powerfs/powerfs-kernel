@@ -194,15 +194,28 @@ get_qemu_pid() {
 # 命令: build
 # ============================================================
 cmd_build() {
-    title "编译 powerfs.ko"
+    title "编译 powerfs.ko (WRITE_PREDICT=${WRITE_PREDICT:-y})"
     cd "${POWERFS_MOD_DIR}"
     make clean 2>/dev/null || true
-    make -j$(nproc) 2>&1 | tail -5
+    # WRITE_PREDICT=y 定义 CONFIG_POWERFS_WRITE_PREDICT, 启用 powerfs_write_predict.c
+    # (异步 dedup + SHA-256 + FingerprintLookup/Record). 可通过环境变量覆盖:
+    #   WRITE_PREDICT=n ./qemuctl.sh build   # 无 dedup (缺省)
+    #   WRITE_PREDICT=y ./qemuctl.sh build   # 启用 dedup (方向②, 热路径零阻塞)
+    make WRITE_PREDICT="${WRITE_PREDICT:-y}" -j$(nproc) 2>&1 | tail -10
     if [ ! -f "${POWERFS_MOD_DIR}/powerfs.ko" ]; then
         error "powerfs.ko 编译失败"
         exit 1
     fi
-    info "powerfs.ko 编译成功 ($(ls -la powerfs.ko | awk '{print $5}') bytes)"
+    local ko_size=$(ls -la powerfs.ko | awk '{print $5}')
+    local ko_mb=$((ko_size / 1024 / 1024))
+    local wp_on=0
+    grep -q "write_predict" <(nm powerfs.ko 2>/dev/null) 2>/dev/null && wp_on=1
+    if [ "${wp_on}" = "1" ]; then
+        info "powerfs.ko 编译成功 (${ko_mb} MB, WRITE_PREDICT=y ✓)"
+    else
+        warn "powerfs.ko 编译成功 (${ko_mb} MB) 但 write_predict 符号未找到 — " \
+             "make WRITE_PREDICT=y 可能没生效"
+    fi
 
     title "构建 initramfs"
     cd "${SCRIPT_DIR}"
@@ -1350,14 +1363,25 @@ cmd_service_start() {
     title "启动 Docker 服务 (RDMA=${USE_RDMA})"
 
     if [ "${USE_RDMA}" = "1" ]; then
-        if [ ! -f "${DOCKER_DIR}/docker-compose.rdma.yml" ]; then
-            error "未找到 docker-compose.rdma.yml: ${DOCKER_DIR}/docker-compose.rdma.yml"
+        # RDMA 前置条件检查: 硬件 RDMA (mlx5) 或 rxe soft-roce 任一可用
+        local rdma_ok=0
+        for i in 0 1 2 3 4; do
+            if [ -c "/dev/infiniband/uverbs${i}" ]; then
+                local ib_dev
+                ib_dev=$(cat "/sys/class/infiniband_verbs/uverbs${i}/device/infiniband/"* 2>/dev/null || \
+                         ls /sys/class/infiniband_verbs/uverbs${i}/../ 2>/dev/null | head -1)
+                info "/dev/infiniband/uverbs${i} → ${ib_dev:-unknown}"
+                rdma_ok=1
+            fi
+        done
+        if [ "${rdma_ok}" = "0" ]; then
+            error "未找到任何 /dev/infiniband/uverbs[0-4] — 无法启用 RDMA"
+            error "  硬件 RDMA: BIOS VT-d + mlx5 SR-IOV VFIO 绑定"
+            error "  Soft-RoCE: sudo modprobe rdma_rxe && rdma link add rxe0 type rxe <netdev>"
             exit 1
         fi
-        # RDMA 前置条件检查
-        if ! ls /dev/infiniband/uverbs2 &>/dev/null; then
-            error "/dev/infiniband/uverbs2 不存在, 请先执行: ./qemuctl.sh rdma-setup"
-            exit 1
+        if [ ! -c /dev/infiniband/rdma_cm ]; then
+            warn "/dev/infiniband/rdma_cm 缺失 (通常在 rdma-core 包, 不应发生)"
         fi
         # 先停止 TCP 服务 (避免端口冲突)
         local tcp_running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -cE "master-1|volume-1|filer-1" || echo 0)
@@ -1431,6 +1455,55 @@ cmd_service_start() {
 
     echo ""
     info "服务启动完成 (RDMA=${USE_RDMA}, Master=${POWERFS_MASTER_ADDR})"
+
+    # --- P3: 证书自动生成 + 同步到 VM share ---
+    # master/filer/volume 全部起来后, 用 powerfs-cli 从 master CA 签发证书.
+    # 之前手动流程每次容易忘, 这里 service start 后自动跑一次.
+    # VM mount 前会从 share 目录拷到 /etc/powerfs/, 确保用的是当前 CA 签发的.
+    if [ "${USE_RDMA}" = "1" ]; then
+        local CERT_SCRIPT="${POWERFS_ROOT}/scripts/generate-certs.sh"
+        local OUTPUT_DIR="${POWERFS_ROOT}/docker/certs-default"
+        local SHARE_DIR="${SCRIPT_DIR}/share"
+
+        step "证书自动生成 (master CA → docker/certs-default)"
+        if [ -x "${CERT_SCRIPT}" ]; then
+            bash "${CERT_SCRIPT}" --topology single \
+                --master-api "${POWERFS_MASTER_ADDR}:9300" \
+                --admin-token "powerfs-admin-test" \
+                --output-dir "${OUTPUT_DIR}" 2>&1 | tail -10
+            local gen_rc=$?
+            if [ "${gen_rc}" = "0" ]; then
+                step "证书同步到 VM share (kernel/vm/share/)"
+                cp -f "${OUTPUT_DIR}/ca.crt" "${SHARE_DIR}/ca.crt"
+                cp -f "${OUTPUT_DIR}/kernel-client-1.crt" "${SHARE_DIR}/kernel-client-1.crt"
+                cp -f "${OUTPUT_DIR}/kernel-client-1.key" "${SHARE_DIR}/kernel-client-1.key"
+                cp -f "${OUTPUT_DIR}/kernel-client-2.crt" "${SHARE_DIR}/kernel-client-2.crt" 2>/dev/null || true
+                cp -f "${OUTPUT_DIR}/kernel-client-2.key" "${SHARE_DIR}/kernel-client-2.key" 2>/dev/null || true
+
+                # --- 关键: restart 存储节点让它们重新加载 leaf 证书 ---
+                # 容器启动时证书文件不存在 (generate-certs.sh 在容器启动后才生成),
+                # filer/volume 进程读过空文件缓存在内存, 后续不会重读. 必须 restart.
+                step "重启 filer + 3 volume (让新 leaf 证书生效)"
+                cd "${DOCKER_DIR}"
+                docker compose -f docker-compose.rdma.yml restart \
+                    filer-1 volume-1 volume-2 volume-3 2>&1 | tail -5
+                sleep 8   # 等重新注册 + 心跳
+                local ok=$(docker logs master-1 --tail 20 2>&1 | grep -c "registered filer\|node=volume-server-[123].*heartbeat\|FULLY_REGISTERED")
+                info "重启后已收到 ${ok} 条注册/心跳日志"
+
+                if [ -f "${OUTPUT_DIR}/ca.key" ] && [ "$(stat -c %U "${OUTPUT_DIR}/ca.key")" = "root" ]; then
+                    warn "ca.key 由 master 容器以 root 写入, 需 chown 才能 git add"
+                fi
+                info "证书已就绪 (ca.crt + kernel-client-1.crt → VM share, 存储节点已重启加载新证书)"
+            else
+                warn "证书生成脚本返回 ${gen_rc}, 继续启动 (mount 可能因证书不匹配失败)"
+                warn "  手动修复: cd ${POWERFS_ROOT} && bash scripts/generate-certs.sh"
+            fi
+        else
+            warn "generate-certs.sh 不存在 (${CERT_SCRIPT}), 跳过证书自动生成"
+        fi
+    fi
+
     cmd_service_status
 }
 
