@@ -260,59 +260,69 @@ static int powerfs_wb_submit_write_direct(struct powerfs_wb_ctx *ctx)
             inode->i_ino, (unsigned long long)ctx->needle_id,
             ctx->needle_len);
 
-    /* C-1.5: 指纹去重 — 整 needle 覆盖写前查 filer 指纹索引.
-     * 缓存未命中时按需预热 (d_find_any_alias + should_dedup, 每 inode 仅一次,
-     * 后续直接读缓存). 预热后若启用, 执行 dedup lookup:
-     *   Match → store_dedup + 跳过 volume 写 + end_page_writeback.
-     *   NoMatch/错误 → 继续正常写 volume. */
+    /* C-1.5 方向②: 先写后问 — 热路径零阻塞.
+     * 正常异步提交 write_needle, 不做任何同步 SHA-256 / RPC.
+     * 仅 lockless 查 pi->dedup_chunks 表: 若异步 worker 已为该 chunk
+     * 命中过 dedup (来自之前覆盖写的后台 lookup), 才跳过 volume 写.
+     *
+     * 首次写: dedup_chunks 为空 → 正常写 → write_cb 里 schedule
+     *   lookup_record_async (后台做 SHA-256 + lookup + record)
+     * 二次覆盖写相同内容: dedup_chunks 已缓存 Match → lockless 命中
+     *   → 跳过 volume 写, store_dedup 记一次 (幂等), end_page_writeback
+     *
+     * 缓存预热: 首次发现 is_enabled==false 时同步查 xattr (每 inode 一次,
+     * 后续命中缓存). 预热本身是同步 RPC, 但只发生一次, 不阻塞后续写. */
     {
         struct powerfs_inode_info *pi = POWERFS_I(inode);
+        loff_t needle_start;
+        u32 chunk_idx;
 
+        needle_start = wpw->offsets[ctx->needle_start_idx];
+        needle_start -= needle_start % POWERFS_CHUNK_SIZE;
+        chunk_idx = (u32)(needle_start / POWERFS_CHUNK_SIZE);
+
+        /* 1. 预热缓存 (每 inode 仅一次) */
         if (!powerfs_write_predict_is_enabled(pi)) {
-            /* 缓存未预热: 同步查 xattr (workqueue 上下文可阻塞).
-             * 每 inode 仅一次, 后续命中缓存走快速路径. */
             struct dentry *alias = d_find_any_alias(inode);
             powerfs_write_predict_should_dedup(inode, alias);
             if (alias)
                 dput(alias);
         }
 
-        if (powerfs_write_predict_is_enabled(pi)) {
-            u64 matched_nid = 0, matched_vid = 0;
-            u32 matched_crc = 0;
-            loff_t needle_start = wpw->offsets[ctx->needle_start_idx];
-            u32 chunk_idx;
-            int dedup_ret;
+        /* 2. lockless 查 dedup_chunks: 异步 worker 之前有没有命中过?
+         * 二次覆盖写相同内容时, dedup_chunks 里已有上次后台 lookup 缓存
+         * 的 matched needle_id, 直接用引用跳过 volume 写. 首次写时表为空,
+         * READ_ONCE 读到 needle_id=0, 继续正常异步写. */
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+        if (powerfs_write_predict_is_enabled(pi) &&
+            pi->dedup_chunks &&
+            chunk_idx < READ_ONCE(pi->dedup_chunk_count) &&
+            READ_ONCE(pi->dedup_chunks[chunk_idx].needle_id) != 0) {
+            u64 matched_nid =
+                READ_ONCE(pi->dedup_chunks[chunk_idx].needle_id);
+            u64 matched_vid =
+                READ_ONCE(pi->dedup_chunks[chunk_idx].volume_id);
 
-            needle_start -= needle_start % POWERFS_CHUNK_SIZE;
-            chunk_idx = (u32)(needle_start / POWERFS_CHUNK_SIZE);
-
-            dedup_ret = powerfs_write_predict_dedup(inode, needle_start,
-                                                     ctx->needle_buf,
-                                                     ctx->needle_len,
-                                                     &matched_nid,
-                                                     &matched_vid,
-                                                     &matched_crc);
-            if (dedup_ret == 1) {
-                /* Match: 跳过 volume 写, 记录去重引用, 直接完成页 */
-                powerfs_write_predict_store_dedup(inode, chunk_idx,
-                                                   matched_nid, matched_vid);
-                for (j = ctx->needle_start_idx;
-                     j < ctx->needle_end_idx; j++) {
-                    struct page *p = wpw->pages[j];
-                    if (wpw->counts[j] == 0)
-                        continue;
-                    end_page_writeback(p);
-                    put_page(p);
-                }
-                kvfree(ctx->needle_buf);
-                kfree(ctx);
-                if (atomic_dec_and_test(&wpw->pending_needles))
-                    powerfs_wb_final_cleanup(wpw);
-                return 0;
+            /* 二次覆盖写命中 dedup: 用引用, 跳过 volume 写 */
+            powerfs_write_predict_store_dedup(inode, chunk_idx,
+                                               matched_nid, matched_vid);
+            for (j = ctx->needle_start_idx;
+                 j < ctx->needle_end_idx; j++) {
+                struct page *p = wpw->pages[j];
+                if (wpw->counts[j] == 0)
+                    continue;
+                end_page_writeback(p);
+                put_page(p);
             }
-            /* NoMatch 或 RPC 错误 → 继续正常写 volume */
+            kvfree(ctx->needle_buf);
+            kfree(ctx);
+            if (atomic_dec_and_test(&wpw->pending_needles))
+                powerfs_wb_final_cleanup(wpw);
+            return 0;
         }
+#endif
+        /* No dedup hit → 继续正常异步写 volume. 后续 write_cb 里调度
+         * lookup_record_async, 后台做 fingerprint lookup + record. */
     }
 
     ret = powerfs_net_write_needle_async(
@@ -812,15 +822,27 @@ static int powerfs_wb_write_cb(struct powerfs_request *req)
                 inode->i_ino, (unsigned long long)ctx->needle_id,
                 err, req->resp_status);
 
-    /* C-1.5: 整 needle 写成功后异步记录指纹 (write_cb 在 RDMA CQ 回调,
-     * 不能做同步 RPC, 用 schedule_work 异步执行). 仅对全覆盖 needle
-     * (needle_len == POWERFS_CHUNK_SIZE) 记录指纹. */
+    /* C-1.5 方向②: 写成功后异步 lookup + record (后台 fingerprint 登记).
+     * write_cb 在 RDMA CQ 回调上下文, 不能做同步 RPC. lookup_record_async
+     * 内部 schedule_work, 由 worker 线程做 SHA-256 + FingerprintLookup +
+     * FingerprintRecord (一次 SHA-256 复用给 lookup 和 record).
+     * 仅对全覆盖 needle (needle_len == POWERFS_CHUNK_SIZE) 登记. */
     if (!err && ctx->needle_len == POWERFS_CHUNK_SIZE) {
         struct powerfs_inode_info *pi = POWERFS_I(inode);
-        if (powerfs_write_predict_is_enabled(pi))
-            powerfs_write_predict_record_async(inode, ctx->needle_id,
-                                                ctx->volume_id, ctx->needle_buf,
-                                                ctx->needle_len);
+        loff_t ns;
+        u32 chunk_idx;
+
+        if (powerfs_write_predict_is_enabled(pi)) {
+            ns = wpw->offsets[ctx->needle_start_idx];
+            ns -= ns % POWERFS_CHUNK_SIZE;
+            chunk_idx = (u32)(ns / POWERFS_CHUNK_SIZE);
+            powerfs_write_predict_lookup_record_async(inode,
+                                                       ctx->needle_id,
+                                                       ctx->volume_id,
+                                                       chunk_idx, ns,
+                                                       ctx->needle_buf,
+                                                       ctx->needle_len);
+        }
     }
 
     /* 完成该 needle 的所有页面 */
@@ -2361,34 +2383,37 @@ static void powerfs_dio_write_worker(struct work_struct *work)
      * Slow path: powerfs_net_write (read-modify-write). */
     if (powerfs_dio_write_can_skip_read(inode, dw->pos, dw->count)) {
         __u64 needle_id = pi->file_key + dw->pos / POWERFS_CHUNK_SIZE;
+        __u32 chunk_idx = (__u32)(dw->pos / POWERFS_CHUNK_SIZE);
+        bool dedup_hit = false;
 
-        /* C-1.5: 写预测指纹去重 — 在写 volume 之前查 filer 是否已有相同内容.
-         * 仅在写整文件 (offset=0, 全量覆盖) 时尝试去重, 避免修改 pi->file_key
-         * 影响其他 chunk 的 needle 引用.
-         * Match/Recoverable → 用匹配到的 needle_id/volume_id 替换 pi 字段,
-         *   跳过 volume 写, sync_size_chunks 同步新引用.
-         * NoMatch → 正常写, 之后 record 指纹供后续去重.
-         * should_dedup=false (xattr off/missing) 或 RPC 失败 → 正常写. */
-        if (dw->pos == 0 && powerfs_write_predict_should_dedup(inode, dw->dentry)) {
-            __u64 dedup_nid = 0;
-            __u64 dedup_vid = 0;
-            __u32 dedup_crc = 0;
-            int dedup_ret;
+        /* C-1.5 方向②: 先写后问 — 热路径零阻塞.
+         * 先预热 xattr 缓存 (每 inode 仅一次), 然后 lockless 查 dedup_chunks:
+         * 若该 chunk 之前异步 lookup 已命中过 dedup (二次覆盖写相同内容),
+         * 直接跳过 volume 写. 否则正常写, 写成功后异步 lookup_record. */
+        if (dw->pos == 0) {
+            if (!powerfs_write_predict_is_enabled(pi))
+                powerfs_write_predict_should_dedup(inode, dw->dentry);
 
-            dedup_ret = powerfs_write_predict_dedup(inode, dw->pos,
-                                                     buf, dw->count,
-                                                     &dedup_nid, &dedup_vid,
-                                                     &dedup_crc);
-            if (dedup_ret > 0) {
-                /* 去重成功: 用匹配到的 needle_id/volume_id 替换 pi 字段,
-                 * 跳过 volume 写. sync_size_chunks 同步新引用到 filer. */
-                pi->volume_id = dedup_vid;
-                pi->file_key = dedup_nid;
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+            if (powerfs_write_predict_is_enabled(pi) &&
+                pi->dedup_chunks &&
+                chunk_idx < READ_ONCE(pi->dedup_chunk_count) &&
+                READ_ONCE(pi->dedup_chunks[chunk_idx].needle_id) != 0) {
+                u64 matched_nid =
+                    READ_ONCE(pi->dedup_chunks[chunk_idx].needle_id);
+                u64 matched_vid =
+                    READ_ONCE(pi->dedup_chunks[chunk_idx].volume_id);
+
+                powerfs_write_predict_store_dedup(inode, chunk_idx,
+                                                   matched_nid, matched_vid);
+                pi->volume_id = matched_vid;
+                pi->file_key = matched_nid;
                 result = 0;
                 written = dw->count;
+                dedup_hit = true;
                 goto dio_write_done;
             }
-            /* dedup_ret <= 0: NoMatch 或错误, 继续正常写 */
+#endif
         }
 
         result = powerfs_net_write_needle(pi->volume_id, needle_id,
@@ -2396,13 +2421,16 @@ static void powerfs_dio_write_worker(struct work_struct *work)
                                            buf, dw->count, NULL, 0);
         if (result == 0) {
             written = dw->count;
-            /* C-1.5: 记录指纹供后续去重 (best-effort, 仅整文件写) */
-            if (dw->pos == 0 && powerfs_write_predict_should_dedup(inode, dw->dentry)) {
-                __u32 crc = crc32_le(0, buf, dw->count);
-                powerfs_write_predict_record(inode, needle_id,
-                                              pi->volume_id, crc,
-                                              buf, dw->count);
-            }
+            /* C-1.5 方向②: 写成功后异步 lookup + record (后台 fingerprint 登记).
+             * DIO workqueue 在 process context, lookup_record_async 内部
+             * schedule_work 不阻塞当前执行. 一次 SHA-256 复用给 lookup + record. */
+            if (dw->pos == 0 && powerfs_write_predict_is_enabled(pi))
+                powerfs_write_predict_lookup_record_async(inode,
+                                                           needle_id,
+                                                           pi->volume_id,
+                                                           chunk_idx,
+                                                           dw->pos,
+                                                           buf, dw->count);
         }
     } else {
         result = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
@@ -2532,53 +2560,57 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
              *   需上层聚合或 buffered I/O 兜底. */
             if (powerfs_dio_write_can_skip_read(inode, pos, count)) {
                 __u64 needle_id = pi->file_key + pos / POWERFS_CHUNK_SIZE;
-                bool dedup_hit = false;
+                __u32 chunk_idx = (__u32)(pos / POWERFS_CHUNK_SIZE);
 
-                /* C-1.5: 同步 DIO 路径写预测指纹去重 (与异步 worker 对齐).
-                 * 仅在写整文件 (offset=0, 全量覆盖) 时尝试去重.
-                 * Match/Recoverable → 用匹配到的 needle_id/volume_id, 跳过 volume 写.
-                 * NoMatch → 正常写, 之后 record 指纹. */
-                if (pos == 0 && powerfs_write_predict_should_dedup(inode, file->f_path.dentry)) {
-                    __u64 dedup_nid = 0;
-                    __u64 dedup_vid = 0;
-                    __u32 dedup_crc = 0;
-                    int dedup_ret;
+                /* C-1.5 方向②: 先写后问 — 热路径零阻塞.
+                 * 先预热 xattr 缓存 (每 inode 仅一次), 然后 lockless 查 dedup_chunks:
+                 * 若该 chunk 之前异步 lookup 已命中过 dedup (二次覆盖写相同内容),
+                 * 直接跳过 volume 写. 否则正常写, 写成功后异步 lookup_record. */
+                if (pos == 0) {
+                    if (!powerfs_write_predict_is_enabled(pi))
+                        powerfs_write_predict_should_dedup(inode, file->f_path.dentry);
 
-                    dedup_ret = powerfs_write_predict_dedup(inode, pos,
-                                                             buf, count,
-                                                             &dedup_nid, &dedup_vid,
-                                                             &dedup_crc);
-                    if (dedup_ret > 0) {
-                        /* 去重成功: 用匹配到的 needle_id/volume_id, 跳过 volume 写 */
-                        pi->volume_id = dedup_vid;
-                        pi->file_key = dedup_nid;
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+                    if (powerfs_write_predict_is_enabled(pi) &&
+                        pi->dedup_chunks &&
+                        chunk_idx < READ_ONCE(pi->dedup_chunk_count) &&
+                        READ_ONCE(pi->dedup_chunks[chunk_idx].needle_id) != 0) {
+                        u64 matched_nid =
+                            READ_ONCE(pi->dedup_chunks[chunk_idx].needle_id);
+                        u64 matched_vid =
+                            READ_ONCE(pi->dedup_chunks[chunk_idx].volume_id);
+
+                        powerfs_write_predict_store_dedup(inode, chunk_idx,
+                                                           matched_nid, matched_vid);
+                        pi->volume_id = matched_vid;
+                        pi->file_key = matched_nid;
                         chunk_written = count;
-                        dedup_hit = true;
                         ret = 0;
+                        goto skip_write;
                     }
-                    /* dedup_ret <= 0: NoMatch 或错误, 继续正常写 */
+#endif
                 }
 
-                if (!dedup_hit) {
-                    /* 正常写路径 (未去重或去重失败) */
-                    ret = powerfs_net_write_needle(pi->volume_id, needle_id,
-                                                    inode->i_ino,
-                                                    buf, count, NULL, 0);
-                    if (ret == 0) {
-                        chunk_written = count;
-                        /* C-1.5: 记录指纹供后续去重 (best-effort, 仅整文件写) */
-                        if (pos == 0 && powerfs_write_predict_should_dedup(inode, file->f_path.dentry)) {
-                            __u32 crc = crc32_le(0, buf, count);
-                            powerfs_write_predict_record(inode, needle_id,
-                                                          pi->volume_id, crc,
-                                                          buf, count);
-                        }
-                    }
+                ret = powerfs_net_write_needle(pi->volume_id, needle_id,
+                                                inode->i_ino,
+                                                buf, count, NULL, 0);
+                if (ret == 0) {
+                    chunk_written = count;
+                    /* C-1.5 方向②: 写成功后异步 lookup + record (后台 fingerprint 登记).
+                     * lookup_record_async 内部 schedule_work, 不阻塞当前执行. */
+                    if (pos == 0 && powerfs_write_predict_is_enabled(pi))
+                        powerfs_write_predict_lookup_record_async(inode,
+                                                                   needle_id,
+                                                                   pi->volume_id,
+                                                                   chunk_idx,
+                                                                   pos,
+                                                                   buf, count);
                 }
             } else {
                 ret = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
                                          pos, buf, count, &chunk_written);
             }
+skip_write:
             kvfree(buf);
 
             if (ret < 0) {

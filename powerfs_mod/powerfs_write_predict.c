@@ -5,19 +5,32 @@
  *
  * Phase C-1.5 (本文件): kernel 端指纹计算 + dedup lookup/record
  *
- * 流水线:
- *   writeback path → should_dedup? → dedup(data) → Match? → skip write
- *                                                   → NoMatch → write + record
+ * ======= 方向②: 先写后问 (async, best-effort) =======
  *
- * 指纹: SHA-256 (kernel crypto API)
- *   - CONFIG_CRYPTO_SHA256=y 在所有内核中可用
- *   - 与 Rust sha2 crate 完全对齐 (同算法, 同 32 字节输出)
- *   - 性能 ~500 MB/s (software), 256KB needle ~0.5ms (vs 网络 ~1-10ms)
+ * 热路径 (writeback submit / DIO write) 完全零阻塞:
+ *   - 正常异步提交 write_needle, 不做任何同步 SHA-256 / RPC
+ *   - 仅 lockless 查 pi->dedup_chunks 表: 若异步 worker 已为该 chunk
+ *     命中过 dedup (来自之前覆盖写的后台 lookup), 才跳过 volume 写
  *
- * 安全回退 (C-1.6):
- *   - xattr 缺失/"off"/阈值≤0 → 不算指纹, 正常写
- *   - crypto API 不可用 → 正常写 (module init 检测, 全局禁用)
- *   - RPC 失败 → 正常写 (best-effort)
+ * 去重流水线 (全异步, workqueue 执行):
+ *   write_cb (RDMA CQ 回调) / DIO write 成功后
+ *     → memcpy needle_buf → schedule_work(lookup_record)
+ *         → compute SHA-256(data)          // 只算一次
+ *         → FingerprintLookup RPC (filer)
+ *           Match → store_dedup(chunk_idx, matched_nid, matched_vid)
+ *         → FingerprintRecord RPC (filer)  // 无论 Match/NoMatch
+ *     → iput + kfree
+ *
+ * 收益:
+ *   - 基线 (no dedup) 性能不变, 因为热路径没有任何额外 work
+ *   - 首次写新数据: 同基线, 后台做一次 lookup+record 缓存指纹
+ *   - 二次覆盖写相同内容: dedup_chunks 已命中 → 跳过 volume 写
+ *   - NoMatch 场景: 零成本 (只后台一次 record, 下次可 dedup)
+ *
+ * 安全回退:
+ *   - xattr 缺失/"off"/阈值≤0 → is_enabled=false → 异步 worker 不调度
+ *   - crypto API 不可用 → init 失败, sha256_tfm=NULL → dedup 静默跳过
+ *   - RPC 失败 → best-effort, 下次写会重试
  *
  * 编译开关: 本文件仅在 make WRITE_PREDICT=y (定义
  * CONFIG_POWERFS_WRITE_PREDICT) 时由 Makefile 编入模块; 缺省不编译,
@@ -48,67 +61,221 @@
 /* 全局 SHA-256 transform (init 时分配, 整个模块生命周期复用) */
 static struct crypto_shash *sha256_tfm;
 
-/* record 异步 work: write_cb (RDMA CQ 回调上下文) 不能做同步 RPC,
- * 把 FingerprintRecord 提交到系统 workqueue 异步执行. */
-struct powerfs_wp_record_work {
+/* ================================================================
+ * === 异步 lookup + record worker (方向②核心) ===
+ *
+ * 合并 FingerprintLookup + FingerprintRecord 到同一个 workqueue worker,
+ * 复用一次 SHA-256 计算. 从 write_cb (RDMA CQ 回调) 或 DIO write 成功
+ * 后调度 — 这两个上下文都不能做同步 RPC, 必须异步.
+ *
+ * 生命周期: write_cb / DIO 成功 → igrab + memcpy → kzalloc work →
+ *   schedule_work → worker 在 process context 执行 lookup + record →
+ *   iput + kfree → done.
+ * ================================================================ */
+
+struct powerfs_wp_lookup_work {
     struct work_struct work;
     struct inode *inode;
-    u64 needle_id;
-    u64 volume_id;
-    u32 crc32;
-    u8 *data;
+    u64 needle_id;       /* 刚写的 needle_id */
+    u64 volume_id;       /* 刚写的 volume_id */
+    u64 chunk_idx;       /* 对应 dedup_chunks 的索引, Match 时写回 */
+    u64 offset;          /* needle 起始 offset, 记录用 */
+    u32 crc32;           /* crc32_le 预计算, 避免 worker 再算 */
+    u8 *data;            /* needle_buf 的深拷贝 */
     size_t data_len;
 };
 
-static void powerfs_wp_record_worker(struct work_struct *work)
+static void powerfs_wp_lookup_worker(struct work_struct *work)
 {
-    struct powerfs_wp_record_work *rw =
-        container_of(work, struct powerfs_wp_record_work, work);
+    struct powerfs_wp_lookup_work *lw =
+        container_of(work, struct powerfs_wp_lookup_work, work);
+    struct inode *inode = lw->inode;
+    u64 shard_id = powerfs_calc_shard_id(inode->i_ino);
+    u64 data_size = (u64)lw->data_len;
+    u8 fp[POWERFS_FP_SIZE];
+    u8 prefix[POWERFS_FP_PREFIX_SIZE];
 
-    powerfs_write_predict_record(rw->inode, rw->needle_id, rw->volume_id,
-                                  rw->crc32, rw->data, rw->data_len);
+    if (!lw->data || lw->data_len == 0)
+        goto out;
 
-    iput(rw->inode);
-    kfree(rw->data);
-    kfree(rw);
+    if (!sha256_tfm)
+        goto out;
+
+    /* 1. 计算 SHA-256 — 只算一次, lookup + record 复用 */
+    {
+        struct shash_desc *desc;
+        int ret;
+
+        desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(sha256_tfm),
+                       GFP_NOFS);
+        if (!desc)
+            goto out;
+
+        desc->tfm = sha256_tfm;
+        ret = crypto_shash_init(desc);
+        if (!ret)
+            ret = crypto_shash_update(desc, lw->data, lw->data_len);
+        if (!ret)
+            ret = crypto_shash_final(desc, fp);
+        kfree(desc);
+
+        if (ret) {
+            pr_debug_ratelimited("powerfs: write_predict lookup SHA-256 failed ino=%lu: %d\n",
+                                 inode->i_ino, ret);
+            goto out;
+        }
+    }
+
+    /* 2. 提取 prefix (与 filer FingerprintIndex 碰撞校验对齐) */
+    memset(prefix, 0, sizeof(prefix));
+    memcpy(prefix, lw->data, min_t(size_t, lw->data_len, sizeof(prefix)));
+
+    /* 3. FingerprintLookup — 查 filer 是否已存在相同内容的 needle */
+    {
+        u8 body[POWERFS_FP_LOOKUP_BODY_SIZE];
+        u8 resp[64];
+        size_t resp_len = 0;
+        int ret;
+        u8 match_kind;
+
+        memcpy(body, fp, POWERFS_FP_SIZE);
+        put_unaligned_le64(data_size, body + 32);
+        memcpy(body + 40, prefix, POWERFS_FP_PREFIX_SIZE);
+        put_unaligned_le64(inode->i_ino, body + 104);
+        put_unaligned_le64(lw->offset, body + 112);
+
+        ret = powerfs_net_send_request(POWERFS_NET_MSG_FINGERPRINT_LOOKUP,
+                                        inode->i_ino,
+                                        body, sizeof(body),
+                                        NULL, 0,
+                                        resp, sizeof(resp),
+                                        NULL, 0,
+                                        500, &resp_len, NULL);
+        if (ret < 0) {
+            pr_debug_ratelimited("powerfs: write_predict lookup RPC failed ino=%lu: %d\n",
+                                 inode->i_ino, ret);
+            /* RPC 失败: 继续 record (幂等, 不影响正确性) */
+            goto do_record;
+        }
+        if (resp_len == 0)
+            goto do_record;  /* 空响应 → NoMatch, 直接 record */
+
+        match_kind = resp[0];
+
+        if (match_kind == POWERFS_FP_LOOKUP_MATCH ||
+            match_kind == POWERFS_FP_LOOKUP_RECOVERABLE) {
+            u64 matched_nid, matched_vid;
+
+            if (resp_len < 17 + 8)
+                goto do_record;  /* 响应过短 → 跳过 store_dedup */
+
+            matched_nid = get_unaligned_le64(resp + 1);
+            matched_vid = get_unaligned_le64(resp + 9);
+
+            /* 4. Match → 缓存到 dedup_chunks, 下次覆盖写该 chunk 时跳过 volume 写 */
+            powerfs_write_predict_store_dedup(inode, (u32)lw->chunk_idx,
+                                               matched_nid, matched_vid);
+
+            pr_info_ratelimited("powerfs: WRITE_PREDICT_DEDUP ino=%lu chunk=%llu %s needle=%#llx vol=%llu\n",
+                                inode->i_ino, lw->chunk_idx,
+                                match_kind == POWERFS_FP_LOOKUP_MATCH ? "MATCH" : "RECOVER",
+                                (unsigned long long)matched_nid,
+                                (unsigned long long)matched_vid);
+        }
+    }
+
+do_record:
+    /* 5. FingerprintRecord — 无论 Match/NoMatch, 把刚写的 needle 登记上
+     * (best-effort, 500ms timeout). Match 场景下 filer 端幂等忽略重复登记. */
+    {
+        u8 body[POWERFS_FP_RECORD_BODY_SIZE];
+        u8 resp[16];
+        size_t resp_len = 0;
+        int ret;
+
+        memcpy(body, fp, POWERFS_FP_SIZE);
+        put_unaligned_le64(lw->needle_id, body + 32);
+        put_unaligned_le64(lw->volume_id, body + 40);
+        put_unaligned_le32(lw->crc32, body + 48);
+        put_unaligned_le64(data_size, body + 52);
+        memcpy(body + 60, prefix, POWERFS_FP_PREFIX_SIZE);
+
+        ret = powerfs_net_send_request(POWERFS_NET_MSG_FINGERPRINT_RECORD,
+                                        inode->i_ino,
+                                        body, sizeof(body),
+                                        NULL, 0,
+                                        resp, sizeof(resp),
+                                        NULL, 0,
+                                        500, &resp_len, NULL);
+        if (ret < 0)
+            pr_debug_ratelimited("powerfs: write_predict record RPC failed ino=%lu: %d\n",
+                                 inode->i_ino, ret);
+    }
+
+out:
+    iput(inode);
+    kfree(lw->data);
+    kfree(lw);
 }
 
 /**
- * powerfs_write_predict_record_async - 异步记录指纹 (write_cb 安全版本).
+ * powerfs_write_predict_lookup_record_async - 异步 lookup + record (方向②核心入口).
  *
- * 在 RDMA CQ 回调 (write_cb) 中调用: 拷贝数据, 提交到系统 workqueue,
- * 由 worker 线程执行同步 FingerprintRecord RPC, 不阻塞 CQ 处理.
+ * 在 write_cb (RDMA CQ 回调) 或 DIO write 成功后调用. context 不能做同步 RPC,
+ * 所以这里拷贝数据 + igrab inode + schedule_work, 真正的 SHA-256 + RPC 在 worker
+ * 线程中异步执行. 一次 SHA-256 同时服务 lookup 和 record, 避免重复计算.
+ *
+ * 触发条件: powerfs_write_predict_is_enabled(pi) == true (xattr 已启用).
+ * 若未启用, 调用方不应调此函数.
+ *
+ * @inode: 文件 inode (内部 igrab, worker 结束后 iput)
+ * @needle_id: 刚写的 needle_id
+ * @volume_id: 刚写的 volume_id
+ * @chunk_idx: 对应 dedup_chunks 的索引 (offset / POWERFS_CHUNK_SIZE)
+ * @offset: needle 起始 offset, 记录用
+ * @data: 刚写的数据 (内部 memcpy 深拷贝, 调用方后续释放不影响)
+ * @data_len: 数据长度 (通常 = POWERFS_CHUNK_SIZE, 即 needle 整体覆盖)
  */
-void powerfs_write_predict_record_async(struct inode *inode,
-                                        u64 needle_id, u64 volume_id,
-                                        const u8 *data, size_t data_len)
+void powerfs_write_predict_lookup_record_async(struct inode *inode,
+                                                u64 needle_id, u64 volume_id,
+                                                u64 chunk_idx, loff_t offset,
+                                                const u8 *data, size_t data_len)
 {
-    struct powerfs_wp_record_work *rw;
+    struct powerfs_wp_lookup_work *lw;
     u8 *data_copy;
 
     if (!data || data_len == 0)
         return;
-
-    rw = kzalloc(sizeof(*rw), GFP_ATOMIC);
-    if (!rw)
+    if (!sha256_tfm)
         return;
+
+    lw = kzalloc(sizeof(*lw), GFP_ATOMIC);
+    if (!lw)
+        return;
+
     data_copy = kmalloc(data_len, GFP_ATOMIC);
     if (!data_copy) {
-        kfree(rw);
+        kfree(lw);
         return;
     }
     memcpy(data_copy, data, data_len);
 
-    rw->inode = igrab(inode);
-    rw->needle_id = needle_id;
-    rw->volume_id = volume_id;
-    rw->crc32 = crc32_le(0, data, data_len);
-    rw->data = data_copy;
-    rw->data_len = data_len;
-    INIT_WORK(&rw->work, powerfs_wp_record_worker);
-    schedule_work(&rw->work);
+    lw->inode = igrab(inode);
+    lw->needle_id = needle_id;
+    lw->volume_id = volume_id;
+    lw->chunk_idx = chunk_idx;
+    lw->offset = offset;
+    lw->crc32 = crc32_le(0, data, data_len);
+    lw->data = data_copy;
+    lw->data_len = data_len;
+    INIT_WORK(&lw->work, powerfs_wp_lookup_worker);
+    schedule_work(&lw->work);
 }
-EXPORT_SYMBOL_GPL(powerfs_write_predict_record_async);
+EXPORT_SYMBOL_GPL(powerfs_write_predict_lookup_record_async);
+
+/* ================================================================
+ * === API 实现 (方向②保留的函数) ===
+ * ================================================================ */
 
 /* xattr value 最大长度 (NN:0.75 / RULE:16 等都 <32 字节) */
 #define POLICY_XATTR_MAX_LEN 64
@@ -131,7 +298,6 @@ void powerfs_write_predict_invalidate(struct inode *inode)
 {
     struct powerfs_inode_info *pi = POWERFS_I(inode);
 
-    /* lockless write: invalidate cache, force re-query on next access */
     WRITE_ONCE(pi->write_predict_cached, false);
     WRITE_ONCE(pi->write_predict_querying, false);
 }
@@ -211,9 +377,8 @@ static bool parse_policy_threshold(const u8 *value, size_t value_len)
         if (!has_digits)
             return false;
 
-        /* threshold = sign * (int_part + frac_part/divisor) > 0 */
         if (sign < 0)
-            return false; /* negative threshold → disable */
+            return false;
 
         return (int_part > 0 || frac_part > 0);
     }
@@ -266,9 +431,7 @@ bool powerfs_write_predict_should_dedup(struct inode *inode,
                                     xattr_val, sizeof(xattr_val),
                                     &xattr_len);
         if (ret == -ENODATA || ret < 0) {
-            /* xattr not set on file → try parent directory inheritance.
-             * 目录级继承: 在父目录上设一次 xattr, 所有子文件自动继承.
-             * 递归向上查 (最多 10 层, 防止循环). */
+            /* xattr not set on file → try parent directory inheritance. */
             struct dentry *parent = dentry;
             int depth;
 
@@ -282,8 +445,6 @@ bool powerfs_write_predict_should_dedup(struct inode *inode,
                 {
                     struct inode *p_inode = d_inode(p);
 
-                    /* 仅查 powerfs 同 sb 的 inode, 避免越界到 VFS root
-                     * (非 powerfs inode) 发起无效 xattr RPC. */
                     if (p_inode && p_inode != inode &&
                         p_inode->i_sb == inode->i_sb) {
                         u64 p_shard = powerfs_calc_shard_id(p_inode->i_ino);
@@ -306,8 +467,7 @@ bool powerfs_write_predict_should_dedup(struct inode *inode,
             enabled = parse_policy_threshold(xattr_val, xattr_len);
         }
 
-        /* cache result — write enabled before cached so lockless
-         * readers never see cached=true with stale enabled. */
+        /* cache result */
         WRITE_ONCE(pi->write_predict_enabled, enabled);
         smp_wmb();
         WRITE_ONCE(pi->write_predict_cached, true);
@@ -323,235 +483,24 @@ EXPORT_SYMBOL_GPL(powerfs_write_predict_should_dedup);
 /**
  * powerfs_write_predict_is_enabled - 快速检查 (仅读缓存, 无需 dentry).
  *
- * 写回热路径专用: 持 i_lock 读 write_predict_cached && write_predict_enabled,
- * 不查 xattr, 不查 dentry. 缓存由 write_iter 中 should_dedup 预热.
+ * 写回热路径专用: 无锁读 write_predict_cached && write_predict_enabled,
+ * 不查 xattr, 不查 dentry. 缓存由首次 should_dedup 调用预热.
+ * 关闭时直接返回 false, 调用方跳过 dedup 相关的所有 work.
  */
 bool powerfs_write_predict_is_enabled(struct powerfs_inode_info *pi)
 {
-    /* 无锁读: bool 读写在所有架构上原子. write_cb (RDMA CQ 回调)
-     * 不能持 pi->i_lock, 否则与 writepage_work_fn 的 locate_chunk
-     * 竞争导致 CQ 处理阻塞、性能暴跌. */
     return READ_ONCE(pi->write_predict_cached) &&
            READ_ONCE(pi->write_predict_enabled);
 }
 EXPORT_SYMBOL_GPL(powerfs_write_predict_is_enabled);
 
 /**
- * compute_sha256 - 计算 SHA-256 指纹.
- *
- * 用全局 sha256_tfm, 每次分配一个 shash_desc 在栈/堆上计算.
- * 返回: 0 成功 (hash_out 写入 32 字节), <0 失败
- */
-static int compute_sha256(const u8 *data, size_t data_len, u8 *hash_out)
-{
-    struct shash_desc *desc;
-    int ret;
-
-    if (!sha256_tfm)
-        return -ENODEV;
-
-    /* shash_desc 大小 = crypto_shash_descsize(tfm) + sizeof(struct shash_desc) */
-    desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(sha256_tfm),
-                   GFP_NOFS);
-    if (!desc)
-        return -ENOMEM;
-
-    desc->tfm = sha256_tfm;
-
-    ret = crypto_shash_init(desc);
-    if (ret)
-        goto out;
-
-    ret = crypto_shash_update(desc, data, data_len);
-    if (ret)
-        goto out;
-
-    ret = crypto_shash_final(desc, hash_out);
-
-out:
-    kfree(desc);
-    return ret;
-}
-
-/**
- * powerfs_write_predict_dedup - 对写数据执行指纹去重.
- *
- * 返回: 1=去重成功, 0=未匹配, <0=错误
- */
-int powerfs_write_predict_dedup(struct inode *inode, loff_t offset,
-                                 const u8 *data, size_t data_len,
-                                 u64 *out_needle_id,
-                                 u64 *out_volume_id,
-                                 u32 *out_crc32)
-{
-    u8 fp[POWERFS_FP_SIZE];
-    u8 prefix[POWERFS_FP_PREFIX_SIZE];
-    u8 body[POWERFS_FP_LOOKUP_BODY_SIZE];
-    u8 resp[64];
-    size_t resp_len = 0;
-    u64 shard_id;
-    u64 data_size;
-    int ret;
-    u8 match_kind;
-
-    if (!data || data_len == 0 || !out_needle_id || !out_volume_id)
-        return -EINVAL;
-
-    /* 1. compute SHA-256 fingerprint */
-    ret = compute_sha256(data, data_len, fp);
-    if (ret) {
-        pr_warn_ratelimited("powerfs: write_predict SHA-256 failed ino=%lu: %d\n",
-                            inode->i_ino, ret);
-        return ret;
-    }
-
-    /* 2. extract prefix */
-    memset(prefix, 0, sizeof(prefix));
-    memcpy(prefix, data, min_t(size_t, data_len, sizeof(prefix)));
-
-    /* 3. build lookup request body */
-    data_size = (u64)data_len;
-    shard_id = powerfs_calc_shard_id(inode->i_ino);
-
-    memcpy(body, fp, POWERFS_FP_SIZE);
-    put_unaligned_le64(data_size, body + 32);
-    memcpy(body + 40, prefix, POWERFS_FP_PREFIX_SIZE);
-    put_unaligned_le64(inode->i_ino, body + 104);
-    put_unaligned_le64((u64)offset, body + 112);
-
-    /* 4. send FingerprintLookup RPC (sync, 500ms timeout) */
-    ret = powerfs_net_send_request(POWERFS_NET_MSG_FINGERPRINT_LOOKUP,
-                                    inode->i_ino,
-                                    body, sizeof(body),
-                                    NULL, 0,
-                                    resp, sizeof(resp),
-                                    NULL, 0,
-                                    500, &resp_len, NULL);
-    if (ret < 0) {
-        pr_debug_ratelimited("powerfs: write_predict lookup RPC failed ino=%lu: %d\n",
-                             inode->i_ino, ret);
-        return ret;
-    }
-    if (ret > 0) {
-        /* status error from filer */
-        pr_debug_ratelimited("powerfs: write_predict lookup status=%d ino=%lu\n",
-                             ret, inode->i_ino);
-        return -EIO;
-    }
-    if (resp_len == 0) {
-        return 0; /* empty response → NoMatch */
-    }
-
-    match_kind = resp[0];
-
-    if (match_kind == POWERFS_FP_LOOKUP_NOMATCH) {
-        pr_debug_ratelimited("powerfs: write_predict NoMatch ino=%lu off=%lld\n",
-                             inode->i_ino, offset);
-        return 0;
-    }
-
-    /* Match or Recoverable: parse needle_id, volume_id, crc32 */
-    if (match_kind == POWERFS_FP_LOOKUP_MATCH) {
-        /* 1 + needle_id(8) + volume_id(8) + crc32(4) + data_size(8) + refcount(4) = 33 */
-        if (resp_len < 33) {
-            pr_warn_ratelimited("powerfs: write_predict Match resp too short %zu\n",
-                                resp_len);
-            return -EIO;
-        }
-        *out_needle_id = get_unaligned_le64(resp + 1);
-        *out_volume_id = get_unaligned_le64(resp + 9);
-        *out_crc32 = get_unaligned_le32(resp + 17);
-        pr_info_ratelimited("powerfs: WRITE_PREDICT_DEDUP ino=%lu off=%lld MATCH needle=%#llx vol=%llu crc=%#x\n",
-                            inode->i_ino, offset,
-                            (unsigned long long)*out_needle_id,
-                            (unsigned long long)*out_volume_id,
-                            *out_crc32);
-        return 1;
-    }
-
-    if (match_kind == POWERFS_FP_LOOKUP_RECOVERABLE) {
-        /* 1 + needle_id(8) + volume_id(8) + crc32(4) + data_size(8) = 29 */
-        if (resp_len < 29) {
-            pr_warn_ratelimited("powerfs: write_predict Recoverable resp too short %zu\n",
-                                resp_len);
-            return -EIO;
-        }
-        *out_needle_id = get_unaligned_le64(resp + 1);
-        *out_volume_id = get_unaligned_le64(resp + 9);
-        *out_crc32 = get_unaligned_le32(resp + 17);
-        pr_info_ratelimited("powerfs: WRITE_PREDICT_DEDUP ino=%lu off=%lld RECOVER needle=%#llx vol=%llu\n",
-                            inode->i_ino, offset,
-                            (unsigned long long)*out_needle_id,
-                            (unsigned long long)*out_volume_id);
-        return 1;
-    }
-
-    pr_warn_ratelimited("powerfs: write_predict unknown match_kind=%d\n",
-                        match_kind);
-    return 0;
-}
-EXPORT_SYMBOL_GPL(powerfs_write_predict_dedup);
-
-/**
- * powerfs_write_predict_record - 写完新 needle 后记录指纹.
- */
-void powerfs_write_predict_record(struct inode *inode,
-                                   u64 needle_id, u64 volume_id,
-                                   u32 crc32,
-                                   const u8 *data, size_t data_len)
-{
-    u8 fp[POWERFS_FP_SIZE];
-    u8 prefix[POWERFS_FP_PREFIX_SIZE];
-    u8 body[POWERFS_FP_RECORD_BODY_SIZE];
-    size_t resp_len = 0;
-    u8 resp[16];
-    int ret;
-
-    if (!data || data_len == 0)
-        return;
-
-    /* compute fingerprint */
-    ret = compute_sha256(data, data_len, fp);
-    if (ret) {
-        pr_debug_ratelimited("powerfs: write_predict record SHA-256 failed: %d\n",
-                             ret);
-        return;
-    }
-
-    /* extract prefix */
-    memset(prefix, 0, sizeof(prefix));
-    memcpy(prefix, data, min_t(size_t, data_len, sizeof(prefix)));
-
-    /* build record body */
-    memcpy(body, fp, POWERFS_FP_SIZE);
-    put_unaligned_le64(needle_id, body + 32);
-    put_unaligned_le64(volume_id, body + 40);
-    put_unaligned_le32(crc32, body + 48);
-    put_unaligned_le64((u64)data_len, body + 52);
-    memcpy(body + 60, prefix, POWERFS_FP_PREFIX_SIZE);
-
-    /* send FingerprintRecord RPC (best-effort, 500ms timeout) */
-    ret = powerfs_net_send_request(POWERFS_NET_MSG_FINGERPRINT_RECORD,
-                                    inode->i_ino,
-                                    body, sizeof(body),
-                                    NULL, 0,
-                                    resp, sizeof(resp),
-                                    NULL, 0,
-                                    500, &resp_len, NULL);
-    if (ret < 0)
-        pr_debug_ratelimited("powerfs: write_predict record RPC failed ino=%lu: %d\n",
-                             inode->i_ino, ret);
-}
-EXPORT_SYMBOL_GPL(powerfs_write_predict_record);
-
-/**
  * powerfs_write_predict_store_dedup - 记录某 chunk 去重命中的 needle 引用.
  *
- * 命中后 pi->dedup_chunks[chunk_idx] = {matched needle_id, matched volume_id},
- * sync_size_chunks 构建 chunks[] 时优先用此表, 把去重后的引用持久化到 Filer.
+ * 由异步 lookup worker 在 Match/Recoverable 时调用. 持 i_lock 保护.
+ * 按需扩展 dedup_chunks 数组 (kalloc + memcpy).
  *
- * 由 i_lock 保护; 按需扩展 dedup_chunks 数组 (kalloc + memcpy).
- * 返回 0 成功, <0 失败 (调用方回退到正常写).
+ * 返回 0 成功, <0 失败 (调用方 best-effort, 忽略即可).
  */
 int powerfs_write_predict_store_dedup(struct inode *inode, u32 chunk_idx,
                                       u64 matched_needle_id,
@@ -574,7 +523,6 @@ int powerfs_write_predict_store_dedup(struct inode *inode, u32 chunk_idx,
                    pi->dedup_chunk_count * sizeof(*new_arr));
             kfree(pi->dedup_chunks);
         }
-        /* 新条目初始化为 0 (未命中) */
         memset(new_arr + pi->dedup_chunk_count, 0,
                (new_count - pi->dedup_chunk_count) * sizeof(*new_arr));
         pi->dedup_chunks = new_arr;
