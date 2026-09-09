@@ -18,7 +18,15 @@
  *   - xattr 缺失/"off"/阈值≤0 → 不算指纹, 正常写
  *   - crypto API 不可用 → 正常写 (module init 检测, 全局禁用)
  *   - RPC 失败 → 正常写 (best-effort)
+ *
+ * 编译开关: 本文件仅在 make WRITE_PREDICT=y (定义
+ * CONFIG_POWERFS_WRITE_PREDICT) 时由 Makefile 编入模块; 缺省不编译,
+ * hook 全部走 powerfs_write_predict.h 中的 static inline 空实现.
  */
+
+#ifndef CONFIG_POWERFS_WRITE_PREDICT
+#error "powerfs_write_predict.c requires CONFIG_POWERFS_WRITE_PREDICT (build with: make WRITE_PREDICT=y)"
+#endif
 
 #include <linux/module.h>
 #include <linux/fs.h>

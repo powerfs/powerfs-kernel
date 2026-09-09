@@ -40,8 +40,18 @@ $(MODULE_NAME)-objs := \
     powerfs_flow.o \
     powerfs_ec.o \
     page_cache.o \
-    powerfs_readahead.o \
-    powerfs_write_predict.o
+    powerfs_readahead.o
+
+# 写预测 + 内容指纹去重 (powerfs_write_predict.c).
+# 缺省关闭: 该功能 hook 在写热路径 (xattr 查询 / SHA-256 / 同步 RPC),
+# 尚未在生产负载验证, 默认不编译以保证正常写零开销零影响.
+# 启用: make WRITE_PREDICT=y (定义 CONFIG_POWERFS_WRITE_PREDICT,
+# 头文件中的 static inline 空实现自动切换为真实实现).
+WRITE_PREDICT ?= n
+ifeq ($(WRITE_PREDICT),y)
+    $(MODULE_NAME)-objs += powerfs_write_predict.o
+    ccflags-y += -DCONFIG_POWERFS_WRITE_PREDICT=1
+endif
 
 # RDMA 传输 (CONFIG_INFINIBAND=y 时编译)
 ifdef CONFIG_INFINIBAND

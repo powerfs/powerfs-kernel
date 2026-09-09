@@ -40,6 +40,19 @@ struct powerfs_inode_info;
 #define POWERFS_FP_LOOKUP_MATCH       1
 #define POWERFS_FP_LOOKUP_RECOVERABLE 2
 
+/*
+ * 编译期总开关: CONFIG_POWERFS_WRITE_PREDICT 由 Makefile 定义
+ * (make WRITE_PREDICT=y), 缺省不定义 — 功能默认关闭.
+ *
+ * 关闭时 powerfs_write_predict.c 不参与编译, 下列 hook 全部为 static
+ * inline 空实现: should_dedup 恒返回 false → 调用点的整个去重分支被
+ * 编译器常量折叠消除, 写路径 (buffered write_iter / DIO / writeback
+ * work_fn) 不产生任何额外指令, 也不依赖 crypto/SHA-256.
+ * pi->write_predict_* 缓存字段在关闭时无人读写, 保留在结构体中
+ * 以避免布局差异.
+ */
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+
 /**
  * powerfs_write_predict_should_dedup - 检查 inode 是否启用了写预测去重.
  *
@@ -126,5 +139,47 @@ int powerfs_write_predict_init(void);
  * powerfs_write_predict_exit - 模块 exit 时释放 SHA-256 transform.
  */
 void powerfs_write_predict_exit(void);
+
+#else /* !CONFIG_POWERFS_WRITE_PREDICT: 缺省关闭, hook 全部为空实现 */
+
+static inline bool powerfs_write_predict_should_dedup(struct inode *inode,
+                                                      struct dentry *dentry)
+{
+    return false;
+}
+
+static inline int powerfs_write_predict_dedup(struct inode *inode, loff_t offset,
+                                              const __u8 *data, size_t data_len,
+                                              __u64 *out_needle_id,
+                                              __u64 *out_volume_id,
+                                              __u32 *out_crc32)
+{
+    return 0;  /* NoMatch → 调用方走正常写 */
+}
+
+static inline void powerfs_write_predict_record(struct inode *inode,
+                                                __u64 needle_id, __u64 volume_id,
+                                                __u32 crc32,
+                                                const __u8 *data, size_t data_len)
+{
+}
+
+static inline void powerfs_write_predict_invalidate(struct inode *inode)
+{
+}
+
+static inline void powerfs_write_predict_inode_init(struct powerfs_inode_info *pi)
+{
+}
+
+static inline int powerfs_write_predict_init(void)
+{
+    return 0;
+}
+
+static inline void powerfs_write_predict_exit(void)
+{
+}
+#endif /* !CONFIG_POWERFS_WRITE_PREDICT */
 
 #endif /* _POWERFS_WRITE_PREDICT_H */
