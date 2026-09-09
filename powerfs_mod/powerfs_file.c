@@ -1174,12 +1174,14 @@ int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
         }
         /* C-1.5: 指纹去重 — 优先用 writeback 命中的匹配 needle 引用,
          * 跳过 volume 写后必须把去重后的引用持久化到 Filer. */
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
         if (ci < pi->dedup_chunk_count && pi->dedup_chunks &&
             pi->dedup_chunks[ci].needle_id != 0) {
             nid = pi->dedup_chunks[ci].needle_id;
             vid = pi->dedup_chunks[ci].volume_id;
             loc_ret = 0;
         }
+#endif
         chunks[ci].chunk_idx = ci;
         chunks[ci].needle_id = loc_ret ? 0 : nid;
         chunks[ci].volume_id  = loc_ret ? 0 : vid;

@@ -48,8 +48,8 @@ struct powerfs_inode_info;
  * inline 空实现: should_dedup 恒返回 false → 调用点的整个去重分支被
  * 编译器常量折叠消除, 写路径 (buffered write_iter / DIO / writeback
  * work_fn) 不产生任何额外指令, 也不依赖 crypto/SHA-256.
- * pi->write_predict_* 缓存字段在关闭时无人读写, 保留在结构体中
- * 以避免布局差异.
+ * pi->dedup_chunks / write_predict_* 字段在关闭时由 #ifdef 排除出
+ * powerfs_inode_info 布局, 零空间残留.
  */
 #ifdef CONFIG_POWERFS_WRITE_PREDICT
 
