@@ -1479,9 +1479,34 @@ existing_lookup:
         /* ===== Case 1: 已实例化 (not in_lookup) ===== */
         if (!in_lookup) {
             if (dn_neg) {
-                if (!d_unhashed(dentry))
-                    d_drop(dentry);
-                return -ENOENT;
+                /* 负 dentry 但走到了 existing_lookup: 典型场景是
+                 * dir_has_local_entry 快速路径 (文件本地已知) 但 inode
+                 * 已被 iput→evict 回收, dentry 变负. 直接 return -ENOENT
+                 * 是错的 —— 文件确实存在, 必须重新实例化.
+                 * 同步调 ->lookup (powerfs_lookup 对 ENOENT 会 d_drop
+                 * unhashed, 对 found 会 d_add positive), 再继续打开. */
+                struct dentry *(*lookup_fn)(struct inode *, struct dentry *,
+                                             unsigned int);
+                struct dentry *res;
+                lookup_fn = (typeof(lookup_fn))dir->i_op->lookup;
+                pr_debug("powerfs: atomic_open existing_lookup negative dentry "
+                         "'%pd' → self-lookup to re-instantiate\n", dentry);
+                res = lookup_fn(dir, dentry, 0);
+                if (IS_ERR(res)) {
+                    long lerr = PTR_ERR(res);
+                    if (lerr == -ENOENT) {
+                        if (!d_unhashed(dentry))
+                            d_drop(dentry);
+                        return -ENOENT;
+                    }
+                    return (int)lerr;
+                }
+                dinode = d_inode(dentry);
+                if (!dinode) {
+                    if (!d_unhashed(dentry))
+                        d_drop(dentry);
+                    return -ENOENT;
+                }
             }
             err = finish_open(file, dentry, powerfs_file_open);
             pr_debug("powerfs: atomic_open existing_lookup positive ino=%lu finish_open rc=%d\n",
