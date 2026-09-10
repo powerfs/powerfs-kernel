@@ -1060,6 +1060,11 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     if (!pi)
         return NULL;
 
+    /* Note: IOP_XATTR is set by VFS inode_init_always() AFTER this function
+     * returns (see fs/inode.c alloc_inode:353).  powerfs_xattr_handlers is
+     * wired up at sb->s_xattr in powerfs_fill_super, so VFS will correctly
+     * set IOP_XATTR when s_xattr != NULL. */
+
     /* P3-5: 统计 opened_inodes + total_inodes */
     if (sbi && sbi->client) {
         percpu_counter_inc(&sbi->client->metrics.opened_inodes);
