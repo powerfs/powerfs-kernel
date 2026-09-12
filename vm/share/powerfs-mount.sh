@@ -22,7 +22,7 @@ KO_FILE="${POWERFS_KO:-/mnt/host/powerfs.ko}"
 # 载入统一配置 (若存在); 下方再给兜底默认值, 即使 env 缺失也能工作.
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 
-: "${POWERFS_MASTER_ADDR:=192.168.100.3}"
+: "${POWERFS_MASTER_ADDR:=192.168.100.4}"
 : "${POWERFS_MASTER_PORT:=9334}"
 : "${POWERFS_SHARD_COUNT:=1}"
 : "${POWERFS_TRANSPORT:=rdma}"
