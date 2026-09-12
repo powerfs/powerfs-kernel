@@ -99,26 +99,52 @@ bool powerfs_write_predict_should_dedup(struct inode *inode,
 bool powerfs_write_predict_is_enabled(struct powerfs_inode_info *pi);
 
 /**
- * powerfs_write_predict_store_dedup - 记录某 chunk 去重命中的 needle 引用.
+ * powerfs_write_predict_check_hit - 热路径: 自身 needle 槽位内容是否未变.
  *
- * 由异步 lookup worker 在 Match/Recoverable 时调用. 持 i_lock 保护.
- * sync_size_chunks 构建 chunks[] 时优先查此表, 将去重后的引用持久化
- * 到 Filer (跳过 volume 写, 零数据传输).
+ * 【正确性关键】仅当该 chunk 已提交 (fp_valid) 的自身引用
+ * (volume_id,file_key+chunk_idx) 与当前待写数据的 xxh64 完全一致时返回
+ * true, 调用方可跳过 volume 写.
  *
- * 热路径也 lockless 查此表: 若该 chunk 的 needle_id != 0, 说明之前覆盖写
- * 时异步 lookup 已命中过 dedup, 直接跳过 volume 写 (仅适用于二次覆盖写
- * 相同内容场景).
+ * false 时本函数已在 dedup 表内预植一条 *provisional* 条目 (fp_valid=0):
+ * 内容指纹=当前数据 xxh64, 引用=自身槽位, 内容代数已 +1. 调用方必须照常
+ * 写 volume, 写成功后调用 powerfs_write_predict_commit() 以输出的 gen
+ * 提交条目; 写失败则条目保持 provisional, 不会错误跳写下一轮.
  *
  * @inode: 文件 inode
  * @chunk_idx: chunk 索引 (offset / POWERFS_CHUNK_SIZE)
- * @matched_needle_id: 匹配到的已有 needle_id
- * @matched_volume_id: 匹配到的 volume_id
+ * @data: 当前待写的完整 chunk 数据
+ * @data_len: 数据长度
+ * @out_needle_id: 输出: 自身槽位 needle_id
+ * @out_volume_id: 输出: 自身槽位 volume_id
+ * @out_xxh: false 时输出: 当前数据 xxh64, 透传给 commit
+ * @out_gen: false 时输出: provisional 条目代数, 透传给 commit
  *
- * 返回: 0 成功, <0 失败 (调用方 best-effort, 忽略即可)
+ * 返回: true=内容未变可跳过物理写; false=需正常写 (并在成功后 commit)
  */
-int powerfs_write_predict_store_dedup(struct inode *inode, u32 chunk_idx,
-                                      __u64 matched_needle_id,
-                                      __u64 matched_volume_id);
+bool powerfs_write_predict_check_hit(struct inode *inode, u32 chunk_idx,
+                                     const __u8 *data, size_t data_len,
+                                     __u64 *out_needle_id,
+                                     __u64 *out_volume_id,
+                                     __u64 *out_xxh, __u64 *out_gen);
+
+/**
+ * powerfs_write_predict_commit - 物理写成功后提交 provisional 条目.
+ *
+ * 可在 RDMA CQ 回调上下文调用: 仅一次自旋锁 + 标量校验, 无数据拷贝/RPC.
+ * 仅当代数、xxh64、自身槽位引用全部匹配时才置 fp_valid=1; 写期间该
+ * chunk 又被更新的覆盖写推进时, 本次提交自动作废.
+ */
+void powerfs_write_predict_commit(struct inode *inode, u32 chunk_idx,
+                                  __u64 needle_id, __u64 volume_id,
+                                  __u64 fp_xxh, __u64 gen);
+
+/**
+ * powerfs_write_predict_inode_destroy - evict/free_inode 时释放去重缓存.
+ *
+ * 幂等. 在途 lookup_work 均持有 inode 引用, evict 到达时表必为空, 此处
+ * WARN 并销毁 xarray, 释放 dedup_chunks.
+ */
+void powerfs_write_predict_inode_destroy(struct powerfs_inode_info *pi);
 
 /**
  * powerfs_write_predict_lookup_record_async - 异步 lookup + record (方向②核心入口).
@@ -144,6 +170,16 @@ void powerfs_write_predict_lookup_record_async(struct inode *inode,
                                                 __u64 needle_id, __u64 volume_id,
                                                 __u64 chunk_idx, loff_t offset,
                                                 const __u8 *data, size_t data_len);
+
+/**
+ * powerfs_write_predict_map_dirty - 自上次成功发布后, dedup 引用映射
+ * (相对自身 file_key 映射) 是否发生过变化. fsync 等长覆写短路必须参考
+ * 它: 为 true 时即使 i_size 未变也要重新发布 chunks.
+ */
+bool powerfs_write_predict_map_dirty(struct powerfs_inode_info *pi);
+
+/* chunks 成功发布到 Filer 后清除映射脏标 */
+void powerfs_write_predict_map_dirty_clear(struct powerfs_inode_info *pi);
 
 /**
  * powerfs_write_predict_invalidate - 标记 per-inode 策略缓存失效.
@@ -182,12 +218,29 @@ static inline bool powerfs_write_predict_is_enabled(struct powerfs_inode_info *p
     return false;
 }
 
-static inline int powerfs_write_predict_store_dedup(struct inode *inode,
+static inline bool powerfs_write_predict_check_hit(struct inode *inode,
                                                     u32 chunk_idx,
-                                                    __u64 matched_needle_id,
-                                                    __u64 matched_volume_id)
+                                                    const __u8 *data,
+                                                    size_t data_len,
+                                                    __u64 *out_needle_id,
+                                                    __u64 *out_volume_id,
+                                                    __u64 *out_xxh,
+                                                    __u64 *out_gen)
 {
-    return -ENOSYS;
+    return false;
+}
+
+static inline void powerfs_write_predict_commit(struct inode *inode,
+                                                 u32 chunk_idx,
+                                                 __u64 needle_id,
+                                                 __u64 volume_id,
+                                                 __u64 fp_xxh, __u64 gen)
+{
+}
+
+static inline void powerfs_write_predict_inode_destroy(
+    struct powerfs_inode_info *pi)
+{
 }
 
 static inline void powerfs_write_predict_lookup_record_async(struct inode *inode,
@@ -197,6 +250,17 @@ static inline void powerfs_write_predict_lookup_record_async(struct inode *inode
                                                               loff_t offset,
                                                               const __u8 *data,
                                                               size_t data_len)
+{
+}
+
+static inline bool powerfs_write_predict_map_dirty(
+    struct powerfs_inode_info *pi)
+{
+    return false;
+}
+
+static inline void powerfs_write_predict_map_dirty_clear(
+    struct powerfs_inode_info *pi)
 {
 }
 

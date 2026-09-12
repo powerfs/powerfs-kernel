@@ -1172,14 +1172,21 @@ int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
             vid = pi->volume_id;
             nid = pi->file_key + ci;
         }
-        /* C-1.5: 指纹去重 — 优先用 writeback 命中的匹配 needle 引用,
-         * 跳过 volume 写后必须把去重后的引用持久化到 Filer. */
+        /* C-1.5: 指纹去重 — 仅当该 chunk 存在内容指纹已验证的引用时,
+         * 用其持久化到 Filer (跳过 volume 写的那些 chunk). wp_lock 与
+         * worker/check_hit 串行, 快照取出后立即放锁. */
 #ifdef CONFIG_POWERFS_WRITE_PREDICT
-        if (ci < pi->dedup_chunk_count && pi->dedup_chunks &&
-            pi->dedup_chunks[ci].needle_id != 0) {
-            nid = pi->dedup_chunks[ci].needle_id;
-            vid = pi->dedup_chunks[ci].volume_id;
-            loc_ret = 0;
+        {
+            struct powerfs_chunk_map *dc;
+
+            spin_lock(&pi->wp_lock);
+            dc = (ci < pi->dedup_chunk_count) ? pi->dedup_chunks : NULL;
+            if (dc && dc[ci].fp_valid && dc[ci].needle_id != 0) {
+                nid = dc[ci].needle_id;
+                vid = dc[ci].volume_id;
+                loc_ret = 0;
+            }
+            spin_unlock(&pi->wp_lock);
         }
 #endif
         chunks[ci].chunk_idx = ci;
@@ -1247,14 +1254,23 @@ int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
      * 没有新变化 — 固定大小覆盖写 / 重复 fsync / 重复 recall flush 命中此处,
      * 跳过整次 update_inode Raft. 注意覆盖写的 needle 数据版本已由上面的
      * FlushNeedles 落盘, 与 size 是否变化无关. content_size 只在一次成功的
-     * update_inode 后置位, 故相等 ⇔ 该 size 的 chunk map 已 durable. */
+     * update_inode 后置位, 故相等 ⇔ 该 size 的 chunk map 已 durable.
+     * 例外: 指纹去重改变了 chunk 引用映射 (共享 needle 命中 / 失配回退自身
+     * key) 时, 即使等长覆写也必须重新发布, 否则 Filer 上的旧映射会指向别的
+     * 内容. */
     {
         u64 committed_size;
+        bool map_dirty;
 
         spin_lock(&pi->i_lock);
         committed_size = pi->content_size;
         spin_unlock(&pi->i_lock);
-        if ((u64)i_size == committed_size) {
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+        map_dirty = powerfs_write_predict_map_dirty(pi);
+#else
+        map_dirty = false;
+#endif
+        if ((u64)i_size == committed_size && !map_dirty) {
             kfree(chunks);
             return 0;
         }
@@ -1271,6 +1287,10 @@ int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
             spin_lock(&pi->i_lock);
             pi->content_size = (u64)i_size;
             spin_unlock(&pi->i_lock);
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+            /* 引用映射已随本次 update_inode 持久化, 清除 dedup 脏标 */
+            powerfs_write_predict_map_dirty_clear(pi);
+#endif
             pr_debug("powerfs: sync_size_chunks(%s) ino=%lu size=%lld chunks=%u "
                      "ok (attempt %d)\n", source, inode->i_ino,
                      (long long)i_size, chunk_count, attempt);

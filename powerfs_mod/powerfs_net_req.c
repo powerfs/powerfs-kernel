@@ -348,8 +348,10 @@ int powerfs_request_do_send(struct powerfs_request *req,
     if (!req || !conn)
         return -EINVAL;
 
-    /* 快速检查连接状态 */
-    if (conn->state != CONN_CONNECTED)
+    /* 快速检查连接状态. 若连接从未建立过 (remount 后 volume/其余 filer
+     * 为后台懒连接), 有界等待首次建连, 避免首 IO 无谓 ENOTCONN. */
+    if (conn->state != CONN_CONNECTED &&
+        powerfs_conn_wait_initial(conn) != 0)
         return -ENOTCONN;
 
     /* [RC17 FIX ROOT CAUSE 17] 状态检查不依赖 conn->sock:

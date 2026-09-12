@@ -852,7 +852,7 @@ fi
 if [ -f "/mnt/host/kernel-client-\${_idx}.crt" ]; then
   cp -f "/mnt/host/kernel-client-\${_idx}.crt" "/etc/powerfs/kernel-client-\${_idx}.crt"
   cp -f "/mnt/host/kernel-client-\${_idx}.key" "/etc/powerfs/kernel-client-\${_idx}.key"
-  echo "CERT_SYNC: kernel-client-\${_idx}.crt <- /mnt/host"
+  echo \"CERT_SYNC: kernel-client-\${_idx}.crt <- /mnt/host\"
 fi
 if [ -f /mnt/host/powerfs.ko ]; then
   insmod /mnt/host/powerfs.ko && echo 'INSMOD_OK: /mnt/host/powerfs.ko'

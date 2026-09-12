@@ -52,14 +52,60 @@
 #include <linux/workqueue.h>
 #include <linux/delay.h>
 #include <linux/crc32.h>
+#include <linux/xxhash.h>
 #include <crypto/hash.h>
 
 #include "powerfs.h"
 #include "powerfs_write_predict.h"
 #include "powerfs_net.h"
 
-/* 全局 SHA-256 transform (init 时分配, 整个模块生命周期复用) */
+/* 全局 SHA-256 transform (init 时分配, 整个模块生命周期复用;
+ * shash transform 无状态, 可被多 CPU 并发使用, 各自持独立 shash_desc) */
 static struct crypto_shash *sha256_tfm;
+
+/* 指纹 worker 专用有界 workqueue: 不再使用系统 events 队列.
+ * WQ_UNBOUND: 不钉死 CPU, 避免饥饿; max_active=4: 全局限并发, RPC 串行
+ * (~500ms timeout) 时最多 4 个在执行, 其余在队列内. 入队另有全局/per-inode
+ * 水位 (WP_INFLIGHT_MAX / WP_PER_INODE_MAX) 兜底, 队列不会无限增长. */
+static struct workqueue_struct *wp_wq;
+
+/* 在途 work (含排队 + 运行) 全局水位: 超出直接丢弃新 work (best-effort) */
+#define WP_INFLIGHT_MAX      256
+/* 单 inode 在途 work 水位 (32 chunks 已可覆盖典型连续写的窗口) */
+#define WP_PER_INODE_MAX     32
+
+static atomic_t wp_inflight = ATOMIC_INIT(0);
+
+/* FingerprintRecord 抽样率 (1/N). 本地去重不依赖 Record; 抽样只为持续
+ * 维护 Filer 侧跨客户端指纹索引, 同时避免热路径每个 needle 都付出
+ * 1MB 拷贝 + SHA-256 + RPC 的代价. */
+#define WP_RECORD_SAMPLE    8
+static atomic_t wp_record_seq = ATOMIC_INIT(0);
+
+/* 同步计算 SHA-256. 调用方须处于 process context (desc 用 GFP_NOFS).
+ * 返回 0 成功. */
+static int wp_compute_sha256(const u8 *data, size_t data_len, u8 out[POWERFS_FP_SIZE])
+{
+    struct shash_desc *desc;
+    int ret;
+
+    if (!sha256_tfm)
+        return -ENODEV;
+
+    desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(sha256_tfm),
+                   GFP_NOFS);
+    if (!desc)
+        return -ENOMEM;
+
+    desc->tfm = sha256_tfm;
+    ret = crypto_shash_init(desc);
+    if (!ret)
+        ret = crypto_shash_update(desc, data, data_len);
+    if (!ret)
+        ret = crypto_shash_final(desc, out);
+    kfree(desc);
+    return ret;
+}
 
 /* ================================================================
  * === 异步 lookup + record worker (方向②核心) ===
@@ -78,12 +124,40 @@ struct powerfs_wp_lookup_work {
     struct inode *inode;
     u64 needle_id;       /* 刚写的 needle_id */
     u64 volume_id;       /* 刚写的 volume_id */
-    u64 chunk_idx;       /* 对应 dedup_chunks 的索引, Match 时写回 */
+    u64 chunk_idx;       /* chunk 索引, per-chunk 单飞去重键 */
     u64 offset;          /* needle 起始 offset, 记录用 */
     u32 crc32;           /* crc32_le 预计算, 避免 worker 再算 */
     u8 *data;            /* needle_buf 的深拷贝 */
     size_t data_len;
 };
+
+/* 锁内确保 chunk 条目存在 (数组扩容). 只能用 GFP_ATOMIC (持自旋锁).
+ * 返回条目指针 (已持锁), 失败返回 NULL. */
+static struct powerfs_chunk_map *wp_entry_ensure_locked(
+    struct powerfs_inode_info *pi, u32 chunk_idx, gfp_t gfp)
+{
+    if (chunk_idx < pi->dedup_chunk_count)
+        return &pi->dedup_chunks[chunk_idx];
+
+    {
+        u32 old_count = pi->dedup_chunk_count;
+        u32 new_count = chunk_idx + 1;
+        struct powerfs_chunk_map *new_arr, *old_arr;
+
+        if (new_count > 4096)
+            return NULL;
+        new_arr = kzalloc(array_size(new_count, sizeof(*new_arr)), gfp);
+        if (!new_arr)
+            return NULL;
+        old_arr = pi->dedup_chunks;
+        if (old_arr)
+            memcpy(new_arr, old_arr, old_count * sizeof(*new_arr));
+        pi->dedup_chunks = new_arr;
+        pi->dedup_chunk_count = new_count;
+        kfree(old_arr);
+        return &new_arr[chunk_idx];
+    }
+}
 
 static void powerfs_wp_lookup_worker(struct work_struct *work)
 {
@@ -98,95 +172,29 @@ static void powerfs_wp_lookup_worker(struct work_struct *work)
     if (!lw->data || lw->data_len == 0)
         goto out;
 
-    if (!sha256_tfm)
+    /* 1. 计算 SHA-256 — 只算一次, lookup + record + 本地缓存复用 */
+    if (wp_compute_sha256(lw->data, lw->data_len, fp)) {
+        pr_debug_ratelimited("powerfs: write_predict SHA-256 failed ino=%lu\n",
+                             inode->i_ino);
         goto out;
-
-    /* 1. 计算 SHA-256 — 只算一次, lookup + record 复用 */
-    {
-        struct shash_desc *desc;
-        int ret;
-
-        desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(sha256_tfm),
-                       GFP_NOFS);
-        if (!desc)
-            goto out;
-
-        desc->tfm = sha256_tfm;
-        ret = crypto_shash_init(desc);
-        if (!ret)
-            ret = crypto_shash_update(desc, lw->data, lw->data_len);
-        if (!ret)
-            ret = crypto_shash_final(desc, fp);
-        kfree(desc);
-
-        if (ret) {
-            pr_debug_ratelimited("powerfs: write_predict lookup SHA-256 failed ino=%lu: %d\n",
-                                 inode->i_ino, ret);
-            goto out;
-        }
     }
 
     /* 2. 提取 prefix (与 filer FingerprintIndex 碰撞校验对齐) */
     memset(prefix, 0, sizeof(prefix));
     memcpy(prefix, lw->data, min_t(size_t, lw->data_len, sizeof(prefix)));
 
-    /* 3. FingerprintLookup — 查 filer 是否已存在相同内容的 needle */
-    {
-        u8 body[POWERFS_FP_LOOKUP_BODY_SIZE];
-        u8 resp[64];
-        size_t resp_len = 0;
-        int ret;
-        u8 match_kind;
+    /* 本地指纹缓存已由 check_hit + powerfs_write_predict_commit 在写
+     * 提交/CQ 路径上零拷贝完成, worker 不再回写 dedup 表. */
 
-        memcpy(body, fp, POWERFS_FP_SIZE);
-        put_unaligned_le64(data_size, body + 32);
-        memcpy(body + 40, prefix, POWERFS_FP_PREFIX_SIZE);
-        put_unaligned_le64(inode->i_ino, body + 104);
-        put_unaligned_le64(lw->offset, body + 112);
+    /* 3. 不发起 FingerprintLookup:
+     * 跨文件 Match 的外部 needle 不能被本客户端复用 (位置固定槽位会被
+     * 属主原地覆写, 无 COW 独立 needle 分配通道), 热路径跳写只依赖本地
+     * 指纹缓存 (步骤 2.5), Lookup 结果无人消费, 纯属每 chunk 一次的额外
+     * RTT (fio 随机覆写场景吞吐被腰斩的主因之一). 跨文件语义仍由
+     * FingerprintRecord 维护, 供 FUSE 等其它客户端使用. */
 
-        ret = powerfs_net_send_request(POWERFS_NET_MSG_FINGERPRINT_LOOKUP,
-                                        inode->i_ino,
-                                        body, sizeof(body),
-                                        NULL, 0,
-                                        resp, sizeof(resp),
-                                        NULL, 0,
-                                        500, &resp_len, NULL);
-        if (ret < 0) {
-            pr_debug_ratelimited("powerfs: write_predict lookup RPC failed ino=%lu: %d\n",
-                                 inode->i_ino, ret);
-            /* RPC 失败: 继续 record (幂等, 不影响正确性) */
-            goto do_record;
-        }
-        if (resp_len == 0)
-            goto do_record;  /* 空响应 → NoMatch, 直接 record */
-
-        match_kind = resp[0];
-
-        if (match_kind == POWERFS_FP_LOOKUP_MATCH ||
-            match_kind == POWERFS_FP_LOOKUP_RECOVERABLE) {
-            u64 matched_nid, matched_vid;
-
-            if (resp_len < 17 + 8)
-                goto do_record;  /* 响应过短 → 跳过 store_dedup */
-
-            matched_nid = get_unaligned_le64(resp + 1);
-            matched_vid = get_unaligned_le64(resp + 9);
-
-            /* 4. Match → 缓存到 dedup_chunks, 下次覆盖写该 chunk 时跳过 volume 写 */
-            powerfs_write_predict_store_dedup(inode, (u32)lw->chunk_idx,
-                                               matched_nid, matched_vid);
-
-            pr_info_ratelimited("powerfs: WRITE_PREDICT_DEDUP ino=%lu chunk=%llu %s needle=%#llx vol=%llu\n",
-                                inode->i_ino, lw->chunk_idx,
-                                match_kind == POWERFS_FP_LOOKUP_MATCH ? "MATCH" : "RECOVER",
-                                (unsigned long long)matched_nid,
-                                (unsigned long long)matched_vid);
-        }
-    }
-
-do_record:
-    /* 5. FingerprintRecord — 无论 Match/NoMatch, 把刚写的 needle 登记上
-     * (best-effort, 500ms timeout). Match 场景下 filer 端幂等忽略重复登记. */
+    /* 4. FingerprintRecord — 把刚写的自有 needle 登记到 filer 指纹索引
+     * (best-effort, 500ms timeout), 供其它客户端做跨文件去重查询. */
     {
         u8 body[POWERFS_FP_RECORD_BODY_SIZE];
         u8 resp[16];
@@ -213,6 +221,16 @@ do_record:
     }
 
 out:
+    /* 摘除 per-chunk 单飞标记并释放水位 (无论中途是否提前退出) */
+    {
+        struct powerfs_inode_info *pi = POWERFS_I(inode);
+
+        spin_lock(&pi->wp_lock);
+        if (xa_erase(&pi->wp_pending, lw->chunk_idx) == lw)
+            pi->wp_pending_cnt--;
+        spin_unlock(&pi->wp_lock);
+        atomic_dec(&wp_inflight);
+    }
     iput(inode);
     kfree(lw->data);
     kfree(lw);
@@ -241,14 +259,38 @@ void powerfs_write_predict_lookup_record_async(struct inode *inode,
                                                 u64 chunk_idx, loff_t offset,
                                                 const u8 *data, size_t data_len)
 {
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
     struct powerfs_wp_lookup_work *lw;
     u8 *data_copy;
+    bool admitted = false;
 
     if (!data || data_len == 0)
         return;
-    if (!sha256_tfm)
+    if (!sha256_tfm || !wp_wq)
         return;
 
+    /* 抽样登记 Filer 指纹索引. 本地去重跳写不依赖 Record (见 check_hit/
+     * commit); Record 只服务 FUSE 等客户端的跨文件查询. 对每个 needle 做
+     * 1MB 深拷贝 + SHA-256 + RPC 在大块随机覆写热路径上代价显著, 全局限
+     * 速到 1/WP_RECORD_SAMPLE: 既持续喂索引, 又把数据面开销压低一个
+     * 数量级. 单 chunk 同一时刻最多一个 worker (xarray 单飞). */
+    if (atomic_inc_return(&wp_record_seq) % WP_RECORD_SAMPLE != 1)
+        return;
+
+    /* 快速水位预检 (持锁仅做判断, 不做分配). */
+    spin_lock(&pi->wp_lock);
+    if (pi->wp_pending_cnt >= WP_PER_INODE_MAX ||
+        atomic_read(&wp_inflight) >= WP_INFLIGHT_MAX) {
+        spin_unlock(&pi->wp_lock);
+        pr_info_ratelimited("powerfs: write_predict work dropped ino=%lu chunk=%llu (pending=%u inflight=%d)\n",
+                            inode->i_ino, chunk_idx, pi->wp_pending_cnt,
+                            atomic_read(&wp_inflight));
+        return;
+    }
+    spin_unlock(&pi->wp_lock);
+
+    /* 调用方可能在 RDMA CQ 回调 (原子上下文), 一律 GFP_ATOMIC.
+     * 1MB 深拷贝失败即丢, 不产生背压传导. */
     lw = kzalloc(sizeof(*lw), GFP_ATOMIC);
     if (!lw)
         return;
@@ -261,6 +303,11 @@ void powerfs_write_predict_lookup_record_async(struct inode *inode,
     memcpy(data_copy, data, data_len);
 
     lw->inode = igrab(inode);
+    if (!lw->inode) {
+        kfree(data_copy);
+        kfree(lw);
+        return;
+    }
     lw->needle_id = needle_id;
     lw->volume_id = volume_id;
     lw->chunk_idx = chunk_idx;
@@ -269,7 +316,26 @@ void powerfs_write_predict_lookup_record_async(struct inode *inode,
     lw->data = data_copy;
     lw->data_len = data_len;
     INIT_WORK(&lw->work, powerfs_wp_lookup_worker);
-    schedule_work(&lw->work);
+
+    /* 二次确认水位 + per-chunk 单飞 */
+    spin_lock(&pi->wp_lock);
+    if (pi->wp_pending_cnt < WP_PER_INODE_MAX &&
+        atomic_read(&wp_inflight) < WP_INFLIGHT_MAX &&
+        xa_insert(&pi->wp_pending, chunk_idx, lw, GFP_ATOMIC) == 0) {
+        pi->wp_pending_cnt++;
+        atomic_inc(&wp_inflight);
+        admitted = true;
+    }
+    spin_unlock(&pi->wp_lock);
+
+    if (!admitted) {
+        iput(inode);
+        kfree(data_copy);
+        kfree(lw);
+        return;
+    }
+
+    queue_work(wp_wq, &lw->work);
 }
 EXPORT_SYMBOL_GPL(powerfs_write_predict_lookup_record_async);
 
@@ -288,8 +354,173 @@ void powerfs_write_predict_inode_init(struct powerfs_inode_info *pi)
     pi->write_predict_enabled = false;
     pi->write_predict_cached = false;
     pi->write_predict_querying = false;
+    pi->dedup_chunks = NULL;
+    pi->dedup_chunk_count = 0;
+    pi->wp_pending_cnt = 0;
+    pi->wp_map_dirty = false;
+    xa_init(&pi->wp_pending);
+    spin_lock_init(&pi->wp_lock);
 }
 EXPORT_SYMBOL_GPL(powerfs_write_predict_inode_init);
+
+/**
+ * powerfs_write_predict_inode_destroy - evict/free_inode 清理.
+ *
+ * 在途 worker 都持有 inode 引用, evict 能到达说明 wp_pending 必为空;
+ * 若 WARN 触发说明引用计数有误, 仍安全释放 (worker 侧 wp_lock 串行,
+ * 最坏丢一次缓存更新, 不涉及 UAF: worker 持有独立 lw).
+ */
+void powerfs_write_predict_inode_destroy(struct powerfs_inode_info *pi)
+{
+    spin_lock(&pi->wp_lock);
+    if (pi->wp_pending_cnt)
+        pr_warn("powerfs: write_predict destroy ino with %u pending works\n",
+                pi->wp_pending_cnt);
+    kfree(pi->dedup_chunks);
+    pi->dedup_chunks = NULL;
+    pi->dedup_chunk_count = 0;
+    pi->wp_pending_cnt = 0;
+    spin_unlock(&pi->wp_lock);
+    xa_destroy(&pi->wp_pending);
+}
+EXPORT_SYMBOL_GPL(powerfs_write_predict_inode_destroy);
+
+/**
+ * powerfs_write_predict_check_hit - 热路径跳写判定 + provisional 预植.
+ *
+ * 只回答一个问题: "本 chunk 的自身 needle 槽位, 上一轮已提交的字节与
+ * 当前待写字节是否完全相同?" 相同 (xxh64 一致 + fp_valid + 自身槽位)
+ * 返回 true, 调用方跳过物理写.
+ *
+ * 返回 false 时 (无条目 / 内容变化 / 仅有 provisional / 外部引用), 已在
+ * 锁内把条目更新为 provisional: fp_valid=0, fp_xxh=当前数据指纹,
+ * nid/vid=自身槽位, wp_gen+1, 并通过 out_* 输出供调用方在写成功后调
+ * powerfs_write_predict_commit(). 写失败则条目永不 validate, 下轮照写.
+ *
+ * 这是陈旧 Match 数据错乱 bug 的根因修复:
+ *   - 旧实现只看 needle_id != 0 就复用引用, 同 chunk A→B 换写会复用 A;
+ *   - 跨文件复用位置固定、会被属主原地覆写的 needle 本质不安全, 禁用.
+ * 本地指纹用 xxh64 (非加密, ~15GB/s); 64bit 碰撞概率可忽略.
+ */
+bool powerfs_write_predict_check_hit(struct inode *inode, u32 chunk_idx,
+                                     const u8 *data, size_t data_len,
+                                     u64 *out_needle_id,
+                                     u64 *out_volume_id,
+                                     u64 *out_xxh, u64 *out_gen)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    u64 own_nid, own_vid;
+    u64 actual;
+    bool hit = false;
+
+    if (!powerfs_write_predict_is_enabled(pi) || !data || data_len == 0)
+        return false;
+
+    own_nid = pi->file_key + chunk_idx;
+    own_vid = pi->volume_id;
+    if (!own_nid || !own_vid)
+        return false;  /* 尚未分配 Flat/Stripe 槽位 (inline 期), 不跟踪 */
+
+    /* 锁外算当前数据指纹 (xxh64 ~15GB/s, 1MB 约 70us) */
+    actual = xxh64(data, data_len, 0);
+
+    spin_lock(&pi->wp_lock);
+    if (pi->dedup_chunks && chunk_idx < pi->dedup_chunk_count) {
+        struct powerfs_chunk_map *e = &pi->dedup_chunks[chunk_idx];
+
+        if (e->fp_valid && e->needle_id != 0 &&
+            e->fp_xxh == actual &&
+            e->needle_id == own_nid && e->volume_id == own_vid) {
+            hit = true;
+        }
+    }
+
+    if (!hit) {
+        /* 预植/刷新 provisional 条目供写成功后 commit */
+        struct powerfs_chunk_map *e =
+            wp_entry_ensure_locked(pi, chunk_idx, GFP_ATOMIC);
+
+        if (e) {
+            /* 内容指纹与已提交条目相同却仍未命中: 只可能是外部引用;
+             * 无论如何本次写自身槽位, 推进代数. 内容指纹变化同样推进. */
+            e->wp_gen++;
+            e->chunk_idx = chunk_idx;
+            e->needle_id = own_nid;
+            e->volume_id = own_vid;
+            e->size = POWERFS_CHUNK_SIZE;
+            e->fp_xxh = actual;
+            e->fp_valid = 0;
+
+            if (out_needle_id)
+                *out_needle_id = own_nid;
+            if (out_volume_id)
+                *out_volume_id = own_vid;
+            if (out_xxh)
+                *out_xxh = actual;
+            if (out_gen)
+                *out_gen = e->wp_gen;
+        }
+    } else {
+        if (out_needle_id)
+            *out_needle_id = own_nid;
+        if (out_volume_id)
+            *out_volume_id = own_vid;
+    }
+    spin_unlock(&pi->wp_lock);
+
+    return hit;
+}
+EXPORT_SYMBOL_GPL(powerfs_write_predict_check_hit);
+
+/**
+ * powerfs_write_predict_commit - 物理写成功后提交 provisional 条目.
+ *
+ * CQ 回调可直接调用: 一次自旋锁 + 标量比较, 无内存拷贝/RPC/哈希.
+ * 代数不匹配 (写期间该 chunk 又被更新一代的写覆盖) 则静默丢弃.
+ */
+void powerfs_write_predict_commit(struct inode *inode, u32 chunk_idx,
+                                  u64 needle_id, u64 volume_id,
+                                  u64 fp_xxh, u64 gen)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+
+    if (needle_id == 0)
+        return;
+
+    spin_lock(&pi->wp_lock);
+    if (pi->dedup_chunks && chunk_idx < pi->dedup_chunk_count) {
+        struct powerfs_chunk_map *e = &pi->dedup_chunks[chunk_idx];
+
+        if (e->wp_gen == gen && !e->fp_valid &&
+            e->needle_id == needle_id && e->volume_id == volume_id &&
+            e->fp_xxh == fp_xxh) {
+            /* 发布内容指纹后再置 valid (热路径在同一把 wp_lock 下读) */
+            smp_wmb();
+            e->fp_valid = 1;
+        }
+    }
+    spin_unlock(&pi->wp_lock);
+}
+EXPORT_SYMBOL_GPL(powerfs_write_predict_commit);
+
+bool powerfs_write_predict_map_dirty(struct powerfs_inode_info *pi)
+{
+    bool dirty;
+
+    spin_lock(&pi->wp_lock);
+    dirty = pi->wp_map_dirty;
+    spin_unlock(&pi->wp_lock);
+    return dirty;
+}
+EXPORT_SYMBOL_GPL(powerfs_write_predict_map_dirty);
+
+void powerfs_write_predict_map_dirty_clear(struct powerfs_inode_info *pi)
+{
+    spin_lock(&pi->wp_lock);
+    pi->wp_map_dirty = false;
+    spin_unlock(&pi->wp_lock);
+}
+EXPORT_SYMBOL_GPL(powerfs_write_predict_map_dirty_clear);
 
 /**
  * powerfs_write_predict_invalidate - 标记 per-inode 策略缓存失效.
@@ -495,66 +726,28 @@ bool powerfs_write_predict_is_enabled(struct powerfs_inode_info *pi)
 EXPORT_SYMBOL_GPL(powerfs_write_predict_is_enabled);
 
 /**
- * powerfs_write_predict_store_dedup - 记录某 chunk 去重命中的 needle 引用.
- *
- * 由异步 lookup worker 在 Match/Recoverable 时调用. 持 i_lock 保护.
- * 按需扩展 dedup_chunks 数组 (kalloc + memcpy).
- *
- * 返回 0 成功, <0 失败 (调用方 best-effort, 忽略即可).
- */
-int powerfs_write_predict_store_dedup(struct inode *inode, u32 chunk_idx,
-                                      u64 matched_needle_id,
-                                      u64 matched_volume_id)
-{
-    struct powerfs_inode_info *pi = POWERFS_I(inode);
-    struct powerfs_chunk_map *new_arr;
-    u32 new_count;
-
-    spin_lock(&pi->i_lock);
-    if (chunk_idx >= pi->dedup_chunk_count) {
-        new_count = chunk_idx + 1;
-        new_arr = kmalloc_array(new_count, sizeof(*new_arr), GFP_ATOMIC);
-        if (!new_arr) {
-            spin_unlock(&pi->i_lock);
-            return -ENOMEM;
-        }
-        if (pi->dedup_chunks) {
-            memcpy(new_arr, pi->dedup_chunks,
-                   pi->dedup_chunk_count * sizeof(*new_arr));
-            kfree(pi->dedup_chunks);
-        }
-        memset(new_arr + pi->dedup_chunk_count, 0,
-               (new_count - pi->dedup_chunk_count) * sizeof(*new_arr));
-        pi->dedup_chunks = new_arr;
-        pi->dedup_chunk_count = new_count;
-    }
-    pi->dedup_chunks[chunk_idx].chunk_idx = chunk_idx;
-    pi->dedup_chunks[chunk_idx].needle_id = matched_needle_id;
-    pi->dedup_chunks[chunk_idx].volume_id = matched_volume_id;
-    pi->dedup_chunks[chunk_idx].size = POWERFS_CHUNK_SIZE;
-    spin_unlock(&pi->i_lock);
-
-    pr_debug("powerfs: write_predict store_dedup ino=%lu chunk=%u -> needle=%llu vol=%llu\n",
-            inode->i_ino, chunk_idx,
-            (unsigned long long)matched_needle_id,
-            (unsigned long long)matched_volume_id);
-    return 0;
-}
-EXPORT_SYMBOL_GPL(powerfs_write_predict_store_dedup);
-
-/**
  * powerfs_write_predict_init - 模块 init 时初始化 SHA-256.
  *
  * 返回: 0 成功, <0 失败 (禁用去重功能, 不阻止模块加载)
  */
 int powerfs_write_predict_init(void)
 {
+    /* WQ_MEM_RECLAIM: 内存回收期间保证有 rescuer 可推进, 避免与回写互锁 */
+    wp_wq = alloc_workqueue("powerfs_fprintk",
+                            WQ_UNBOUND | WQ_MEM_RECLAIM, 4);
+    if (!wp_wq) {
+        pr_warn("powerfs: fingerprint workqueue alloc failed, write predict disabled\n");
+        return -ENOMEM;
+    }
+
     sha256_tfm = crypto_alloc_shash("sha256", 0, 0);
     if (IS_ERR(sha256_tfm)) {
         int err = PTR_ERR(sha256_tfm);
         pr_warn("powerfs: SHA-256 crypto alloc failed (%d), write predict disabled\n",
                 err);
         sha256_tfm = NULL;
+        destroy_workqueue(wp_wq);
+        wp_wq = NULL;
         return err;
     }
     pr_info("powerfs: write predict initialized (SHA-256, block_size=%u)\n",
@@ -564,10 +757,17 @@ int powerfs_write_predict_init(void)
 EXPORT_SYMBOL_GPL(powerfs_write_predict_init);
 
 /**
- * powerfs_write_predict_exit - 模块 exit 时释放 SHA-256.
+ * powerfs_write_predict_exit - 模块 exit: 先排空 worker 再释放资源.
+ *
+ * destroy_workqueue 内部先 flush: 保证所有 lookup/record RPC 完成、
+ * iput 已执行后才返回, 此后再释放 SHA-256 transform.
  */
 void powerfs_write_predict_exit(void)
 {
+    if (wp_wq) {
+        destroy_workqueue(wp_wq);
+        wp_wq = NULL;
+    }
     if (sha256_tfm) {
         crypto_free_shash(sha256_tfm);
         sha256_tfm = NULL;

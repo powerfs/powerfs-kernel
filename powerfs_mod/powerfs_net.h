@@ -802,6 +802,7 @@ struct powerfs_net_server_conn {
     /* 状态机 */
     enum powerfs_conn_state state;
     spinlock_t state_lock;      /* 保护 state */
+    u8 ever_connected;          /* 历史上是否曾 CONNECTED 过 (只置位一次) */
 
     /* Per-conn 重连 */
     struct delayed_work reconnect_work;
@@ -1035,6 +1036,17 @@ void powerfs_conn_disconnect_one(struct powerfs_net_server_conn *conn);
 /* 连接状态变更 (内部调用, 触发路由表更新) */
 void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
                             enum powerfs_conn_state new_state);
+
+/*
+ * 首请求等待初始连接建立 (remount 后 volume/其余 filer 为后台懒连接).
+ * 仅当该连接从未 CONNECTED 过时阻塞等待 (有界), 已连接立即返回 0;
+ * 连接曾建立后断开 (RECONNECTING/FAULT) 不在此等待, 保持快速失败语义.
+ * 返回 0=已连接, -ENOTCONN=超时/正在停止.
+ */
+int powerfs_conn_wait_initial(struct powerfs_net_server_conn *conn);
+
+/* 初始连接最大等待时间 (ms) — RDMA 首连 + 握手通常 1-2s */
+#define POWERFS_CONN_INITIAL_WAIT_MS 10000
 
 /* === 请求生命周期 (参照  osd_request 设计) === */
 

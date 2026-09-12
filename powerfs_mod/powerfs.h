@@ -8,6 +8,7 @@
 #include <linux/rbtree.h>
 #include <linux/atomic.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 #include <linux/mutex.h>
 #include <linux/statfs.h>
 #include <linux/seq_file.h>
@@ -22,6 +23,7 @@
 #endif /* DEAD_CODE */
 #include "powerfs_net_transport.h"  /* enum powerfs_transport_type + transport_ops */
 #include "powerfs_readahead.h"   /* ML 自适应预取 (Phase A-0/A-1) */
+#include "powerfs_write_predict.h" /* 指纹去重常量/hook (WP 关闭时为空实现) */
 
 /* ========== 常量定义 ========== */
 
@@ -258,6 +260,15 @@ struct powerfs_chunk_map {
     u64 volume_id;
     u32 crc32;
     u64 size;   /* chunk 有效数据大小 (字节), 用于 Filer 元数据同步 */
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+    /* 本地热路径内容指纹 (xxh64, ~15GB/s): 仅用于判定 "自身 needle
+     * 槽位上一轮写入的字节与当前待写字节是否完全相同". 非加密哈希;
+     * 64bit 碰撞概率 ~1e-19, 可安全用于跳写判定. 跨文件语义需要的
+     * SHA-256 只在异步 worker 内为 FingerprintRecord 计算, 不落本地表. */
+    u64 fp_xxh;
+    u8  fp_valid;            /* fp_xxh/needle_id 是经过内容验证的引用 */
+    u64 wp_gen;              /* 内容代数: 每次实际写/失配 +1, worker 仅能写回自己那一代 */
+#endif
 };
 
 /* ==============================================================
@@ -560,9 +571,18 @@ struct powerfs_inode_info {
      * writeback 整 needle 覆盖写前查 filer 指纹索引, 命中则跳过 volume 写,
      * 把 (matched needle_id, matched volume_id) 记入此表, sync_size_chunks
      * 构建 chunks[] 时优先查此表, 将去重后的引用持久化到 Filer.
-     * 由 i_lock 保护; evict_inode/free_inode 释放. */
+     * 由 wp_lock 保护; evict_inode/free_inode 释放. */
     struct powerfs_chunk_map *dedup_chunks;
     u32 dedup_chunk_count;
+    /* per-chunk 单飞: chunk_idx -> 在途 lookup_work (NULL=无).
+     * wp_pending_cnt = 在途 work 数 (含排队/运行), 超水位丢弃新 work. */
+    struct xarray wp_pending;
+    u32 wp_pending_cnt;
+    spinlock_t wp_lock;     /* dedup_chunks + wp_pending + wp_pending_cnt */
+    /* dedup 引用映射 (相对自身 file_key 映射) 发生过变化: 本次 fsync
+     * 即使 i_size 未变也必须重新发布 chunks, 否则其他客户端/重读会沿
+     * 旧映射读到别的内容. 发布成功后清除. */
+    bool wp_map_dirty;
 #endif /* CONFIG_POWERFS_WRITE_PREDICT */
     u64 content_size;
     u64 volume_id;
@@ -811,6 +831,14 @@ static inline struct powerfs_inode_info *POWERFS_I(struct inode *inode)
  * 调用方持 pi->i_lock 或确保 chunks 数组不被并发释放.
  * 返回 0 成功, -EINVAL inline 文件 (不走 volume 路径) 或 chunk_idx 越界.
  */
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+/* 读路径专用 chunk 定位: 优先 consult 指纹去重表 (命中的共享 needle /
+ * 失活后显式回退自身 key), 未追踪时等价于 powerfs_locate_chunk.
+ * 写路径不得使用 (共享 needle 绝不能被覆写). */
+int powerfs_locate_chunk_for_read(struct powerfs_inode_info *pi, loff_t offset,
+                                  u64 *volume_id_out, u64 *needle_id_out);
+#endif
+
 int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
                          u64 *volume_id_out, u64 *needle_id_out);
 

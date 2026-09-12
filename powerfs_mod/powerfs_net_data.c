@@ -282,7 +282,12 @@ int powerfs_net_read(struct powerfs_inode_info *pi, __u64 ino,
         __u32 to_copy;
 
         spin_lock(&pi->i_lock);
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+        ret = powerfs_locate_chunk_for_read(pi, cur_offset,
+                                             &volume_id, &needle_id);
+#else
         ret = powerfs_locate_chunk(pi, cur_offset, &volume_id, &needle_id);
+#endif
         spin_unlock(&pi->i_lock);
         if (ret) {
             pr_warn("powerfs: read locate ino=%llu offset=%llu failed: %d\n",
@@ -611,23 +616,34 @@ struct powerfs_net_server_conn *powerfs_net_find_volume_conn(__u64 volume_id,
     }
     spin_unlock(&g_pool.vol_route_lock);
 
-    /* Fallback: vol_routes 未命中, 按 type 找首个已连接的 volume conn */
+    /* Fallback: vol_routes 未命中, 按 type 找首个 volume conn.
+     * 优先已连接的; 若全都尚未连上 (remount 后懒连接窗口), 也返回一个
+     * in_use 连接 — do_send 会经 powerfs_conn_wait_initial 等待建连,
+     * 而不是在此直接 NULL -> ENOTCONN. */
     {
         enum powerfs_net_server_type want = is_meta
             ? POWERFS_NET_SERVER_VOLUME_META : POWERFS_NET_SERVER_VOLUME;
+        struct powerfs_net_server_conn *fallback = NULL;
 
         for (i = 0; i < g_pool.volume_count; i++) {
             struct powerfs_net_server_conn *conn = &g_pool.volumes[i];
-            if (conn->in_use && conn->type == want &&
-                conn->state == CONN_CONNECTED) {
+            if (!conn->in_use || conn->type != want)
+                continue;
+            if (conn->state == CONN_CONNECTED) {
                 pr_warn("powerfs: find_volume_conn: volume_id=%llu not in vol_routes (%d routes), fallback to volumes[%d] %s:%u (meta=%d)\n",
                         (unsigned long long)volume_id, g_pool.vol_route_count,
                         i, conn->addr, conn->port, is_meta);
                 return conn;
             }
+            if (!fallback)
+                fallback = conn;
         }
+        if (fallback)
+            pr_warn("powerfs: find_volume_conn: volume_id=%llu no connected vol, waiting on %s:%u (meta=%d)\n",
+                    (unsigned long long)volume_id,
+                    fallback->addr, fallback->port, is_meta);
+        return fallback;
     }
-    return NULL;
 }
 
 /*

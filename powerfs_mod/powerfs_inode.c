@@ -266,6 +266,64 @@ int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
     return 0;
 }
 
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+/*
+ * powerfs_locate_chunk_for_read - 读路径 chunk 定位 (去重感知).
+ *
+ * 1. dedup 条目 fp_valid 且有 needle -> 该 chunk 逻辑内容当前由该
+ *    (可能跨文件的) 共享 needle 持有, 直接读它;
+ * 2. 条目存在但已失活 (换内容后 check_hit 失效, 新内容已写入自身
+ *    needle) -> 显式返回自身 file_key+ci 映射, 防止读到 pi->chunks
+ *    里此前发布的旧共享引用;
+ * 3. 未追踪该 chunk -> 回退常规 powerfs_locate_chunk.
+ *
+ * 仅供读路径; 写路径必须继续走自身 key (共享 needle 不可覆写).
+ */
+int powerfs_locate_chunk_for_read(struct powerfs_inode_info *pi, loff_t offset,
+                                  u64 *volume_id_out, u64 *needle_id_out)
+{
+    u64 chunk_idx = (u64)(offset / POWERFS_CHUNK_SIZE);
+    struct powerfs_chunk_map *e = NULL;
+    bool tracked = false;
+    bool valid = false;
+    u64 vid = 0, nid = 0;
+
+    if (pi->placement == POWERFS_PLACEMENT_INLINE)
+        return -EINVAL;
+
+    spin_lock(&pi->wp_lock);
+    if (pi->dedup_chunks && chunk_idx < pi->dedup_chunk_count) {
+        e = &pi->dedup_chunks[chunk_idx];
+        tracked = true;
+        if (e->fp_valid && e->needle_id != 0) {
+            vid = e->volume_id;
+            nid = e->needle_id;
+            valid = true;
+        }
+    }
+    spin_unlock(&pi->wp_lock);
+
+    if (valid) {
+        *volume_id_out = vid;
+        *needle_id_out = nid;
+        return 0;
+    }
+
+    /* 已追踪但失活: Flat 文件强制自身 key 映射 (不看 pi->chunks 旧发布).
+     * Stripe 暂未启用 dedup, 回退常规路径. */
+    if (tracked &&
+        pi->placement != POWERFS_PLACEMENT_STRIPE &&
+        pi->placement != POWERFS_PLACEMENT_WIDESTRIPE &&
+        pi->volume_id && pi->file_key) {
+        *volume_id_out = pi->volume_id;
+        *needle_id_out = pi->file_key + chunk_idx;
+        return 0;
+    }
+
+    return powerfs_locate_chunk(pi, offset, volume_id_out, needle_id_out);
+}
+#endif /* CONFIG_POWERFS_WRITE_PREDICT */
+
 /*
  * powerfs_apply_layout_to_inode - K3-1 将 FileLayout 解析结果应用到 inode
  *
@@ -1268,8 +1326,8 @@ void powerfs_free_inode(struct inode *inode)
     kfree(pi->chunks);
     pi->chunks = NULL;
 #ifdef CONFIG_POWERFS_WRITE_PREDICT
-    kfree(pi->dedup_chunks);
-    pi->dedup_chunks = NULL;
+    /* 幂等: evict 通常已销毁, 异常路径 (evict 未跑) 兜底 */
+    powerfs_write_predict_inode_destroy(pi);
 #endif
 
     /* K2: 释放 Inline 数据缓冲 */
@@ -1461,12 +1519,8 @@ void powerfs_evict_inode(struct inode *inode)
         kfree(pi->chunks);
     pi->chunks = NULL;
     pi->chunk_count = 0;
-#ifdef CONFIG_POWERFS_WRITE_PREDICT
-    if (pi->dedup_chunks && virt_addr_valid(pi->dedup_chunks))
-        kfree(pi->dedup_chunks);
-    pi->dedup_chunks = NULL;
-    pi->dedup_chunk_count = 0;
-#endif
+    /* write_predict 去重缓存 (dedup_chunks + pending xarray) 在 i_lock
+     * 释放后统一销毁 (wp_lock 独立, 避免锁嵌套). */
 
     /* K3-1: 释放 Stripe volume_ids 数组 (evict 时释放, 避免 slab 重分配后悬挂) */
     if (pi->volume_ids && virt_addr_valid(pi->volume_ids))
@@ -1506,6 +1560,11 @@ void powerfs_evict_inode(struct inode *inode)
     pi->dir_lease_epoch = 0;
     pi->shutdown = true;
     spin_unlock(&pi->i_lock);
+
+    /* 释放写预测去重缓存 (幂等; 在途 worker 持有 inode 引用, 此处必为空) */
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+    powerfs_write_predict_inode_destroy(pi);
+#endif
 
     /* 6. 清理目录缓存链表 (使用 dir_mutex, 不在 i_lock 下) */
     powerfs_clear_dir_entries(inode);

@@ -418,6 +418,8 @@ void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
     spin_lock(&conn->state_lock);
     old_state = conn->state;
     conn->state = new_state;
+    if (new_state == CONN_CONNECTED)
+        conn->ever_connected = 1;
     spin_unlock(&conn->state_lock);
 
     if (old_state != new_state)
@@ -476,6 +478,36 @@ void powerfs_conn_set_state(struct powerfs_net_server_conn *conn,
         wake_up(&conn->reconnect_wq);
 }
 EXPORT_SYMBOL_GPL(powerfs_conn_set_state);
+
+/*
+ * powerfs_conn_wait_initial - 等待后台懒连接完成首次建连.
+ *
+ * mount 时 pool_init 只保证至少一个 filer 连上, volume/其余 filer 的连接
+ * 由 reconnect work 后台建立; remount 后首个数据 IO 可能撞上 CONN_INIT/
+ * CONNECTING 而立即收到 -ENOTCONN. 此处在连接"从未连上过"时进行一次
+ * 有界等待 (CONNECTED 经 set_state 唤醒 reconnect_wq). 曾经连上过的
+ * 连接 (断连重连窗口) 不等待, 保留调用方快速失败/重试的既有语义.
+ */
+int powerfs_conn_wait_initial(struct powerfs_net_server_conn *conn)
+{
+    long timeout = msecs_to_jiffies(POWERFS_CONN_INITIAL_WAIT_MS);
+
+    if (!conn)
+        return -ENOTCONN;
+    if (READ_ONCE(conn->state) == CONN_CONNECTED)
+        return 0;
+    if (READ_ONCE(conn->ever_connected))
+        return -ENOTCONN;
+
+    wait_event_timeout(conn->reconnect_wq,
+                       READ_ONCE(conn->state) == CONN_CONNECTED ||
+                       READ_ONCE(conn->ever_connected) ||
+                       atomic_read(&g_pool.stopping),
+                       timeout);
+
+    return READ_ONCE(conn->state) == CONN_CONNECTED ? 0 : -ENOTCONN;
+}
+EXPORT_SYMBOL_GPL(powerfs_conn_wait_initial);
 
 /* === 3.5 v2: 调度器基础设施 + sk 回调 + 调度器收发 ===
  *
