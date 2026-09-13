@@ -802,6 +802,7 @@ set +e
 # host 端先算好 _idx (vm1→1, vm2→2), 嵌入到 VM 脚本的证书路径
 _idx=\"${vid##vm}\"
 CA=/etc/powerfs/ca.crt
+# vm1/vm2 各持独立客户端证书 (SAN 分别为 .100/.101), 由 share 目录下发
 CRT=/etc/powerfs/kernel-client-\${_idx}.crt
 KEY=/etc/powerfs/kernel-client-\${_idx}.key
 # Ensure IB net config: flush → addr → route (same priority rule as start_single)
@@ -811,9 +812,9 @@ ip addr add ${iip}/24 dev ib0
 ip route del 192.168.100.0/24 table main 2>/dev/null
 ip route add 192.168.100.0/24 dev ib0 proto kernel scope link src ${iip} metric 10 2>/dev/null
 # Sanity check RDMA link pingable via ib0 (only required for rdma transport)
-if [ \"${POWERFS_TRANSPORT}\" = \"rdma\" ] && ! ping -c 2 -W 1 -I ib0 192.168.100.3 >/dev/null 2>&1; then
-  echo 'IB_UNREACHABLE: cannot ping 192.168.100.3 via ib0'
-  echo 'current route:'; ip route get 192.168.100.3
+if [ \"${POWERFS_TRANSPORT}\" = \"rdma\" ] && ! ping -c 2 -W 1 -I ib0 ${POWERFS_MASTER_ADDR} >/dev/null 2>&1; then
+  echo "IB_UNREACHABLE: cannot ping ${POWERFS_MASTER_ADDR} via ib0"
+  echo 'current route:'; ip route get ${POWERFS_MASTER_ADDR}
   exit 2
 fi
 # Clean prior state
@@ -856,6 +857,11 @@ if [ -f "/mnt/host/kernel-client-\${_idx}.crt" ]; then
 fi
 if [ -f /mnt/host/powerfs.ko ]; then
   insmod /mnt/host/powerfs.ko && echo 'INSMOD_OK: /mnt/host/powerfs.ko'
+  # 下发本机对应的客户端证书 (SAN 与 ib0 IP 匹配, 否则 master 拒绝注册)
+  for f in ca.crt kernel-client-\${_idx}.crt kernel-client-\${_idx}.key; do
+    [ -f /mnt/host/\$f ] && cp -f /mnt/host/\$f /etc/powerfs/\$f
+  done
+  chmod 600 \$KEY 2>/dev/null
 else
   echo 'WARN_9P_FALLBACK: /mnt/host powerfs.ko missing - use builtin /powerfs.ko'
   insmod /powerfs.ko 2>/dev/null
