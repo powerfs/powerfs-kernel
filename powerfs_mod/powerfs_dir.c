@@ -214,6 +214,9 @@ void powerfs_flush_dirty_creates(struct inode *dir)
     count = dpi->dirty_create_count;
     list_replace_init(&dpi->dirty_creates, &tmp_list);
     dpi->dirty_create_count = 0;
+    /* 标记 flush in-flight: 摘链到 RPC 完成期间, 并发 lookup 必须等待,
+     * 不能穿透到服务端拿 ENOENT (read-your-writes 一致性). */
+    dpi->dirty_creates_flushing = true;
     spin_unlock(&dpi->dirty_creates_lock);
 
     /* 2. Build array for RPC (copy snapshots from list nodes) */
@@ -223,7 +226,9 @@ void powerfs_flush_dirty_creates(struct inode *dir)
         spin_lock(&dpi->dirty_creates_lock);
         list_splice(&tmp_list, &dpi->dirty_creates);
         dpi->dirty_create_count = count;
+        dpi->dirty_creates_flushing = false;
         spin_unlock(&dpi->dirty_creates_lock);
+        wake_up_all(&dpi->dirty_create_wait);
         queue_delayed_work(system_long_wq, &dpi->flush_work,
                            msecs_to_jiffies(POWERFS_DIRTY_FLUSH_RETRY_MS));
         return;
@@ -378,6 +383,14 @@ void powerfs_flush_dirty_creates(struct inode *dir)
         }
     }
 
+    /* flush 收尾 (成功/重试/放弃均流经此处): 清除 in-flight 标志并
+     * 唤醒在 read-your-writes 窗口内等待的 lookup. 成功时 BatchCreate
+     * 已提交, 等待方 retry lookup 必可命中. */
+    spin_lock(&dpi->dirty_creates_lock);
+    dpi->dirty_creates_flushing = false;
+    spin_unlock(&dpi->dirty_creates_lock);
+    wake_up_all(&dpi->dirty_create_wait);
+
     kfree(entries);
 }
 
@@ -507,9 +520,24 @@ void powerfs_flush_pending_create(struct inode *inode, bool force)
         return;
     }
 
-    if (S_ISDIR(dir->i_mode) && POWERFS_I(dir)->dirty_create_count > 0) {
-        pr_debug("powerfs: pre-data-sync flush dir=%lu for child ino=%lu\n",
-                 dir->i_ino, inode->i_ino);
+    if (S_ISDIR(dir->i_mode) &&
+        (POWERFS_I(dir)->dirty_create_count > 0 ||
+         POWERFS_I(dir)->dirty_creates_flushing)) {
+        /* 必须覆盖两种状态:
+         *  count>0: 批次还在链上 (100ms timer 未到), cancel+同步 flush;
+         *  flushing: flush worker 已摘链、BatchCreate RPC in-flight.
+         * 早期版本只判断 count>0, worker in-flight 时直接返回, 调用方
+         * (release/writeback 迁移) 随即向 Filer 发数据/布局 RPC, 与
+         * BatchCreate 形成跨连接乱序: reader 侧 lookup 会观察到最长
+         * 数十毫秒的 ENOENT 窗口 (高负载 writer 批量时必现).
+         * cancel_delayed_work_sync() 对正在执行的 workfn 会等待其跑完
+         * (含 RPC 完成 + flushing=false + wake_up), 因此返回后本文件的
+         * create 必然已 raft 提交; 紧接着再 flush 一次以兜住失败回链或
+         * worker 等待期间新入链的条目. */
+        pr_debug("powerfs: pre-data-sync flush dir=%lu for child ino=%lu count=%d flushing=%d\n",
+                 dir->i_ino, inode->i_ino,
+                 POWERFS_I(dir)->dirty_create_count,
+                 POWERFS_I(dir)->dirty_creates_flushing ? 1 : 0);
         cancel_delayed_work_sync(&POWERFS_I(dir)->flush_work);
         powerfs_flush_dirty_creates(dir);
     }
@@ -653,25 +681,44 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
          * file never transiently observes ENOENT for it inside the
          * deferred-flush window. On retry success the found-path below
          * runs; on persistent ENOENT the negative (uncached) path runs.
-         * Safe under dir i_rwsem read lock: flush only takes
-         * dirty_creates_lock + a BatchCreate RPC, never i_rwsem, so it
-         * cannot deadlock against the cancelled flush_work. */
-        if (err == -ENOENT &&
-            powerfs_has_pending_dirty_create(dir, dentry->d_name.name)) {
-            pr_info_ratelimited("powerfs: lookup '%pd' enoent but pending local create; flush+retry\n",
-                                dentry);
-            cancel_delayed_work_sync(&POWERFS_I(dir)->flush_work);
-            powerfs_flush_dirty_creates(dir);
-            ts_net = ktime_get_ns();
-            err = powerfs_net_lookup_timeout(dir->i_ino, dentry->d_name.name,
-                                              strlen(dentry->d_name.name),
-                                              &ino, &mode, &uid, &gid,
-                                              &size, &nlink,
-                                              &mtime, &atime, &ctime,
-                                              &volume_id, &file_key,
-                                              &lookup_layout,
-                                              timeout_ms);
-            net_dur_us = div_u64(ktime_get_ns() - ts_net, 1000);
+         *
+         * 同样需要覆盖 "flush in-flight" 窗口: flush 已把批次摘链
+         * (dirty_create_count 归 0, has_pending 为假) 但 BatchCreate RPC
+         * 尚未返回, 此刻并发 lookup 打向 Filer 仍得 ENOENT (4 路并发
+         * create+read 高负载必现). 检测 dirty_creates_flushing 后:
+         * cancel_delayed_work_sync 等回 worker 调用, wait_event 等回
+         * fsync/evict/rmdir 的直接调用, 再 flush 等待期间新入队批次.
+         * Safe under dir i_rwsem read lock: flush/wake 只取
+         * dirty_creates_lock + BatchCreate RPC, 从不取 i_rwsem. */
+        if (err == -ENOENT) {
+            struct powerfs_inode_info *ldpi = POWERFS_I(dir);
+            bool name_pending =
+                powerfs_has_pending_dirty_create(dir, dentry->d_name.name);
+            bool flush_inflight;
+
+            spin_lock(&ldpi->dirty_creates_lock);
+            flush_inflight = ldpi->dirty_creates_flushing;
+            spin_unlock(&ldpi->dirty_creates_lock);
+
+            if (name_pending || flush_inflight) {
+                pr_info_ratelimited("powerfs: lookup '%pd' enoent but local create pending=%d inflight=%d; wait+flush+retry\n",
+                                    dentry, name_pending, flush_inflight);
+                cancel_delayed_work_sync(&ldpi->flush_work);
+                wait_event_timeout(ldpi->dirty_create_wait,
+                    !READ_ONCE(ldpi->dirty_creates_flushing),
+                    msecs_to_jiffies(5000));
+                powerfs_flush_dirty_creates(dir);
+                ts_net = ktime_get_ns();
+                err = powerfs_net_lookup_timeout(dir->i_ino, dentry->d_name.name,
+                                                  strlen(dentry->d_name.name),
+                                                  &ino, &mode, &uid, &gid,
+                                                  &size, &nlink,
+                                                  &mtime, &atime, &ctime,
+                                                  &volume_id, &file_key,
+                                                  &lookup_layout,
+                                                  timeout_ms);
+                net_dur_us = div_u64(ktime_get_ns() - ts_net, 1000);
+            }
         }
 
         /* 断连/重连期间超时或网络不可达, 返回 -EAGAIN 让 VFS/应用层重试.
@@ -1119,6 +1166,21 @@ slow_path:
         struct powerfs_inode_info *pi = POWERFS_I(inode);
         spin_lock(&pi->i_lock);
         powerfs_apply_layout_to_inode(pi, &mknod_layout);
+        /* 同步 create 响应携带的是 Filer 权威布局:
+         *  - Inline: 直接标记对齐, 首写进 inline 缓冲, release 提交 inline;
+         *  - Flat/Stripe 但响应未预分配 volume (空 chunks): 不能直接走普通
+         *    Flat writeback (volume_id=0 会被跳过导致丢数), 标记未对齐,
+         *    首写先进 inline staging, release 时 align 迁移到 Volume
+         *    (与 fast-create BatchCreate 回填 placement 的路径一致);
+         *  - 无 Placement tag (旧 Filer): 保留 init 默认 (Flat+aligned). */
+        if (mknod_layout.has_placement &&
+            mknod_layout.placement != POWERFS_PLACEMENT_INLINE &&
+            pi->volume_id == 0) {
+            pi->layout_aligned = false;
+        } else if (mknod_layout.has_placement &&
+                   mknod_layout.placement == POWERFS_PLACEMENT_INLINE) {
+            pi->layout_aligned = true;
+        }
         spin_unlock(&pi->i_lock);
         /* P0-1 诊断: 创建时的布局状态 */
         pr_debug("powerfs: do_create '%pd' ino=%lu vid=%llu fkey=%llu placement=%u has_layout=%u\n",
@@ -1246,6 +1308,48 @@ int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
     if (!inode) {
         pr_warn("powerfs: rmdir '%pd' no inode\n", dentry);
         return -ENOENT;
+    }
+
+    /* 本地非空预检 (POSIX 语义, 必须先于 RPC):
+     * fast-create 的子文件/子目录可能还停留在本客户端的 pending
+     * BatchCreate 队列 (100ms 后台聚合窗口), 服务端此刻并不知道它们
+     * 存在, 仅靠服务端非空检查会把非空目录当成空目录删除, pending
+     * 子项随之成为孤儿 (touch f; rmdir dir 紧接执行时 100% 触发).
+     * dcache 中任何 positive 子 dentry (含未 flush 的新建项) 都算非空;
+     * negative dentry 不计. 跨客户端并发新建仍由服务端权威检查兜底. */
+    if (!simple_empty(dentry)) {
+        pr_debug("powerfs: rmdir '%pd' rejected locally: not empty\n", dentry);
+        return -ENOTEMPTY;
+    }
+
+    /* 本客户端 optimistic create 的子项目前只存在于 dirty_creates
+     * 聚合队列 (后台 100ms BatchCreate), 服务端此刻看不到它们.
+     * 进入本函数时 VFS 已持有: 父目录 i_rwsem (do_rmdir) 和被删目录
+     * 自身 i_rwsem (6.17 vfs_rmdir L4450), 与并发 create/mkdir 天然
+     * 串行 — 切勿在此再次 inode_lock(inode), 否则写锁递归自锁
+     * (hung_task → panic).
+     *
+     * 这里先同步 flush pending 子项. 注意 BatchCreate 按"被删目录
+     * inode"路由 raft shard, 而 RMDIR 按"父目录 inode"路由, 两者可能
+     * 落在不同 shard, flush 成功后立刻 RMDIR 仍可能因跨 shard 视图
+     * 窗口被判为空而误删. 因此 flush 前只要存在 pending 子项, flush
+     * 成功 (服务端已确认这些子项存在) 后直接返回 -ENOTEMPTY, 不再
+     * 依赖 RMDIR 的服务端空检查; flush 失败 (断连/OOM 重试中) 返回
+     * -EAGAIN. 跨客户端并发新建仍由下方 RMDIR 的服务端权威检查兜底. */
+    {
+        struct powerfs_inode_info *rpi = POWERFS_I(inode);
+
+        if (rpi->dirty_create_count > 0) {
+            cancel_delayed_work_sync(&rpi->flush_work);
+            powerfs_flush_dirty_creates(inode);
+            if (rpi->dirty_create_count > 0) {
+                pr_warn("powerfs: rmdir '%pd' deferred: %d local creates still unflushed\n",
+                        dentry, rpi->dirty_create_count);
+                return -EAGAIN;
+            }
+            /* 本客户端的 pending 子项已确认发布到服务端 → 目录必非空 */
+            return -ENOTEMPTY;
+        }
     }
 
     /*
@@ -1424,18 +1528,26 @@ int powerfs_atomic_open(struct inode *dir, struct dentry *dentry,
              *
              * For non-fast-path-eligible cases (e.g. special files), fall
              * back to the original network pre-lookup. */
-            if (dir_has_local_entry(dir, dentry->d_name.name)) {
+            if (dir_has_local_entry(dir, dentry->d_name.name) &&
+                !(flags & O_CREAT)) {
+                /* 非创建场景可直接信任本地条目; O_CREAT 必须走下方网络
+                 * 权威确认: readdir 在 Filer 删除可见性窗口内可能把刚
+                 * unlink 的同名条目 REFETCH_UN_DELETE 复活, 盲信会让
+                 * open(O_CREAT) 拿到 ENOENT 且吞掉创建语义 (数据丢失). */
                 pr_debug("powerfs: atomic_open '%pd' local dir_entry HIT → existing_lookup\n",
                          dentry);
                 d_lookup_done(dentry);
                 goto existing_lookup;
             }
-            /* Not in local dir_entries — skip pre-lookup RPC, go to create.
-             * Only do network pre-lookup for non-regular files or when the
-             * fast path is not available (pool empty + net connected). */
-            if (!S_ISREG(create_mode | S_IFREG) || !powerfs_net_is_connected()) {
+            /* O_CREAT (无 O_EXCL): 始终网络 pre-lookup 一次做权威存在性
+             * 判定 —— 命中已存在文件则打开, ENOENT 才真正创建;
+             * 非普通文件或 net 不可用时同样走 pre-lookup. */
+            if ((flags & O_CREAT) ||
+                !S_ISREG(create_mode | S_IFREG) ||
+                !powerfs_net_is_connected()) {
                 struct dentry *(*lookup_fn)(struct inode *, struct dentry *, unsigned int);
                 struct dentry *lres;
+                bool pre_enoent = false;
                 lookup_fn = (typeof(lookup_fn))dir->i_op->lookup;
                 pr_debug("powerfs: atomic_open '%pd' !O_EXCL → pre-lookup (non-fast-path)\n",
                          dentry);
@@ -1447,6 +1559,7 @@ int powerfs_atomic_open(struct inode *dir, struct dentry *dentry,
                                 dentry, lerr);
                         return (int)lerr;
                     }
+                    pre_enoent = true;
                     pr_debug("powerfs: atomic_open '%pd' pre-lookup ENOENT → creating\n",
                              dentry);
                 } else {
@@ -1457,8 +1570,15 @@ int powerfs_atomic_open(struct inode *dir, struct dentry *dentry,
                         d_lookup_done(dentry);
                         goto existing_lookup;
                     }
+                    pre_enoent = true;
                     pr_debug("powerfs: atomic_open '%pd' pre-lookup NULL (ENOENT no-cache) → creating\n",
                              dentry);
+                }
+                if (pre_enoent && (flags & O_CREAT) &&
+                    dir_has_local_entry(dir, dentry->d_name.name)) {
+                    /* 网络权威确认不存在且本地确有同名 active 条目: 必是
+                     * readdir 陈旧复活的幽灵, 标记删除后走正常 create. */
+                    powerfs_remove_dir_entry(dir, dentry->d_name.name);
                 }
             }
         }
@@ -2780,9 +2900,15 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
                 list_for_each_entry(de, &dpi->dir_entries, list) {
                     if (strcmp(de->name, ne->name) == 0) {
                         found = true;
-                        /* 如果本地标记为 deleted 但 Filer 仍返回该条目,
-                         * 说明文件被重建 (同名新 inode), un-delete 并更新元数据. */
-                        if (de->deleted) {
+                        /* 如果本地标记为 deleted 但 Filer 仍返回该条目:
+                         *  - 同名且 inode 不同: 文件被重建, un-delete 并
+                         *    更新元数据;
+                         *  - 同名且 inode 相同: 这是 Filer 删除可见性
+                         *    窗口的陈旧返回 (unlink raft 提交后短时间内
+                         *    readdir 仍可能看到旧条目), 必须保持 deleted,
+                         *    否则幽灵条目会让后续 open(O_CREAT) 误判文件
+                         *    存在而吞掉创建语义. 也不更新 fetch_epoch. */
+                        if (de->deleted && de->ino != ne->ino) {
                             pr_debug("powerfs: readdir REFETCH_UN_DELETE "
                                     "dir_ino=%lu name='%s' old_ino=%llu "
                                     "new_ino=%llu (Filer still has it, "
@@ -2792,10 +2918,12 @@ int powerfs_readdir(struct file *file, struct dir_context *ctx)
                             de->deleted = false;
                             de->ino = ne->ino;
                             de->type = ne->mode & S_IFMT;
+                            de->fetch_epoch = fetch_epoch;
+                        } else if (!de->deleted) {
+                            /* 标记本次 refetch 见过此条目 (Filer 仍返回该 name),
+                             * 防止下方 stale-active 清理把它误删. */
+                            de->fetch_epoch = fetch_epoch;
                         }
-                        /* 标记本次 refetch 见过此条目 (Filer 仍返回该 name),
-                         * 防止下方 stale-active 清理把它误删. */
-                        de->fetch_epoch = fetch_epoch;
                         break;
                     }
                 }

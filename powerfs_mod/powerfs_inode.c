@@ -335,6 +335,7 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
 {
     u64 *old_vids;
     u8 *old_inline;
+    bool preserve_stripe_arrays = false;
 
     if (!pi || !layout)
         return;
@@ -449,17 +450,58 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
      * Flat/Inline 模式不应携带 volume_ids, 但若误传则释放避免泄漏. */
     if (pi->placement == POWERFS_PLACEMENT_STRIPE ||
         pi->placement == POWERFS_PLACEMENT_WIDESTRIPE) {
-        pi->stripe_size = layout->stripe_size;
-        pi->stripe_count = layout->stripe_count;
-        pi->start_volume_idx = layout->start_volume_idx;
+        /* 不缩容保护: 文件只写了部分 stripe 轮次时 (如 80MB = unit0 64MB
+         * + unit1 16MB, 分配时一次拿到 4 个 unit), Filer 持久化的 anchors
+         * 只含写过的卷 (2 个). reopen/refresh 下发的 volume_ids 是本地的
+         * 真子集且 stripe_size 一致时, 保留本地 alloc 得到的完整卷集与
+         * base keys — 否则卷数组被缩窄, 后续写超过 N×stripe_size 时会
+         * 寻址到未分配的 needle. 布局真变更 (stripe_size 不同/含未知卷)
+         * 时照常接受服务端布局. */
+        if (pi->stripe_size > 0 &&
+            pi->stripe_size == layout->stripe_size &&
+            pi->volume_ids_count > layout->volume_ids_count &&
+            layout->volume_ids_count > 0 && pi->volume_ids) {
+            bool subset = true;
+            u32 a, b;
 
-        /* volume_ids 所有权转移: 先释放旧数组, 再挂载新数组 */
-        old_vids = pi->volume_ids;
-        pi->volume_ids = layout->volume_ids;
-        pi->volume_ids_count = layout->volume_ids_count;
-        layout->volume_ids = NULL;       /* 所有权转移, 防止 double-free */
-        layout->volume_ids_count = 0;
-        kfree(old_vids);
+            for (a = 0; a < layout->volume_ids_count; a++) {
+                bool found = false;
+                for (b = 0; b < pi->volume_ids_count; b++) {
+                    if (layout->volume_ids[a] == pi->volume_ids[b]) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    subset = false;
+                    break;
+                }
+            }
+            if (subset)
+                preserve_stripe_arrays = true;
+        }
+
+        if (preserve_stripe_arrays) {
+            pr_info("powerfs: apply_layout ino=%lu preserve local stripe arrays local_n=%u >= server_n=%u stripe_size=%llu\n",
+                    pi->netfs.inode.i_ino,
+                    pi->volume_ids_count, layout->volume_ids_count,
+                    (unsigned long long)pi->stripe_size);
+            kfree(layout->volume_ids);
+            layout->volume_ids = NULL;
+            layout->volume_ids_count = 0;
+        } else {
+            pi->stripe_size = layout->stripe_size;
+            pi->stripe_count = layout->stripe_count;
+            pi->start_volume_idx = layout->start_volume_idx;
+
+            /* volume_ids 所有权转移: 先释放旧数组, 再挂载新数组 */
+            old_vids = pi->volume_ids;
+            pi->volume_ids = layout->volume_ids;
+            pi->volume_ids_count = layout->volume_ids_count;
+            layout->volume_ids = NULL;       /* 所有权转移, 防止 double-free */
+            layout->volume_ids_count = 0;
+            kfree(old_vids);
+        }
         pr_debug("powerfs: STRIPE-LAYOUT ino=%lu stripe_sz=%llu count=%u start=%u vids=%u anchors=%u vid0=%llu vid1=%llu vid2=%llu\n",
                 pi->netfs.inode.i_ino,
                 (unsigned long long)pi->stripe_size, pi->stripe_count,
@@ -560,7 +602,7 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
                                             : POWERFS_CHUNK_SIZE;
             u64 chunks_per_unit = (stripe_sz && csz) ? (stripe_sz / csz) : 1;
 
-            if (nkeys > 0 && chunks_per_unit > 0) {
+            if (nkeys > 0 && chunks_per_unit > 0 && !preserve_stripe_arrays) {
                 /* apply_layout 在持 pi->i_lock (spinlock) 上下文调用, 用 GFP_ATOMIC.
                  * stripe_count 通常很小 (3-8), 分配易成功; 失败则 locate 回退 file_key. */
                 u64 *new_keys = kcalloc(nkeys, sizeof(u64), GFP_ATOMIC);
@@ -1159,6 +1201,8 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     INIT_LIST_HEAD(&pi->dirty_creates);
     pi->dirty_create_count = 0;
     INIT_DELAYED_WORK(&pi->flush_work, powerfs_flush_dirty_creates_work_fn);
+    pi->dirty_creates_flushing = false;
+    init_waitqueue_head(&pi->dirty_create_wait);
 
     /* ML 自适应预取初始化 (Phase A-0): cached=false, mb=0, version=0 */
     powerfs_readahead_inode_init(pi);

@@ -1880,6 +1880,7 @@ static int powerfs_migrate_inline_out(struct inode *inode,
             pi->volume_id = alloc_result.allocs[0];
             pi->file_key = alloc_result.allocs[1];
             pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+            pi->layout_aligned = true;   /* 同 Stripe 分支, 防止后续页误入 inline 分支 */
             kfree(pi->volume_ids);
             pi->volume_ids = NULL;
             pi->volume_ids_count = 0;
@@ -1911,6 +1912,9 @@ static int powerfs_migrate_inline_out(struct inode *inode,
         pi->file_key = alloc_result.allocs[1];
         pi->volume_id = alloc_result.allocs[0];
         pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+        /* 布局已确定: 后续 write_end 必须走普通 writeback, 否则仍落入
+         * inline staging 分支, pos>=8KB 时返回 -EFBIG 把文件截断在 12KB. */
+        pi->layout_aligned = true;
         kfree(pi->inline_data);
         pi->inline_data = NULL;
         pi->inline_len = 0;
@@ -1925,6 +1929,11 @@ static int powerfs_migrate_inline_out(struct inode *inode,
         pi->volume_id = alloc_result.volume_id;
         pi->file_key = alloc_result.file_key;
         pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+        /* 迁移完成即权威布局: 必须翻转 layout_aligned, 否则 write_end
+         * 的 (placement==INLINE || !layout_aligned) 条件仍成立, 后续页
+         * 继续进 inline staging, 在 pos>=INLINE_MAX 时 copied=0 返回
+         * -EFBIG, 大文件被永久截断在 12KB (3 页). */
+        pi->layout_aligned = true;
         kfree(pi->inline_data);
         pi->inline_data = NULL;
         pi->inline_len = 0;

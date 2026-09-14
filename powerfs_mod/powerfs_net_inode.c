@@ -1161,7 +1161,7 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
  *               + ChunkLayout(0xA4)]
  *
  * FileLayout 编码 (对齐 powerfs-layout codec.rs encode_file_layout):
- *   Placement: u8 tag (Flat=0, Inline=1, Stripe=2)
+ *   Placement: u8 tag (Inline=0, Flat=1, Stripe=2, WideStripe=3)
  *   Reliability: bytes [tag] (SingleReplica=0)
  *   ReliabilityState: u8 (PendingReplicated=0)
  *   ChunkLayout: bytes [tag=1(PerChunk), count u32 LE, ChunkRef * count]

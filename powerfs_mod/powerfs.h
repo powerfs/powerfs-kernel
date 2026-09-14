@@ -718,6 +718,12 @@ struct powerfs_inode_info {
     int dirty_create_count;
     int dirty_create_retries;  /* consecutive flush failure count */
     struct delayed_work flush_work;
+    /* flush 摘链 (count 归零) 到 BatchCreate RPC 完成之间为 true.
+     * 此窗口内并发 lookup 在服务端仍 ENOENT, 且 has_pending 因 count=0
+     * 失效 — read-your-writes 补丁需据此等待并重试 (高负载下 4 路
+     * 并发 create/read 必现). 配合 dirty_create_wait 等待队列. */
+    bool dirty_creates_flushing;
+    wait_queue_head_t dirty_create_wait;
 
     /* === 对齐 : 未 commit 的 async dirop / iop 链表 (Async DIROPS 核心) === */
     struct list_head i_unsafe_dirops;    /* uncommitted mds dir op 链表 */
