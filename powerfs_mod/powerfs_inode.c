@@ -51,6 +51,7 @@
  * them static (single-TU use) — only the forward symbol declaration is needed. */
 static const struct inode_operations powerfs_dir_inode_operations;
 static const struct inode_operations powerfs_file_inode_operations;
+static const struct inode_operations powerfs_symlink_inode_operations;
 
 /* ========== 异步 inode 刷新工作队列 ==========
  * 用于 powerfs_invalidate_one: 从 NOTIFY 回调中异步刷新 inode 元数据.
@@ -1108,7 +1109,7 @@ int powerfs_init_inode(struct inode *inode, umode_t mode,
         break;
 
     case S_IFLNK:
-        inode->i_op = &page_symlink_inode_operations;
+        inode->i_op = &powerfs_symlink_inode_operations;
         inode_nohighmem(inode);
         set_nlink(inode, 1);
         break;
@@ -2565,6 +2566,63 @@ static const struct inode_operations powerfs_file_inode_operations = {
     .listxattr      = powerfs_listxattr,
     .get_inode_acl  = powerfs_get_acl,  /* P0-3 fix: POSIX ACL get (文件 ACCESS ACL) */
     .set_acl        = powerfs_set_acl,  /* P0-3 fix: POSIX ACL set (setfacl 修改文件 ACL) */
-    .fileattr_get   = powerfs_fileattr_get,  /* P1-3: chattr/lsattr GETFLAGS/FSGETXATTR 回调 */
+    .fileattr_get   = powerfs_fileattr_get,  /* P1-3: chattr/lsattr GETFLAGS/FSSETXATTR 回调 */
     .fileattr_set   = powerfs_fileattr_set,  /* P1-3: chattr SETFLAGS/FSSETXATTR 回调 */
+};
+
+/* 符号链接 inode 操作
+ *
+ * 不使用 page_symlink_inode_operations: PowerFS symlink 目标存储在
+ * inline_data (Filer 侧 InlineData). page_symlink 依赖 page cache,
+ * 但 refresh_work 会 invalidate clean pages, 导致 page_get_link 回退到
+ * netfs_read_folio — 若 i_size=0 (Filer 未设 symlink size) 则返回空串,
+ * VFS 将空目标解释为"当前目录", 形成自引用循环 → ELOOP.
+ *
+ * 自定义 get_link 直接从 inline_data 读取目标, 绕过 page cache.
+ */
+static void powerfs_put_link(void *arg)
+{
+    kfree(arg);
+}
+
+static const char *powerfs_get_link(struct dentry *dentry, struct inode *inode,
+                                    struct delayed_call *done)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    char *copy;
+    u32 len;
+    const char *src;
+
+    /* RCU walk (dentry==NULL): 不能分配内存, 强制 REF walk */
+    if (!dentry)
+        return ERR_PTR(-ECHILD);
+
+    spin_lock(&pi->i_lock);
+    src = pi->inline_data;
+    len = pi->inline_len;
+    if (!src || len == 0) {
+        spin_unlock(&pi->i_lock);
+        /* inline_data 不可用: 回退到 page cache (page_symlink 路径) */
+        return page_get_link(dentry, inode, done);
+    }
+    /* REF walk: 可分配. 拷贝 inline_data 到稳定缓冲, 确保 NUL 终止 */
+    copy = kmalloc(len + 1, GFP_KERNEL);
+    if (!copy) {
+        spin_unlock(&pi->i_lock);
+        return ERR_PTR(-ENOMEM);
+    }
+    memcpy(copy, src, len);
+    copy[len] = '\0';
+    spin_unlock(&pi->i_lock);
+
+    set_delayed_call(done, powerfs_put_link, copy);
+    return copy;
+}
+
+static const struct inode_operations powerfs_symlink_inode_operations = {
+    .get_link       = powerfs_get_link,
+    .getattr        = powerfs_getattr,
+    .setattr        = powerfs_setattr,
+    .permission     = powerfs_permission,
+    .listxattr      = powerfs_listxattr,
 };
