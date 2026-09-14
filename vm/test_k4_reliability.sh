@@ -33,7 +33,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/fault_injection.sh"
 
-MNT=/mnt/pfs
+MNT=/mnt/powerfs
 FUSE_MNT=/mnt/powerfs           # FUSE 容器内挂载点 (fuse-1)
 FUSE_CONTAINER="fuse-1"         # FUSE 容器名 (docker-compose-single.yml)
 POWERFS_MOD_DIR="/home/portion/powerfs/kernel/powerfs_mod"

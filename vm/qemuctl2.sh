@@ -11,7 +11,7 @@
 #   MAC (TAP eth0):        52:54:00:12:34:56     52:54:00:12:34:58
 #   MAC (user-net eth1):   52:54:00:12:34:57     52:54:00:12:34:59
 #   eth0 (docker-net) IP:  172.30.0.100          172.30.0.101
-#   ib0 (IPoIB) IP:        192.168.100.100       192.168.100.101
+#   ib0 (IPoIB) IP:        192.168.100.51        192.168.100.52
 #   VFIO VF BDF:           自动探测 mlx5_1 的 前两个 VF (virtfn0, virtfn1)
 #
 # 用法:
@@ -89,7 +89,7 @@ VM1_NAME="${VM1_NAME:-vm1}"
 VM1_SSH_PORT="${VM1_SSH_PORT:-2223}"
 VM1_TAP="${VM1_TAP:-tap0}"
 VM1_ETH0_IP="${VM1_ETH0_IP:-172.30.0.100}"
-VM1_IB0_IP="${VM1_IB0_IP:-192.168.100.100}"
+VM1_IB0_IP="${VM1_IB0_IP:-192.168.100.51}"
 VM1_MAC0="${VM1_MAC0:-52:54:00:12:34:56}"
 VM1_MAC1="${VM1_MAC1:-52:54:00:12:34:57}"
 VM1_VF_IDX="${VM1_VF_IDX:-0}"   # virtfnN on mlx5_1 (0 = first VF)
@@ -99,7 +99,7 @@ VM2_NAME="${VM2_NAME:-vm2}"
 VM2_SSH_PORT="${VM2_SSH_PORT:-2224}"
 VM2_TAP="${VM2_TAP:-tap1}"
 VM2_ETH0_IP="${VM2_ETH0_IP:-172.30.0.101}"
-VM2_IB0_IP="${VM2_IB0_IP:-192.168.100.101}"
+VM2_IB0_IP="${VM2_IB0_IP:-192.168.100.52}"
 VM2_MAC0="${VM2_MAC0:-52:54:00:12:34:58}"
 VM2_MAC1="${VM2_MAC1:-52:54:00:12:34:59}"
 VM2_VF_IDX="${VM2_VF_IDX:-1}"   # virtfnN on mlx5_1 (1 = second VF)
@@ -114,6 +114,10 @@ VM2_CPUS="${VM2_CPUS:-9,11,13,15}"
 # SR-IOV PF: mlx5_1 (link ACTIVE, max 16 VFs)
 IB_PF_NAME="${IB_PF_NAME:-mlx5_1}"
 IB_NUM_VFS="${IB_NUM_VFS:-2}"  # need at least 2 for two VMs
+# VF GUID/link-state 是否由本脚本配置 (1=配置, 0=跳过).
+# 当 PF 上的 VF 已由其他栈 (如 unirdma) 分配 GUID 并在运行时, 设为 0
+# 以免重写在跑 VF 的 node_guid; 此时所选 VF 必须已绑 vfio-pci.
+IB_CONFIGURE_VF_GUID="${IB_CONFIGURE_VF_GUID:-1}"
 
 # ============================================================
 # 颜色输出
@@ -310,7 +314,7 @@ ensure_sriov_and_vfio() {
     # ============================================================
     local ib_iface
     ib_iface="$(ls "${pf_sysfs}/device/net/" 2>/dev/null | head -1)"
-    if [ -n "${ib_iface}" ]; then
+    if [ "${IB_CONFIGURE_VF_GUID}" = "1" ] && [ -n "${ib_iface}" ]; then
         # 解析 PF node guid 格式: 5c:25:73:03:00:cf:ea:a3, 保留前14 hex chars, 后2字节替换
         local pf_node
         pf_node="$(cat "${pf_sysfs}/node_guid" 2>/dev/null | tr ':' ' ')"
@@ -347,6 +351,8 @@ ensure_sriov_and_vfio() {
                 info "  VF${i} GUID + link-state OK ✓"
             fi
         done
+    elif [ "${IB_CONFIGURE_VF_GUID}" != "1" ]; then
+        info "  Skip VF GUID/link-state config (IB_CONFIGURE_VF_GUID=${IB_CONFIGURE_VF_GUID}) — VFs must be pre-configured"
     else
         warn "No IPoIB netdev for ${IB_PF_NAME} — cannot set VF GUIDs; VM-side RDMA may fail (no-SGID)"
     fi
@@ -667,7 +673,7 @@ cmd_start() {
         error "Expected ${IB_NUM_VFS} VF BDFs, got ${#BDFS[@]}: ${BDFS[*]}"
         exit 1
     fi
-    info "  VF0=${BDFS[0]}  VF1=${BDFS[1]}"
+    info "  VF0=${BDFS[0]}  VF1=${BDFS[1]}  (vm1→VF${VM1_VF_IDX}=${BDFS[VM1_VF_IDX]}  vm2→VF${VM2_VF_IDX}=${BDFS[VM2_VF_IDX]})"
 
     step "[2/5] Network: create TAP ${VM1_TAP}/${VM2_TAP} + bridge attach"
     ensure_taps || { error "TAP setup failed"; exit 1; }
@@ -678,11 +684,11 @@ cmd_start() {
 
     # start vm2 first (new VF), then vm1 — vm1 uses the VF the legacy config was using
     step "[4/5] Launch VM2 (SSH=:${VM2_SSH_PORT}, eth0=${VM2_ETH0_IP}, ib0=${VM2_IB0_IP})"
-    start_single vm2 "${BDFS[1]}"
+    start_single vm2 "${BDFS[VM2_VF_IDX]}"
     local vm2_rc=$?
 
     step "[5/5] Launch VM1 (SSH=:${VM1_SSH_PORT}, eth0=${VM1_ETH0_IP}, ib0=${VM1_IB0_IP})"
-    start_single vm1 "${BDFS[0]}"
+    start_single vm1 "${BDFS[VM1_VF_IDX]}"
     local vm1_rc=$?
 
     echo ""
@@ -802,7 +808,7 @@ set +e
 # host 端先算好 _idx (vm1→1, vm2→2), 嵌入到 VM 脚本的证书路径
 _idx=\"${vid##vm}\"
 CA=/etc/powerfs/ca.crt
-# vm1/vm2 各持独立客户端证书 (SAN 分别为 .100/.101), 由 share 目录下发
+# vm1/vm2 各持独立客户端证书 (SAN 含 ib0 .51/.52 与 eth0 .100/.101), 由 share 目录下发
 CRT=/etc/powerfs/kernel-client-\${_idx}.crt
 KEY=/etc/powerfs/kernel-client-\${_idx}.key
 # Ensure IB net config: flush → addr → route (same priority rule as start_single)
