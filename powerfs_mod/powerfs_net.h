@@ -325,6 +325,8 @@ enum powerfs_net_msg_type {
 #define POWERFS_NET_STATUS_ERR_BAD_FD      9
 #define POWERFS_NET_STATUS_ERR_SERVER      10
 #define POWERFS_NET_STATUS_ERR_REDIRECT    11  /* 响应体 Owner 字段携带 leader net 地址 "ip:port", 客户端需切换连接重试 */
+#define POWERFS_NET_STATUS_ERR_BAD_REQUEST 12
+#define POWERFS_NET_STATUS_ERR_STALE_LAYOUT 13 /* 客户端提交 inline_data 但 inode 已迁移为 Flat/Stripe, 需重新获取布局重试 */
 
 /* ========== TLV 字段 ID ========== */
 
@@ -1404,12 +1406,13 @@ int powerfs_net_alloc_inode_batch(__u64 shard_id, __u32 count,
  * (single Raft commit cycle for the whole batch).
  *
  * @shard_id:   parent directory's shard (all entries share this shard)
- * @entries:    array of powerfs_dirty_create snapshots
+ * @entries:    array of powerfs_dirty_create snapshots (placement_out is
+ *              written back from the response per-entry placement tags)
  * @count:      number of entries
  * @flushed:    out — number of entries successfully flushed
  * Returns 0 on success, negative errno on failure. */
 int powerfs_net_batch_create(__u64 shard_id,
-                             const struct powerfs_dirty_create *entries,
+                             struct powerfs_dirty_create *entries,
                              __u32 count, __u32 *flushed);
 
 /* UNLINK / RMDIR */

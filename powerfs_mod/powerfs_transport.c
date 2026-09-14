@@ -73,6 +73,7 @@ static int powerfs_net_status_to_errno(__u16 status)
     case POWERFS_NET_STATUS_ERR_NO_SPACE:    return -ENOSPC;
     case POWERFS_NET_STATUS_ERR_BAD_FD:      return -EBADF;
     case POWERFS_NET_STATUS_ERR_SERVER:      return -EREMOTEIO;
+    case POWERFS_NET_STATUS_ERR_STALE_LAYOUT: return -ESTALE;
     default:                                 return -EIO;
     }
 }

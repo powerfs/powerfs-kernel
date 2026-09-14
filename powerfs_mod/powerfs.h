@@ -473,6 +473,12 @@ struct powerfs_dirty_create {
     __u64 mtime;
     __u64 atime;
     char name[NAME_MAX + 1];
+    /* Output: TLV placement_tag from BatchCreate response
+     * (INLINE=0, FLAT=1, STRIPE=2, WIDE_STRIPE=3).
+     * 0 = Inline (default for kzalloc, or old Filer that doesn't report
+     * placement). The flush worker reads this to update the child inode's
+     * placement from the BatchCreate response backfill (#106 step 3). */
+    __u8 placement_out;
     struct list_head list;  /* -> parent dir's dirty_creates */
 };
 
@@ -609,6 +615,14 @@ struct powerfs_inode_info {
     u32 inline_len;             /* inline_data 实际长度 (字节) */
     u32 inline_max_size;        /* Inline 阈值 (从 Filer 获取, 默认 POWERFS_INLINE_MAX_SIZE) */
     bool inline_dirty;          /* inline_data 已修改, close 时需提交到 Filer */
+
+    /* 本地乐观创建 (fast-create) 的 inode 初始按 INLINE 处理, 但 Filer 的
+     * LayoutPredictor 可能在 CREATE 时就依据文件名把 storage_mode 决定为
+     * Flat/Stripe。BatchCreate 响应回填 placement_tag 后, flush worker 据此
+     * 更新 inode placement。false 表示尚未与 Filer 权威布局对齐 —
+     * powerfs_align_inline_before_commit 会据此决定是否需要迁移 inline_data。
+     * lookup/iget 得到的 inode 布局直接来自 Filer, 置 true。 */
+    bool layout_aligned;
 
     /* === K3: Stripe/WideStripe 多卷元数据 ===
      * 从 GETATTR/CREATE 响应解析, 由 powerfs_apply_layout_to_inode() 填充.
@@ -841,6 +855,13 @@ int powerfs_locate_chunk_for_read(struct powerfs_inode_info *pi, loff_t offset,
 
 int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
                          u64 *volume_id_out, u64 *needle_id_out);
+
+/* 提交 inline 数据前根据 BatchCreate 回填的 placement 完成布局对齐
+ * (防乐观创建文件被静默丢数据, #106 step 4)。
+ * 必须在 fsync/close 的 inline 提交之前、进程上下文 (可阻塞做 flush) 调用。
+ * 返回 0=仍为 Inline/无需处理, 1=已迁移为卷布局 (调用方应转走 Flat/Stripe
+ * 提交), <0=错误 (调用方应中止本次提交并保留 dirty)。 */
+int powerfs_align_inline_before_commit(struct inode *inode);
 
 /* K3-1: powerfs_apply_layout_to_inode - 将 FileLayout 解析结果应用到 inode
  *
@@ -1160,7 +1181,10 @@ struct powerfs_sb_info {
 #define POWERFS_DIRTY_FLUSH_THRESHOLD 32  /* flush when dirty_count >= this */
 #define POWERFS_DIRTY_FLUSH_TIMEOUT_MS 100  /*兜底 flush interval (ms) */
 #define POWERFS_DIRTY_FLUSH_RETRY_MS 200   /* retry interval on RPC failure */
-#define POWERFS_DIRTY_FLUSH_MAX_RETRIES 10  /* give up after this many failures */
+/* Must outlast filer shard leader election (observed ~5s after
+ * docker stop leader, allow headroom for a second round under load):
+ * 150 x 200ms = 30s. 旧值 10 (2s) 短于选举超时, failover 窗口内创建必丢. */
+#define POWERFS_DIRTY_FLUSH_MAX_RETRIES 150
 
 #define POWERFS_SB_INFO(sb) ((struct powerfs_sb_info *)(sb)->s_fs_info)
 

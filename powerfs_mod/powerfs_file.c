@@ -359,9 +359,6 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 
     pr_debug("powerfs: fsync ino=%lu start=%llu end=%llu datasync=%d i_size=%lld\n",
             inode->i_ino, start, end, datasync, i_size_read(inode));
-    pr_info("powerfs: [FSYNC75] fsync ENTER ino=%lu start=%llu end=%llu datasync=%d i_size=%lld\n",
-            inode->i_ino, (unsigned long long)start, (unsigned long long)end,
-            datasync, (long long)i_size_read(inode));
 
     /* 对齐  fsync 前置: 拿 FILE_WR + AUTH_EXCL 引用, flush dirty_caps.
      * 写回脏页前先确保服务端知道我们有脏态 (revoke 阻塞到 flush ACK). */
@@ -390,8 +387,19 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
         pr_warn("powerfs: fsync write_and_wait error: %d\n", ret);
         goto out_put;
     }
-    pr_info("powerfs: [FSYNC75] fsync AFTER write_and_wait ino=%lu i_size=%lld ret=%d\n",
-            inode->i_ino, (long long)i_size_read(inode), ret);
+
+    /* Bug A (#106) 修复: 乐观创建的 inode 本地按 INLINE 处理, 但 Filer 的
+     * LayoutPredictor 可能按文件名预测为 Flat/Stripe。BatchCreate 响应回填
+     * placement_tag 后, 本函数据其决定迁移策略。若已为卷布局则把 inline
+     * 缓冲迁出, 随后自然走下方 Flat/Stripe 提交。失败则中止 fsync (返回
+     * 错误给应用), 绝不能在布局未知时把 inline 提交当成功。 */
+    {
+        int aret = powerfs_align_inline_before_commit(inode);
+        if (aret < 0) {
+            ret = aret;
+            goto out_put;
+        }
+    }
 
     /* K2-5: Inline 模式 — 通过 UPDATE_INODE 同步 inline_data 到 Filer.
      * 复用 release 路径逻辑: 快照 inline_data → 锁外网络 I/O → 清 dirty.
@@ -916,6 +924,14 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
      * normally-created files or when the batch is already flushed. */
     powerfs_flush_pending_create(inode, false);
 
+    /* Bug A (#106) 修复: close 提交前根据 BatchCreate 回填的 placement 对齐
+     * 布局。乐观创建的 .bin 等可能被 Filer 置为 Flat/Stripe, 此时把 inline
+     * 缓冲迁到 Volume, 随后走下方 Flat 分支同步 size+chunks。失败则保留
+     * dirty 跳过本次提交 (VFS 忽略 release 返回值), 由后续 fsync/再次
+     * open-release 重试, 避免静默丢。 */
+    if (powerfs_align_inline_before_commit(inode) < 0)
+        return 0;
+
     /* Inline 模式 + dirty: 同步 inline_data 到 Filer (K2-5).
      * Flat 模式: 同步 size+chunks 到 Filer (对齐 FUSE sync_size_chunks_on_close).
      *   不同步的话 Filer 端 chunks 为空, remount/lookup 后 read locate 失败 (-EINVAL). */
@@ -1127,10 +1143,6 @@ int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
     bool is_stripe;
     int attempt, ret = -EIO;
 
-    pr_info("powerfs: [FSYNC75] sync_size_chunks(%s) ENTER ino=%lu i_size=%lld content_size=%llu placement=%d\n",
-            source, inode->i_ino, (long long)i_size_read(inode),
-            (unsigned long long)pi->content_size, pi->placement);
-
     if (pi->placement != POWERFS_PLACEMENT_FLAT &&
         pi->placement != POWERFS_PLACEMENT_STRIPE &&
         pi->placement != POWERFS_PLACEMENT_WIDESTRIPE)
@@ -1232,11 +1244,6 @@ int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
                     flush_keys[nk++] = chunks[cj].needle_id;
             }
             flush_ret = powerfs_net_flush_needles(vid, flush_keys, nk);
-            pr_info("powerfs: [FSYNC75] flush_needles(%s) ino=%lu vid=%llu nk=%u ret=%d keys=[",
-                    source, inode->i_ino, (unsigned long long)vid, nk, flush_ret);
-            for (cj = 0; cj < nk && cj < 8; cj++)
-                pr_cont("%llu%s", (unsigned long long)flush_keys[cj], cj < nk-1 ? "," : "");
-            pr_cont("]\n");
             if (flush_ret)
                 pr_warn("powerfs: sync_size_chunks(%s) ino=%lu flush_needles vid=%llu nk=%u failed: %d\n",
                         source, inode->i_ino, (unsigned long long)vid,

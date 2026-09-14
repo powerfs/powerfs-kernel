@@ -246,7 +246,7 @@ int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
     if (!pi->volume_id || !pi->file_key) {
         /* P0-1 诊断: FLAT 文件缺 volume_id/file_key 导致 writepage BW=0.
          * 打印完整 inode 状态帮助定位根因 (创建路径未设? refresh_work 覆盖?). */
-        pr_debug("powerfs: locate EINVAL ino=%lu placement=%u vid=%llu fkey=%llu chunks=%p chunk_count=%u volids=%p vid_count=%u offset=%lld\n",
+        pr_warn_ratelimited("powerfs: locate EINVAL ino=%lu placement=%u vid=%llu fkey=%llu chunks=%p chunk_count=%u volids=%p vid_count=%u ssz=%llu csz=%u offset=%lld\n",
                 pi->netfs.inode.i_ino, pi->placement,
                 (unsigned long long)pi->volume_id,
                 (unsigned long long)pi->file_key,
@@ -1264,6 +1264,9 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->inline_len = 0;
     pi->inline_max_size = 0;  /* GETATTR 响应覆盖, 或 apply_layout 时设默认值 */
     pi->inline_dirty = false;
+    /* 默认已对齐: lookup/iget 路径的布局直接来自 Filer。乐观 fast-create
+     * 会在置本地 INLINE 时显式改为 false。 */
+    pi->layout_aligned = true;
 
     /* 异步 setattr work (writeback offload) */
     INIT_WORK(&pi->setattr_work, powerfs_setattr_work_fn);

@@ -236,6 +236,18 @@ void powerfs_flush_dirty_creates(struct inode *dir)
     shard_id = shard_map_route(dir->i_ino);
     ret = powerfs_net_batch_create(shard_id, entries, count, &flushed);
 
+    /* Copy placement_out from the entries array back to the original list
+     * nodes. powerfs_net_batch_create writes placement tags into the
+     * entries[] copies (parsed from the BatchCreate response), but the
+     * ilookup loop below reads dc->placement_out from tmp_list originals. */
+    if (ret == 0) {
+        i = 0;
+        list_for_each_entry(dc, &tmp_list, list) {
+            dc->placement_out = entries[i].placement_out;
+            i++;
+        }
+    }
+
     if (ret == 0) {
         /* Success: the inodes are now visible on the Filer, so other
          * clients can look them up and open them. Retire the speculative
@@ -258,6 +270,41 @@ void powerfs_flush_dirty_creates(struct inode *dir)
                 bool need_grant, is_write;
 
                 spin_lock(&cpi->i_lock);
+                /* Backfill placement from the BatchCreate response (#106
+                 * step 3). The Filer's LayoutPredictor may have chosen
+                 * Flat/Stripe for this file (e.g. .bin → Flat).
+                 *
+                 * For Inline (placement_out=0): set layout_aligned=true
+                 * so the align function skips this inode — no migration
+                 * needed, inline_data is in the right place.
+                 *
+                 * For Flat/Stripe (placement_out!=0): set placement but
+                 * leave layout_aligned=false. The inline_data still lives
+                 * in the inode's inline buffer and must be migrated to a
+                 * Volume before the Flat release path can sync chunks.
+                 * Leaving layout_aligned=false lets the align function
+                 * (powerfs_align_inline_before_commit) run the migration
+                 * via powerfs_migrate_inline_out.
+                 *
+                 * Idempotent retry (placement_out=0 + kernel already
+                 * migrated to Flat/Stripe): cpi->placement != INLINE, so
+                 * the else-if doesn't fire — placement untouched. */
+                pr_debug("powerfs: BATCH_BACKFILL ino=%llu placement_out=%u cpi_placement=%u layout_aligned=%d inline_dirty=%d\n",
+                        dc->ino, dc->placement_out, cpi->placement,
+                        cpi->layout_aligned ? 1 : 0, cpi->inline_dirty ? 1 : 0);
+                if (dc->placement_out != 0) {
+                    if (cpi->placement != dc->placement_out) {
+                        cpi->placement = dc->placement_out;
+                        pr_debug("powerfs: batch_create backfill ino=%llu "
+                                "placement=%u\n", dc->ino,
+                                dc->placement_out);
+                    }
+                    /* layout_aligned stays false: align must migrate
+                     * inline_data → Volume before the Flat release path. */
+                } else if (cpi->placement == POWERFS_PLACEMENT_INLINE) {
+                    /* Inline confirmed by Filer — no GETATTR needed. */
+                    cpi->layout_aligned = true;
+                }
                 if (cpi->local_cap_granted) {
                     open_wr = cpi->i_nr_by_mode[POWERFS_FILE_MODE_WR] > 0;
                     open_rd = cpi->i_nr_by_mode[POWERFS_FILE_MODE_RD] > 0;
@@ -972,6 +1019,9 @@ static struct inode *__powerfs_do_create_core(struct mnt_idmap *idmap,
             /* Set Inline placement locally (same as Filer returns for new files) */
             pi->placement = POWERFS_PLACEMENT_INLINE;
             pi->inline_max_size = POWERFS_INLINE_MAX_SIZE;
+            /* Filer 的 LayoutPredictor 可能在 CREATE 时改判为 Flat/Stripe,
+             * BatchCreate 不回传该决定, 故首次提交 inline 数据前需对齐。 */
+            pi->layout_aligned = false;
             /* Mark as locally created — file_open and file_release skip RPCs */
             pi->local_cap_granted = true;
             pi->content_size = 0;

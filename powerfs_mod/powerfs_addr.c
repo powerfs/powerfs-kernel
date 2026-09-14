@@ -1257,7 +1257,14 @@ int powerfs_writepages(struct address_space *mapping,
      * 不清 xarray 的 PAGECACHE_TAG_DIRTY tag, 导致 refresh_work 的
      * mapping_tagged(PAGECACHE_TAG_DIRTY) 误判为有脏页, 跳过 page
      * cache invalidate, 其他客户端写入后本地读到旧数据. */
-    if (POWERFS_I(inode)->placement == POWERFS_PLACEMENT_INLINE) {
+    /* K2: Inline files (and FLAT/Stripe files whose volume hasn't been
+     * allocated yet — e.g. BatchCreate backfilled placement to FLAT but
+     * powerfs_migrate_inline_out hasn't run yet) skip Volume Server
+     * writeback. Data is in inline_data, submitted via the close/release
+     * path. Clearing dirty pages here lets filemap_write_and_wait_range
+     * succeed without spurious -EIO from locate_chunk(EINVAL). */
+    if (POWERFS_I(inode)->placement == POWERFS_PLACEMENT_INLINE ||
+        POWERFS_I(inode)->volume_id == 0) {
         struct folio_batch fbatch2;
         pgoff_t idx2 = wbc->range_start >> PAGE_SHIFT;
         pgoff_t end2 = wbc->range_end >> PAGE_SHIFT;
@@ -1374,8 +1381,6 @@ int powerfs_writepages(struct address_space *mapping,
             pr_debug("powerfs: WPAGES page ino=%lu offset=%lld i_size=%lld\n",
                     inode->i_ino, offset, i_size_read(inode));
             if (offset >= i_size_read(inode)) {
-                pr_info("powerfs: [FSYNC75] WPAGES SKIP offset=%lld >= i_size=%lld ino=%lu\n",
-                        (long long)offset, (long long)i_size_read(inode), inode->i_ino);
                 unlock_page(page);
                 continue;
             }
@@ -1985,6 +1990,86 @@ migrate_done:
 }
 
 /*
+ * powerfs_align_inline_before_commit - 提交 inline 数据前根据 BatchCreate
+ * 回填的 placement 完成布局对齐
+ *
+ * Bug A (#106) 三层修复 step 3/4:
+ *   BatchCreate 响应已回填 per-entry placement_tag (step 3), powerfs_dir.c
+ *   的 flush worker 已将 placement 写入 inode。本函数不再需要 GETATTR RPC
+ *   来发现 Filer 端布局 (step 4 移除 GETATTR-align workaround), 直接信任
+ *   BatchCreate 回填值:
+ *   - layout_aligned=true (BatchCreate 确认 Inline): 保持 inline 提交;
+ *   - placement=FLAT/Stripe, volume_id==0: 迁移 inline 缓冲到 Volume;
+ *   - placement=FLAT/Stripe, volume_id!=0: 已迁移, 无需处理;
+ *   - placement=INLINE 且 !layout_aligned (BatchCreate 未成功): 返回
+ *     -EAGAIN 保留 dirty, 由后续 fsync/再次 open-release 重试。
+ *
+ * 返回: 0 = 仍为 Inline 或无需对齐; 1 = 已迁移为卷布局; <0 = 错误。
+ */
+int powerfs_align_inline_before_commit(struct inode *inode)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    bool need_flush;
+    int ret;
+
+    spin_lock(&pi->i_lock);
+    if (pi->layout_aligned ||
+        !pi->inline_dirty || !pi->inline_data || pi->inline_len == 0) {
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+
+    /* BatchCreate 回填已完成迁移 */
+    if (pi->placement != POWERFS_PLACEMENT_INLINE && pi->volume_id != 0) {
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+
+    need_flush = (pi->placement == POWERFS_PLACEMENT_INLINE &&
+                  !pi->layout_aligned);
+    spin_unlock(&pi->i_lock);
+
+    /* 确保乐观 fast-create 的 BatchCreate 已提交 (幂等: 已发布则为 no-op)。
+     * BatchCreate 响应回填 placement_tag 到 inode, 之后即可根据 placement
+     * 决定迁移策略, 无需额外 GETATTR RPC。 */
+    if (need_flush)
+        powerfs_flush_pending_create(inode, false);
+
+    /* Flush 后重新检查: BatchCreate 回填可能已更新 placement/layout_aligned */
+    spin_lock(&pi->i_lock);
+    if (pi->layout_aligned) {
+        /* BatchCreate 确认 Inline, layout 已对齐 */
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+    if (pi->placement != POWERFS_PLACEMENT_INLINE && pi->volume_id != 0) {
+        /* BatchCreate 回填 FLAT/Stripe 且迁移已完成 */
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+    if (pi->placement != POWERFS_PLACEMENT_INLINE && pi->volume_id == 0) {
+        /* BatchCreate 回填 FLAT/Stripe, 迁移尚未执行 — 直接迁移 */
+        pi->layout_aligned = true;
+        spin_unlock(&pi->i_lock);
+        pr_debug("powerfs: ALIGN ino=%lu placement=%u — migrating inline buffer to volume\n",
+                inode->i_ino, pi->placement);
+        ret = powerfs_migrate_inline_out(inode, pi);
+        if (ret < 0) {
+            pr_warn("powerfs: ALIGN ino=%lu inline→volume migrate failed: %d (data kept dirty)\n",
+                    inode->i_ino, ret);
+            return ret;
+        }
+        return 1;
+    }
+    /* placement=INLINE && !layout_aligned: BatchCreate 未成功提交到 Filer,
+     * 无法安全提交 inline_data。返回 -EAGAIN 保留 dirty, 等待重试。 */
+    spin_unlock(&pi->i_lock);
+    pr_warn_ratelimited("powerfs: ALIGN ino=%lu BatchCreate not synced, keep dirty\n",
+            inode->i_ino);
+    return -EAGAIN;
+}
+
+/*
  * powerfs_write_end - 写结束 (Stage C: 纯 page cache 更新, 无网络 IO)
  *
  * 参照 xxx_write_end (fs/xxx/addr.c):
@@ -2009,9 +2094,8 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
     loff_t end_pos = pos + copied;
     unsigned int got_caps = (unsigned int)(uintptr_t)fsdata;
 
-    pr_debug("powerfs: WB_END ino=%lu pos=%lld copied=%u len=%u i_size=%lld uptodate=%d\n",
-            inode->i_ino, pos, copied, len, i_size_read(inode),
-            folio_test_uptodate(folio));
+    pr_debug("powerfs: WB_END ino=%lu pos=%lld copied=%u len=%u i_size=%lld placement=%u\n",
+            inode->i_ino, pos, copied, len, i_size_read(inode), pi->placement);
 
     if (copied > 0) {
         if (!folio_test_uptodate(folio)) {
@@ -2047,16 +2131,27 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
          *
          * 并发保护: 持 i_lock 修改 inline_data.
          * 注意: kvmalloc 在持 spinlock 时可能睡眠 (GFP_KERNEL),
-         * 因此先在锁外分配, 再持锁替换. */
-        if (pi->placement == POWERFS_PLACEMENT_INLINE) {
+         * 因此先在锁外分配, 再持锁替换.
+         *
+         * Fast-created files whose layout hasn't been aligned yet must always
+         * populate inline_data, even if a background BatchCreate flush
+         * backfilled placement to FLAT/Stripe between open and write (and
+         * cleared local_cap_granted in the process). The inline_data is the
+         * staging buffer — the align function migrates it to Volume when
+         * needed. Without this, data only lands in page cache and is lost
+         * when writepages skips Volume Server writeback for volume_id=0.
+         * layout_aligned is only set true by: (a) BatchCreate backfill for
+         * confirmed-Inline files, or (b) the align function after successful
+         * migration — so !layout_aligned reliably identifies files
+         * whose layout is still speculative. */
+        if (pi->placement == POWERFS_PLACEMENT_INLINE ||
+            !pi->layout_aligned) {
             size_t folio_off = offset_in_folio(folio, pos);
             size_t need_len = end_pos;
             u8 *new_buf = NULL;
 
-            /* K2: 仅首次写入(pos==0)输出日志, 避免 bs=1 时 8192 条日志淹没 serial */
-            if (pos == 0)
-                pr_debug("powerfs: WB_END INLINE first write ino=%lu copied=%u end=%zu\n",
-                        inode->i_ino, copied, end_pos);
+            pr_info("powerfs: WB_END_INLINE ino=%lu pos=%lld copied=%u need_len=%zu inline_data=%p inline_len=%u\n",
+                    inode->i_ino, pos, copied, need_len, pi->inline_data, pi->inline_len);
 
             /* K2-7: 检查是否超出 inline 硬上限 (8KB).
              * 超出时截断到 INLINE_MAX_SIZE, 写入后触发迁移到 Flat.
@@ -2118,7 +2213,7 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                 memcpy(pi->inline_data + pos, kaddr, copied);
                 kunmap_local(kaddr);
                 pi->inline_dirty = true;
-                pr_debug("powerfs: WB_END INLINE ino=%lu pos=%lld copied=%u inline_len=%u\n",
+                pr_info("powerfs: WB_END_INLINE_DONE ino=%lu pos=%lld copied=%u inline_len=%u inline_dirty=1\n",
                         inode->i_ino, pos, copied, pi->inline_len);
             }
             spin_unlock(&pi->i_lock);

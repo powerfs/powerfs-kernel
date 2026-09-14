@@ -1771,7 +1771,33 @@ xattr_flush_done:
         __u32 snap_len;
         __u64 shard_id;
         int attempt;
+        int aret;
         bool inline_synced = false;
+
+        /* Bug A (#106) 修复 (4KB 乐观创建文件 fsync 成功但 size=0):
+         * fast-create 本地按 INLINE 处理, 但 Filer 的 LayoutPredictor 可能
+         * 按文件名预测为 Flat/Stripe。BatchCreate 响应回填 placement_tag,
+         * 本函数据此决定迁移策略:
+         *   0 = Filer 确为 Inline, 继续下方 inline 同步;
+         *   1 = 已迁移为卷布局 (数据写入 Volume、placement 已切、页已 re-dirty),
+         *       跳过 inline UPDATE, 由调用方走 Flat/Stripe 的 writeback +
+         *       size/chunks 同步完成持久化;
+         *  <0 = 对齐/迁移失败: 保留 inline_dirty 并返回错误, 绝不当成功。 */
+        aret = powerfs_align_inline_before_commit(inode);
+        if (aret < 0) {
+            pr_warn_ratelimited("powerfs: cap_flush INLINE ino=%lu layout align failed: %d, keep inline_dirty\n",
+                                inode->i_ino, aret);
+            spin_lock(&pi->i_lock);
+            pi->inline_dirty = true;
+            spin_unlock(&pi->i_lock);
+            ret = ret ?: aret;
+            goto inline_flush_done;
+        }
+        if (aret > 0) {
+            pr_debug("powerfs: cap_flush INLINE ino=%lu migrated to volume layout before flush, skip inline update\n",
+                    inode->i_ino);
+            goto inline_flush_done;
+        }
 
         /* Snapshot inline_data under lock (network I/O cannot hold spinlock) */
         spin_lock(&pi->i_lock);
