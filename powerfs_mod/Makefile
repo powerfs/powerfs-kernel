@@ -89,6 +89,7 @@ ccflags-y += -Wno-format
 ccflags-y += -Wno-unused-result
 ccflags-y += -Wno-maybe-uninitialized
 ccflags-y += -Wno-error
+ccflags-y += -Wno-error=unused-label
 ccflags-y += -Wno-stack-protector
 ccflags-y += -Wframe-larger-than=8192
 ccflags-y += -I$(PWD)

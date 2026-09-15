@@ -2074,6 +2074,17 @@ static long powerfs_fallocate(struct file *file, int mode,
             if (pi->placement == POWERFS_PLACEMENT_INLINE)
                 pi->inline_dirty = true;
         }
+        /* PUNCH_HOLE changes file data without changing i_size. Update
+         * mtime/ctime so the subsequent setattr flush (AUTH_EXCL dirty,
+         * see falloc_done below) increments the server-side i_version.
+         * This triggers an Invalidate broadcast to other clients that hold
+         * stale pagecache (no active cap to recall); their next open /
+         * get_caps detects the version/mtime change and discards cached
+         * pages, forcing a re-fetch of the zeroed region. */
+        { struct timespec64 now = current_time(inode);
+          inode_set_mtime(inode, now.tv_sec, now.tv_nsec);
+          inode_set_ctime(inode, now.tv_sec, now.tv_nsec); }
+        mark_inode_dirty(inode);
         ret = 0;
     } else if (!(mode & FALLOC_FL_KEEP_SIZE)) {
         /* Default mode: extend file size */
@@ -2180,9 +2191,15 @@ falloc_done:
     inode_unlock(inode);
 
     /* fallocate 成功 (punch/extend) 后, 标记 EXCL/AUTH dirty.
-     * INLINE: inline_dirty 已在分支内置位, 这里额外 mark cap dirty 供 revoke 感知. */
-    if (ret == 0 && !(mode & FALLOC_FL_KEEP_SIZE))
-        powerfs_cap_mark_dirty(pi, POWERFS_CAP_AUTH_EXCL | POWERFS_CAP_FILE_EXCL);
+     * INLINE: inline_dirty 已在分支内置位, 这里额外 mark cap dirty 供 revoke 感知.
+     * PUNCH_HOLE: 仅标 AUTH_EXCL dirty, 推送 setattr(mtime) 到 Filer 以触发
+     * i_version 递增 + Invalidate 广播 (见上方 punch_hole 分支注释). */
+    if (ret == 0) {
+        if (!(mode & FALLOC_FL_KEEP_SIZE))
+            powerfs_cap_mark_dirty(pi, POWERFS_CAP_AUTH_EXCL | POWERFS_CAP_FILE_EXCL);
+        else if (mode & FALLOC_FL_PUNCH_HOLE)
+            powerfs_cap_mark_dirty(pi, POWERFS_CAP_AUTH_EXCL);
+    }
 
     if (got)
         powerfs_cap_put_refs(pi, got);

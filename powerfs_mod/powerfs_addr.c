@@ -2188,7 +2188,51 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
             if (!pi->inline_data || pi->inline_len < need_len) {
                 u8 *old = pi->inline_data;
                 u32 old_len = pi->inline_len;
+                loff_t cur_i_size = i_size_read(inode);
                 spin_unlock(&pi->i_lock);
+
+                /* MC-108 竞态修复: cap_revoke INLINE 路径会释放本地
+                 * inline_data 副本 (inline_data=NULL, inline_len=0) 但保留
+                 * i_size, 随后异步排队 powerfs_invalidate_one 刷新. 在 refresh
+                 * 完成前的窗口内, 另一客户端的 write 进入 write_end 会从空
+                 * buffer 重建, 导致 need_len=pos+copied 而非 i_size, 文件
+                 * 被缩小 (8192→4097), 原数据丢失.
+                 *
+                 * 仅在此竞态窗口 (old==NULL && i_size>0) 同步从 Filer 拉取
+                 * inline_data 重建 buffer, 普通路径 (old!=NULL 或 i_size==0)
+                 * 零开销.
+                 * 对齐 apply_layout 的 inline_data 所有权转移语义. */
+                if (!old && cur_i_size > 0) {
+                    struct powerfs_file_layout srv_layout;
+                    __u64 srv_size = 0;
+                    int gerr;
+
+                    memset(&srv_layout, 0, sizeof(srv_layout));
+                    gerr = powerfs_net_getattr(inode->i_ino,
+                                               NULL, NULL, NULL,
+                                               &srv_size, NULL,
+                                               NULL, NULL, NULL,
+                                               NULL, NULL,
+                                               &srv_layout,
+                                               NULL, NULL, NULL,
+                                               NULL, NULL);
+                    if (gerr == 0 && srv_layout.has_inline_data &&
+                        srv_layout.inline_data && srv_layout.inline_len > 0) {
+                        old = srv_layout.inline_data;
+                        old_len = srv_layout.inline_len;
+                        /* 所有权转移: 防止下方 kfree 释放 */
+                        srv_layout.inline_data = NULL;
+                        srv_layout.inline_len = 0;
+                        pr_info("powerfs: WB_END INLINE ino=%lu recovered "
+                                "inline_data from Filer (%u bytes, i_size=%lld)\n",
+                                inode->i_ino, old_len, cur_i_size);
+                        /* need_len 至少覆盖原文件大小, 防止缩小 */
+                        if (need_len < old_len)
+                            need_len = old_len;
+                    }
+                    /* srv_layout.inline_data 若未转移则释放避免泄漏 */
+                    kfree(srv_layout.inline_data);
+                }
 
                 /* 锁外分配 (GFP_KERNEL 可睡眠) */
                 new_buf = kvmalloc(need_len, GFP_KERNEL);
@@ -2198,6 +2242,7 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                     /* 分配失败不影响 page cache, writeback 仍会标脏页.
                      * inline_data 不更新, close 时可能丢失数据.
                      * 后续可回退到 Flat 模式. */
+                    kfree(old);
                     goto inline_done;
                 }
                 /* 拷贝旧数据到新 buffer */
@@ -2206,6 +2251,9 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                 /* 新区域清零 */
                 if (need_len > old_len)
                     memset(new_buf + old_len, 0, need_len - old_len);
+                /* 竞态恢复的 srv inline_data 已拷贝到 new_buf, 释放 */
+                kfree(old);
+                old = NULL; old_len = 0;
 
                 /* 持锁替换 */
                 spin_lock(&pi->i_lock);
@@ -2575,7 +2623,6 @@ static void powerfs_dio_write_worker(struct work_struct *work)
         result = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
                                     dw->pos, buf, dw->count, &written);
     }
-dio_write_done:
     kvfree(buf);
 
     if (result >= 0) {
@@ -2761,7 +2808,6 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
                 ret = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
                                          pos, buf, count, &chunk_written);
             }
-skip_write:
             kvfree(buf);
 
             if (ret < 0) {

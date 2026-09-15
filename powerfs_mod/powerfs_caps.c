@@ -1401,6 +1401,24 @@ void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
         }
     }
 
+    /* 4c. 非 INLINE 普通文件 (FLAT/STRIPE) 的 pagecache 失效.
+     * 当读/写数据 cap (FILE_SHARED/FILE_CACHE/FILE_WR/FILE_EXCL) 被回收时,
+     * 另一个客户端即将获得写权限 (punch_hole/truncate/write), 本地缓存的
+     * 干净页可能即将过期. 必须失效 pagecache, 强制下次 read 从 Filer 重新
+     * 拉取, 保证跨客户端可见性.
+     *
+     * INLINE 文件的 pagecache 失效已在步骤 4b 处理; 目录缓存在步骤 4 处理.
+     * 步骤 2 已 flush 全部脏数据, 此处 invalidate_mapping_pages 只丢弃干净页
+     * (非阻塞, 自动跳过 dirty/locked 页). */
+    if (S_ISREG(inode->i_mode) &&
+        pi->placement != POWERFS_PLACEMENT_INLINE &&
+        (revoking & (POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_CACHE |
+                     POWERFS_CAP_FILE_WR | POWERFS_CAP_FILE_EXCL))) {
+        spin_unlock(&pi->i_lock);
+        invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
+        spin_lock(&pi->i_lock);
+    }
+
     /* 5. §13.4.2: 发 CapRecallAck 到 Filer, 证明 flush 完成 + issued 已降级.
      *    服务端收到 ACK 才会完成 recall 流程, 将 EXCLUSIVE 权限授予新申请者.
      *    注意: RPC 不能在 spinlock 下执行, 临时释放 i_lock (此时已无 shared
