@@ -1872,7 +1872,9 @@ int powerfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
      * 导致 -EINVAL, 因为 Inline 文件无 needle). */
     {
         size_t target_len = strlen(symname) + 1;
-        u8 *buf = kvmalloc(target_len, GFP_KERNEL);
+        /* kmalloc 而非 kvmalloc: inline_data 在全模块统一用 kfree 释放
+         * (evict/cap revoke), 分配器必须一致. */
+        u8 *buf = kmalloc(target_len, GFP_KERNEL);
         if (buf) {
             memcpy(buf, symname, target_len);
             spin_lock(&pi->i_lock);

@@ -2189,6 +2189,13 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                 u8 *old = pi->inline_data;
                 u32 old_len = pi->inline_len;
                 loff_t cur_i_size = i_size_read(inode);
+                /* 在锁内摘掉指针并转移所有权: 重建 buffer 的窗口内,
+                 * cap revoke 等并发路径可能释放/替换 inline_data。
+                 * 摘指针后本函数对 old 负唯一释放责任, 避免重建完成时
+                 * 再次 kfree(pi->inline_data) 造成 double-free
+                 * (SLUB: "0 allocated objects but 1 are to be freed"). */
+                pi->inline_data = NULL;
+                pi->inline_len = 0;
                 spin_unlock(&pi->i_lock);
 
                 /* MC-108 竞态修复: cap_revoke INLINE 路径会释放本地
@@ -2234,14 +2241,24 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                     kfree(srv_layout.inline_data);
                 }
 
-                /* 锁外分配 (GFP_KERNEL 可睡眠) */
-                new_buf = kvmalloc(need_len, GFP_KERNEL);
+                /* 锁外分配 (GFP_KERNEL 可睡眠).
+                 * 必须用 kmalloc 而非 kvmalloc: need_len <= INLINE_MAX_SIZE
+                 * (8KB), 而全模块 (cap revoke / evict_inode / 迁移等) 对
+                 * inline_data 一律 kfree; kvmalloc 在 size>PAGE_SIZE 且内存
+                 * 紧张时会返回 vmalloc 指针, kfree 无法识别, 同样会损坏 slab. */
+                new_buf = kmalloc(need_len, GFP_KERNEL);
                 if (!new_buf) {
-                    pr_warn("powerfs: WB_END INLINE ino=%lu kvmalloc %zu failed\n",
+                    pr_warn("powerfs: WB_END INLINE ino=%lu kmalloc %zu failed\n",
                             inode->i_ino, need_len);
-                    /* 分配失败不影响 page cache, writeback 仍会标脏页.
-                     * inline_data 不更新, close 时可能丢失数据.
-                     * 后续可回退到 Flat 模式. */
+                    /* 指针已在锁内摘除; OOM 时把 old 挂回去保持原状.
+                     * 若并发路径已重新安装 buffer, 则释放 old. */
+                    spin_lock(&pi->i_lock);
+                    if (!pi->inline_data) {
+                        pi->inline_data = old;
+                        pi->inline_len = old_len;
+                        old = NULL;
+                    }
+                    spin_unlock(&pi->i_lock);
                     kfree(old);
                     goto inline_done;
                 }
@@ -2251,17 +2268,21 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                 /* 新区域清零 */
                 if (need_len > old_len)
                     memset(new_buf + old_len, 0, need_len - old_len);
-                /* 竞态恢复的 srv inline_data 已拷贝到 new_buf, 释放 */
+                /* old 的唯一释放点 (已在锁内从 pi->inline_data 摘除,
+                 * 下方持锁安装时绝不再 kfree(pi->inline_data)). */
                 kfree(old);
                 old = NULL; old_len = 0;
 
-                /* 持锁替换 */
+                /* 持锁安装: 重建窗口内若有并发路径重新安装了 buffer
+                 * (cap revoke 只会置 NULL; 非 NULL 说明被抢先), 保留
+                 * 后来者, 本函数的 new_buf 交给锁外统一 kfree. */
                 spin_lock(&pi->i_lock);
-                kfree(pi->inline_data);
-                pi->inline_data = new_buf;
-                pi->inline_len = need_len;
-                /* new_buf 所有权已转移, 防止下方 kfree */
-                new_buf = NULL;
+                if (!pi->inline_data) {
+                    pi->inline_data = new_buf;
+                    pi->inline_len = need_len;
+                    /* new_buf 所有权已转移, 防止下方 kfree */
+                    new_buf = NULL;
+                }
             }
 
             /* 从 folio 拷贝写入的数据到 inline_data */
