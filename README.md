@@ -101,6 +101,41 @@ make clean && make -j$(nproc)
 # Output: powerfs.ko
 ```
 
+### DKMS install (auto-rebuild on kernel upgrades)
+
+For machines that keep the module across kernel updates, install it as a
+DKMS package — the distro dkms hook then rebuilds powerfs.ko automatically
+whenever a new kernel is installed:
+
+```bash
+cd powerfs_mod
+sudo ./dkms.sh install        # stages to /usr/src, dkms add/build/install
+sudo modprobe powerfs
+```
+
+`./dkms.sh` also supports `build` (compile only, no `/lib/modules` install),
+`status`, and `uninstall`. To build against a custom kernel source tree,
+expose it at the standard location first — dkms 2.8's
+`--kernelsourcedir` path runs `make mrproper` and fails on 6.17 (the
+`prepare-all` target was removed):
+
+```bash
+sudo ln -s /path/to/linux-6.17 /lib/modules/6.17.0/build
+sudo ./dkms.sh build -k 6.17.0
+```
+
+Prerequisites:
+
+- Linux 6.17+ (`BUILD_EXCLUSIVE_KERNEL` in `dkms.conf` rejects older kernels)
+- prepared kernel headers/build tree at `/lib/modules/$(uname -r)/build`
+- the kernel must export the `simple_xattr_*` symbols — custom kernels need
+  `patches/export-simple-xattr-symbols-linux-6.17.patch` applied at kernel
+  build time
+- RDMA transport (`powerfs_net_rdma.o`) is compiled automatically when the
+  target kernel has `CONFIG_INFINIBAND=y/m`; without it the module builds
+  TCP-only
+- on Secure Boot hosts the module must be MOK-signed before `modprobe`
+
 ### Static verification
 
 ```bash
