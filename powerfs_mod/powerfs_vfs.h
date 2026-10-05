@@ -104,6 +104,16 @@ int powerfs_file_open(struct inode *inode, struct file *file);
  * committed before the recall ACK promotes another client. */
 int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
                                    int max_attempts);
+/* MC-108 Task 3: INLINE 文件同步提交 inline_data 到 Filer.
+ * 提交语义: size = max(i_size, inline_data_end), 负载按该 size 零扩展
+ * (truncate/fallocate 扩展后仅低偏移有写入时, 高区零洞随提交一并持久化);
+ * 快照-提交-清脏全程以 pi->inline_seq 判并发: 成功且代际未变才清
+ * inline_dirty, 失败/代际变化一律保留脏标供后续重放.
+ * max_attempts: RPC 尝试次数 (500ms×attempt 退避, 对齐 FUSE release);
+ * 快照竞争 (-EAGAIN) 每次尝试内最多重取 3 次, 不计入 max_attempts.
+ * 返回 0=已提交 (或本无数据), 负 errno=未提交 (dirty 保留). */
+int powerfs_inline_commit_sync(struct inode *inode, const char *source,
+                               int max_attempts);
 int powerfs_lock(struct file *filp, int cmd, struct file_lock *fl);
 int powerfs_flock(struct file *filp, int cmd, struct file_lock *fl);
 int powerfs_dir_fsync(struct file *file, loff_t start, loff_t end, int datasync);

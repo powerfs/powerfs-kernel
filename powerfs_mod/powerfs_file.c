@@ -46,6 +46,159 @@
 #include "powerfs_write_predict.h"
 #include <linux/crc32.h>        /* crc32_le (写预测指纹计算) */
 
+/* ========== MC-108 Task 3: inline 同步提交 helper ========== */
+
+int powerfs_inline_commit_sync(struct inode *inode, const char *source,
+                               int max_attempts)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    u64 ino = inode->i_ino;
+    u32 i_size;
+    u8 *snap_data = NULL;
+    u32 snap_len = 0;
+    u32 snap_seq = 0;
+    u32 snap_map = 0;       /* MC-108 Task 5: 快照脏 4K 块位图 */
+    u64 shard_id;
+    int attempt, snap_retry;
+    int ret = 0;
+    bool synced = false;
+
+    /* 前置条件: Inline 模式 + dirty */
+    spin_lock(&pi->i_lock);
+    if (pi->placement != POWERFS_PLACEMENT_INLINE || !pi->inline_dirty) {
+        spin_unlock(&pi->i_lock);
+        return 0;               /* 无数据需提交 */
+    }
+    spin_unlock(&pi->i_lock);
+
+    /* 提交 size = max(i_size, inline_data_end).
+     * i_size 可能大于 inline_len (truncate/fallocate 扩展后仅低偏移写入,
+     * 或仅扩展未写入) — 高区零洞必须随提交持久化, 否则 Filer 端 size 偏小
+     * 导致零区丢失 (MC-108 Task 3). INLINE 文件 size 必然 <= INLINE_MAX. */
+    {
+        loff_t sz = i_size_read(inode);
+        if (sz > POWERFS_INLINE_MAX_SIZE) {
+            pr_warn_ratelimited("powerfs: inline_commit ino=%lu i_size=%lld > INLINE_MAX=%d, clamp\n",
+                                ino, sz, POWERFS_INLINE_MAX_SIZE);
+            sz = POWERFS_INLINE_MAX_SIZE;
+        }
+        i_size = (u32)sz;
+    }
+    shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
+
+    for (attempt = 1; attempt <= max_attempts; attempt++) {
+        /* --- 快照阶段: 锁内校验 seq+len 不变后拷贝 --- */
+        bool snap_ok = false;
+        u32 snap_data_len = 0;  /* 快照中实际数据长度 (零洞起点) */
+
+        for (snap_retry = 0; snap_retry < 3; snap_retry++) {
+            u32 cur_len;
+            u32 cur_seq;
+            u32 need;
+
+            spin_lock(&pi->i_lock);
+            cur_len = pi->inline_len;
+            cur_seq = pi->inline_seq;
+            spin_unlock(&pi->i_lock);
+
+            /* 快照缓冲需覆盖 max(cur_len, i_size) (零洞区也要提交) */
+            need = max(cur_len, i_size);
+            if (need == 0) {
+                /* dirty 但 size=0 且无数据 (异常残留): 清 dirty */
+                spin_lock(&pi->i_lock);
+                if (pi->inline_seq == cur_seq) {
+                    pi->inline_dirty = false;
+                    powerfs_inline_dirty_map_reset(pi);
+                }
+                spin_unlock(&pi->i_lock);
+                ret = 0;
+                synced = true;
+                goto out;
+            }
+            if (snap_len != need) {
+                u8 *new_buf = krealloc(snap_data, need, GFP_KERNEL);
+
+                if (!new_buf) {
+                    ret = -ENOMEM;
+                    goto out;
+                }
+                snap_data = new_buf;
+                snap_len = need;
+            }
+
+            spin_lock(&pi->i_lock);
+            if (pi->inline_len == cur_len && pi->inline_seq == cur_seq) {
+                /* 代际匹配: 拷贝实际数据区, 高区零洞在锁外统一 memset */
+                if (cur_len > 0 && pi->inline_data)
+                    memcpy(snap_data, pi->inline_data, cur_len);
+                snap_data_len = cur_len;
+                snap_seq = cur_seq;
+                /* MC-108 Task 5: 快照脏位图 — 提交成功后按位清除 */
+                snap_map = pi->inline_dirty_map;
+                snap_ok = true;
+            }
+            spin_unlock(&pi->i_lock);
+            if (snap_ok)
+                break;
+            /* 代际变化: 重取 (最多 3 次, 不计入 RPC 尝试) */
+        }
+        if (!snap_ok) {
+            ret = -EAGAIN;
+            goto next_attempt;
+        }
+
+        /* 零扩展: [snap_data_len, snap_len) 清零 — snap_len =
+         * max(inline_data_end, i_size), 高区是 truncate/fallocate 扩展
+         * 产生但从未写入的零洞, 必须随提交持久化 (MC-108 Task 3). */
+        if (snap_len > snap_data_len)
+            memset(snap_data + snap_data_len, 0, snap_len - snap_data_len);
+
+        ret = powerfs_net_update_inode_size_chunks(
+                shard_id, powerfs_inode_io_ino(inode),
+                (__u64)snap_len,
+                source ? source : "kernel",
+                NULL, 0,
+                snap_data, snap_len,
+                &snap_map);
+
+        if (ret == 0) {
+            synced = true;
+            break;
+        }
+
+next_attempt:
+        if (attempt < max_attempts)
+            msleep(500 * attempt);
+    }
+
+out:
+    kfree(snap_data);
+
+    if (synced) {
+        /* 成功 + 代际未变 → 清 dirty; 代际变化说明提交在飞期间有新写,
+         * 保留 dirty 供下一次 fsync/close/recall 重放. */
+        spin_lock(&pi->i_lock);
+        if (pi->inline_seq == snap_seq) {
+            pi->inline_dirty = false;
+            /* MC-108 Task 5: 清除本次提交已持久化的脏块位. 提交在飞期间
+             * 的新写 (seq 变化) 置的位不在 snap_map 中, 自然保留. */
+            pi->inline_dirty_map &= ~snap_map;
+            pr_debug("powerfs: inline_commit ino=%lu synced size=%u seq=%u map=0x%x (%s)\n",
+                     ino, snap_len, snap_seq, snap_map,
+                     source ? source : "kernel");
+        } else {
+            pr_debug("powerfs: inline_commit ino=%lu synced but seq changed (%u->%u), keep dirty\n",
+                     ino, snap_seq, pi->inline_seq);
+        }
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+
+    pr_warn_ratelimited("powerfs: inline_commit ino=%lu FAILED after %d attempts: %d (%s)\n",
+                        ino, max_attempts, ret, source ? source : "kernel");
+    return ret;
+}
+
 /* ========== 文件操作 ========== */
 
 /*
@@ -106,60 +259,26 @@ static int powerfs_flush(struct file *file, fl_owner_t id)
      *
      * dirty_after 判据与 had_dirty 对称 (Linux 6.17 基线)。 */
     if (had_dirty) {
-        bool inline_dirty_after;
         bool pages_dirty_after;
-        spin_lock(&pi->i_lock);
-        inline_dirty_after = (pi->placement == POWERFS_PLACEMENT_INLINE &&
-                              pi->inline_dirty);
-        spin_unlock(&pi->i_lock);
         pages_dirty_after = (inode->i_state & I_DIRTY_PAGES) != 0;
 
-        if (!(inline_dirty_after || pages_dirty_after)) {
-            if (pi->placement == POWERFS_PLACEMENT_INLINE && pi->inline_dirty) {
-                /* INLINE 路径 — 复用 release 骨架的快照+网络提交。
-                 * flush 只做 1 次尝试；失败下次 release 重试兜底。 */
-                u8 *snap_data = NULL;
-                u32 snap_len = 0;
-                u64 shard_id;
-
-                spin_lock(&pi->i_lock);
-                if (pi->inline_data && pi->inline_len > 0)
-                    snap_len = pi->inline_len;
-                spin_unlock(&pi->i_lock);
-
-                if (snap_len > 0) {
-                    snap_data = kmalloc(snap_len, GFP_KERNEL);
-                    if (!snap_data) {
-                        sync_ret = -ENOMEM;
-                        goto flush_out;
-                    }
-                    spin_lock(&pi->i_lock);
-                    if (pi->inline_data && pi->inline_len == snap_len) {
-                        memcpy(snap_data, pi->inline_data, snap_len);
-                    } else {
-                        spin_unlock(&pi->i_lock);
-                        kfree(snap_data);
-                        goto flush_out; /* concurrent inode changed */
-                    }
-                    spin_unlock(&pi->i_lock);
-
-                    shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
-                    sync_ret = powerfs_net_update_inode_size_chunks(shard_id, ino,
-                                                                    (u64)snap_len,
-                                                                    "kernel-flush",
-                                                                    NULL, 0,
-                                                                    snap_data, snap_len);
-                    kfree(snap_data);
-                    if (sync_ret == 0) {
-                        /* 不清 inline_dirty：release 会重新查 dirty，安全重复提交
-                         * (相同 size+data 幂等)；清掉反而可能让 release 跳过。 */
-                        pr_debug("powerfs: FLUSH INLINE ino=%lu synced ok\n", ino);
-                    } else {
-                        pr_warn("powerfs: FLUSH INLINE ino=%lu update err=%d "
-                                "(release path will retry)\n", ino, sync_ret);
-                    }
-                }
-            } else if (pi->placement == POWERFS_PLACEMENT_FLAT && pi->volume_id && pi->file_key) {
+        /* MC-108 Task 3: Inline 文件不走 "dirty cleared" 守卫.
+         * writepages 对 Inline 不提交 Filer (或仅在 WB_SYNC_ALL 时提交),
+         * 故 inline_dirty 不会因 writepages 清除; 若套用这个守卫,
+         * inline_dirty_after 始终为 true → 同步永远被跳过. */
+        if (pi->placement == POWERFS_PLACEMENT_INLINE) {
+            /* flush 只做 1 次尝试; 失败由 release 重试兜底.
+             * helper 内部幂等: inline_dirty==false 时直接返回 0. */
+            sync_ret = powerfs_inline_commit_sync(inode, "kernel-flush", 1);
+            if (sync_ret)
+                pr_warn("powerfs: FLUSH INLINE ino=%lu err=%d (release will retry)\n",
+                        ino, sync_ret);
+        } else if (pages_dirty_after) {
+            /* FLAT/Stripe: 仍有脏页未写回 (writepages 被限流/断连),
+             * 跳过 sync 避免 stale size 覆盖服务端更大值. */
+            pr_debug("powerfs: FLUSH ino=%lu pages still dirty after writeback, skip sync\n",
+                     ino);
+        } else if (pi->placement == POWERFS_PLACEMENT_FLAT && pi->volume_id && pi->file_key) {
                 /* FLAT/Stripe 路径 — 复用 RELEASE FLAT 骨架：
                  * 构造 chunk_map 数组 + powerfs_net_update_inode_size_chunks。 */
                 loff_t i_size = i_size_read(inode);
@@ -168,9 +287,9 @@ static int powerfs_flush(struct file *file, fl_owner_t id)
                 u32 chunk_count, i;
                 struct powerfs_chunk_map *chunks = NULL;
 
-                /* content_size 未变 → 上次已提交过，跳过避免 clobber */
+                /* content_size 未变且本地 chunk 映射已发布 → 跳过避免 clobber */
                 spin_lock(&pi->i_lock);
-                if ((u64)i_size == pi->content_size) {
+                if ((u64)i_size == pi->content_size && !pi->chunks_dirty) {
                     spin_unlock(&pi->i_lock);
                     goto flush_out;
                 }
@@ -202,11 +321,12 @@ static int powerfs_flush(struct file *file, fl_owner_t id)
                                                                 (u64)i_size,
                                                                 "kernel-flush",
                                                                 chunks, chunk_count,
-                                                                NULL, 0);
+                                                                NULL, 0, NULL);
                 kfree(chunks);
                 if (sync_ret == 0) {
                     spin_lock(&pi->i_lock);
                     pi->content_size = (u64)i_size;
+                    pi->chunks_dirty = false;
                     spin_unlock(&pi->i_lock);
                     pr_debug("powerfs: FLUSH FLAT ino=%lu size=%lld chunks=%u ok\n",
                              ino, i_size, chunk_count);
@@ -226,7 +346,7 @@ static int powerfs_flush(struct file *file, fl_owner_t id)
                 struct powerfs_chunk_map *sc = NULL;
 
                 spin_lock(&pi->i_lock);
-                if ((u64)ssz == pi->content_size) {
+                if ((u64)ssz == pi->content_size && !pi->chunks_dirty) {
                     spin_unlock(&pi->i_lock);
                     goto flush_out;
                 }
@@ -260,11 +380,12 @@ static int powerfs_flush(struct file *file, fl_owner_t id)
                                                                 (u64)ssz,
                                                                 "kernel-flush",
                                                                 sc, s_cnt,
-                                                                NULL, 0);
+                                                                NULL, 0, NULL);
                 kfree(sc);
                 if (sync_ret == 0) {
                     spin_lock(&pi->i_lock);
                     pi->content_size = (u64)ssz;
+                    pi->chunks_dirty = false;
                     spin_unlock(&pi->i_lock);
                     pr_debug("powerfs: FLUSH STRIPE ino=%lu size=%lld chunks=%u ok\n",
                              ino, ssz, s_cnt);
@@ -273,10 +394,6 @@ static int powerfs_flush(struct file *file, fl_owner_t id)
                             "(release path will retry)\n", ino, sync_ret);
                 }
             }
-        } else {
-            pr_debug("powerfs: FLUSH ino=%lu skip metadata sync (dirty remains after flush)\n",
-                     ino);
-        }
     } else {
         pr_debug("powerfs: FLUSH ino=%lu skip (had_dirty=false, read-only or already synced)\n",
                  ino);
@@ -359,9 +476,6 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 
     pr_debug("powerfs: fsync ino=%lu start=%llu end=%llu datasync=%d i_size=%lld\n",
             inode->i_ino, start, end, datasync, i_size_read(inode));
-    pr_info("powerfs: [FSYNC75] fsync ENTER ino=%lu start=%llu end=%llu datasync=%d i_size=%lld\n",
-            inode->i_ino, (unsigned long long)start, (unsigned long long)end,
-            datasync, (long long)i_size_read(inode));
 
     /* 对齐  fsync 前置: 拿 FILE_WR + AUTH_EXCL 引用, flush dirty_caps.
      * 写回脏页前先确保服务端知道我们有脏态 (revoke 阻塞到 flush ACK). */
@@ -384,64 +498,20 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
      * otherwise those data RPCs target an inode the Filer doesn't know. */
     powerfs_flush_pending_create(inode, false);
 
-    /* 触发脏页写回 (Flat: writepage→powerfs_net_write; Inline: 仅清脏标) */
+    /* 触发脏页写回 (Flat: writepage→powerfs_net_write;
+     * Inline WB_SYNC_ALL: writepages 内同步提交 inline_data, MC-108 Task 3) */
     ret = file_write_and_wait_range(file, start, end);
     if (ret < 0) {
         pr_warn("powerfs: fsync write_and_wait error: %d\n", ret);
         goto out_put;
     }
-    pr_info("powerfs: [FSYNC75] fsync AFTER write_and_wait ino=%lu i_size=%lld ret=%d\n",
-            inode->i_ino, (long long)i_size_read(inode), ret);
 
-    /* K2-5: Inline 模式 — 通过 UPDATE_INODE 同步 inline_data 到 Filer.
-     * 复用 release 路径逻辑: 快照 inline_data → 锁外网络 I/O → 清 dirty.
-     * fsync 不做重试 (由调用方决定是否重试), 单次同步失败返回错误. */
+    /* K2-5 + MC-108 Task 3: Inline 兜底提交.
+     * 常规 write(2) 脏页已由上面 writepages WB_SYNC_ALL 提交; 此处覆盖
+     * 无脏页但 inline_dirty 的场景 (fallocate 扩展 / setattr 扩展).
+     * fsync 单次尝试, 失败透传 errno 由调用方决定重试. */
     if (pi->placement == POWERFS_PLACEMENT_INLINE && pi->inline_dirty) {
-        u8 *snap_data;
-        u32 snap_len;
-        u64 shard_id;
-
-        spin_lock(&pi->i_lock);
-        if (!pi->inline_data || pi->inline_len == 0) {
-            pi->inline_dirty = false;
-            spin_unlock(&pi->i_lock);
-            goto out_put;
-        }
-        snap_len = pi->inline_len;
-        spin_unlock(&pi->i_lock);
-
-        snap_data = kmalloc(snap_len, GFP_KERNEL);
-        if (!snap_data) {
-            ret = -ENOMEM;
-            goto out_put;
-        }
-
-        spin_lock(&pi->i_lock);
-        if (pi->inline_data && pi->inline_len == snap_len) {
-            memcpy(snap_data, pi->inline_data, snap_len);
-        } else {
-            spin_unlock(&pi->i_lock);
-            kfree(snap_data);
-            goto out_put;
-        }
-        spin_unlock(&pi->i_lock);
-
-        shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : inode->i_ino);
-        ret = powerfs_net_update_inode_size_chunks(shard_id, inode->i_ino,
-                                                    (__u64)snap_len,
-                                                    "kernel",
-                                                    NULL, 0,
-                                                    snap_data, snap_len);
-        kfree(snap_data);
-        if (ret < 0) {
-            pr_warn("powerfs: fsync INLINE ino=%lu update failed: %d\n",
-                    inode->i_ino, ret);
-            goto out_put;
-        }
-        /* 成功则清 dirty */
-        spin_lock(&pi->i_lock);
-        pi->inline_dirty = false;
-        spin_unlock(&pi->i_lock);
+        ret = powerfs_inline_commit_sync(inode, "kernel-fsync", 1);
         goto out_put;
     }
 
@@ -848,13 +918,7 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
 {
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(inode->i_sb);
-    u8 *snap_data = NULL;
-    u32 snap_len = 0;
-    u64 shard_id;
     u64 ino = inode->i_ino;
-    int attempt;
-    int ret = 0;
-    bool synced = false;
 
     /* P3-5: 统计 opened_files (与 file_open 对称) */
     if (sbi && sbi->client)
@@ -920,86 +984,15 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
      * Flat 模式: 同步 size+chunks 到 Filer (对齐 FUSE sync_size_chunks_on_close).
      *   不同步的话 Filer 端 chunks 为空, remount/lookup 后 read locate 失败 (-EINVAL). */
     if (pi->placement == POWERFS_PLACEMENT_INLINE && pi->inline_dirty) {
-    pr_debug("powerfs: RELEASE INLINE ino=%lu dirty=%d inline_len=%u\n",
-            ino, pi->inline_dirty ? 1 : 0, pi->inline_len);
+        int rel_ret;
 
-    /* 持锁快照 inline_data (网络 I/O 不能持 spinlock) */
-    spin_lock(&pi->i_lock);
-    if (!pi->inline_data || pi->inline_len == 0) {
-        /* dirty 标记但无数据 — 异常状态, 清标志避免反复重试 */
-        pi->inline_dirty = false;
-        spin_unlock(&pi->i_lock);
-        pr_warn("powerfs: RELEASE INLINE ino=%lu dirty but no inline_data\n", ino);
+        /* MC-108 Task 3: 复用 powerfs_inline_commit_sync; max_attempts=5
+         * 覆盖 Raft 选举窗口 (~3s). 失败保留 dirty (evict_inode 时 kfree 丢弃). */
+        rel_ret = powerfs_inline_commit_sync(inode, "kernel-release", 5);
+        if (rel_ret)
+            pr_err("powerfs: RELEASE INLINE ino=%lu FAILED: %d — data may be lost\n",
+                   ino, rel_ret);
         return 0;
-    }
-    snap_len = pi->inline_len;
-    spin_unlock(&pi->i_lock);
-
-    /* 锁外分配快照缓冲并拷贝 */
-    snap_data = kmalloc(snap_len, GFP_KERNEL);
-    if (!snap_data) {
-        pr_warn("powerfs: RELEASE INLINE ino=%lu kmalloc %u failed, data may be lost\n",
-                ino, snap_len);
-        return 0;
-    }
-    spin_lock(&pi->i_lock);
-    if (pi->inline_data && pi->inline_len == snap_len) {
-        memcpy(snap_data, pi->inline_data, snap_len);
-    } else {
-        /* 并发修改了 inline_data, 放弃本次同步 */
-        spin_unlock(&pi->i_lock);
-        pr_warn("powerfs: RELEASE INLINE ino=%lu inline_data changed during snapshot\n", ino);
-        kfree(snap_data);
-        return 0;
-    }
-    spin_unlock(&pi->i_lock);
-
-    /* K2: 调试 — 输出 snap_data 的 checksum, 与 issue_read 的 csum 比较 */
-    {
-        __u32 i, csum = 0;
-        for (i = 0; i < snap_len; i++)
-            csum += snap_data[i];
-        pr_debug("powerfs: RELEASE INLINE ino=%lu snap_len=%u csum=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                ino, snap_len, csum,
-                snap_len > 0 ? snap_data[0] : 0, snap_len > 1 ? snap_data[1] : 0,
-                snap_len > 2 ? snap_data[2] : 0, snap_len > 3 ? snap_data[3] : 0,
-                snap_len > 4 ? snap_data[4] : 0, snap_len > 5 ? snap_data[5] : 0,
-                snap_len > 6 ? snap_data[6] : 0, snap_len > 7 ? snap_data[7] : 0);
-    }
-
-    shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
-
-    /* 5 次重试, 500ms×attempt 退避 (对齐 FUSE, 覆盖 Raft 选举窗口 ~3s) */
-    for (attempt = 1; attempt <= 5; attempt++) {
-        ret = powerfs_net_update_inode_size_chunks(shard_id, ino,
-                                                    (__u64)snap_len,
-                                                    "kernel",
-                                                    NULL, 0,
-                                                    snap_data, snap_len);
-        if (ret == 0) {
-            synced = true;
-            pr_debug("powerfs: RELEASE INLINE ino=%lu synced size=%u (attempt %d)\n",
-                     ino, snap_len, attempt);
-            break;
-        }
-        pr_warn("powerfs: RELEASE INLINE ino=%lu attempt %d failed: %d\n",
-                ino, attempt, ret);
-        if (attempt < 5)
-            msleep(500 * attempt);
-    }
-
-    /* 成功则清 dirty; 失败保留 dirty (evict_inode 时 kfree, 数据丢失) */
-    if (synced) {
-        spin_lock(&pi->i_lock);
-        pi->inline_dirty = false;
-        spin_unlock(&pi->i_lock);
-    } else {
-        pr_err("powerfs: RELEASE INLINE ino=%lu FAILED after 5 attempts: %d — data may be lost\n",
-               ino, ret);
-    }
-
-    kfree(snap_data);
-    return 0;
     } /* end Inline release */
 
     /* Flat 模式: close 时同步 size+chunks 到 Filer.
@@ -1127,10 +1120,6 @@ int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
     bool is_stripe;
     int attempt, ret = -EIO;
 
-    pr_info("powerfs: [FSYNC75] sync_size_chunks(%s) ENTER ino=%lu i_size=%lld content_size=%llu placement=%d\n",
-            source, inode->i_ino, (long long)i_size_read(inode),
-            (unsigned long long)pi->content_size, pi->placement);
-
     if (pi->placement != POWERFS_PLACEMENT_FLAT &&
         pi->placement != POWERFS_PLACEMENT_STRIPE &&
         pi->placement != POWERFS_PLACEMENT_WIDESTRIPE)
@@ -1232,11 +1221,6 @@ int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
                     flush_keys[nk++] = chunks[cj].needle_id;
             }
             flush_ret = powerfs_net_flush_needles(vid, flush_keys, nk);
-            pr_info("powerfs: [FSYNC75] flush_needles(%s) ino=%lu vid=%llu nk=%u ret=%d keys=[",
-                    source, inode->i_ino, (unsigned long long)vid, nk, flush_ret);
-            for (cj = 0; cj < nk && cj < 8; cj++)
-                pr_cont("%llu%s", (unsigned long long)flush_keys[cj], cj < nk-1 ? "," : "");
-            pr_cont("]\n");
             if (flush_ret)
                 pr_warn("powerfs: sync_size_chunks(%s) ino=%lu flush_needles vid=%llu nk=%u failed: %d\n",
                         source, inode->i_ino, (unsigned long long)vid,
@@ -1264,11 +1248,12 @@ int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
 
         spin_lock(&pi->i_lock);
         committed_size = pi->content_size;
+        map_dirty = pi->chunks_dirty;
         spin_unlock(&pi->i_lock);
 #ifdef CONFIG_POWERFS_WRITE_PREDICT
-        map_dirty = powerfs_write_predict_map_dirty(pi);
+        map_dirty = map_dirty || powerfs_write_predict_map_dirty(pi);
 #else
-        map_dirty = false;
+        /* map_dirty 已持有 chunks_dirty */
 #endif
         if ((u64)i_size == committed_size && !map_dirty) {
             kfree(chunks);
@@ -1279,13 +1264,14 @@ int powerfs_sync_inode_size_chunks(struct inode *inode, const char *source,
     shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : inode->i_ino);
 
     for (attempt = 1; attempt <= max_attempts; attempt++) {
-        ret = powerfs_net_update_inode_size_chunks(shard_id, inode->i_ino,
+        ret = powerfs_net_update_inode_size_chunks(shard_id, powerfs_inode_io_ino(inode),
                                                     (u64)i_size, source,
                                                     chunks, chunk_count,
-                                                    NULL, 0);
+                                                    NULL, 0, NULL);
         if (ret == 0) {
             spin_lock(&pi->i_lock);
             pi->content_size = (u64)i_size;
+            pi->chunks_dirty = false;
             spin_unlock(&pi->i_lock);
 #ifdef CONFIG_POWERFS_WRITE_PREDICT
             /* 引用映射已随本次 update_inode 持久化, 清除 dedup 脏标 */
@@ -1326,6 +1312,7 @@ int powerfs_file_open(struct inode *inode, struct file *file)
     struct powerfs_inode_info *pi = POWERFS_I(inode);
     unsigned int got = POWERFS_CAP_PIN;
     bool is_write_open = !!(file->f_mode & FMODE_WRITE);
+    int ret;
 
     /* Optimistic local create: skip cap_open_grant RPC if the inode was
      * created locally. We call cap_open_grant_local instead which issues
@@ -1334,9 +1321,17 @@ int powerfs_file_open(struct inode *inode, struct file *file)
     if (pi->local_cap_granted) {
         cap_open_grant_local(pi, is_write_open);
     } else {
-        /* §13.3: 先从 Filer 获取授权 CapOpenGrant (永不阻塞),
-         * 根据响应挂载 cap + 更新 issued 位. 网络失败自动降级 (不阻断 open). */
-        cap_open_grant_and_issue(pi, is_write_open);
+        /* §13.3: 先从 Filer 获取授权 CapOpenGrant. 网络失败已在
+         * cap_open_grant_and_issue 内部降级消化 (返回 0), 返回值非零
+         * 只剩 -EAGAIN/-ENOMEM — 必须上抛阻断 open:
+         * MC-108 Task 5: -EAGAIN = Filer 返回 MigrateInProgress(0xE3),
+         * 内核 20×100ms 有界重试耗尽. 此前返回值被忽略, open 照常
+         * 成功 → 迁移窗口内第二者拿到写能力, quiesce 语义被绕过
+         * (TR-5.3 取证实锤: dmesg "migrate window persists" 与
+         * open_rc=0 并存). 上抛让 VFS 退避, 重试由用户驱动. */
+        ret = cap_open_grant_and_issue(pi, is_write_open);
+        if (ret)
+            return ret;
     }
 
     spin_lock(&pi->i_lock);
@@ -2059,13 +2054,25 @@ static long powerfs_fallocate(struct file *file, int mode,
              */
             filemap_write_and_wait(inode->i_mapping);
         } else {
-            /* Non-FLAT (INLINE): just release page cache (original
-             * behavior). INLINE data is in inline_data, not the server
-             * needle, so truncate_pagecache_range is sufficient.
-             */
+            /* Non-FLAT (INLINE): 释放 page cache 并同步清零 inline_data
+             * 对应区间 — 否则 commit 路径会把 punch 前的旧数据写回
+             * Filer, punch 洞读不到零 (MC-108 Task 3 同源修复). */
             truncate_pagecache_range(inode, offset, new_size - 1);
-            if (pi->placement == POWERFS_PLACEMENT_INLINE)
+            if (pi->placement == POWERFS_PLACEMENT_INLINE) {
+                loff_t punch_end = min(new_size, (loff_t)pi->inline_len);
+                spin_lock(&pi->i_lock);
+                punch_end = min(new_size, (loff_t)pi->inline_len);
+                if (pi->inline_data && offset < punch_end) {
+                    memset(pi->inline_data + offset, 0, punch_end - offset);
+                    /* MC-108 Task 5: punch 清零是本客户端的内容变更,
+                     * 标记对应脏块, Filer 端按位合并 (并发写者的
+                     * disjoint 区间不被本快照清除) */
+                    powerfs_inline_dirty_mark_range(pi, offset, punch_end);
+                    pi->inline_seq++;
+                }
                 pi->inline_dirty = true;
+                spin_unlock(&pi->i_lock);
+            }
         }
         ret = 0;
     } else if (!(mode & FALLOC_FL_KEEP_SIZE)) {
@@ -2160,7 +2167,14 @@ static long powerfs_fallocate(struct file *file, int mode,
                  */
                 filemap_write_and_wait(inode->i_mapping);
             } else if (pi->placement == POWERFS_PLACEMENT_INLINE) {
+                /* MC-108 Task 5: extend 的零洞 [old_size, new_size) 是本
+                 * 客户端的内容变更 (ftruncate 语义), 标记脏块随提交持久化;
+                 * 快照零洞由 inline_commit_sync 的 memset 补齐 */
+                spin_lock(&pi->i_lock);
+                powerfs_inline_dirty_mark_range(pi, old_size, new_size);
                 pi->inline_dirty = true;
+                pi->inline_seq++;
+                spin_unlock(&pi->i_lock);
             }
         }
         ret = 0;

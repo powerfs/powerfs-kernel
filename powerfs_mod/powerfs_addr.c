@@ -473,10 +473,6 @@ static int powerfs_wb_submit_blob_extents(struct powerfs_writepage_work *wpw,
             atomic_inc(&wpw->pending_needles);
 
         /* Submit WriteNeedleBlob */
-        pr_debug("powerfs: WB_BLOB_SUBMIT ino=%lu nid=%llu off=%llu len=%zu\n",
-                inode->i_ino, (unsigned long long)needle_id,
-                (unsigned long long)ctx->blob_offset, ext_size);
-
         ret = powerfs_net_write_needle_blob_async(
             volume_id, needle_id, inode->i_ino,
             ctx->blob_offset,
@@ -551,8 +547,9 @@ static void powerfs_wb_free_rcu(struct rcu_head *rcu)
  * wpw 内存通过 call_rcu 延迟释放 (work_struct 生命周期约束).
  * 由最后一个完成的 ctx (或 work_fn 的自身 ref) 触发.
  *
- * 并发安全: VFS writeback 子系统通过 PAGECACHE_TAG_DIRTY →
- * PAGECACHE_TAG_WRITEBACK 的原子转换保证同一页面不会被并发 writeback.
+ * 并发安全: 正常页生命周期由 powerfs_writepages/writepage 的
+ * PageWriteback 守卫保证 (issue#12: 页在旧 batch 在飞时可被再次
+ * redirty, DIRTY/WRITEBACK tag 会并存, 入队前必须显式跳过或等待);
  * 不同 needle 组的 WriteNeedleBlob 请求天然独立, 同一 needle 的并发
  * partial write 由 Volume Server coalescer 安全合并. */
 static void powerfs_wb_final_cleanup(struct powerfs_writepage_work *wpw)
@@ -819,11 +816,6 @@ static int powerfs_wb_write_cb(struct powerfs_request *req)
     struct inode *inode = wpw->inode;
     int err = 0;
 
-    pr_debug("powerfs: WB_WRITE_CB ino=%lu nid=%llu err=%d status=%u pages=[%d,%d)\n",
-            inode->i_ino, (unsigned long long)ctx->needle_id,
-            req->error, req->resp_status,
-            ctx->needle_start_idx, ctx->needle_end_idx);
-
     if (req->error < 0) {
         err = req->error;
     } else if (req->resp_status != POWERFS_NET_STATUS_OK) {
@@ -946,7 +938,7 @@ static void powerfs_writepage_work_fn(struct work_struct *work)
         loc_ret = powerfs_locate_chunk(pi, offset, &volume_id, &needle_id);
         spin_unlock(&pi->i_lock);
         if (loc_ret) {
-            pr_warn("powerfs: writepage locate ino=%lu offset=%lld err=%d\n",
+            pr_debug("powerfs: writepage locate ino=%lu offset=%lld err=%d\n",
                     inode->i_ino, offset, loc_ret);
             mapping_set_error(page->mapping, loc_ret);
             end_page_writeback(page);
@@ -1217,8 +1209,9 @@ fail_all:
  * 并发控制 (参考 Ceph ceph_writepages_start):
  *   - max_active 限制全局并发 worker (workqueue 级)
  *   - wb_in_flight 全局 in-flight 上限 (throttle)
- *   - 无 per-inode mutex: 不同 needle 组的 WriteNeedleBlob 天然并行
- *     同一页不被并发处理 (VFS page tag 原子转换保证)
+ *   - 无 per-inode mutex: 不同 needle 组的 WriteNeedleBlob 天然并行;
+ *     同一页的并发 writeback 由主循环的 PageWriteback 守卫排除
+ *     (issue#12, 见守卫处注释)
  *     同一 needle 的并发 partial write 由 Volume Server coalescer 合并
  */
 int powerfs_writepages(struct address_space *mapping,
@@ -1247,22 +1240,160 @@ int powerfs_writepages(struct address_space *mapping,
         return 0;
     }
 
-    /* K2: Inline 文件不走 Volume Server writeback.
-     * 数据已在 write_end 中同步到 inline_data 缓冲,
-     * close 时通过 UPDATE_INODE 提交到 Filer.
-     * 这里清理脏页标记, 让 writeback 认为已完成.
+    /* K2 + MC-108 Task 3: Inline 文件 writeback.
      *
-     * ROOT46: 必须用 folio_clear_dirty_for_io + start/end_writeback
-     * 完整流程, 而非 folio_clear_dirty. 后者只清 PG_dirty 标志位,
-     * 不清 xarray 的 PAGECACHE_TAG_DIRTY tag, 导致 refresh_work 的
-     * mapping_tagged(PAGECACHE_TAG_DIRTY) 误判为有脏页, 跳过 page
-     * cache invalidate, 其他客户端写入后本地读到旧数据. */
+     * Pass 1 (所有模式): 把脏 folio 内容同步进 inline_data.
+     *   write(2) 路径 write_end 已同步过 (幂等重拷); mmap 脏页在此首次
+     *   落入 inline_data — 修复旧实现 "mmap 脏页仅清脏标" 的丢数据缺口.
+     *
+     * Pass 2 (仅 WB_SYNC_ALL): 同步提交 inline_data 到 Filer,
+     *   成功后才允许清脏 (Pass 3); 失败保留全部脏标 (folio tag +
+     *   inline_dirty), mapping_set_error 让 fsync/sync 感知错误.
+     *   WB_SYNC_NONE (后台回写) 不做 RPC — inline_dirty 由后续的
+     *   fsync/close/recall 路径提交.
+     *
+     * Pass 3: 清 folio 脏标. 必须用 folio_clear_dirty_for_io +
+     *   start/end_writeback 完整流程 (ROOT46), 否则 PAGECACHE_TAG_DIRTY
+     *   残留导致 refresh_work 跳过 invalidate, 读到旧数据. */
     if (POWERFS_I(inode)->placement == POWERFS_PLACEMENT_INLINE) {
         struct folio_batch fbatch2;
         pgoff_t idx2 = wbc->range_start >> PAGE_SHIFT;
         pgoff_t end2 = wbc->range_end >> PAGE_SHIFT;
+        int wb_ret = 0;
 
-        pr_debug("powerfs: WPAGES INLINE ino=%lu, clean dirty pages\n", inode->i_ino);
+        /* Pass 1: folio → inline_data */
+        folio_batch_init(&fbatch2);
+        while (filemap_get_folios_tag(mapping, &idx2, end2,
+                                       PAGECACHE_TAG_DIRTY, &fbatch2) > 0) {
+            int i;
+            for (i = 0; i < folio_batch_count(&fbatch2); i++) {
+                struct folio *f = fbatch2.folios[i];
+                loff_t fpos;
+                size_t flen, fend, need;
+                u8 *grow_buf = NULL, *old_buf = NULL;
+
+                folio_lock(f);
+                if (!folio_test_dirty(f)) {
+                    folio_unlock(f);
+                    folio_put(f);
+                    continue;
+                }
+                /* MC-108 TR-4.2 migration fence: while we blocked on this
+                 * folio lock, the concurrent write_end() migration may have
+                 * completed (it holds the current folio lock for the whole
+                 * MIGRATE RPC, then applies Flat/Stripe and frees inline_data
+                 * before unlocking). Continuing the INLINE path here would
+                 * resurrect inline_data, commit it, and Pass 3 would clear the
+                 * folio dirty bit without ever sending a blob write — the
+                 * initiator's bytes are then silently lost. Abort and leave
+                 * every dirty folio for the Flat/Stripe writeback path. */
+                {
+                    bool migrated_now;
+
+                    spin_lock(&pi->i_lock);
+                    migrated_now =
+                        pi->placement != POWERFS_PLACEMENT_INLINE;
+                    spin_unlock(&pi->i_lock);
+                    if (migrated_now) {
+                        folio_unlock(f);
+                        folio_put(f);
+                        goto inline_migrated_abort;
+                    }
+                }
+                fpos = folio_pos(f);
+                flen = folio_size(f);
+                fend = (size_t)fpos + flen;
+                if (fend > (size_t)POWERFS_INLINE_MAX_SIZE)
+                    fend = POWERFS_INLINE_MAX_SIZE;
+                /* 不超过 i_size (folio 尾部可能越 EOF) */
+                if (fend > (size_t)i_size_read(inode))
+                    fend = (size_t)i_size_read(inode);
+                if ((size_t)fpos >= fend) {
+                    folio_unlock(f);
+                    folio_put(f);
+                    continue;
+                }
+                need = fend;
+
+                /* 必要时扩容 inline_data (锁外分配, 持锁替换) */
+                spin_lock(&pi->i_lock);
+                if (!pi->inline_data || pi->inline_len < need) {
+                    spin_unlock(&pi->i_lock);
+                    grow_buf = kvmalloc(need, GFP_NOFS);
+                    if (!grow_buf) {
+                        folio_unlock(f);
+                        folio_put(f);
+                        wb_ret = -ENOMEM;
+                        goto inline_wb_out;
+                    }
+                    spin_lock(&pi->i_lock);
+                    if (pi->inline_data && pi->inline_len >= need) {
+                        /* 并发已扩容, 丢弃本次分配 */
+                        spin_unlock(&pi->i_lock);
+                        kvfree(grow_buf);
+                        grow_buf = NULL;
+                        spin_lock(&pi->i_lock);
+                    } else {
+                        if (pi->inline_data && pi->inline_len > 0)
+                            memcpy(grow_buf, pi->inline_data, pi->inline_len);
+                        if (need > pi->inline_len)
+                            memset(grow_buf + pi->inline_len, 0,
+                                   need - pi->inline_len);
+                        old_buf = pi->inline_data;
+                        pi->inline_data = grow_buf;
+                        pi->inline_len = need;
+                        grow_buf = NULL;
+                    }
+                }
+                /* folio → inline_data 拷贝 (持 folio lock + i_lock,
+                 * 与 write_end 锁序一致) */
+                if (pi->inline_data && need <= pi->inline_len) {
+                    void *kaddr = kmap_local_folio(f, 0);
+                    memcpy(pi->inline_data + fpos, kaddr, fend - (size_t)fpos);
+                    kunmap_local(kaddr);
+                    pi->inline_dirty = true;
+                    pi->inline_seq++;
+                    /* MC-108 Task 5: 标记本 folio 覆盖的 4K 块 */
+                    powerfs_inline_dirty_mark_range(pi, fpos, fend);
+                }
+                spin_unlock(&pi->i_lock);
+                kvfree(grow_buf);
+                kvfree(old_buf);
+                folio_unlock(f);
+                folio_put(f);
+            }
+            folio_batch_init(&fbatch2);
+            if (idx2 > end2)
+                break;
+        }
+
+        /* MC-108 TR-4.2 migration fence (between Pass 1 and Pass 2): a
+         * concurrent write_end() migration can complete while Pass 1 walks
+         * other folios or drops the locks. Never commit a resurrected inline
+         * snapshot nor clear dirty bits once placement has flipped. */
+        {
+            bool migrated_now;
+
+            spin_lock(&pi->i_lock);
+            migrated_now = pi->placement != POWERFS_PLACEMENT_INLINE;
+            spin_unlock(&pi->i_lock);
+            if (migrated_now)
+                goto inline_migrated_abort;
+        }
+
+        /* Pass 2: WB_SYNC_ALL 同步提交 Filer, 成功才清脏 (Task 3 核心) */
+        if (wbc->sync_mode == WB_SYNC_ALL) {
+            wb_ret = powerfs_inline_commit_sync(inode, "kernel-wb", 5);
+            if (wb_ret) {
+                pr_warn_ratelimited("powerfs: WPAGES INLINE ino=%lu sync commit failed: %d, keep dirty\n",
+                                    inode->i_ino, wb_ret);
+                mapping_set_error(mapping, wb_ret);
+                return wb_ret;
+            }
+        }
+
+        /* Pass 3: 清 folio 脏标 (数据已在 inline_data / 已提交 Filer) */
+        idx2 = wbc->range_start >> PAGE_SHIFT;
         folio_batch_init(&fbatch2);
         while (filemap_get_folios_tag(mapping, &idx2, end2,
                                        PAGECACHE_TAG_DIRTY, &fbatch2) > 0) {
@@ -1270,10 +1401,19 @@ int powerfs_writepages(struct address_space *mapping,
             for (i = 0; i < folio_batch_count(&fbatch2); i++) {
                 struct folio *f = fbatch2.folios[i];
                 folio_lock(f);
-                /* 清 PG_dirty → start_writeback 清 xarray DIRTY tag
-                 * 并设 WRITEBACK tag → end_writeback 清 WRITEBACK tag.
-                 * 无实际 I/O (INLINE 数据已在 write_end 同步到 inline_data). */
-                if (folio_clear_dirty_for_io(f)) {
+                /* 超出 INLINE_MAX 的脏 folio 未被 Pass 1 同步 (mmap 越界
+                 * 写入, 正常应已迁移 Flat), 必须保留脏标防丢数据. */
+                if (folio_pos(f) >= POWERFS_INLINE_MAX_SIZE) {
+                    pr_warn_ratelimited("powerfs: WPAGES INLINE ino=%lu folio pos=%llu beyond INLINE_MAX, keep dirty\n",
+                                        inode->i_ino, (u64)folio_pos(f));
+                } else if (READ_ONCE(pi->placement) !=
+                           POWERFS_PLACEMENT_INLINE) {
+                    /* MC-108 TR-4.2: migration raced with Pass 2 (network
+                     * RPC). Keep the dirty bit so Flat/Stripe writeback will
+                     * RMW this folio into the destination needle. */
+                    pr_debug("powerfs: WPAGES ino=%lu migrated mid-flush, keep folio dirty\n",
+                             inode->i_ino);
+                } else if (folio_clear_dirty_for_io(f)) {
                     folio_start_writeback(f);
                     folio_end_writeback(f);
                 }
@@ -1284,7 +1424,30 @@ int powerfs_writepages(struct address_space *mapping,
             if (idx2 > end2)
                 break;
         }
+inline_migrated_abort:
+        /* MC-108 TR-4.2: placement flipped to Flat/Stripe while this
+         * writepages call was inside the INLINE path. Discard any inline
+         * buffer our Pass 1 may have resurrected and return without
+         * touching folio dirty bits; the dirty folios are reaped by the
+         * normal Flat/Stripe writeback below (on a later writepages call). */
+        {
+            u8 *stale_inline;
+
+            spin_lock(&pi->i_lock);
+            stale_inline = pi->inline_data;
+            pi->inline_data = NULL;
+            pi->inline_len = 0;
+            pi->inline_dirty = false;
+            pi->inline_seq++;
+            powerfs_inline_dirty_map_reset(pi);  /* MC-108 Task 5 */
+            spin_unlock(&pi->i_lock);
+            kvfree(stale_inline);
+        }
+        pr_debug("powerfs: WPAGES ino=%lu aborted INLINE flush: migration raced, folios stay dirty\n",
+                 inode->i_ino);
         return 0;
+inline_wb_out:
+        return wb_ret;
     }
 
     if (powerfs_net_is_stopping()) {
@@ -1305,9 +1468,11 @@ int powerfs_writepages(struct address_space *mapping,
     }
 
     /* 无 per-inode writeback mutex: 参考 Ceph ceph_writepages_start,
-     * 不取任何 per-inode 锁。VFS writeback 子系统通过 page tag 原子转换
-     * (DIRTY → WRITEBACK) 保证同一页面不被并发 writeback; 不同 needle
-     * 组的 WriteNeedleBlob 请求天然独立, 可并行 in-flight。 */
+     * 不取任何 per-inode 锁。注意 page tag 的 DIRTY → WRITEBACK 转换
+     * 并不能阻止同一页被并发 writeback: 页在旧 batch 在飞期间可被再次
+     * redirty, 此时两个 tag 并存, filemap_get_folios_tag(DIRTY) 仍会
+     * 捞到它, 所以下方入队前必须显式做 PageWriteback 守卫 (issue#12)。
+     * 不同 needle 组的 WriteNeedleBlob 请求天然独立, 可并行 in-flight。 */
 
     folio_batch_init(&fbatch);
 
@@ -1337,9 +1502,44 @@ int powerfs_writepages(struct address_space *mapping,
                 continue;
             }
 
-            clear_page_dirty_for_io(page);
+            /* issue#12: 该页可能仍被一个尚未完成的旧 writeback batch 持有
+             * (在 PageWriteback 期间被再次 redirty 时, radix 的 DIRTY 与
+             * WRITEBACK tag 会并存, 仅靠 tag 转换不能排除). 若把它再次入队:
+             *  - __folio_start_writeback 对已置位页属于双重 start;
+             *  - 旧 batch 的 end_page_writeback 底层是 XOR 而非
+             *    "仅在置位时清除" (__folio_end_writeback 用
+             *    folio_xor_flags_has_waiters): 当它在新 batch 之后清除时,
+             *    会把已清零的 PG_writeback 重新翻成 1, 且 NR_WRITEBACK
+             *    多减一次, 页在 evict 阶段永久卡在 folio_wait_writeback.
+             * 因此: 后台回写 (WB_SYNC_NONE) 重新标脏跳过; fsync 等同步
+             * 回写则等待旧 writeback 完成再处理同一脏内容. */
+            if (PageWriteback(page)) {
+                if (wbc->sync_mode == WB_SYNC_NONE) {
+                    redirty_page_for_writepage(wbc, page);
+                    unlock_page(page);
+                    continue;
+                }
+                unlock_page(page);
+                folio_wait_writeback(page_folio(page));
+                lock_page(page);
+                if (!PageDirty(page)) {
+                    unlock_page(page);
+                    continue;
+                }
+            }
 
             offset = page_offset(page);
+            if (offset >= i_size_read(inode)) {
+                pr_debug("powerfs: WPAGES skip offset=%lld >= i_size=%lld ino=%lu\n",
+                        (long long)offset, (long long)i_size_read(inode),
+                        inode->i_ino);
+                unlock_page(page);
+                continue;
+            }
+            if (offset + count > i_size_read(inode))
+                count = i_size_read(inode) - offset;
+
+            clear_page_dirty_for_io(page);
             /* 按 needle (chunk) 边界分组: 当页面的 chunk_idx 变化时,
              * 提交当前 batch, 确保同一 needle 的所有页面在同一个 batch
              * 中完成 read-modify-write. 避免多个 batch 并发对同一 needle
@@ -1373,14 +1573,6 @@ int powerfs_writepages(struct address_space *mapping,
 
             pr_debug("powerfs: WPAGES page ino=%lu offset=%lld i_size=%lld\n",
                     inode->i_ino, offset, i_size_read(inode));
-            if (offset >= i_size_read(inode)) {
-                pr_info("powerfs: [FSYNC75] WPAGES SKIP offset=%lld >= i_size=%lld ino=%lu\n",
-                        (long long)offset, (long long)i_size_read(inode), inode->i_ino);
-                unlock_page(page);
-                continue;
-            }
-            if (offset + count > i_size_read(inode))
-                count = i_size_read(inode) - offset;
 
             /* 分配 batch (如果当前没有 pending) */
             if (!batch) {
@@ -1471,6 +1663,14 @@ int powerfs_writepage(struct page *page, struct writeback_control *wbc)
     size_t count = PAGE_SIZE;
 
     if (powerfs_net_is_stopping()) {
+        redirty_page_for_writepage(wbc, page);
+        unlock_page(page);
+        return 0;
+    }
+
+    /* issue#12: 仍被旧 batch 持有的页不得重复 start writeback (见
+     * powerfs_writepages 中的详细说明). */
+    if (PageWriteback(page)) {
         redirty_page_for_writepage(wbc, page);
         unlock_page(page);
         return 0;
@@ -1758,35 +1958,227 @@ static bool powerfs_detect_content_binary(const u8 *data, size_t len)
  *
  * 返回 0 成功, 负数错误码 (网络错误透传, inline_data 保持原状).
  */
+/* powerfs_volume_alloc_present_locked - inode 是否已持有 Volume 分配.
+ * 调用方持 pi->i_lock. Flat 需 vid+fkey; Stripe 需 volume_ids;
+ * INLINE 返回 true (它不属卷分配语义, 由 inline 迁移路径处理). */
+static bool powerfs_volume_alloc_present_locked(struct powerfs_inode_info *pi)
+{
+    if (pi->placement == POWERFS_PLACEMENT_FLAT)
+        return pi->volume_id && pi->file_key;
+    if (pi->placement == POWERFS_PLACEMENT_STRIPE ||
+        pi->placement == POWERFS_PLACEMENT_WIDESTRIPE)
+        return pi->volume_ids && pi->volume_ids_count > 0;
+    return true;
+}
+
+/* powerfs_apply_migrate_alloc - 把 MIGRATE_INLINE_ALLOC 结果落到 inode.
+ * 接管 r->allocs 所有权 (内部 kfree). 调用方不得持 pi->i_lock.
+ * 逻辑与原 inline 迁移第 5 步相同, 供 inline 迁移和 "空壳 Flat/Stripe
+ * 首次写分配" 两条路径复用. */
+static void powerfs_apply_migrate_alloc(struct inode *inode,
+                                        struct powerfs_migrate_alloc_result *r)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+
+    if (r->is_stripe) {
+        u64 *new_vids = kmalloc_array(r->stripe_count, sizeof(u64),
+                                      GFP_KERNEL);
+        u64 *new_keys = kmalloc_array(r->stripe_count, sizeof(u64),
+                                      GFP_KERNEL);
+        u64 *old_vids, *old_keys;
+        u32 i;
+
+        if (!new_vids || !new_keys) {
+            /* 数据已在/将在 Volume Server, inode 却无法记录 Stripe 布局:
+             * 退化为 Flat (allocs[0/1]), 保证 writeback 仍可定位. */
+            pr_warn("powerfs: alloc ino=%lu kmalloc stripe arrays failed, fall back to Flat\n",
+                    inode->i_ino);
+            kfree(new_vids);
+            kfree(new_keys);
+            spin_lock(&pi->i_lock);
+            pi->placement = POWERFS_PLACEMENT_FLAT;
+            pi->volume_id = r->allocs[0];
+            pi->file_key = r->allocs[1];
+            pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+            kfree(pi->volume_ids);
+            pi->volume_ids = NULL;
+            pi->volume_ids_count = 0;
+            kfree(pi->stripe_needle_keys);
+            pi->stripe_needle_keys = NULL;
+            kfree(pi->inline_data);
+            pi->inline_data = NULL;
+            pi->inline_len = 0;
+            pi->inline_dirty = false;
+            pi->inline_seq++;
+            powerfs_inline_dirty_map_reset(pi);  /* MC-108 Task 5 */
+            pi->chunks_dirty = true;
+            spin_unlock(&pi->i_lock);
+            kfree(r->allocs);
+            return;
+        }
+        for (i = 0; i < r->stripe_count; i++) {
+            new_vids[i] = r->allocs[i * 2];
+            new_keys[i] = r->allocs[i * 2 + 1];
+        }
+
+        spin_lock(&pi->i_lock);
+        old_vids = pi->volume_ids;
+        old_keys = pi->stripe_needle_keys;
+        pi->volume_ids = new_vids;
+        pi->stripe_needle_keys = new_keys;
+        pi->volume_ids_count = r->stripe_count;
+        pi->placement = POWERFS_PLACEMENT_STRIPE;
+        pi->stripe_size = r->stripe_size;
+        pi->stripe_count = r->stripe_count;
+        /* file_key/volume_id = 第一个 stripe (兼容 Flat fallback 路径) */
+        pi->file_key = r->allocs[1];
+        pi->volume_id = r->allocs[0];
+        pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+        kfree(pi->inline_data);
+        pi->inline_data = NULL;
+        pi->inline_len = 0;
+        pi->inline_dirty = false;
+        pi->inline_seq++;
+        powerfs_inline_dirty_map_reset(pi);  /* MC-108 Task 5 */
+        pi->chunks_dirty = true;
+        spin_unlock(&pi->i_lock);
+        kfree(old_vids);
+        kfree(old_keys);
+    } else {
+        spin_lock(&pi->i_lock);
+        pi->placement = POWERFS_PLACEMENT_FLAT;
+        pi->volume_id = r->volume_id;
+        pi->file_key = r->file_key;
+        pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
+        kfree(pi->inline_data);
+        pi->inline_data = NULL;
+        pi->inline_len = 0;
+        pi->inline_dirty = false;
+        pi->inline_seq++;
+        powerfs_inline_dirty_map_reset(pi);  /* MC-108 Task 5 */
+        pi->chunks_dirty = true;
+        spin_unlock(&pi->i_lock);
+    }
+
+    kfree(r->allocs);
+}
+
+/* powerfs_ensure_skip_locked - 本 inode 是否无需 ensure 分配 (持 i_lock).
+ * INLINE 且有 inline 数据 → 归 powerfs_migrate_inline_out 处理;
+ * INLINE 空文件 (DIO 首写) → 仍需首次 Flat 分配;
+ * Flat/Stripe → 已有卷映射即跳过. */
+static bool powerfs_ensure_skip_locked(struct powerfs_inode_info *pi)
+{
+    if (pi->placement == POWERFS_PLACEMENT_INLINE)
+        return pi->inline_data && pi->inline_len > 0;
+    return powerfs_volume_alloc_present_locked(pi);
+}
+
+/* powerfs_ensure_volume_alloc - Flat/Stripe "空壳" inode 首次写前分配.
+ *
+ * Filer 在 create / ftruncate 扩到 inline 阈值之上时, 可能只把
+ * storage_mode 置为 Flat/Stripe 而不立即分配 needle (lazy first-write
+ * allocation; 与 FUSE 客户端在无 fid write 时直接调 migrate_inline_alloc
+ * 同模型, Filer 对该状态定义为 "NORMAL first-allocation path" 且对已有
+ * chunks 幂等). 此时本地 placement=Flat/Stripe 但 volume_id/file_key/
+ * volume_ids 全空, writeback 的 locate_chunk 必返回 -EINVAL (历史 bug:
+ * ftruncate 64M 预分配后 fio 写, writepage locate err=-22, fsync 失败).
+ *
+ * INLINE inode 直接返回 0 — 由 write_end 的 inline 内容迁移路径处理.
+ *
+ * 并发: alloc_mutex + 锁内双重检查, 同一 inode 只有一个在途分配,
+ * 杜绝两个写各分到不同 needle 后近重复分配丢数据.
+ *
+ * 上下文: 进程上下文 (内含网络 RPC, 会睡眠); write_end 持 folio lock
+ * 调用与 migrate_inline_out 同约束, 安全.
+ *
+ * 返回 0 = 已有分配或本次成功; <0 = 错误码透传.
+ */
+static int powerfs_ensure_volume_alloc(struct inode *inode,
+                                       struct powerfs_inode_info *pi)
+{
+    struct powerfs_migrate_alloc_result res = {0};
+    u64 shard_id;
+    bool want_stripe = false;
+    int ret;
+
+    spin_lock(&pi->i_lock);
+    if (powerfs_ensure_skip_locked(pi)) {
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+    spin_unlock(&pi->i_lock);
+
+    mutex_lock(&pi->alloc_mutex);
+    spin_lock(&pi->i_lock);
+    if (powerfs_ensure_skip_locked(pi)) {
+        spin_unlock(&pi->i_lock);
+        mutex_unlock(&pi->alloc_mutex);
+        return 0;
+    }
+    want_stripe = (pi->placement == POWERFS_PLACEMENT_STRIPE ||
+                   pi->placement == POWERFS_PLACEMENT_WIDESTRIPE);
+    spin_unlock(&pi->i_lock);
+
+    /* 乐观创建的文件先补提 BatchCreate, 否则 Filer 返回 ENOENT */
+    powerfs_flush_pending_create(inode, false);
+    shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino
+                                              : inode->i_ino);
+    ret = powerfs_net_migrate_inline_alloc(shard_id, powerfs_inode_io_ino(inode),
+                                           want_stripe, &res);
+    if (ret < 0) {
+        pr_warn("powerfs: first-write alloc ino=%lu mode=%s failed: %d\n",
+                inode->i_ino, want_stripe ? "stripe" : "flat", ret);
+        mutex_unlock(&pi->alloc_mutex);
+        return ret;
+    }
+
+    powerfs_apply_migrate_alloc(inode, &res);
+    mutex_unlock(&pi->alloc_mutex);
+
+    pr_info("powerfs: first-write alloc done ino=%lu placement=%u vid=%llu fkey=%llu vc=%u\n",
+            inode->i_ino, pi->placement,
+            (unsigned long long)pi->volume_id,
+            (unsigned long long)pi->file_key, pi->volume_ids_count);
+    return 0;
+}
+
 static int powerfs_migrate_inline_out(struct inode *inode,
                                        struct powerfs_inode_info *pi)
 {
     u8 *snap_data = NULL;
     u32 snap_len = 0;
-    u64 shard_id, ino = inode->i_ino;
+    u64 shard_id, ino = powerfs_inode_io_ino(inode);
     struct powerfs_migrate_alloc_result alloc_result = {0};
     bool desired_stripe;
     u64 write_vid, write_nid;
     int ret;
 
-    /* 1. 持锁快照 inline_data (网络 I/O 不能持 spinlock) */
+    /* 1. 持锁快照 inline_data (网络 I/O 不能持 spinlock).
+     * MC-108 Task 3: snap_len = max(i_size, inline_len), 零扩展.
+     * 否则 truncate-up 到 8192 但只写 4K 时, 迁移只写 4K 数据,
+     * 剩余 4K 零区在 Flat/Stripe 端成为未定义数据. */
     spin_lock(&pi->i_lock);
     if (!pi->inline_data || pi->inline_len == 0) {
         spin_unlock(&pi->i_lock);
         pr_warn("powerfs: MIGRATE ino=%lu no inline_data to migrate\n", ino);
         return -EINVAL;
     }
-    snap_len = pi->inline_len;
+    {
+        u64 i_size = i_size_read(inode);
+        snap_len = max_t(u32, (u32)i_size, pi->inline_len);
+    }
     spin_unlock(&pi->i_lock);
 
-    snap_data = kmalloc(snap_len, GFP_KERNEL);
+    snap_data = kzalloc(snap_len, GFP_KERNEL);
     if (!snap_data) {
-        pr_warn("powerfs: MIGRATE ino=%lu kmalloc %u failed\n", ino, snap_len);
+        pr_warn("powerfs: MIGRATE ino=%lu kzalloc %u failed\n", ino, snap_len);
         return -ENOMEM;
     }
     spin_lock(&pi->i_lock);
-    if (pi->inline_data && pi->inline_len == snap_len) {
-        memcpy(snap_data, pi->inline_data, snap_len);
+    if (pi->inline_data && pi->inline_len <= snap_len) {
+        memcpy(snap_data, pi->inline_data, pi->inline_len);
+        /* 零扩展部分已由 kzalloc 清零, 无需 memset */
     } else {
         spin_unlock(&pi->i_lock);
         pr_warn("powerfs: MIGRATE ino=%lu inline_data changed during snapshot\n", ino);
@@ -1802,7 +2194,20 @@ static int powerfs_migrate_inline_out(struct inode *inode,
             ino, snap_len, desired_stripe ? "Stripe" : "Flat");
 
     /* 3. 调 Filer MIGRATE_INLINE_ALLOC 分配.
-     * shard_id = shard_map_route(parent_ino) — 区间路由, 对齐 FUSE ShardMap. */
+     * shard_id = shard_map_route(parent_ino) — 区间路由, 对齐 FUSE ShardMap.
+     * alloc_mutex 串行化分配 RPC (与 powerfs_ensure_volume_alloc 共用):
+     * 两个并发写若各自分配会得到两套 needle, close 只 sync 一套 → 丢数据.
+     * 拿锁后复查 placement, 等待者直接复用先行迁移的结果. */
+    mutex_lock(&pi->alloc_mutex);
+    spin_lock(&pi->i_lock);
+    if (pi->placement != POWERFS_PLACEMENT_INLINE) {
+        spin_unlock(&pi->i_lock);
+        mutex_unlock(&pi->alloc_mutex);
+        kfree(snap_data);
+        return 0;
+    }
+    spin_unlock(&pi->i_lock);
+
     shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);
     /* Phase 3: for an optimistically-created file, commit the deferred
      * BatchCreate metadata first — otherwise the Filer doesn't know this
@@ -1814,6 +2219,7 @@ static int powerfs_migrate_inline_out(struct inode *inode,
     if (ret < 0) {
         pr_warn("powerfs: MIGRATE ino=%lu alloc failed: %d, inline buffer unmodified\n",
                 ino, ret);
+        mutex_unlock(&pi->alloc_mutex);
         kfree(snap_data);
         return ret;  /* 透传网络错误 (-ENOTCONN/-ETIMEDOUT 等), 非 EFBIG */
     }
@@ -1822,7 +2228,15 @@ static int powerfs_migrate_inline_out(struct inode *inode,
      * lease_token=NULL: Volume Server 不校验 lease.
      * ClientId="kernel-client" 必须发送 (write_needle 注释).
      * Stripe 路径: snap_data ≤ 8KB < stripe_size, 写到第一个 stripe unit
-     * (allocs[0]); 后续 writeback 按 powerfs_locate_chunk 路由到其它 unit. */
+     * (allocs[0]); 后续 writeback 按 powerfs_locate_chunk 路由到其它 unit.
+     *
+     * MC-108 Task 8: 当 Filer 在 Begin→Commit 窗口内已用其内部凭据把
+     * 权威快照物化到目标针 (alloc_result.committed=true) 时, 客户端必须
+     * 跳过这次整针写. 本地 snap_data 是迁移发起时的陈旧快照, 无条件整针
+     * 覆盖 + volume 端 invalidate coalescer 会确定性清掉迁移窗口内对端
+     * 并发 blob 写已落盘/在途的区间 (TR-4.2 数据损坏根因之一).
+     * 此处只 adopt 布局; 下面的 re-dirty 会让各页以 blob 部分写 RMW
+     * 回到服务端, 与 Filer 物化版本按 per-needle 锁串行合并. */
     if (alloc_result.is_stripe) {
         write_vid = alloc_result.allocs[0];      /* 第一个 stripe 的 volume_id */
         write_nid = alloc_result.allocs[1];      /* 第一个 stripe 的 needle_id (base) */
@@ -1830,106 +2244,35 @@ static int powerfs_migrate_inline_out(struct inode *inode,
         write_vid = alloc_result.volume_id;
         write_nid = alloc_result.file_key;
     }
-    ret = powerfs_net_write_needle(write_vid, write_nid, ino,
-                                    snap_data, snap_len,
-                                    NULL, 0);
-    if (ret < 0) {
-        pr_warn("powerfs: MIGRATE ino=%lu write_needle failed: %d, needle_id=%#llx leaked\n",
-                ino, ret, (unsigned long long)write_nid);
-        kfree(alloc_result.allocs);
-        kfree(snap_data);
-        return ret;  /* 透传网络错误, 非 EFBIG */
+
+    if (alloc_result.committed) {
+        pr_debug("powerfs: MIGRATE ino=%lu Filer already committed needle_id=%#llx epoch=%llu, skip redundant full write\n",
+                ino, (unsigned long long)write_nid,
+                (unsigned long long)alloc_result.migrate_epoch);
+    } else {
+        ret = powerfs_net_write_needle(write_vid, write_nid, ino,
+                                        snap_data, snap_len,
+                                        NULL, 0);
+        if (ret < 0) {
+            pr_warn("powerfs: MIGRATE ino=%lu write_needle failed: %d, needle_id=%#llx leaked\n",
+                    ino, ret, (unsigned long long)write_nid);
+            kfree(alloc_result.allocs);
+            mutex_unlock(&pi->alloc_mutex);
+            kfree(snap_data);
+            return ret;  /* 透传网络错误, 非 EFBIG */
+        }
+
+        pr_debug("powerfs: MIGRATE ino=%lu write_needle OK volume_id=%llu needle_id=%#llx size=%u (%s)\n",
+                ino, (unsigned long long)write_vid,
+                (unsigned long long)write_nid, snap_len,
+                alloc_result.is_stripe ? "Stripe" : "Flat");
     }
 
-    pr_debug("powerfs: MIGRATE ino=%lu write_needle OK volume_id=%llu needle_id=%#llx size=%u (%s)\n",
-            ino, (unsigned long long)write_vid,
-            (unsigned long long)write_nid, snap_len,
-            alloc_result.is_stripe ? "Stripe" : "Flat");
-
-    /* 5. 持锁切换 inode: 释放 inline_data, 更新布局元数据.
+    /* 5. 持锁切换 inode: 释放 inline_data, 更新布局元数据 (复用 helper).
      * 后续 write 走对应 writeback 路径, close 时 UPDATE_INODE_SIZE_CHUNKS
      * 同步 size+chunks 到 Filer (原子清除 inline_data + 设布局 chunks). */
-    if (alloc_result.is_stripe) {
-        /* Stripe 路径: 预分配 volume_ids + stripe_needle_keys 数组 (锁外 GFP_KERNEL 可睡眠).
-         * Filer 为每个 stripe 独立分配 (volume_id, needle_id), 两者都需保存:
-         *   volume_ids[i]        = allocs[2i]
-         *   stripe_needle_keys[i]= allocs[2i+1] (per-stripe base needle) */
-        u64 *new_vids = kmalloc_array(alloc_result.stripe_count,
-                                       sizeof(u64), GFP_KERNEL);
-        u64 *new_keys = kmalloc_array(alloc_result.stripe_count,
-                                       sizeof(u64), GFP_KERNEL);
-        u64 *old_vids, *old_keys;
-        u32 i;
-
-        if (!new_vids || !new_keys) {
-            /* 分配失败: 数据已写 Volume Server, 但 inode 没切换.
-             * close 时 UPDATE_INODE_SIZE_CHUNKS 仍带 inline_data → 数据不一致.
-             * 退化为 Flat (用 allocs[0] 作 volume_id/file_key), 至少
-             * 后续 writeback 能找到数据. */
-            pr_warn("powerfs: MIGRATE ino=%lu kmalloc stripe arrays failed, fall back to Flat\n",
-                    ino);
-            kfree(new_vids);
-            kfree(new_keys);
-            spin_lock(&pi->i_lock);
-            pi->placement = POWERFS_PLACEMENT_FLAT;
-            pi->volume_id = alloc_result.allocs[0];
-            pi->file_key = alloc_result.allocs[1];
-            pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
-            kfree(pi->volume_ids);
-            pi->volume_ids = NULL;
-            pi->volume_ids_count = 0;
-            kfree(pi->stripe_needle_keys);
-            pi->stripe_needle_keys = NULL;
-            kfree(pi->inline_data);
-            pi->inline_data = NULL;
-            pi->inline_len = 0;
-            pi->inline_dirty = false;
-            spin_unlock(&pi->i_lock);
-            goto migrate_done;
-        }
-        for (i = 0; i < alloc_result.stripe_count; i++) {
-            new_vids[i] = alloc_result.allocs[i * 2];
-            new_keys[i] = alloc_result.allocs[i * 2 + 1];
-        }
-
-        spin_lock(&pi->i_lock);
-        /* 释放旧数组 (placement 切换场景) */
-        old_vids = pi->volume_ids;
-        old_keys = pi->stripe_needle_keys;
-        pi->volume_ids = new_vids;
-        pi->stripe_needle_keys = new_keys;
-        pi->volume_ids_count = alloc_result.stripe_count;
-        pi->placement = POWERFS_PLACEMENT_STRIPE;
-        pi->stripe_size = alloc_result.stripe_size;
-        pi->stripe_count = alloc_result.stripe_count;
-        /* file_key/volume_id = 第一个 stripe (兼容 Flat fallback 路径) */
-        pi->file_key = alloc_result.allocs[1];
-        pi->volume_id = alloc_result.allocs[0];
-        pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
-        kfree(pi->inline_data);
-        pi->inline_data = NULL;
-        pi->inline_len = 0;
-        pi->inline_dirty = false;
-        spin_unlock(&pi->i_lock);
-        kfree(old_vids);
-        kfree(old_keys);
-    } else {
-        /* Flat 路径 (原 K2-7 逻辑) */
-        spin_lock(&pi->i_lock);
-        pi->placement = POWERFS_PLACEMENT_FLAT;
-        pi->volume_id = alloc_result.volume_id;
-        pi->file_key = alloc_result.file_key;
-        pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
-        kfree(pi->inline_data);
-        pi->inline_data = NULL;
-        pi->inline_len = 0;
-        pi->inline_dirty = false;
-        spin_unlock(&pi->i_lock);
-    }
-
-migrate_done:
-    kfree(alloc_result.allocs);
-    kfree(snap_data);
+    powerfs_apply_migrate_alloc(inode, &alloc_result);
+    mutex_unlock(&pi->alloc_mutex);
 
     /* K2-9: After migration, the Volume Server only has inline_data (≤8KB).
      * Pages beyond inline_data's range were written via write_end (which
@@ -1981,6 +2324,7 @@ migrate_done:
 
     pr_debug("powerfs: MIGRATE ino=%lu → %s done, subsequent writes → Volume Server\n",
             ino, alloc_result.is_stripe ? "Stripe" : "Flat");
+    kfree(snap_data);
     return 0;
 }
 
@@ -2028,6 +2372,21 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
          * and folio_mark_dirty, finds no dirty pages, then overwrites
          * i_size with stale server value (0) + invalidate_mapping_pages
          * discards the just-written data → 0-byte files. */
+        if (pi->placement != POWERFS_PLACEMENT_INLINE) {
+            /* Bug#12: Flat/Stripe "空壳" inode (ftruncate 预分配 / create
+             * 时 Filer 只定了 storage_mode, 尚未分配 needle). 若直接标脏,
+             * writepage 的 locate_chunk 必返 -EINVAL (fsync EIO). 首次写
+             * 前同步补齐卷分配 (服务端为正常首次分配路径, 幂等; 与 DIO
+             * 路径共用 helper). 失败则不标脏, 错误透传给 write(). */
+            int alloc_ret = powerfs_ensure_volume_alloc(inode, pi);
+            if (alloc_ret < 0) {
+                folio_unlock(folio);
+                folio_put(folio);
+                if (got_caps)
+                    powerfs_cap_put_refs(pi, got_caps);
+                return alloc_ret;
+            }
+        }
         folio_mark_dirty(folio);
         powerfs_cap_mark_dirty(pi, POWERFS_CAP_FILE_WR);
         if (end_pos > i_size_read(inode)) {
@@ -2058,25 +2417,56 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                 pr_debug("powerfs: WB_END INLINE first write ino=%lu copied=%u end=%zu\n",
                         inode->i_ino, copied, end_pos);
 
-            /* K2-7: 检查是否超出 inline 硬上限 (8KB).
-             * 超出时截断到 INLINE_MAX_SIZE, 写入后触发迁移到 Flat.
-             * 迁移阈值 = min(inline_max_size × 1.5, INLINE_MAX_SIZE),
-             * 对齐 FUSE fuse.rs L3444. */
+            /* K2-7: 写越过 inline 硬上限 (8KB).
+             * MC-108 fix2: 旧实现截断 copied 并返回 -EFBIG, 但 folio 已在
+             * 上方标脏且 placement 停留 INLINE — 数据只存在于本地脏页,
+             * writepages 对 INLINE 越界页 "keep dirty" 永不持久化, 服务端
+             * 永远缺这块 (TR-4.2 M 模式 25/25 FAIL 根因: pos>=8192 的写
+             * 全部死路, 脏页每 5s 重试永不落盘).
+             * 现改为在此处就地完成迁移, placement 切到 Flat/Stripe 后由
+             * blob 回写持久化当前 folio (上方已 folio_mark_dirty):
+             *   - 本地 inline 缓冲有内容 (服务端权威前缀或未提交脏数据)
+             *     → 内容迁移 powerfs_migrate_inline_out (快照 max(i_size,
+             *     inline_len) 零扩展整针写), 与 K2-7 阈值路径同语义;
+             *   - 本地无 inline 内容 (空壳 adopt / DIO 首写)
+             *     → 仅补卷分配 powerfs_ensure_volume_alloc; 服务端 Inline
+             *     内容由 Filer 在迁移窗口物化 (committed=1 只 adopt),
+             *     服务端 Empty 时首分配, 当前 folio 走 blob RMW.
+             * 两种情况下本 folio 数据已拷入页缓存, 不再截断 copied. */
             if (need_len > POWERFS_INLINE_MAX_SIZE) {
-                pr_warn("powerfs: WB_END INLINE ino=%lu write end=%zu > INLINE_MAX=%d, "
-                        "will migrate after write\n",
-                        inode->i_ino, need_len, POWERFS_INLINE_MAX_SIZE);
-                need_len = POWERFS_INLINE_MAX_SIZE;
-                copied = min_t(unsigned int, copied,
-                               POWERFS_INLINE_MAX_SIZE - pos);
-                if (copied == 0) {
-                    /* pos 已超 8KB, 无法写入 inline_data.
-                     * 返回 -EFBIG 触发上层重试 (此时若已迁移则走 Flat). */
-                    folio_unlock(folio);
-                    folio_put(folio);
-                    return -EFBIG;
+                bool have_inline;
+                int mig_ret;
+
+                spin_lock(&pi->i_lock);
+                have_inline = pi->inline_data && pi->inline_len > 0;
+                spin_unlock(&pi->i_lock);
+
+                if (have_inline) {
+                    mig_ret = powerfs_migrate_inline_out(inode, pi);
+                    if (mig_ret < 0) {
+                        pr_warn("powerfs: WB_END INLINE ino=%lu migrate failed: %d\n",
+                                inode->i_ino, mig_ret);
+                        folio_unlock(folio);
+                        folio_put(folio);
+                        if (got_caps)
+                            powerfs_cap_put_refs(pi, got_caps);
+                        return mig_ret;
+                    }
+                } else {
+                    mig_ret = powerfs_ensure_volume_alloc(inode, pi);
+                    if (mig_ret < 0) {
+                        pr_warn("powerfs: WB_END INLINE ino=%lu first-write alloc failed: %d\n",
+                                inode->i_ino, mig_ret);
+                        folio_unlock(folio);
+                        folio_put(folio);
+                        if (got_caps)
+                            powerfs_cap_put_refs(pi, got_caps);
+                        return mig_ret;
+                    }
                 }
-                end_pos = pos + copied;
+                pr_warn_ratelimited("powerfs: WB_END INLINE ino=%lu crossed INLINE_MAX mid-write, placement now %u, folio left dirty for blob writeback\n",
+                                    inode->i_ino, READ_ONCE(pi->placement));
+                goto inline_done;
             }
 
             /* 若 inline_data 未分配或不够大, 在锁外分配新 buffer */
@@ -2118,6 +2508,9 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                 memcpy(pi->inline_data + pos, kaddr, copied);
                 kunmap_local(kaddr);
                 pi->inline_dirty = true;
+                pi->inline_seq++;   /* MC-108 Task 3: 内容变更代际递增 */
+                /* MC-108 Task 5: 标记本写入覆盖的 4K 块, 提交按位合并 */
+                powerfs_inline_dirty_mark_range(pi, pos, pos + copied);
                 pr_debug("powerfs: WB_END INLINE ino=%lu pos=%lld copied=%u inline_len=%u\n",
                         inode->i_ino, pos, copied, pi->inline_len);
             }
@@ -2361,35 +2754,17 @@ static void powerfs_dio_write_worker(struct work_struct *work)
                page_address(dw->pages[i]) + off, this);
     }
 
-    /* 无 volume 映射: 直写前需获取 volume_id/file_key (同步路径同款逻辑).
-     * workqueue 进程上下文可睡眠, 网络 RPC 安全. */
-    if (!pi->volume_id && !pi->file_key &&
-        !pi->chunks && !pi->volume_ids) {
-        if (pi->placement == POWERFS_PLACEMENT_INLINE &&
-            pi->inline_data && pi->inline_len > 0) {
-            result = powerfs_migrate_inline_out(inode, pi);
-        } else {
-            struct powerfs_migrate_alloc_result alloc = {0};
-            __u64 shard_id =
-                shard_map_route(pi->parent_ino ? pi->parent_ino : inode->i_ino);
-
-            powerfs_flush_pending_create(inode, false);
-            result = powerfs_net_migrate_inline_alloc(shard_id, inode->i_ino,
-                                                      false, &alloc);
-            if (result >= 0) {
-                spin_lock(&pi->i_lock);
-                pi->placement = POWERFS_PLACEMENT_FLAT;
-                pi->volume_id = alloc.volume_id;
-                pi->file_key = alloc.file_key;
-                pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
-                spin_unlock(&pi->i_lock);
-                kfree(alloc.allocs);
-            }
-        }
-        if (result < 0) {
-            kvfree(buf);
-            goto free_pages;
-        }
+    /* 无 volume 映射: 直写前先完成 inline 内容迁移, 或对空壳/空 inline
+     * 文件做首次卷分配 (Bug#12 统一路径, workqueue 进程上下文可睡眠). */
+    if (pi->placement == POWERFS_PLACEMENT_INLINE &&
+        pi->inline_data && pi->inline_len > 0) {
+        result = powerfs_migrate_inline_out(inode, pi);
+    } else {
+        result = powerfs_ensure_volume_alloc(inode, pi);
+    }
+    if (result < 0) {
+        kvfree(buf);
+        goto free_pages;
     }
 
     if (!pi->volume_id && !pi->file_key &&
@@ -2446,7 +2821,7 @@ static void powerfs_dio_write_worker(struct work_struct *work)
         }
 
         result = powerfs_net_write_needle(pi->volume_id, needle_id,
-                                           inode->i_ino,
+                                           powerfs_inode_io_ino(inode),
                                            buf, dw->count, NULL, 0);
         if (result == 0) {
             written = dw->count;
@@ -2471,7 +2846,9 @@ static void powerfs_dio_write_worker(struct work_struct *work)
         result = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
                                     dw->pos, buf, dw->count, &written);
     }
-dio_write_done:
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+dio_write_done:             /* 唯一 goto 在上方 ifdef 内, 同步条件编译 */
+#endif
     kvfree(buf);
 
     if (result >= 0) {
@@ -2538,40 +2915,25 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
                 return -EFAULT;
             }
 
-            /* 无 volume 映射 (INLINE 或 FLAT 但未分配): 直写前需获取
+            /* 无 volume 映射 (INLINE 或空壳 Flat/Stripe): 直写前需获取
              * volume_id/file_key.
-             *   - INLINE 有 inline_data: 调用 powerfs_migrate_inline_out (内容感知
+             *   - INLINE 有 inline_data: powerfs_migrate_inline_out (内容感知
              *     迁移, 写 snap_data 到 Volume Server 后切换 placement).
-             *   - 其他 (INLINE 无 inline_data / FLAT 未分配): 向 Filer 申请 Flat 布局.
+             *   - 其他 (INLINE 无 inline_data / 空壳 Flat/Stripe):
+             *     powerfs_ensure_volume_alloc 首次分配 (Bug#12).
              * 失败透传错误码, 不回退 buffered I/O. */
-            if (!pi->volume_id && !pi->file_key &&
-                !pi->chunks && !pi->volume_ids) {
-                if (pi->placement == POWERFS_PLACEMENT_INLINE &&
-                    pi->inline_data && pi->inline_len > 0) {
-                    ret = powerfs_migrate_inline_out(inode, pi);
-                    if (ret < 0) {
-                        kvfree(buf);
-                        return ret;
-                    }
-                } else {
-                    struct powerfs_migrate_alloc_result alloc = {0};
-                    __u64 shard_id =
-                        shard_map_route(pi->parent_ino ? pi->parent_ino : inode->i_ino);
-
-                    powerfs_flush_pending_create(inode, false);
-                    ret = powerfs_net_migrate_inline_alloc(shard_id, inode->i_ino,
-                                                           false, &alloc);
-                    if (ret < 0) {
-                        kvfree(buf);
-                        return ret;
-                    }
-                    spin_lock(&pi->i_lock);
-                    pi->placement = POWERFS_PLACEMENT_FLAT;
-                    pi->volume_id = alloc.volume_id;
-                    pi->file_key = alloc.file_key;
-                    pi->layout_chunk_size = POWERFS_CHUNK_SIZE;
-                    spin_unlock(&pi->i_lock);
-                    kfree(alloc.allocs);
+            if (pi->placement == POWERFS_PLACEMENT_INLINE &&
+                pi->inline_data && pi->inline_len > 0) {
+                ret = powerfs_migrate_inline_out(inode, pi);
+                if (ret < 0) {
+                    kvfree(buf);
+                    return ret;
+                }
+            } else {
+                ret = powerfs_ensure_volume_alloc(inode, pi);
+                if (ret < 0) {
+                    kvfree(buf);
+                    return ret;
                 }
             }
 
@@ -2632,7 +2994,7 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
                 }
 
                 ret = powerfs_net_write_needle(pi->volume_id, needle_id,
-                                                inode->i_ino,
+                                                powerfs_inode_io_ino(inode),
                                                 buf, count, NULL, 0);
                 if (ret == 0) {
                     chunk_written = count;
@@ -2657,7 +3019,9 @@ static ssize_t powerfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
                 ret = powerfs_net_write(inode->i_ino, pi->volume_id, pi->file_key,
                                          pos, buf, count, &chunk_written);
             }
-skip_write:
+#ifdef CONFIG_POWERFS_WRITE_PREDICT
+skip_write:                 /* 唯一 goto 在上方 ifdef 内, 同步条件编译 */
+#endif
             kvfree(buf);
 
             if (ret < 0) {

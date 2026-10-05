@@ -29,6 +29,7 @@
 #include <linux/iversion.h>     /* inode_inc_iversion_raw (page_mkwrite) */
 #include <linux/filelock.h>     /* posix_lock_file / locks_lock_inode_wait / FL_FLOCK / FL_POSIX */
 #include <linux/posix_acl_xattr.h>  /* posix_acl_from_xattr / posix_acl_to_xattr (序列化 xattr<->acl) */
+#include <linux/vmalloc.h>        /* kvmalloc / kvfree */
 #include <linux/migrate.h>      /* filemap_migrate_folio (页迁移, P1-4) */
 #include <linux/fs.h>           /* FS_IOC_* ioctl 编号 (P1-3) */
 #include <linux/fileattr.h>     /* ioctl_getflags/ioctl_setflags/ioctl_fsgetxattr/ioctl_fssetxattr (P1-3, Linux 6.17+) */
@@ -117,6 +118,19 @@ struct inode *powerfs_iget(struct super_block *sb, u64 ino)
              ino, inode, !!(inode->i_state & I_NEW));
 
     return inode;
+}
+
+/* MC-108: inode number to use for data-plane RPCs. A placeholder inode that
+ * lost a same-name create race is redirected to the Filer's winner inode;
+ * all I/O must target the winner so open fds keep landing on the right file. */
+u64 powerfs_inode_io_ino(struct inode *inode)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    u64 r;
+    spin_lock(&pi->i_lock);
+    r = pi->redirected_to;
+    spin_unlock(&pi->i_lock);
+    return r ? r : inode->i_ino;
 }
 
 /*
@@ -384,13 +398,11 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
                     pi->placement, layout->placement, pi->netfs.inode.i_ino);
             return;
         } else {
-            /* P0-1 诊断: placement 变更, 打印前后值 + volume_id/file_key 状态.
-             * 覆盖 INLINE→FLAT 场景: 若 vid=0 会导致 locate EINVAL. */
-            pr_debug("powerfs: apply_layout placement %u→%u ino=%lu vid=%llu fkey=%llu has_vids=%u\n",
+            pr_debug("powerfs: apply_layout placement %u→%u ino=%lu vid=%llu fkey=%llu vids=%p vc=%u\n",
                     pi->placement, layout->placement, pi->netfs.inode.i_ino,
                     (unsigned long long)pi->volume_id,
                     (unsigned long long)pi->file_key,
-                    layout->has_placement);
+                    pi->volume_ids, pi->volume_ids_count);
             pi->placement = layout->placement;
         }
     }
@@ -423,10 +435,14 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
             layout->inline_data = NULL;
             layout->inline_len = 0;
         } else {
-            /* inline_data 所有权转移: 先释放旧 buffer, 再挂载新 buffer */
+            /* inline_data 所有权转移: 先释放旧 buffer, 再挂载新 buffer.
+             * MC-108 Task 3: seq 递增以通知所有在飞提交"数据已换代". */
             old_inline = pi->inline_data;
             pi->inline_data = layout->inline_data;
             pi->inline_len = layout->inline_len;
+            pi->inline_seq++;
+            powerfs_inline_dirty_map_reset(pi);  /* MC-108 Task 5: 服务端数据
+                                                    整体替换, 位图清零 */
             layout->inline_data = NULL;       /* 所有权转移, 防止 double-free */
             layout->inline_len = 0;
             kfree(old_inline);
@@ -442,6 +458,8 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
             pi->inline_data = NULL;
             pi->inline_len = 0;
             pi->inline_dirty = false;
+            pi->inline_seq++;
+            powerfs_inline_dirty_map_reset(pi);  /* MC-108 Task 5 */
         }
     }
 
@@ -1198,6 +1216,7 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->i_wanted_max_size = 0;
     pi->i_requested_max_size = 0;
     mutex_init(&pi->i_truncate_mutex);
+    mutex_init(&pi->alloc_mutex);
     pi->i_truncate_seq = 0;
     pi->i_truncate_size_visible = 0;
     pi->i_xattr_version = 0;
@@ -1231,6 +1250,7 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->dedup_chunk_count = 0;
 #endif
     pi->content_size = 0;
+    pi->chunks_dirty = false;
     pi->volume_id = 0;
     pi->file_key = 0;
     pi->shutdown = false;
@@ -1264,6 +1284,11 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->inline_len = 0;
     pi->inline_max_size = 0;  /* GETATTR 响应覆盖, 或 apply_layout 时设默认值 */
     pi->inline_dirty = false;
+    pi->inline_seq = 0;
+    pi->inline_dirty_map = 0;  /* MC-108 Task 5: 脏 4K 块位图 */
+    pi->redirected_to = 0;  /* MC-108: 必须清零, slab 复用会残留旧 winner ino,
+                             * 否则数据面 RPC (migrate/needle) 被重定向到陈旧
+                             * ino → Filer ENOENT, 写被整体丢弃. */
 
     /* 异步 setattr work (writeback offload) */
     INIT_WORK(&pi->setattr_work, powerfs_setattr_work_fn);
@@ -1883,23 +1908,56 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
          *   - inline_len 仍为旧值 (如 4096)
          *   - write_end 中 inline_len >= need_len, 不重新分配
          *   - 旧 inline_data buffer 被部分覆盖, 数据不一致
-         * truncate 到非 0: 截断 inline_data 到新大小 */
+         * truncate 到非 0: 截断 inline_data 到新大小
+         *
+         * MC-108 Task 3: 扩展 (ia_size > inline_len) 也必须处理:
+         * inline 缓冲按 i_size 零扩展 + 置 dirty, 否则纯 truncate(8192)
+         * 后无写入路径可持久化新 size (content_size 闸门会跳过提交),
+         * Filer 端 size 停滞导致零区丢失. */
         if (pi->placement == POWERFS_PLACEMENT_INLINE) {
-            spin_lock(&pi->i_lock);
             if (attr->ia_size == 0) {
+                spin_lock(&pi->i_lock);
                 kfree(pi->inline_data);
                 pi->inline_data = NULL;
                 pi->inline_len = 0;
                 pi->inline_dirty = false;
+                pi->inline_seq++;
+                powerfs_inline_dirty_map_reset(pi);  /* MC-108 Task 5 */
+                spin_unlock(&pi->i_lock);
                 pr_debug("powerfs: SETATTR truncate INLINE ino=%lu size=0, cleared inline_data\n",
                         inode->i_ino);
-            } else if (pi->inline_data && attr->ia_size < pi->inline_len) {
-                pi->inline_len = attr->ia_size;
+            } else if (attr->ia_size < old_size) {
+                /* 显式 truncate-down: 截断 inline_data 到新大小 */
+                spin_lock(&pi->i_lock);
+                if (pi->inline_data && attr->ia_size < pi->inline_len) {
+                    pi->inline_len = attr->ia_size;
+                    pi->inline_seq++;
+                }
                 pi->inline_dirty = true;
+                spin_unlock(&pi->i_lock);
                 pr_debug("powerfs: SETATTR truncate INLINE ino=%lu size=%llu, inline_len=%u\n",
                         inode->i_ino, attr->ia_size, pi->inline_len);
+            } else if (attr->ia_size > old_size &&
+                       attr->ia_size <= POWERFS_INLINE_MAX_SIZE) {
+                /* 扩展: 仅置 dirty + seq, 不预扩 inline_data.
+                 * 原因: write_end 的迁移条件是 inline_len >=
+                 * min(inline_max_size*3/2, INLINE_MAX_SIZE). 若这里把
+                 * inline_len 预扩到 8192, 下一次写 (哪怕只写 1 字节) 都会
+                 * 触发 Inline→Flat 迁移. 纯 truncate-extend 的持久化由
+                 * commit 路径 (fsync/close/recall/writepages) 的
+                 * powerfs_inline_commit_sync 快照零扩展
+                 * (max(i_size, inline_len)) 负责, 无需预扩缓冲.
+                 * MC-108 Task 5: 零洞 [old_size, ia_size) 是本客户端的
+                 * 内容变更, 标记脏块随提交按位合并. */
+                spin_lock(&pi->i_lock);
+                powerfs_inline_dirty_mark_range(pi, old_size,
+                                                (loff_t)attr->ia_size);
+                pi->inline_dirty = true;
+                pi->inline_seq++;
+                spin_unlock(&pi->i_lock);
+                pr_debug("powerfs: SETATTR extend INLINE ino=%lu size=%llu, dirty=1\n",
+                        inode->i_ino, attr->ia_size);
             }
-            spin_unlock(&pi->i_lock);
         }
 
         /* K2-10: When a FLAT file is truncated (i_size decreases), the
@@ -2164,11 +2222,12 @@ int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
             powerfs_net_is_connected()) {
             u64 shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : inode->i_ino);
             int uret;
-            uret = powerfs_net_update_inode_size_chunks(shard_id, inode->i_ino,
+            uret = powerfs_net_update_inode_size_chunks(shard_id, powerfs_inode_io_ino(inode),
                                                          0ULL, /* size=0 */
                                                          "kernel-setattr-trunc0",
                                                          NULL, 0, /* chunks=empty */
-                                                         NULL, 0); /* inline_data=none */
+                                                         NULL, 0, /* inline_data=none */
+                                                         NULL); /* 无脏位图 */
             if (uret < 0)
                 pr_warn("powerfs: setattr trunc0 update_inode_size_chunks "
                         "ino=%lu failed: %d (next flush/release will retry)\n",

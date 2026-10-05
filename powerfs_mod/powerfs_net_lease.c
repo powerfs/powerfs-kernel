@@ -354,7 +354,8 @@ int powerfs_net_cap_open_grant(__u64 ino,
                                bool is_write_open,
                                char *lease_token_out, size_t *token_len_out,
                                __u8 *cap_set_out, __u64 *epoch_out,
-                               __u64 *sn_out, __u64 *duration_ms_out)
+                               __u64 *sn_out, __u64 *duration_ms_out,
+                               bool *migrating_out)
 {
     __u8 body[512];
     struct powerfs_tlv_enc enc;
@@ -385,6 +386,8 @@ int powerfs_net_cap_open_grant(__u64 ino,
         *sn_out = 0;
     if (duration_ms_out)
         *duration_ms_out = 0;
+    if (migrating_out)
+        *migrating_out = false;
 
     resp_body = kvmalloc(POWERFS_NET_MAX_BODY, GFP_NOFS);
     if (!resp_body)
@@ -415,12 +418,21 @@ int powerfs_net_cap_open_grant(__u64 ino,
     }
 
     /* 解码响应: TLV 字段顺序随意 (按 FieldId find). */
-    if (resp_body_len > 0) {
+    {
+        __u8 mig = 0;
+        int found;
+
         powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
         decode_cap_grant_fields(&dec,
                                 lease_token_out, token_len_out,
                                 cap_set_out, epoch_out,
                                 sn_out, duration_ms_out);
+        /* MC-108 Task 5: MigrateInProgress (0xE3) — 迁移窗口内 Filer
+         * 暂缓写 cap 授予. find_u8 全域扫描, 不依赖字段顺序. */
+        found = powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_MIGRATE_IN_PROGRESS,
+                                        &mig);
+        if (found == 0 && migrating_out)
+            *migrating_out = (mig != 0);
     }
 
     ret = 0;

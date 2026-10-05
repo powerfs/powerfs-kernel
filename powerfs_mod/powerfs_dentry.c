@@ -748,3 +748,16 @@ int powerfs_invalidate_dentry(u64 parent_ino, const char *name, size_t name_len,
     return 0;
 }
 EXPORT_SYMBOL_GPL(powerfs_invalidate_dentry);
+
+/* MC-108 T2-D: wait for any previously-queued DentryInvalidate works to
+ * complete before taking an optimistic fast-path create decision. A stale
+ * negative dentry must not let a client skip the authoritative Filer lookup
+ * and locally create a placeholder that will lose a same-name race. This
+ * flushes the shared refresh workqueue; fast-path creates are rare (only
+ * while holding AUTH_EXCL as lone writer) so the serialization cost is
+ * acceptable. Safe to call with powerfs_refresh_wq == NULL. */
+void powerfs_flush_dentry_invalidates(void)
+{
+    if (powerfs_refresh_wq)
+        flush_workqueue(powerfs_refresh_wq);
+}

@@ -234,7 +234,40 @@ void powerfs_flush_dirty_creates(struct inode *dir)
 
     /* 3. Send BatchCreate RPC (one Raft commit for all entries) */
     shard_id = shard_map_route(dir->i_ino);
-    ret = powerfs_net_batch_create(shard_id, entries, count, &flushed);
+    {
+        struct powerfs_batch_entry_result *res_arr =
+            kvmalloc_array(count, sizeof(*res_arr), GFP_NOFS);
+        if (!res_arr) {
+            spin_lock(&dpi->dirty_creates_lock);
+            list_splice(&tmp_list, &dpi->dirty_creates);
+            dpi->dirty_create_count = count;
+            spin_unlock(&dpi->dirty_creates_lock);
+            queue_delayed_work(system_long_wq, &dpi->flush_work,
+                               msecs_to_jiffies(POWERFS_DIRTY_FLUSH_RETRY_MS));
+            kfree(entries);
+            return;
+        }
+        ret = powerfs_net_batch_create(shard_id, entries, count, &flushed,
+                                       res_arr);
+
+        if (ret == 0) {
+            /* MC-108: for each entry, check whether we lost a same-name
+             * race (adopted_existing). If so, switch the local placeholder
+             * inode/dentry to the authoritative winner inode so subsequent
+             * writes land on the correct file. */
+            __u32 ri = 0;
+            list_for_each_entry(dc, &tmp_list, list) {
+                if (ri < count && res_arr[ri].adopted_existing) {
+                    powerfs_switch_to_winner_inode(dir, dc->ino,
+                                                   res_arr[ri].ino,
+                                                   res_arr[ri].placement_tag,
+                                                   dc->name, dc->name_len);
+                }
+                ri++;
+            }
+        }
+        kvfree(res_arr);
+    }
 
     if (ret == 0) {
         /* Success: the inodes are now visible on the Filer, so other
@@ -368,6 +401,193 @@ void powerfs_check_dirty_flush(struct inode *dir)
     else
         queue_delayed_work(system_long_wq, &dpi->flush_work,
                            msecs_to_jiffies(POWERFS_DIRTY_FLUSH_TIMEOUT_MS));
+}
+
+/* MC-108: a locally-created placeholder inode lost a same-name BatchCreate
+ * race. The Filer adopted a pre-existing WINNER inode. Re-point the local
+ * state at the winner so all subsequent I/O lands on the authoritative file.
+ *
+ * Steps:
+ *   1. LOOKUP the winner to get authoritative attrs (ino/mode/size/layout/
+ *      volume_id/file_key) and instantiate the winner inode.
+ *   2. Migrate any dirty inline data from the placeholder onto the winner
+ *      (take the larger size) so the loser's writes are not lost.
+ *   3. Copy the winner's storage metadata (volume_id/file_key/placement)
+ *      into the placeholder and set pi->redirected_to = winner_ino, so any
+ *      open file descriptors still referencing the placeholder forward their
+ *      I/O RPCs to the winner's needles.
+ *   4. Re-instantiate the placeholder's dentry alias to the winner inode so
+ *      fresh lookups/opens resolve directly to the winner.
+ *   5. Update the parent's dir_entries list to point at the winner ino.
+ */
+void powerfs_switch_to_winner_inode(struct inode *dir, u64 placeholder_ino,
+                                    u64 winner_ino, u8 placement_tag,
+                                    const char *name, size_t name_len)
+{
+    struct super_block *sb = dir->i_sb;
+    struct inode *placeholder, *winner = NULL;
+    struct dentry *alias;
+    struct powerfs_inode_info *ppi, *wpi;
+    __u64 ino = 0, size = 0, mtime = 0, atime = 0, ctime = 0, volume_id = 0, file_key = 0;
+    __u32 mode = 0, uid = 0, gid = 0, nlink = 0;
+    struct powerfs_file_layout layout;
+    int err;
+
+    (void)placement_tag;
+
+    placeholder = ilookup(sb, placeholder_ino);
+    if (!placeholder)
+        return; /* already evicted; next lookup gets the winner */
+
+    ppi = POWERFS_I(placeholder);
+
+    memset(&layout, 0, sizeof(layout));
+    err = powerfs_net_lookup_timeout(dir->i_ino, name, name_len,
+                                     &ino, &mode, &uid, &gid, &size, &nlink,
+                                     &mtime, &atime, &ctime,
+                                     &volume_id, &file_key, &layout,
+                                     POWERFS_LOOKUP_TIMEOUT_MS);
+    if (err || ino == 0) {
+        pr_warn_ratelimited("powerfs: MC-108 switch_to_winner lookup '%.*s' "
+                            "failed err=%d (placeholder=%llu)\n",
+                            (int)name_len, name, err, placeholder_ino);
+        iput(placeholder);
+        return;
+    }
+    winner_ino = ino;
+
+    winner = powerfs_iget(sb, winner_ino);
+    if (IS_ERR(winner)) {
+        pr_warn("powerfs: MC-108 switch_to_winner iget ino=%llu failed: %ld\n",
+                winner_ino, PTR_ERR(winner));
+        kfree(layout.volume_ids);
+        kfree(layout.inline_data);
+        kfree(layout.replica_chunks);
+        kfree(layout.ec_chunks);
+        iput(placeholder);
+        return;
+    }
+
+    if (winner->i_state & I_NEW) {
+        powerfs_init_inode(winner, mode, dir->i_ino, name);
+        winner->i_mode = mode;
+        winner->i_uid = make_kuid(&init_user_ns, uid);
+        winner->i_gid = make_kgid(&init_user_ns, gid);
+        i_size_write(winner, size);
+        set_nlink(winner, nlink);
+        inode_set_mtime(winner, mtime, 0);
+        inode_set_atime(winner, atime, 0);
+        inode_set_ctime(winner, ctime, 0);
+        wpi = POWERFS_I(winner);
+        spin_lock(&wpi->i_lock);
+        wpi->cache_valid = true;
+        wpi->content_size = size;
+        wpi->volume_id = volume_id;
+        wpi->file_key = file_key;
+        powerfs_apply_layout_to_inode(wpi, &layout);
+        spin_unlock(&wpi->i_lock);
+        unlock_new_inode(winner);
+    } else {
+        /* Winner already cached; ensure layout is applied. */
+        kfree(layout.volume_ids);
+        kfree(layout.inline_data);
+        kfree(layout.replica_chunks);
+        kfree(layout.ec_chunks);
+    }
+    wpi = POWERFS_I(winner);
+
+    /* ---- Migrate dirty inline data from placeholder -> winner ---- */
+    {
+        u8 *p_data = NULL;
+        u32 p_len = 0;
+        bool p_dirty = false;
+        u64 p_size = i_size_read(placeholder);
+
+        spin_lock(&ppi->i_lock);
+        p_dirty = ppi->inline_dirty;
+        if (ppi->inline_data && ppi->inline_len) {
+            p_len = ppi->inline_len;
+            p_data = kmemdup(ppi->inline_data, p_len, GFP_NOFS);
+        }
+        spin_unlock(&ppi->i_lock);
+
+        if (p_dirty && p_data) {
+            spin_lock(&wpi->i_lock);
+            if (wpi->placement == POWERFS_PLACEMENT_INLINE) {
+                if (!wpi->inline_data || p_size > wpi->inline_len) {
+                    kfree(wpi->inline_data);
+                    wpi->inline_data = p_data;
+                    wpi->inline_len = p_len;
+                    wpi->inline_dirty = true;
+                    wpi->inline_seq++;  /* MC-108 Task 3: 内容换代 */
+                    /* MC-108 Task 5: adopted 缓冲整体来自 placeholder 脏数据,
+                     * 全部位标记为本客户端自有 — 否则提交 mask 缺位导致
+                     * Filer 合并时丢弃 placeholder 的写入 (数据丢失) */
+                    {
+                        u32 blocks = (p_len + 4095) >> 12;
+
+                        wpi->inline_dirty_map =
+                            (blocks == 0) ? 0 :
+                            (blocks >= 32) ? UINT_MAX :
+                            (1u << blocks) - 1;
+                    }
+                    p_data = NULL; /* ownership transferred */
+                }
+            }
+            spin_unlock(&wpi->i_lock);
+            if (p_size > i_size_read(winner))
+                i_size_write(winner, p_size);
+        }
+        kfree(p_data);
+    }
+
+    /* ---- Redirect placeholder I/O to the winner ---- */
+    {
+        u64 w_vol, w_fkey;
+        u8 w_placement;
+        spin_lock(&wpi->i_lock);
+        w_vol = wpi->volume_id;
+        w_fkey = wpi->file_key;
+        w_placement = wpi->placement;
+        spin_unlock(&wpi->i_lock);
+
+        spin_lock(&ppi->i_lock);
+        ppi->redirected_to = winner_ino;
+        ppi->volume_id = w_vol;
+        ppi->file_key = w_fkey;
+        ppi->placement = w_placement;
+        /* No longer a locally-created placeholder: clear the marker so
+         * future open/cap paths talk to the Filer normally. */
+        ppi->local_cap_granted = false;
+        spin_unlock(&ppi->i_lock);
+    }
+
+    /* ---- Unhash the placeholder dentry so later lookups resolve to
+     * the winner. We deliberately do NOT re-instantiate this dentry onto
+     * the winner: d_drop() does not detach the inode binding, and
+     * d_instantiate() on an already-bound dentry trips
+     * BUG_ON(!hlist_unhashed(d_u.d_alias)) in fs/dcache.c (observed as a
+     * kernel BUG/panic under concurrent double-writer create:
+     * dd -> flush_pending_create -> adopt winner). The still-open fd keeps
+     * using the placeholder inode, whose volume layout was rewritten to
+     * the winner's above, so its reads/writes route to the same needle.
+     * A fresh open/lookup after d_drop() walks the Filer and binds the
+     * winner inode. */
+    alias = d_find_any_alias(placeholder);
+    if (alias) {
+        d_drop(alias);
+        dput(alias);
+    }
+    /* Release both inode references taken above (ilookup + iget); the
+     * unhashed dentry retains its own reference on placeholder. */
+    iput(placeholder);
+    iput(winner);
+
+    /* ---- Update parent dir_entries to the winner ino ---- */
+    powerfs_add_dir_entry(dir, winner_ino, S_IFREG, name);
+
+    pr_info("powerfs: MC-108 switched placeholder ino=%llu -> winner ino=%llu name='%.*s'\n",
+            placeholder_ino, winner_ino, (int)name_len, name);
 }
 
 /* Merge an mtime/atime update into a pending optimistic-create entry so it
@@ -889,7 +1109,8 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
 static struct inode *__powerfs_do_create_core(struct mnt_idmap *idmap,
                                                struct inode *dir,
                                                struct dentry *dentry,
-                                               umode_t mode, dev_t dev)
+                                               umode_t mode, dev_t dev,
+                                               bool exclusive)
 {
     struct powerfs_sb_info *sbi = POWERFS_SB_INFO(dir->i_sb);
     struct powerfs_inode_info *parent_pi = POWERFS_I(dir);
@@ -933,8 +1154,15 @@ static struct inode *__powerfs_do_create_core(struct mnt_idmap *idmap,
      *     synchronously on fsync/evict/AUTH_EXCL recall
      *   - If file is written, existing migrate + close sync path handles it
      */
-    if (S_ISREG(mode)) {
+    if (S_ISREG(mode) && !exclusive) {
         u64 shard_id = shard_map_route(dir->i_ino);
+
+        /* MC-108 T2-D: drain any pending DentryInvalidate for this (dir,name)
+         * before deciding optimistically. Otherwise a stale negative dentry
+         * (not yet invalidated by an async Filer notify) could let us skip
+         * the authoritative lookup and create a placeholder that loses the
+         * race. Fast-path creates are rare so a workqueue flush is fine. */
+        powerfs_flush_dentry_invalidates();
 
         /* Phase 3: acquire exclusive AUTH_EXCL on the parent directory.
          * cap_open_grant_and_issue() never blocks the VFS — on network
@@ -1027,7 +1255,7 @@ slow_path:
                                        dentry->d_name.len, mode,
                                        from_kuid(&init_user_ns, current_fsuid()),
                                        from_kgid(&init_user_ns, current_fsgid()),
-                                       S_ISDIR(mode), &remote_ino,
+                                       S_ISDIR(mode), exclusive, &remote_ino,
                                        &volume_id, &file_key, &layout);
         if (rerr) {
             pr_warn("powerfs: net_create '%pd' failed: %d\n", dentry, rerr);
@@ -1107,7 +1335,7 @@ int powerfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
     if (ret)
         return ret;
 
-    inode = __powerfs_do_create_core(idmap, dir, dentry, mode, dev);
+    inode = __powerfs_do_create_core(idmap, dir, dentry, mode, dev, false);
     if (IS_ERR(inode)) {
         int rerr = PTR_ERR(inode);
         pr_warn("powerfs: mknod '%pd' do_create_core failed: %d\n", dentry, rerr);
@@ -1423,7 +1651,8 @@ int powerfs_atomic_open(struct inode *dir, struct dentry *dentry,
             d_drop(dentry);
 
         inode = __powerfs_do_create_core(idmap, dir, dentry,
-                                          create_mode | S_IFREG, 0);
+                                          create_mode | S_IFREG, 0,
+                                          !!(flags & O_EXCL));
         if (IS_ERR(inode)) {
             int rerr = PTR_ERR(inode);
             inode = NULL;

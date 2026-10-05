@@ -167,6 +167,9 @@ echo "=== 优化内核配置 (QEMU + 调试) ==="
 # 配合 powerfs.ko 里 CONFIG_INFINIBAND 的 RDMA transport 路径.
 ./scripts/config --enable CONFIG_INFINIBAND
 ./scripts/config --enable CONFIG_INFINIBAND_USER_ACCESS
+# RDMA UCM: userspace RDMA CM (/dev/infiniband/rdma_cm) — required by librdmacm
+# for SPDK nvmf RDMA transport (rdma_create_event_channel).
+./scripts/config --enable CONFIG_RDMA_UCM
 ./scripts/config --enable CONFIG_INFINIBAND_USER_MEM
 ./scripts/config --enable CONFIG_INFINIBAND_ON_DEMAND_PAGING
 ./scripts/config --enable CONFIG_INFINIBAND_ADDR_TRANS

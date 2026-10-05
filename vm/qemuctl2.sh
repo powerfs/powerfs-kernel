@@ -11,7 +11,7 @@
 #   MAC (TAP eth0):        52:54:00:12:34:56     52:54:00:12:34:58
 #   MAC (user-net eth1):   52:54:00:12:34:57     52:54:00:12:34:59
 #   eth0 (docker-net) IP:  172.30.0.100          172.30.0.101
-#   ib0 (IPoIB) IP:        192.168.100.100       192.168.100.101
+#   ib0 (IPoIB) IP:        192.168.100.51        192.168.100.52
 #   VFIO VF BDF:           自动探测 mlx5_1 的 前两个 VF (virtfn0, virtfn1)
 #
 # 用法:
@@ -89,7 +89,7 @@ VM1_NAME="${VM1_NAME:-vm1}"
 VM1_SSH_PORT="${VM1_SSH_PORT:-2223}"
 VM1_TAP="${VM1_TAP:-tap0}"
 VM1_ETH0_IP="${VM1_ETH0_IP:-172.30.0.100}"
-VM1_IB0_IP="${VM1_IB0_IP:-192.168.100.100}"
+VM1_IB0_IP="${VM1_IB0_IP:-192.168.100.51}"
 VM1_MAC0="${VM1_MAC0:-52:54:00:12:34:56}"
 VM1_MAC1="${VM1_MAC1:-52:54:00:12:34:57}"
 VM1_VF_IDX="${VM1_VF_IDX:-0}"   # virtfnN on mlx5_1 (0 = first VF)
@@ -99,7 +99,7 @@ VM2_NAME="${VM2_NAME:-vm2}"
 VM2_SSH_PORT="${VM2_SSH_PORT:-2224}"
 VM2_TAP="${VM2_TAP:-tap1}"
 VM2_ETH0_IP="${VM2_ETH0_IP:-172.30.0.101}"
-VM2_IB0_IP="${VM2_IB0_IP:-192.168.100.101}"
+VM2_IB0_IP="${VM2_IB0_IP:-192.168.100.52}"
 VM2_MAC0="${VM2_MAC0:-52:54:00:12:34:58}"
 VM2_MAC1="${VM2_MAC1:-52:54:00:12:34:59}"
 VM2_VF_IDX="${VM2_VF_IDX:-1}"   # virtfnN on mlx5_1 (1 = second VF)

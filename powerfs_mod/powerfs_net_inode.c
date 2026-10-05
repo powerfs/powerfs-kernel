@@ -678,14 +678,18 @@ int powerfs_net_alloc_inode_batch(__u64 shard_id, __u32 count,
  */
 int powerfs_net_batch_create(__u64 shard_id,
                              const struct powerfs_dirty_create *entries,
-                             __u32 count, __u32 *flushed)
+                             __u32 count, __u32 *flushed,
+                             struct powerfs_batch_entry_result *results)
 {
     /* Body size: ShardId(12) + Count(6) + per-entry(~40 + name_len + 2×time).
      * Worst case: 64 × (80 + 255) ≈ 21KB. Use kvmalloc for safety. */
     size_t body_cap = 64 + (size_t)count * (80 + NAME_MAX + 1);
     __u8 *body;
     struct powerfs_tlv_enc enc;
-    __u8 resp[64];
+    /* Response: Count(10) + per-entry(ino 13 + placement 6 + optional name
+     * ~260). Worst case ~17KB for 64 entries; kvmalloc. */
+    size_t resp_cap = 64 + (size_t)count * (16 + NAME_MAX + 8);
+    __u8 *resp;
     size_t resp_len = 0;
     __u32 i;
     int ret;
@@ -699,6 +703,11 @@ int powerfs_net_batch_create(__u64 shard_id,
     body = kvmalloc(body_cap, GFP_NOFS);
     if (!body)
         return -ENOMEM;
+    resp = kvmalloc(resp_cap, GFP_NOFS);
+    if (!resp) {
+        kvfree(body);
+        return -ENOMEM;
+    }
 
     powerfs_tlv_enc_init(&enc, body, body_cap);
     powerfs_tlv_enc_u64(&enc, POWERFS_NET_FLD_SHARD_ID, shard_id);
@@ -732,23 +741,108 @@ int powerfs_net_batch_create(__u64 shard_id,
                 POWERFS_NET_MSG_BATCH_CREATE, shard_id,
                 body, powerfs_tlv_enc_len(&enc),
                 NULL, 0,
-                resp, sizeof(resp),
+                resp, resp_cap,
                 NULL, 0, POWERFS_META_TIMEOUT_MS,
                 &resp_len, NULL);
     kvfree(body);
-    if (ret < 0)
+    if (ret < 0) {
+        kvfree(resp);
         return ret;
-    if (ret > 0)
+    }
+    if (ret > 0) {
+        kvfree(resp);
         return net_status_to_errno((__u16)ret);
+    }
 
-    if (flushed) {
-        struct powerfs_tlv_dec dec;
-        *flushed = count;  /* default: all flushed */
-        if (resp_len > 0) {
-            powerfs_tlv_dec_init(&dec, resp, resp_len);
-            powerfs_tlv_dec_find_u32(&dec, POWERFS_NET_FLD_COUNT, flushed);
+    /* Default: assume all flushed; refined below if response present. */
+    if (flushed)
+        *flushed = count;
+
+    if (results) {
+        for (i = 0; i < count; i++) {
+            results[i].ino = entries[i].ino;
+            results[i].placement_tag = 0;
+            results[i].adopted_existing = false;
         }
     }
+
+    if (resp_len > 0) {
+        struct powerfs_tlv_dec dec;
+        __u8 field;
+        size_t length;
+
+        powerfs_tlv_dec_init(&dec, resp, resp_len);
+
+        /* First pass: Count field. */
+        if (powerfs_tlv_dec_find_u32(&dec, POWERFS_NET_FLD_COUNT,
+                                     flushed ? flushed : &(__u32){0}) != 0) {
+            /* No Count field — old server. Keep defaults (all flushed,
+             * results = own ino). Safe fallback. */
+        }
+
+        /* Second pass: iterate Entry blocks and map to request entries.
+         *
+         * Mapping rule (matches Filer encode_batch_create_resp order):
+         *   - Response entries appear in the SAME order as successful
+         *     request entries (failed entries are omitted).
+         *   - A normal entry has no Name sub-field; ino == request ino.
+         *   - A race-loser entry carries Name (= winner_of_name), and ino
+         *     is the pre-existing winner (may differ from request ino).
+         * We walk request entries with `req_idx`; for each response entry:
+         *   - if it has a Name, find the matching request entry by name
+         *     (search from req_idx onward) and assign it the result;
+         *   - else assign to request entry at req_idx and advance req_idx. */
+        if (results) {
+            __u32 req_idx = 0;
+            struct powerfs_tlv_dec dec2;
+            powerfs_tlv_dec_init(&dec2, resp, resp_len);
+
+            while (powerfs_tlv_dec_next(&dec2, &field, &length) == 0) {
+                const __u8 *edata = dec2.buf + dec2.pos;
+                if (field == POWERFS_NET_FLD_ENTRY) {
+                    struct powerfs_tlv_dec ed;
+                    __u64 eino = 0;
+                    __u8 etag = 0;
+                    char ename[NAME_MAX + 1];
+                    bool has_name = false;
+                    __u32 target_idx = count;
+
+                    powerfs_tlv_dec_init(&ed, edata, length);
+                    powerfs_tlv_dec_find_u64(&ed, POWERFS_NET_FLD_INO, &eino);
+                    powerfs_tlv_dec_find_u8(&ed, POWERFS_NET_FLD_PLACEMENT,
+                                            &etag);
+                    if (powerfs_tlv_dec_string(&ed, POWERFS_NET_FLD_NAME,
+                                               ename, sizeof(ename)) == 0) {
+                        has_name = true;
+                    }
+
+                    if (has_name) {
+                        __u32 j;
+                        for (j = req_idx; j < count; j++) {
+                            if (strcmp(entries[j].name, ename) == 0) {
+                                target_idx = j;
+                                break;
+                            }
+                        }
+                    } else {
+                        if (req_idx < count)
+                            target_idx = req_idx++;
+                    }
+
+                    if (target_idx < count) {
+                        results[target_idx].ino = eino;
+                        results[target_idx].placement_tag = etag;
+                        results[target_idx].adopted_existing =
+                            (eino != entries[target_idx].ino);
+                    }
+                }
+                /* Advance past this field's data. */
+                dec2.pos += length;
+            }
+        }
+    }
+
+    kvfree(resp);
     return 0;
 }
 
@@ -766,6 +860,7 @@ int powerfs_net_batch_create(__u64 shard_id,
  */
 int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
                         __u32 mode, __u32 uid, __u32 gid, bool is_dir,
+                        bool exclusive,
                         __u64 *ino_ret,
                         __u64 *volume_id_ret, __u64 *file_key_ret,
                         struct powerfs_file_layout *layout)
@@ -963,6 +1058,13 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
         powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_GID, gid);
     }
     powerfs_tlv_enc_u8(&enc, POWERFS_NET_FLD_IS_DIR, is_dir ? 1 : 0);
+    /* MC-108: CreateFlags (u32, bit0=O_EXCL). Only sent for regular files;
+     * directories never use O_EXCL. When exclusive=1 and the name already
+     * exists the Filer returns STATUS_ERR_ALREADY_EXISTS (2) which
+     * net_status_to_errno maps to -EEXIST. */
+    if (!is_dir)
+        powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_CREATE_FLAGS,
+                            exclusive ? 1u : 0u);
 
     {
         u64 _ts0 = ktime_get_ns();
@@ -1120,7 +1222,8 @@ int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
                                          const struct powerfs_chunk_map *chunks,
                                          __u32 chunk_count,
                                          const __u8 *inline_data,
-                                         __u32 inline_len)
+                                         __u32 inline_len,
+                                         const __u32 *inline_dirty_mask)
 {
     /* body 大小估算: 固定头(~80B) + ChunkLayout(5 + 44*chunk_count) + inline_data.
      * chunk_count=0 且无 inline_data 时 256B 足够; 多 chunk/大 inline 动态分配. */
@@ -1185,9 +1288,22 @@ int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
         /* InlineData (0xAE) — 文件数据直接编码在 inode 元数据中 */
         powerfs_tlv_enc_bytes(&enc, POWERFS_NET_FLD_INLINE_DATA,
                               inline_data, inline_len);
-        /* InlineMaxSize (0xAF) — 通知 Filer 当前 inline 阈值 */
+        /* InlineMaxSize (0xAF) — 通知 Filer 当前 inline 阈值.
+         * 必须在 FileLayout 字段块内 (Placement..InlineMaxSize 连续编码):
+         * filer 端 decode_file_layout 贪心循环遇非 FileLayout 字段即停止,
+         * 若 InlineMaxSize 被 DirtyBitmap(0xE1, 非 FileLayout 字段) 隔开,
+         * 循环读不到 max_size → assemble_placement(Inline) 缺参报 Err →
+         * 整个 layout 静默降级 Flat 默认, InlineData 解码丢失 (数据无
+         * 服务端副本). */
         powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_INLINE_MAX_SIZE,
                             POWERFS_INLINE_MAX_SIZE);
+        /* DirtyBitmap (0xE1) — MC-108 Task 5: 脏 4K 块位图, Filer 按位
+         * 合并置位块 (并发写 disjoint 区间互相存活). NULL = 旧整替换语义.
+         * 编码在 FileLayout 字段块之后 (0xE1 非 FileLayout 字段; filer 用
+         * 独立游标解码本字段, 位置顺序无关). */
+        if (inline_dirty_mask)
+            powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_DIRTY_BITMAP,
+                                *inline_dirty_mask);
     } else {
         /* FileLayout: Placement=Flat, Reliability=SingleReplica,
          * ReliabilityState=PendingReplicated, ChunkLayout=PerChunk */
@@ -1366,9 +1482,24 @@ int powerfs_net_migrate_inline_alloc(__u64 shard_id, __u64 ino,
         out->alloc_count = got;
         out->allocs = allocs;
 
-        pr_debug("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → Stripe count=%u size=%llu\n",
+        /* MC-108 Task 4/8: committed/epoch 是两种布局共用的尾部字段. */
+        {
+            __u8 committed8 = 0;
+
+            powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+            if (powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_MIGRATE_EPOCH,
+                                         &out->migrate_epoch) != 0)
+                out->migrate_epoch = 0;
+            powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+            if (powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_MIGRATE_COMMITTED,
+                                        &committed8) == 0)
+                out->committed = committed8 != 0;
+        }
+
+        pr_debug("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → Stripe count=%u size=%llu committed=%u epoch=%llu\n",
                 (unsigned long long)ino, stripe_count,
-                (unsigned long long)stripe_size);
+                (unsigned long long)stripe_size,
+                out->committed, (unsigned long long)out->migrate_epoch);
         kvfree(resp_body);
         return 0;
     }
@@ -1397,9 +1528,24 @@ int powerfs_net_migrate_inline_alloc(__u64 shard_id, __u64 ino,
         out->volume_id = v_id;
         out->file_key = f_key;
 
-        pr_debug("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → Flat volume_id=%llu file_key=%#llx\n",
+        /* MC-108 Task 4/8: committed/epoch 是两种布局共用的尾部字段. */
+        {
+            __u8 committed8 = 0;
+
+            powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+            if (powerfs_tlv_dec_find_u64(&dec, POWERFS_NET_FLD_MIGRATE_EPOCH,
+                                         &out->migrate_epoch) != 0)
+                out->migrate_epoch = 0;
+            powerfs_tlv_dec_init(&dec, resp_body, resp_body_len);
+            if (powerfs_tlv_dec_find_u8(&dec, POWERFS_NET_FLD_MIGRATE_COMMITTED,
+                                        &committed8) == 0)
+                out->committed = committed8 != 0;
+        }
+
+        pr_debug("powerfs: MIGRATE_INLINE_ALLOC ino=%llu → Flat volume_id=%llu file_key=%#llx committed=%u epoch=%llu\n",
                 (unsigned long long)ino, (unsigned long long)v_id,
-                (unsigned long long)f_key);
+                (unsigned long long)f_key,
+                out->committed, (unsigned long long)out->migrate_epoch);
         kvfree(resp_body);
         return 0;
     }

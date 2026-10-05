@@ -524,6 +524,37 @@ enum powerfs_net_field_id {
      * 二进制内容 → Stripe (多卷并行), 文本内容 → Flat (单卷).
      * 与 Rust FieldId::DesiredMode=0xD6 严格对齐. */
     POWERFS_NET_FLD_DESIRED_MODE = 0xD6,
+    /* CreateFlags (u32, TLV 0xDF): CREATE 请求中客户端携带的创建标志位.
+     * 与 Rust FieldId::CreateFlags=0xDF 严格对齐. bit0 = O_EXCL (排他创建,
+     * 已存在则 Filer 返回 STATUS_ERR_ALREADY_EXISTS → -EEXIST). */
+    POWERFS_NET_FLD_CREATE_FLAGS = 0xDF,
+    /* MigrateEpoch (u64, TLV 0xE0): MIGRATE_INLINE_ALLOC 响应中 Filer 返回
+     * 的迁移纪元. 真迁移 (committed=1) 时为本次 BeginMigration 的 epoch,
+     * 首次分配 (committed=0) 时为 0. 与 Rust FieldId::MigrateEpoch=0xE0
+     * 严格对齐. 预留给后续 STALE_EPOCH 重试 (MC-108 Task 6/7). */
+    POWERFS_NET_FLD_MIGRATE_EPOCH = 0xE0,
+    /* MigrateCommitted (u8, TLV 0xE2): MIGRATE_INLINE_ALLOC 响应中标识
+     * Filer 是否已自行完成 inline 快照物化并提交 Flat/Stripe 布局.
+     * 1 = 客户端禁止再写整针 (否则陈旧快照会覆盖迁移期间的并发写),
+     *     只需 adopt 布局并 re-dirty 页;
+     * 0 = 旧版语义 (Empty 首分配), 客户端照常写整针.
+     * 与 Rust FieldId::MigrateCommitted=0xE2 严格对齐. */
+    POWERFS_NET_FLD_MIGRATE_COMMITTED = 0xE2,
+    /* DirtyBitmap (u32, TLV 0xE1): UPDATE_INODE_SIZE_CHUNKS 请求中随
+     * InlineData 携带的脏 4K 块位图 (bit i = 第 i 个 4 KiB 块含本客户端
+     * 自有脏字节). MC-108 Task 5: Filer 只合并置位块到权威 inline 快照
+     * (disjoint 区间并发写者互相存活, 重叠块按 Raft apply 顺序 last-wins),
+     * 未携带时保持旧整缓冲替换语义 (powerfs-fuse 兼容). 与 Rust
+     * FieldId::DirtyBitmap=0xE1 严格对齐. */
+    POWERFS_NET_FLD_DIRTY_BITMAP = 0xE1,
+    /* MigrateInProgress (u8, TLV 0xE3): CAP_OPEN_GRANT 响应标志.
+     * 1 = 该 inode 正处于 Inline→Flat/Stripe 迁移窗口 (Migrating),
+     * Filer 暂缓授予写 cap. 客户端收到后有界重试 (≈2s) 后返回 -EAGAIN.
+     * 注意: 不能用错误码表达此条件 — 内核 cap_open_grant_and_issue 对
+     * RPC 失败 (ret<0) 的既有语义是降级 SHARED_WRITE 不重试, 用响应
+     * 标志才能驱动主动重试. 与 Rust FieldId::MigrateInProgress=0xE3
+     * 严格对齐. */
+    POWERFS_NET_FLD_MIGRATE_IN_PROGRESS = 0xE3,
 };
 
 /* ========== 帧头结构 (28 字节, packed) ========== */
@@ -1333,6 +1364,11 @@ struct powerfs_migrate_alloc_result {
     __u32 alloc_count;       /* 实际分配数量 (通常 == stripe_count) */
     __u64 *allocs;           /* [alloc_count] pairs: {volume_id, needle_id},
                                * 由本函数内 kmalloc, 调用方 kfree */
+    /* MC-108 Task 4/8: Filer 是否已自行物化快照并提交布局.
+     * true 时调用方不得再发整针 WriteNeedle (避免陈旧快照覆盖并发写). */
+    bool committed;
+    /* Filer 返回的迁移 epoch (committed=true 时有效; 预留 Task 6/7 重试). */
+    __u64 migrate_epoch;
 };
 
 /* GETATTR (返回完整属性含时间戳 + volume_id/file_key 用于数据直连) */
@@ -1340,6 +1376,7 @@ struct powerfs_file_layout;  /* 定义在 powerfs.h */
 struct powerfs_chunk_map;   /* 定义在 powerfs.h */
 struct powerfs_inode_info;  /* 定义在 powerfs.h */
 struct powerfs_dirty_create;/* 定义在 powerfs.h */
+struct powerfs_batch_entry_result; /* 定义在 powerfs.h (MC-108) */
 
 /* LOOKUP (返回完整属性含时间戳 + volume_id/file_key 用于数据直连).
  * powerfs_net_lookup 用默认 10s 超时 (兼容旧调用方).
@@ -1386,6 +1423,7 @@ int powerfs_net_setattr(__u64 ino, __u32 mode_valid, __u32 mode,
  *         为 false, 调用方按默认 Flat 处理. 可为 NULL. */
 int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
                         __u32 mode, __u32 uid, __u32 gid, bool is_dir,
+                        bool exclusive,
                         __u64 *ino_ret,
                         __u64 *volume_id_ret, __u64 *file_key_ret,
                         struct powerfs_file_layout *layout);
@@ -1407,10 +1445,14 @@ int powerfs_net_alloc_inode_batch(__u64 shard_id, __u32 count,
  * @entries:    array of powerfs_dirty_create snapshots
  * @count:      number of entries
  * @flushed:    out — number of entries successfully flushed
+ * @results:    out (caller-allocated, count elements) — per-entry result
+ *              (authoritative ino, placement_tag, adopted_existing). May be
+ *              NULL if the caller doesn't need per-entry detail.
  * Returns 0 on success, negative errno on failure. */
 int powerfs_net_batch_create(__u64 shard_id,
                              const struct powerfs_dirty_create *entries,
-                             __u32 count, __u32 *flushed);
+                             __u32 count, __u32 *flushed,
+                             struct powerfs_batch_entry_result *results);
 
 /* UNLINK / RMDIR */
 int powerfs_net_unlink(__u64 dir_ino, const char *name, size_t name_len,
@@ -1434,13 +1476,18 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
  *       K1 阶段内核不维护 chunks 列表, 不应调用此函数 (用 setattr 替代).
  *       K2/K3 阶段内核维护 chunks 后, close/fsync 切换到此函数.
  *
+ * MC-108 Task 5: inline_dirty_mask 非 NULL 时随 InlineData 编码
+ * DirtyBitmap (0xE1), Filer 按位图合并置位块; NULL 时保持旧整缓冲
+ * 替换语义 (chunks 路径 / 兼容调用方).
+ *
  * 返回 0 成功, 负数错误码. */
 int powerfs_net_update_inode_size_chunks(__u64 shard_id, __u64 ino, __u64 size,
                                          const char *client_id,
                                          const struct powerfs_chunk_map *chunks,
                                          __u32 chunk_count,
                                          const __u8 *inline_data,
-                                         __u32 inline_len);
+                                         __u32 inline_len,
+                                         const __u32 *inline_dirty_mask);
 
 /* K2-6: MIGRATE_INLINE_ALLOC — Inline → Flat/Stripe 迁移分配.
  *
@@ -1843,16 +1890,20 @@ int powerfs_net_release_lease(__u64 volume_id, __u64 ino,
  *   epoch_out:         CapEpoch (fencer 递增号, recall 时 IO 依此判定过期)
  *   sn_out:            CapSn (全局 grant 序列号, 跨 handoff 排序 IO)
  *   duration_ms_out:   Lease 有效期 (毫秒), 0 表示服务端未返回
+ *   migrating_out:     MC-108 Task 5: true = inode 处于 Inline 迁移窗口,
+ *                      Filer 暂缓写 cap 授予 (响应含 MigrateInProgress=0xE3)
  *
  * 返回: 0 成功, <0 错误 (-ENOTCONN / -ETIMEDOUT / -EIO 等).
- * 注意: CapOpenGrant 永不 EAGAIN, 服务端总是返回 STATUS_OK 并授予适配当前
- * 并发场景的 cap (EXCLUSIVE / CAP_R / NONE for SHARED_WRITE). */
+ * 注意: CapOpenGrant 永不 EAGAIN, 服务端总是返回 STATUS_OK; 迁移窗口内
+ * 通过 migrating_out 标志表达暂缓授予, 由调用方决定重试策略 (错误码会
+ * 触发内核降级语义, 无法区分"暂缓"与"故障"). */
 int powerfs_net_cap_open_grant(__u64 ino,
                                const char *client_id,
                                bool is_write_open,
                                char *lease_token_out, size_t *token_len_out,
                                __u8 *cap_set_out, __u64 *epoch_out,
-                               __u64 *sn_out, __u64 *duration_ms_out);
+                               __u64 *sn_out, __u64 *duration_ms_out,
+                               bool *migrating_out);
 
 /* CapRecallAck: 收到 Filer→Client CapRecallNotify 推送后,
  * flush 完脏数据 + 降级 cap 位, 向服务端 ACK.

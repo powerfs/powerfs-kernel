@@ -476,6 +476,23 @@ struct powerfs_dirty_create {
     struct list_head list;  /* -> parent dir's dirty_creates */
 };
 
+/* Per-entry result of a BatchCreate RPC. The Filer now returns one
+ * Entry block per accepted entry (failed entries are omitted).
+ *
+ * MC-108: when two clients create the same name, the loser's BatchCreate
+ * entry is resolved by the Filer to the pre-existing WINNER inode. In
+ * that case `adopted_existing` is true and `ino` is the winner (NOT the
+ * client's placeholder ino). The caller must switch its local placeholder
+ * inode/dentry to the winner before issuing any writes.
+ *
+ * `placement_tag`: 0 inline / 1 flat / 2 stripe / 3 wide stripe (the
+ * authoritative placement the client must adopt, even for the winner). */
+struct powerfs_batch_entry_result {
+    __u64 ino;
+    __u8  placement_tag;
+    bool  adopted_existing;
+};
+
 struct powerfs_inode_info {
     struct netfs_inode netfs;          /* 内含 struct inode，必须第一个字段 */
 
@@ -585,6 +602,22 @@ struct powerfs_inode_info {
     bool wp_map_dirty;
 #endif /* CONFIG_POWERFS_WRITE_PREDICT */
     u64 content_size;
+    /* MC-108: when a locally-created placeholder inode lost a same-name
+     * create race, the Filer adopted a pre-existing WINNER inode. We swap
+     * the dentry to the winner, but open file descriptors still reference
+     * this placeholder inode (file->f_inode is set at open time and 6.17
+     * has no sb->s_files to walk and rewrite it). To keep those fds'
+     * reads/writes landing on the authoritative file, all data RPCs use
+     * `redirected_to` (winner ino) instead of `inode->i_ino` when set.
+     * The placeholder's storage metadata (file_key/volume_id/layout/
+     * inline_data) is also copied from the winner at switch time. */
+    u64 redirected_to;        /* 0 = normal; else winner ino to redirect I/O to */
+    /* 本地 chunk 映射尚未发布到 Filer: ftruncate/SETATTR 已把 i_size 持久化
+     * (content_size == i_size) 但服务端 chunks 为空, 随后首次写才通过
+     * MIGRATE_INLINE_ALLOC 拿到 (vid,file_key). 此时即使 size 未变也必须
+     * 发布一次 size+chunks, 否则重连/重开读不到数据 (issue#12).
+     * update_inode_size_chunks 成功后清除. 持 i_lock 访问. */
+    bool chunks_dirty;
     u64 volume_id;
     u64 file_key;   /* needle_id (base, chunk N = file_key + N), from Filer Create or GetAttr */
 
@@ -609,6 +642,18 @@ struct powerfs_inode_info {
     u32 inline_len;             /* inline_data 实际长度 (字节) */
     u32 inline_max_size;        /* Inline 阈值 (从 Filer 获取, 默认 POWERFS_INLINE_MAX_SIZE) */
     bool inline_dirty;          /* inline_data 已修改, close 时需提交到 Filer */
+    /* MC-108 Task 3: inline 快照代际. 每次 inline_data 内容/长度变更
+     * (write_end 拷贝、setattr truncate、refresh 替换、punch 清零等) 递增.
+     * 提交路径快照时记录 snap_seq, 提交成功后仅当 inline_seq == snap_seq
+     * 才清 inline_dirty — 防止提交在飞期间的并发写被误判为已持久化. */
+    u32 inline_seq;
+    /* MC-108 Task 5: 脏 4K 块位图 (bit i = 第 i 个 4 KiB 块含本客户端
+     * 自有脏字节). 提交时随 inline_data 携带给 Filer, Filer 只合并置位块
+     * (disjoint 区间并发写者互相存活, 重叠块按 Raft apply 顺序 last-wins).
+     * 持 i_lock 访问. 内容变更点 (write_end/writepages/punch/extend) 置位,
+     * 缓冲整体替换/丢弃点 (apply_layout 装载、迁移出、cap_revoke、trunc0)
+     * 清零. 提交成功后清除快照中已持久化的位. */
+    u32 inline_dirty_map;
 
     /* === K3: Stripe/WideStripe 多卷元数据 ===
      * 从 GETATTR/CREATE 响应解析, 由 powerfs_apply_layout_to_inode() 填充.
@@ -655,6 +700,9 @@ struct powerfs_inode_info {
 
     /* === 对齐 : truncate 顺序屏障 + btime + xattr version === */
     struct mutex i_truncate_mutex;        /* 与写回/setattr 互斥 */
+    /* 串行化 inline 迁移与 Flat/Stripe 首次写分配 (MIGRATE_INLINE_ALLOC),
+     * 防止两个并发写各自分配出不同的 needle → 近重复分配丢数据. */
+    struct mutex alloc_mutex;
     u32 i_truncate_seq;                   /* 最近一次截断的序号 ( 同名字段) */
     u64 i_truncate_size_visible;          /* 用户可见 truncate_size (已 vmtruncate 完成) */
     struct timespec64 i_btime;            /* 文件创建时间 (birth/creation time,
@@ -819,6 +867,34 @@ struct powerfs_inode_info {
 static inline struct powerfs_inode_info *POWERFS_I(struct inode *inode)
 {
     return container_of(inode, struct powerfs_inode_info, netfs.inode);
+}
+
+/* MC-108 Task 5: 标记 [start, end) 字节区间所属的 4K 块为脏.
+ * 必须持 pi->i_lock 调用. 位图只有 32 位 (覆盖 128 KiB), inline 文件
+ * 必然 <= INLINE_MAX (默认 8 KiB); 超出范围的块忽略 — 那些写入会
+ * 先触发 Inline→Flat 迁移, 不走 inline 提交路径. */
+static inline void powerfs_inline_dirty_mark_range(struct powerfs_inode_info *pi,
+                                                    loff_t start, loff_t end)
+{
+    u32 first, last, i;
+
+    if (end <= start)
+        return;
+    first = (u32)((u64)start >> 12);
+    last = (u32)((u64)(end - 1) >> 12);
+    if (first >= 32)
+        return;
+    if (last >= 32)
+        last = 31;
+    for (i = first; i <= last; i++)
+        pi->inline_dirty_map |= (1u << i);
+}
+
+/* MC-108 Task 5: 清空脏位图 — 缓冲被服务端数据整体替换或丢弃时调用
+ * (新内容来源不再是"本客户端自有脏字节"). 必须持 pi->i_lock 调用. */
+static inline void powerfs_inline_dirty_map_reset(struct powerfs_inode_info *pi)
+{
+    pi->inline_dirty_map = 0;
 }
 
 /* K1-5: powerfs_locate_chunk - 统一 chunk 定位 (Flat/Stripe 多卷入口)
@@ -1231,6 +1307,28 @@ struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry,
 int powerfs_init_inode(struct inode *inode, umode_t mode,
                        u64 parent_ino, const char *name);
 
+/* MC-108: effective inode number for I/O RPCs. When a locally-created
+ * placeholder inode lost a same-name create race, it is redirected to the
+ * Filer's authoritative winner inode (pi->redirected_to). All data-plane
+ * RPCs (migrate/update_inode/read_needle/write_needle) must use this
+ * instead of inode->i_ino so open fds keep landing on the correct file. */
+static inline u64 powerfs_effective_ino(const struct powerfs_inode_info *pi)
+{
+    return pi->redirected_to ? pi->redirected_to : 0;
+}
+/* Returns the ino to use for RPCs given an inode: redirected winner if set,
+ * else inode->i_ino. (Helper for paths that only have struct inode*.) */
+u64 powerfs_inode_io_ino(struct inode *inode);
+
+/* Switch a locally-created placeholder inode/dentry to the authoritative
+ * winner inode after losing a same-name BatchCreate race. Called from
+ * flush_dirty_creates. Performs a LOOKUP to populate the winner, swaps the
+ * dentry alias, migrates dirty inline data, updates the parent's dir_entry,
+ * and marks the placeholder as redirected so its open fds forward I/O. */
+void powerfs_switch_to_winner_inode(struct inode *dir, u64 placeholder_ino,
+                                    u64 winner_ino, u8 placement_tag,
+                                    const char *name, size_t name_len);
+
 /* setattr/rename 操作 */
 int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
                     struct iattr *attr);
@@ -1262,6 +1360,8 @@ int powerfs_invalidate_one(u64 ino);
  * (parent,name,version) dedup is performed inside: replays/network retransmits
  * with the same (or older) version are ignored. */
 int powerfs_invalidate_dentry(u64 parent_ino, const char *name, size_t name_len, u64 version);
+/* MC-108 T2-D: flush pending DentryInvalidate works before optimistic create. */
+void powerfs_flush_dentry_invalidates(void);
 
 /* Destroy (free) all entries in the dentry notify dedup ring. Called from
  * module_exit to leak all name strings. */
