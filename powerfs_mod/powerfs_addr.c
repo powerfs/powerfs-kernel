@@ -1254,8 +1254,15 @@ int powerfs_writepages(struct address_space *mapping,
      *
      * Pass 3: 清 folio 脏标. 必须用 folio_clear_dirty_for_io +
      *   start/end_writeback 完整流程 (ROOT46), 否则 PAGECACHE_TAG_DIRTY
-     *   残留导致 refresh_work 跳过 invalidate, 读到旧数据. */
-    if (POWERFS_I(inode)->placement == POWERFS_PLACEMENT_INLINE) {
+     *   残留导致 refresh_work 跳过 invalidate, 读到旧数据.
+     *
+     * Bug A (#106): FLAT placement 但 volume_id==0 (BatchCreate 回填
+     *   placement 后 migrate_inline_out 尚未运行) 也走本路径 — 数据仍在
+     *   inline_data, 经 close/release 提交; 走卷写回会在 locate_chunk
+     *   处 EINVAL/-EIO. (powerfs_inline_commit_sync 对非 INLINE 无操作,
+     *   Pass 2 仅 INLINE 生效, FLAT 无卷场景由 fsync 的 align 迁移兜底.) */
+    if (POWERFS_I(inode)->placement == POWERFS_PLACEMENT_INLINE ||
+        POWERFS_I(inode)->volume_id == 0) {
         struct folio_batch fbatch2;
         pgoff_t idx2 = wbc->range_start >> PAGE_SHIFT;
         pgoff_t end2 = wbc->range_end >> PAGE_SHIFT;
@@ -1573,6 +1580,15 @@ inline_wb_out:
 
             pr_debug("powerfs: WPAGES page ino=%lu offset=%lld i_size=%lld\n",
                     inode->i_ino, offset, i_size_read(inode));
+            /* 越界页守卫: truncate-down 后残留的超出 EOF 的脏页不得写入
+             * 卷 — 全越界直接跳过, 部分越界截短 count, 否则截断前的旧
+             * 数据会在卷上复活 (数据正确性). */
+            if (offset >= i_size_read(inode)) {
+                unlock_page(page);
+                continue;
+            }
+            if (offset + count > i_size_read(inode))
+                count = i_size_read(inode) - offset;
 
             /* 分配 batch (如果当前没有 pending) */
             if (!batch) {
@@ -2246,6 +2262,10 @@ static int powerfs_migrate_inline_out(struct inode *inode,
     }
 
     if (alloc_result.committed) {
+        /* Task 8 迁移物化幂等 adopt: Filer 已在 Begin..Commit 窗口内用内部
+         * 凭据物化权威快照时, 跳过冗余整针写 (本地陈旧快照无条件覆盖会
+         * 确定性清掉迁移窗口内对端并发 blob 写), 仅 adopt 布局, 由
+         * re-dirty + blob 部分写 RMW 与服务端版本按 per-needle 锁合并. */
         pr_debug("powerfs: MIGRATE ino=%lu Filer already committed needle_id=%#llx epoch=%llu, skip redundant full write\n",
                 ino, (unsigned long long)write_nid,
                 (unsigned long long)alloc_result.migrate_epoch);
@@ -2329,6 +2349,86 @@ static int powerfs_migrate_inline_out(struct inode *inode,
 }
 
 /*
+ * powerfs_align_inline_before_commit - 提交 inline 数据前根据 BatchCreate
+ * 回填的 placement 完成布局对齐
+ *
+ * Bug A (#106) 三层修复 step 3/4:
+ *   BatchCreate 响应已回填 per-entry placement_tag (step 3), powerfs_dir.c
+ *   的 flush worker 已将 placement 写入 inode。本函数不再需要 GETATTR RPC
+ *   来发现 Filer 端布局 (step 4 移除 GETATTR-align workaround), 直接信任
+ *   BatchCreate 回填值:
+ *   - layout_aligned=true (BatchCreate 确认 Inline): 保持 inline 提交;
+ *   - placement=FLAT/Stripe, volume_id==0: 迁移 inline 缓冲到 Volume;
+ *   - placement=FLAT/Stripe, volume_id!=0: 已迁移, 无需处理;
+ *   - placement=INLINE 且 !layout_aligned (BatchCreate 未成功): 返回
+ *     -EAGAIN 保留 dirty, 由后续 fsync/再次 open-release 重试。
+ *
+ * 返回: 0 = 仍为 Inline 或无需对齐; 1 = 已迁移为卷布局; <0 = 错误。
+ */
+int powerfs_align_inline_before_commit(struct inode *inode)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    bool need_flush;
+    int ret;
+
+    spin_lock(&pi->i_lock);
+    if (pi->layout_aligned ||
+        !pi->inline_dirty || !pi->inline_data || pi->inline_len == 0) {
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+
+    /* BatchCreate 回填已完成迁移 */
+    if (pi->placement != POWERFS_PLACEMENT_INLINE && pi->volume_id != 0) {
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+
+    need_flush = (pi->placement == POWERFS_PLACEMENT_INLINE &&
+                  !pi->layout_aligned);
+    spin_unlock(&pi->i_lock);
+
+    /* 确保乐观 fast-create 的 BatchCreate 已提交 (幂等: 已发布则为 no-op)。
+     * BatchCreate 响应回填 placement_tag 到 inode, 之后即可根据 placement
+     * 决定迁移策略, 无需额外 GETATTR RPC。 */
+    if (need_flush)
+        powerfs_flush_pending_create(inode, false);
+
+    /* Flush 后重新检查: BatchCreate 回填可能已更新 placement/layout_aligned */
+    spin_lock(&pi->i_lock);
+    if (pi->layout_aligned) {
+        /* BatchCreate 确认 Inline, layout 已对齐 */
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+    if (pi->placement != POWERFS_PLACEMENT_INLINE && pi->volume_id != 0) {
+        /* BatchCreate 回填 FLAT/Stripe 且迁移已完成 */
+        spin_unlock(&pi->i_lock);
+        return 0;
+    }
+    if (pi->placement != POWERFS_PLACEMENT_INLINE && pi->volume_id == 0) {
+        /* BatchCreate 回填 FLAT/Stripe, 迁移尚未执行 — 直接迁移 */
+        pi->layout_aligned = true;
+        spin_unlock(&pi->i_lock);
+        pr_debug("powerfs: ALIGN ino=%lu placement=%u — migrating inline buffer to volume\n",
+                inode->i_ino, pi->placement);
+        ret = powerfs_migrate_inline_out(inode, pi);
+        if (ret < 0) {
+            pr_warn("powerfs: ALIGN ino=%lu inline→volume migrate failed: %d (data kept dirty)\n",
+                    inode->i_ino, ret);
+            return ret;
+        }
+        return 1;
+    }
+    /* placement=INLINE && !layout_aligned: BatchCreate 未成功提交到 Filer,
+     * 无法安全提交 inline_data。返回 -EAGAIN 保留 dirty, 等待重试。 */
+    spin_unlock(&pi->i_lock);
+    pr_warn_ratelimited("powerfs: ALIGN ino=%lu BatchCreate not synced, keep dirty\n",
+            inode->i_ino);
+    return -EAGAIN;
+}
+
+/*
  * powerfs_write_end - 写结束 (Stage C: 纯 page cache 更新, 无网络 IO)
  *
  * 参照 xxx_write_end (fs/xxx/addr.c):
@@ -2353,9 +2453,8 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
     loff_t end_pos = pos + copied;
     unsigned int got_caps = (unsigned int)(uintptr_t)fsdata;
 
-    pr_debug("powerfs: WB_END ino=%lu pos=%lld copied=%u len=%u i_size=%lld uptodate=%d\n",
-            inode->i_ino, pos, copied, len, i_size_read(inode),
-            folio_test_uptodate(folio));
+    pr_debug("powerfs: WB_END ino=%lu pos=%lld copied=%u len=%u i_size=%lld placement=%u\n",
+            inode->i_ino, pos, copied, len, i_size_read(inode), pi->placement);
 
     if (copied > 0) {
         if (!folio_test_uptodate(folio)) {
@@ -2406,16 +2505,27 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
          *
          * 并发保护: 持 i_lock 修改 inline_data.
          * 注意: kvmalloc 在持 spinlock 时可能睡眠 (GFP_KERNEL),
-         * 因此先在锁外分配, 再持锁替换. */
-        if (pi->placement == POWERFS_PLACEMENT_INLINE) {
+         * 因此先在锁外分配, 再持锁替换.
+         *
+         * Fast-created files whose layout hasn't been aligned yet must always
+         * populate inline_data, even if a background BatchCreate flush
+         * backfilled placement to FLAT/Stripe between open and write (and
+         * cleared local_cap_granted in the process). The inline_data is the
+         * staging buffer — the align function migrates it to Volume when
+         * needed. Without this, data only lands in page cache and is lost
+         * when writepages skips Volume Server writeback for volume_id=0.
+         * layout_aligned is only set true by: (a) BatchCreate backfill for
+         * confirmed-Inline files, or (b) the align function after successful
+         * migration — so !layout_aligned reliably identifies files
+         * whose layout is still speculative. */
+        if (pi->placement == POWERFS_PLACEMENT_INLINE ||
+            !pi->layout_aligned) {
             size_t folio_off = offset_in_folio(folio, pos);
             size_t need_len = end_pos;
             u8 *new_buf = NULL;
 
-            /* K2: 仅首次写入(pos==0)输出日志, 避免 bs=1 时 8192 条日志淹没 serial */
-            if (pos == 0)
-                pr_debug("powerfs: WB_END INLINE first write ino=%lu copied=%u end=%zu\n",
-                        inode->i_ino, copied, end_pos);
+            pr_info("powerfs: WB_END_INLINE ino=%lu pos=%lld copied=%u need_len=%zu inline_data=%p inline_len=%u\n",
+                    inode->i_ino, pos, copied, need_len, pi->inline_data, pi->inline_len);
 
             /* K2-7: 写越过 inline 硬上限 (8KB).
              * MC-108 fix2: 旧实现截断 copied 并返回 -EFBIG, 但 folio 已在
@@ -2474,16 +2584,78 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
             if (!pi->inline_data || pi->inline_len < need_len) {
                 u8 *old = pi->inline_data;
                 u32 old_len = pi->inline_len;
+                loff_t cur_i_size = i_size_read(inode);
+                /* 在锁内摘掉指针并转移所有权: 重建 buffer 的窗口内,
+                 * cap revoke 等并发路径可能释放/替换 inline_data。
+                 * 摘指针后本函数对 old 负唯一释放责任, 避免重建完成时
+                 * 再次 kfree(pi->inline_data) 造成 double-free
+                 * (SLUB: "0 allocated objects but 1 are to be freed"). */
+                pi->inline_data = NULL;
+                pi->inline_len = 0;
                 spin_unlock(&pi->i_lock);
 
-                /* 锁外分配 (GFP_KERNEL 可睡眠) */
-                new_buf = kvmalloc(need_len, GFP_KERNEL);
+                /* MC-108 竞态修复: cap_revoke INLINE 路径会释放本地
+                 * inline_data 副本 (inline_data=NULL, inline_len=0) 但保留
+                 * i_size, 随后异步排队 powerfs_invalidate_one 刷新. 在 refresh
+                 * 完成前的窗口内, 另一客户端的 write 进入 write_end 会从空
+                 * buffer 重建, 导致 need_len=pos+copied 而非 i_size, 文件
+                 * 被缩小 (8192→4097), 原数据丢失.
+                 *
+                 * 仅在此竞态窗口 (old==NULL && i_size>0) 同步从 Filer 拉取
+                 * inline_data 重建 buffer, 普通路径 (old!=NULL 或 i_size==0)
+                 * 零开销.
+                 * 对齐 apply_layout 的 inline_data 所有权转移语义. */
+                if (!old && cur_i_size > 0) {
+                    struct powerfs_file_layout srv_layout;
+                    __u64 srv_size = 0;
+                    int gerr;
+
+                    memset(&srv_layout, 0, sizeof(srv_layout));
+                    gerr = powerfs_net_getattr(inode->i_ino,
+                                               NULL, NULL, NULL,
+                                               &srv_size, NULL,
+                                               NULL, NULL, NULL,
+                                               NULL, NULL,
+                                               &srv_layout,
+                                               NULL, NULL, NULL,
+                                               NULL, NULL);
+                    if (gerr == 0 && srv_layout.has_inline_data &&
+                        srv_layout.inline_data && srv_layout.inline_len > 0) {
+                        old = srv_layout.inline_data;
+                        old_len = srv_layout.inline_len;
+                        /* 所有权转移: 防止下方 kfree 释放 */
+                        srv_layout.inline_data = NULL;
+                        srv_layout.inline_len = 0;
+                        pr_info("powerfs: WB_END INLINE ino=%lu recovered "
+                                "inline_data from Filer (%u bytes, i_size=%lld)\n",
+                                inode->i_ino, old_len, cur_i_size);
+                        /* need_len 至少覆盖原文件大小, 防止缩小 */
+                        if (need_len < old_len)
+                            need_len = old_len;
+                    }
+                    /* srv_layout.inline_data 若未转移则释放避免泄漏 */
+                    kfree(srv_layout.inline_data);
+                }
+
+                /* 锁外分配 (GFP_KERNEL 可睡眠).
+                 * 必须用 kmalloc 而非 kvmalloc: need_len <= INLINE_MAX_SIZE
+                 * (8KB), 而全模块 (cap revoke / evict_inode / 迁移等) 对
+                 * inline_data 一律 kfree; kvmalloc 在 size>PAGE_SIZE 且内存
+                 * 紧张时会返回 vmalloc 指针, kfree 无法识别, 同样会损坏 slab. */
+                new_buf = kmalloc(need_len, GFP_KERNEL);
                 if (!new_buf) {
-                    pr_warn("powerfs: WB_END INLINE ino=%lu kvmalloc %zu failed\n",
+                    pr_warn("powerfs: WB_END INLINE ino=%lu kmalloc %zu failed\n",
                             inode->i_ino, need_len);
-                    /* 分配失败不影响 page cache, writeback 仍会标脏页.
-                     * inline_data 不更新, close 时可能丢失数据.
-                     * 后续可回退到 Flat 模式. */
+                    /* 指针已在锁内摘除; OOM 时把 old 挂回去保持原状.
+                     * 若并发路径已重新安装 buffer, 则释放 old. */
+                    spin_lock(&pi->i_lock);
+                    if (!pi->inline_data) {
+                        pi->inline_data = old;
+                        pi->inline_len = old_len;
+                        old = NULL;
+                    }
+                    spin_unlock(&pi->i_lock);
+                    kfree(old);
                     goto inline_done;
                 }
                 /* 拷贝旧数据到新 buffer */
@@ -2492,14 +2664,21 @@ int powerfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
                 /* 新区域清零 */
                 if (need_len > old_len)
                     memset(new_buf + old_len, 0, need_len - old_len);
+                /* old 的唯一释放点 (已在锁内从 pi->inline_data 摘除,
+                 * 下方持锁安装时绝不再 kfree(pi->inline_data)). */
+                kfree(old);
+                old = NULL; old_len = 0;
 
-                /* 持锁替换 */
+                /* 持锁安装: 重建窗口内若有并发路径重新安装了 buffer
+                 * (cap revoke 只会置 NULL; 非 NULL 说明被抢先), 保留
+                 * 后来者, 本函数的 new_buf 交给锁外统一 kfree. */
                 spin_lock(&pi->i_lock);
-                kfree(pi->inline_data);
-                pi->inline_data = new_buf;
-                pi->inline_len = need_len;
-                /* new_buf 所有权已转移, 防止下方 kfree */
-                new_buf = NULL;
+                if (!pi->inline_data) {
+                    pi->inline_data = new_buf;
+                    pi->inline_len = need_len;
+                    /* new_buf 所有权已转移, 防止下方 kfree */
+                    new_buf = NULL;
+                }
             }
 
             /* 从 folio 拷贝写入的数据到 inline_data */

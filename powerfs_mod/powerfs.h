@@ -473,6 +473,12 @@ struct powerfs_dirty_create {
     __u64 mtime;
     __u64 atime;
     char name[NAME_MAX + 1];
+    /* Output: TLV placement_tag from BatchCreate response
+     * (INLINE=0, FLAT=1, STRIPE=2, WIDE_STRIPE=3).
+     * 0 = Inline (default for kzalloc, or old Filer that doesn't report
+     * placement). The flush worker reads this to update the child inode's
+     * placement from the BatchCreate response backfill (#106 step 3). */
+    __u8 placement_out;
     struct list_head list;  /* -> parent dir's dirty_creates */
 };
 
@@ -655,6 +661,14 @@ struct powerfs_inode_info {
      * 清零. 提交成功后清除快照中已持久化的位. */
     u32 inline_dirty_map;
 
+    /* 本地乐观创建 (fast-create) 的 inode 初始按 INLINE 处理, 但 Filer 的
+     * LayoutPredictor 可能在 CREATE 时就依据文件名把 storage_mode 决定为
+     * Flat/Stripe。BatchCreate 响应回填 placement_tag 后, flush worker 据此
+     * 更新 inode placement。false 表示尚未与 Filer 权威布局对齐 —
+     * powerfs_align_inline_before_commit 会据此决定是否需要迁移 inline_data。
+     * lookup/iget 得到的 inode 布局直接来自 Filer, 置 true。 */
+    bool layout_aligned;
+
     /* === K3: Stripe/WideStripe 多卷元数据 ===
      * 从 GETATTR/CREATE 响应解析, 由 powerfs_apply_layout_to_inode() 填充.
      * volume_ids 在 evict_inode/free_inode 中释放 (kmalloc).
@@ -752,6 +766,12 @@ struct powerfs_inode_info {
     int dirty_create_count;
     int dirty_create_retries;  /* consecutive flush failure count */
     struct delayed_work flush_work;
+    /* flush 摘链 (count 归零) 到 BatchCreate RPC 完成之间为 true.
+     * 此窗口内并发 lookup 在服务端仍 ENOENT, 且 has_pending 因 count=0
+     * 失效 — read-your-writes 补丁需据此等待并重试 (高负载下 4 路
+     * 并发 create/read 必现). 配合 dirty_create_wait 等待队列. */
+    bool dirty_creates_flushing;
+    wait_queue_head_t dirty_create_wait;
 
     /* === 对齐 : 未 commit 的 async dirop / iop 链表 (Async DIROPS 核心) === */
     struct list_head i_unsafe_dirops;    /* uncommitted mds dir op 链表 */
@@ -917,6 +937,13 @@ int powerfs_locate_chunk_for_read(struct powerfs_inode_info *pi, loff_t offset,
 
 int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
                          u64 *volume_id_out, u64 *needle_id_out);
+
+/* 提交 inline 数据前根据 BatchCreate 回填的 placement 完成布局对齐
+ * (防乐观创建文件被静默丢数据, #106 step 4)。
+ * 必须在 fsync/close 的 inline 提交之前、进程上下文 (可阻塞做 flush) 调用。
+ * 返回 0=仍为 Inline/无需处理, 1=已迁移为卷布局 (调用方应转走 Flat/Stripe
+ * 提交), <0=错误 (调用方应中止本次提交并保留 dirty)。 */
+int powerfs_align_inline_before_commit(struct inode *inode);
 
 /* K3-1: powerfs_apply_layout_to_inode - 将 FileLayout 解析结果应用到 inode
  *
@@ -1236,7 +1263,10 @@ struct powerfs_sb_info {
 #define POWERFS_DIRTY_FLUSH_THRESHOLD 32  /* flush when dirty_count >= this */
 #define POWERFS_DIRTY_FLUSH_TIMEOUT_MS 100  /*兜底 flush interval (ms) */
 #define POWERFS_DIRTY_FLUSH_RETRY_MS 200   /* retry interval on RPC failure */
-#define POWERFS_DIRTY_FLUSH_MAX_RETRIES 10  /* give up after this many failures */
+/* Must outlast filer shard leader election (observed ~5s after
+ * docker stop leader, allow headroom for a second round under load):
+ * 150 x 200ms = 30s. 旧值 10 (2s) 短于选举超时, failover 窗口内创建必丢. */
+#define POWERFS_DIRTY_FLUSH_MAX_RETRIES 150
 
 #define POWERFS_SB_INFO(sb) ((struct powerfs_sb_info *)(sb)->s_fs_info)
 

@@ -33,7 +33,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/fault_injection.sh"
 
-MNT=/mnt/pfs
+MNT=/mnt/powerfs
 FUSE_MNT=/mnt/powerfs           # FUSE 容器内挂载点 (fuse-1)
 FUSE_CONTAINER="fuse-1"         # FUSE 容器名 (docker-compose-single.yml)
 POWERFS_MOD_DIR="/home/portion/powerfs/kernel/powerfs_mod"
@@ -635,7 +635,8 @@ test_t6_sustained() {
     if [ "$has_fio" = "no" ]; then
         warn "VM 内无 fio, 使用 dd 替代"
         # 使用 dd 持续读写替代
-        return $(_t6_dd_alternative)
+        _t6_dd_alternative
+        return $?
     fi
     ok "VM 内 fio 可用"
 

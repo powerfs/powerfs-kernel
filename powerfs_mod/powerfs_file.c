@@ -506,6 +506,19 @@ static int powerfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
         goto out_put;
     }
 
+    /* Bug A (#106) 修复: 乐观创建的 inode 本地按 INLINE 处理, 但 Filer 的
+     * LayoutPredictor 可能按文件名预测为 Flat/Stripe。BatchCreate 响应回填
+     * placement_tag 后, 本函数据其决定迁移策略。若已为卷布局则把 inline
+     * 缓冲迁出, 随后自然走下方 Flat/Stripe 提交。失败则中止 fsync (返回
+     * 错误给应用), 绝不能在布局未知时把 inline 提交当成功。 */
+    {
+        int aret = powerfs_align_inline_before_commit(inode);
+        if (aret < 0) {
+            ret = aret;
+            goto out_put;
+        }
+    }
+
     /* K2-5 + MC-108 Task 3: Inline 兜底提交.
      * 常规 write(2) 脏页已由上面 writepages WB_SYNC_ALL 提交; 此处覆盖
      * 无脏页但 inline_dirty 的场景 (fallocate 扩展 / setattr 扩展).
@@ -979,6 +992,14 @@ static int powerfs_file_release(struct inode *inode, struct file *file)
      * hasn't fired) and the written data is silently lost. No-op for
      * normally-created files or when the batch is already flushed. */
     powerfs_flush_pending_create(inode, false);
+
+    /* Bug A (#106) 修复: close 提交前根据 BatchCreate 回填的 placement 对齐
+     * 布局。乐观创建的 .bin 等可能被 Filer 置为 Flat/Stripe, 此时把 inline
+     * 缓冲迁到 Volume, 随后走下方 Flat 分支同步 size+chunks。失败则保留
+     * dirty 跳过本次提交 (VFS 忽略 release 返回值), 由后续 fsync/再次
+     * open-release 重试, 避免静默丢。 */
+    if (powerfs_align_inline_before_commit(inode) < 0)
+        return 0;
 
     /* Inline 模式 + dirty: 同步 inline_data 到 Filer (K2-5).
      * Flat 模式: 同步 size+chunks 到 Filer (对齐 FUSE sync_size_chunks_on_close).
@@ -2074,6 +2095,17 @@ static long powerfs_fallocate(struct file *file, int mode,
                 spin_unlock(&pi->i_lock);
             }
         }
+        /* PUNCH_HOLE changes file data without changing i_size. Update
+         * mtime/ctime so the subsequent setattr flush (AUTH_EXCL dirty,
+         * see falloc_done below) increments the server-side i_version.
+         * This triggers an Invalidate broadcast to other clients that hold
+         * stale pagecache (no active cap to recall); their next open /
+         * get_caps detects the version/mtime change and discards cached
+         * pages, forcing a re-fetch of the zeroed region. */
+        { struct timespec64 now = current_time(inode);
+          inode_set_mtime(inode, now.tv_sec, now.tv_nsec);
+          inode_set_ctime(inode, now.tv_sec, now.tv_nsec); }
+        mark_inode_dirty(inode);
         ret = 0;
     } else if (!(mode & FALLOC_FL_KEEP_SIZE)) {
         /* Default mode: extend file size */
@@ -2187,9 +2219,15 @@ falloc_done:
     inode_unlock(inode);
 
     /* fallocate 成功 (punch/extend) 后, 标记 EXCL/AUTH dirty.
-     * INLINE: inline_dirty 已在分支内置位, 这里额外 mark cap dirty 供 revoke 感知. */
-    if (ret == 0 && !(mode & FALLOC_FL_KEEP_SIZE))
-        powerfs_cap_mark_dirty(pi, POWERFS_CAP_AUTH_EXCL | POWERFS_CAP_FILE_EXCL);
+     * INLINE: inline_dirty 已在分支内置位, 这里额外 mark cap dirty 供 revoke 感知.
+     * PUNCH_HOLE: 仅标 AUTH_EXCL dirty, 推送 setattr(mtime) 到 Filer 以触发
+     * i_version 递增 + Invalidate 广播 (见上方 punch_hole 分支注释). */
+    if (ret == 0) {
+        if (!(mode & FALLOC_FL_KEEP_SIZE))
+            powerfs_cap_mark_dirty(pi, POWERFS_CAP_AUTH_EXCL | POWERFS_CAP_FILE_EXCL);
+        else if (mode & FALLOC_FL_PUNCH_HOLE)
+            powerfs_cap_mark_dirty(pi, POWERFS_CAP_AUTH_EXCL);
+    }
 
     if (got)
         powerfs_cap_put_refs(pi, got);

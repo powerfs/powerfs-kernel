@@ -1494,6 +1494,7 @@ int net_status_to_errno(__u16 status)
     case POWERFS_NET_STATUS_ERR_SERVER:      return -EREMOTEIO;
     /* REDIRECT 正常在 send_request 内部处理; 若漏到此处说明重试耗尽, 返回 -EAGAIN */
     case POWERFS_NET_STATUS_ERR_REDIRECT:    return -EAGAIN;
+    case POWERFS_NET_STATUS_ERR_STALE_LAYOUT: return -ESTALE;
     default:                                 return -EIO;
     }
 }

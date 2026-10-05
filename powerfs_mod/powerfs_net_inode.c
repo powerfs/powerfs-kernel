@@ -682,7 +682,8 @@ int powerfs_net_batch_create(__u64 shard_id,
                              struct powerfs_batch_entry_result *results)
 {
     /* Body size: ShardId(12) + Count(6) + per-entry(~40 + name_len + 2×time).
-     * Worst case: 64 × (80 + 255) ≈ 21KB. Use kvmalloc for safety. */
+     * Worst case: 64 × (80 + 255) ≈ 21KB. Use kvmalloc for safety.
+     * Resp: Count(6) + N × (Ino(12) + Placement(4)) ≈ 10 + N×16. */
     size_t body_cap = 64 + (size_t)count * (80 + NAME_MAX + 1);
     __u8 *body;
     struct powerfs_tlv_enc enc;
@@ -1066,21 +1067,12 @@ int powerfs_net_create(__u64 dir_ino, const char *name, size_t name_len,
         powerfs_tlv_enc_u32(&enc, POWERFS_NET_FLD_CREATE_FLAGS,
                             exclusive ? 1u : 0u);
 
-    {
-        u64 _ts0 = ktime_get_ns();
-        ret = powerfs_net_send_request(msg_type, dir_ino,
-                                        body, powerfs_tlv_enc_len(&enc),
-                                        NULL, 0,
-                                        resp_body, POWERFS_NET_RESP_INLINE_CAP,
-                                        NULL, 0, POWERFS_META_TIMEOUT_MS,
-                                        &resp_body_len, NULL);
-        if (!is_dir) {
-            u64 _ms = (ktime_get_ns() - _ts0) / 1000000;
-            if (_ms > 2)
-                pr_info("CREATE_RPC: send_request took %llums (msg=0x%x ino=%llu)\n",
-                        _ms, msg_type, dir_ino);
-        }
-    }
+    ret = powerfs_net_send_request(msg_type, dir_ino,
+                                    body, powerfs_tlv_enc_len(&enc),
+                                    NULL, 0,
+                                    resp_body, POWERFS_NET_RESP_INLINE_CAP,
+                                    NULL, 0, POWERFS_META_TIMEOUT_MS,
+                                    &resp_body_len, NULL);
     if (ret < 0)
         goto out;
     if (ret > 0) {
@@ -1207,7 +1199,7 @@ int powerfs_net_rename(__u64 old_dir_ino, const char *old_name, size_t old_name_
  *               + ChunkLayout(0xA4)]
  *
  * FileLayout 编码 (对齐 powerfs-layout codec.rs encode_file_layout):
- *   Placement: u8 tag (Flat=0, Inline=1, Stripe=2)
+ *   Placement: u8 tag (Inline=0, Flat=1, Stripe=2, WideStripe=3)
  *   Reliability: bytes [tag] (SingleReplica=0)
  *   ReliabilityState: u8 (PendingReplicated=0)
  *   ChunkLayout: bytes [tag=1(PerChunk), count u32 LE, ChunkRef * count]

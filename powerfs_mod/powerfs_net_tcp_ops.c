@@ -14,7 +14,7 @@
  *   tcp_disconnect  -> powerfs_net_close_socket(conn->sock) + sock=NULL
  *   tcp_is_connected -> conn->sock != NULL && state == CONN_CONNECTED
  *   tcp_send_frame  -> pfs_frame_send_nonblock(conn->sock, ...)
- *   tcp_has_rx_data -> !skb_queue_empty(&sock->sk->sk_receive_queue) || rx_ready
+ *   tcp_has_rx_data -> !skb_queue_empty(&sock->sk->sk_receive_queue)
  *   tcp_recv_frame  -> pfs_rx_step(conn)
  *   (其余 no-op: TCP sk 回调始终激活, 无需显式 arm)
  */
@@ -101,14 +101,20 @@ static int tcp_send_frame(struct powerfs_net_server_conn *conn,
                                    data, data_len, req);
 }
 
-/* 是否有可收数据. 与 pfs_process_receive 的 EAGAIN 分支判断一致:
- * 优先看 skb_queue, 兜底 rx_ready (sk_data_ready 回调置位). */
+/* 是否有可收数据. 仅以 socket 接收队列为准.
+ *
+ * 绝不能兜底 conn->rx_ready: pfs_process_receive 执行期间 conn 已移出
+ * rx_list 但 rx_ready 仍为 1 (要等 process_receive 返回后由
+ * pfs_rx_thread_fn 在 rx_lock 下清零/重判). 若这里在队列空时返回
+ * rx_ready(=1), 内层 "recv EAGAIN → has_rx_data=true → continue" 循环
+ * 永不退出, rx kthread 100% CPU 忙转 (实测 1200 万次/秒), 并饿死同调度池
+ * 其他 conn (响应滞留 sk_receive_queue 无人读 → 30s 超时, Bug B).
+ * 最终 rx_ready 裁决在 pfs_rx_thread_fn 的 rx_lock 临界区完成,
+ * 与 pfs_data_ready 回调互斥, 不会丢唤醒. */
 static bool tcp_has_rx_data(struct powerfs_net_server_conn *conn)
 {
-    if (conn->sock && conn->sock->sk &&
-        !skb_queue_empty(&conn->sock->sk->sk_receive_queue))
-        return true;
-    return conn->rx_ready;
+    return conn->sock && conn->sock->sk &&
+           !skb_queue_empty(&conn->sock->sk->sk_receive_queue);
 }
 
 /* 非阻塞推进收帧状态机. 直接转发 pfs_rx_step:

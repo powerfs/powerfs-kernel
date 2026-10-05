@@ -1767,8 +1767,9 @@ void pfs_process_receive(struct powerfs_net_server_conn *conn)
              *   false → break, rx_ready 的最终决定交给 pfs_rx_thread_fn
              *           在 rx_lock 下做 (避免与回调 race:
              *           无锁清 rx_ready=0 会 clobber 回调刚设的 rx_ready=1) */
-            if (conn->transport->has_rx_data(conn))
+            if (conn->transport->has_rx_data(conn)) {
                 continue;
+            }
             break;
         }
         /* EOF/RST/错误 → 断连, reset partial 状态 */

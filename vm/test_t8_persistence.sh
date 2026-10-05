@@ -20,9 +20,10 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/fault_injection.sh"
 
-MNT=/mnt/pfs
+MNT=/mnt/powerfs
 POWERFS_MOD_DIR="${SCRIPT_DIR}/../powerfs_mod"
 QEMUCTL="${SCRIPT_DIR}/qemuctl.sh"
+MOUNT_CMD="mount -t powerfs -o master_addr=172.30.0.11,172.30.0.12,172.30.0.13,master_port=9334,shard_count=3,ca_crt=/etc/powerfs/ca.crt,client_crt=/etc/powerfs/kernel-client-1.crt,client_key=/etc/powerfs/kernel-client-1.key,transport=tcp,readahead=auto powerfs"
 
 # 颜色
 RED='\033[0;31m'
@@ -131,7 +132,7 @@ do_rmmmod() {
 
 do_remount() {
     vm "mkdir -p ${MNT}" 2>/dev/null
-    vm "mount -t powerfs none ${MNT}" 2>/dev/null
+    vm "${MOUNT_CMD} ${MNT}" 2>/dev/null
     sleep 2
     if ! vm "mount | grep -q 'on ${MNT} type powerfs'" 2>/dev/null; then
         ng "remount" "remount failed: ${MNT} not mounted"
@@ -152,14 +153,8 @@ cycle_mount() {
         return 1
     fi
 
-    # 重新加载模块 (需要 master_addr/master_port 参数, 从 /proc/cmdline 读取)
-    local cmdline master_addr master_port
-    cmdline=$(vm "cat /proc/cmdline" 2>/dev/null)
-    master_addr=$(echo "$cmdline" | grep -o 'powerfs_master_addr=[^ ]*' | head -1 | cut -d= -f2)
-    master_port=$(echo "$cmdline" | grep -o 'powerfs_master_port=[^ ]*' | head -1 | cut -d= -f2)
-    master_addr=${master_addr:-172.30.0.11,172.30.0.12,172.30.0.13}
-    master_port=${master_port:-9334}
-    vm "insmod /powerfs.ko master_addr=${master_addr} master_port=${master_port} shard_count=2" 2>/dev/null
+    # 重新加载模块 (从 /mnt/host/powerfs.ko 加载)
+    vm "insmod /mnt/host/powerfs.ko" 2>/dev/null
     sleep 1
     if ! vm "lsmod | grep -q powerfs" 2>/dev/null; then
         ng "module reload failed"

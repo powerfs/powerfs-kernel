@@ -1426,6 +1426,24 @@ void powerfs_cap_revoke(struct powerfs_inode_info *pi, struct powerfs_cap *cap,
         }
     }
 
+    /* 4c. 非 INLINE 普通文件 (FLAT/STRIPE) 的 pagecache 失效.
+     * 当读/写数据 cap (FILE_SHARED/FILE_CACHE/FILE_WR/FILE_EXCL) 被回收时,
+     * 另一个客户端即将获得写权限 (punch_hole/truncate/write), 本地缓存的
+     * 干净页可能即将过期. 必须失效 pagecache, 强制下次 read 从 Filer 重新
+     * 拉取, 保证跨客户端可见性.
+     *
+     * INLINE 文件的 pagecache 失效已在步骤 4b 处理; 目录缓存在步骤 4 处理.
+     * 步骤 2 已 flush 全部脏数据, 此处 invalidate_mapping_pages 只丢弃干净页
+     * (非阻塞, 自动跳过 dirty/locked 页). */
+    if (S_ISREG(inode->i_mode) &&
+        pi->placement != POWERFS_PLACEMENT_INLINE &&
+        (revoking & (POWERFS_CAP_FILE_SHARED | POWERFS_CAP_FILE_CACHE |
+                     POWERFS_CAP_FILE_WR | POWERFS_CAP_FILE_EXCL))) {
+        spin_unlock(&pi->i_lock);
+        invalidate_mapping_pages(inode->i_mapping, 0, (pgoff_t)-1);
+        spin_lock(&pi->i_lock);
+    }
+
     /* 5. §13.4.2: 发 CapRecallAck 到 Filer, 证明 flush 完成 + issued 已降级.
      *    服务端收到 ACK 才会完成 recall 流程, 将 EXCLUSIVE 权限授予新申请者.
      *    注意: RPC 不能在 spinlock 下执行, 临时释放 i_lock (此时已无 shared
@@ -1796,7 +1814,35 @@ xattr_flush_done:
      *   max(i_size, inline_data_end) + 零洞扩展 + seq 代际清脏),
      *   max_attempts=5 覆盖 Raft 选举窗口. */
     if (need_inline_flush) {
-        int cret = powerfs_inline_commit_sync(inode, "kernel-capflush", 5);
+        int cret = 0;
+        int aret;
+
+        /* Bug A (#106) 修复 (4KB 乐观创建文件 fsync 成功但 size=0):
+         * fast-create 本地按 INLINE 处理, 但 Filer 的 LayoutPredictor 可能
+         * 按文件名预测为 Flat/Stripe。BatchCreate 响应回填 placement_tag,
+         * powerfs_align_inline_before_commit 据此决定迁移策略:
+         *   0 = Filer 确为 Inline, 继续下方 inline 同步;
+         *   1 = 已迁移为卷布局 (数据写入 Volume、placement 已切、页已 re-dirty),
+         *       跳过 inline UPDATE, 由调用方走 Flat/Stripe 的 writeback +
+         *       size/chunks 同步完成持久化;
+         *  <0 = 对齐/迁移失败: 保留 inline_dirty 并返回错误, 绝不当成功。 */
+        aret = powerfs_align_inline_before_commit(inode);
+        if (aret < 0) {
+            pr_warn_ratelimited("powerfs: cap_flush INLINE ino=%lu layout align failed: %d, keep inline_dirty\n",
+                                inode->i_ino, aret);
+            spin_lock(&pi->i_lock);
+            pi->inline_dirty = true;
+            spin_unlock(&pi->i_lock);
+            ret = ret ?: aret;
+        } else if (aret > 0) {
+            pr_debug("powerfs: cap_flush INLINE ino=%lu migrated to volume layout before flush, skip inline update\n",
+                     inode->i_ino);
+        } else {
+            /* MC-108 Task 3: 复用 powerfs_inline_commit_sync (size 取
+             * max(i_size, inline_data_end) + 零洞扩展 + seq 代际清脏),
+             * max_attempts=5 覆盖 Raft 选举窗口. */
+            cret = powerfs_inline_commit_sync(inode, "kernel-capflush", 5);
+        }
 
         if (cret) {
             /* 保留 inline_dirty (helper 内部已保证), 供下次 recall/fsync/close 重试 */

@@ -34,10 +34,11 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/fault_injection.sh"
 
-MNT=/mnt/pfs
+MNT=/mnt/powerfs
 FUSE_MNT=/mnt/powerfs
 FUSE_CONTAINER="fuse-1"
 POWERFS_MOD_DIR="/home/portion/powerfs/kernel/powerfs_mod"
+MOUNT_CMD="mount -t powerfs -o master_addr=172.30.0.11,172.30.0.12,172.30.0.13,master_port=9334,shard_count=3,ca_crt=/etc/powerfs/ca.crt,client_crt=/etc/powerfs/kernel-client-1.crt,client_key=/etc/powerfs/kernel-client-1.key,transport=tcp,readahead=auto powerfs"
 
 PASS=0
 FAIL=0
@@ -490,7 +491,7 @@ test_t4_inline_persist() {
     echo "  [T4-2] umount + remount..."
     vm "umount ${MNT}" 2>/dev/null
     sleep 3
-    vm "mount -t powerfs none ${MNT}" 2>/dev/null
+    vm "${MOUNT_CMD} ${MNT}" 2>/dev/null
     sleep 3
 
     if ! check_mount; then
@@ -658,7 +659,7 @@ test_t6_fsync() {
     echo "  [T6-2] remount 后验证 fsync 持久化..."
     vm "umount ${MNT}" 2>/dev/null
     sleep 3
-    vm "mount -t powerfs none ${MNT}" 2>/dev/null
+    vm "${MOUNT_CMD} ${MNT}" 2>/dev/null
     sleep 3
 
     if ! check_mount; then

@@ -34,7 +34,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/fault_injection.sh"
 
-MNT=/mnt/pfs
+MNT=/mnt/powerfs
 FUSE_MNT=/mnt/powerfs           # FUSE 容器内挂载点 (fuse-1)
 FUSE_CONTAINER="fuse-1"         # FUSE 容器名
 POWERFS_MOD_DIR="/home/portion/powerfs/kernel/powerfs_mod"
@@ -438,7 +438,7 @@ test_t2_fuse_to_kernel() {
     #   - 1M Flat (单 chunk)
     #   - 10M Flat (多 chunk)
     local cases=(
-        "100B_inline:100B:1:100:inline"
+        "100B_inline:1:100:100:inline"
         "1M_flat:1M:1:1048576:flat"
         "10M_flat:10M:1:10485760:flat"
     )

@@ -52,6 +52,7 @@
  * them static (single-TU use) — only the forward symbol declaration is needed. */
 static const struct inode_operations powerfs_dir_inode_operations;
 static const struct inode_operations powerfs_file_inode_operations;
+static const struct inode_operations powerfs_symlink_inode_operations;
 
 /* ========== 异步 inode 刷新工作队列 ==========
  * 用于 powerfs_invalidate_one: 从 NOTIFY 回调中异步刷新 inode 元数据.
@@ -260,7 +261,7 @@ int powerfs_locate_chunk(struct powerfs_inode_info *pi, loff_t offset,
     if (!pi->volume_id || !pi->file_key) {
         /* P0-1 诊断: FLAT 文件缺 volume_id/file_key 导致 writepage BW=0.
          * 打印完整 inode 状态帮助定位根因 (创建路径未设? refresh_work 覆盖?). */
-        pr_debug("powerfs: locate EINVAL ino=%lu placement=%u vid=%llu fkey=%llu chunks=%p chunk_count=%u volids=%p vid_count=%u offset=%lld\n",
+        pr_warn_ratelimited("powerfs: locate EINVAL ino=%lu placement=%u vid=%llu fkey=%llu chunks=%p chunk_count=%u volids=%p vid_count=%u ssz=%llu csz=%u offset=%lld\n",
                 pi->netfs.inode.i_ino, pi->placement,
                 (unsigned long long)pi->volume_id,
                 (unsigned long long)pi->file_key,
@@ -349,6 +350,7 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
 {
     u64 *old_vids;
     u8 *old_inline;
+    bool preserve_stripe_arrays = false;
 
     if (!pi || !layout)
         return;
@@ -467,17 +469,58 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
      * Flat/Inline 模式不应携带 volume_ids, 但若误传则释放避免泄漏. */
     if (pi->placement == POWERFS_PLACEMENT_STRIPE ||
         pi->placement == POWERFS_PLACEMENT_WIDESTRIPE) {
-        pi->stripe_size = layout->stripe_size;
-        pi->stripe_count = layout->stripe_count;
-        pi->start_volume_idx = layout->start_volume_idx;
+        /* 不缩容保护: 文件只写了部分 stripe 轮次时 (如 80MB = unit0 64MB
+         * + unit1 16MB, 分配时一次拿到 4 个 unit), Filer 持久化的 anchors
+         * 只含写过的卷 (2 个). reopen/refresh 下发的 volume_ids 是本地的
+         * 真子集且 stripe_size 一致时, 保留本地 alloc 得到的完整卷集与
+         * base keys — 否则卷数组被缩窄, 后续写超过 N×stripe_size 时会
+         * 寻址到未分配的 needle. 布局真变更 (stripe_size 不同/含未知卷)
+         * 时照常接受服务端布局. */
+        if (pi->stripe_size > 0 &&
+            pi->stripe_size == layout->stripe_size &&
+            pi->volume_ids_count > layout->volume_ids_count &&
+            layout->volume_ids_count > 0 && pi->volume_ids) {
+            bool subset = true;
+            u32 a, b;
 
-        /* volume_ids 所有权转移: 先释放旧数组, 再挂载新数组 */
-        old_vids = pi->volume_ids;
-        pi->volume_ids = layout->volume_ids;
-        pi->volume_ids_count = layout->volume_ids_count;
-        layout->volume_ids = NULL;       /* 所有权转移, 防止 double-free */
-        layout->volume_ids_count = 0;
-        kfree(old_vids);
+            for (a = 0; a < layout->volume_ids_count; a++) {
+                bool found = false;
+                for (b = 0; b < pi->volume_ids_count; b++) {
+                    if (layout->volume_ids[a] == pi->volume_ids[b]) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    subset = false;
+                    break;
+                }
+            }
+            if (subset)
+                preserve_stripe_arrays = true;
+        }
+
+        if (preserve_stripe_arrays) {
+            pr_info("powerfs: apply_layout ino=%lu preserve local stripe arrays local_n=%u >= server_n=%u stripe_size=%llu\n",
+                    pi->netfs.inode.i_ino,
+                    pi->volume_ids_count, layout->volume_ids_count,
+                    (unsigned long long)pi->stripe_size);
+            kfree(layout->volume_ids);
+            layout->volume_ids = NULL;
+            layout->volume_ids_count = 0;
+        } else {
+            pi->stripe_size = layout->stripe_size;
+            pi->stripe_count = layout->stripe_count;
+            pi->start_volume_idx = layout->start_volume_idx;
+
+            /* volume_ids 所有权转移: 先释放旧数组, 再挂载新数组 */
+            old_vids = pi->volume_ids;
+            pi->volume_ids = layout->volume_ids;
+            pi->volume_ids_count = layout->volume_ids_count;
+            layout->volume_ids = NULL;       /* 所有权转移, 防止 double-free */
+            layout->volume_ids_count = 0;
+            kfree(old_vids);
+        }
         pr_debug("powerfs: STRIPE-LAYOUT ino=%lu stripe_sz=%llu count=%u start=%u vids=%u anchors=%u vid0=%llu vid1=%llu vid2=%llu\n",
                 pi->netfs.inode.i_ino,
                 (unsigned long long)pi->stripe_size, pi->stripe_count,
@@ -578,7 +621,7 @@ void powerfs_apply_layout_to_inode(struct powerfs_inode_info *pi,
                                             : POWERFS_CHUNK_SIZE;
             u64 chunks_per_unit = (stripe_sz && csz) ? (stripe_sz / csz) : 1;
 
-            if (nkeys > 0 && chunks_per_unit > 0) {
+            if (nkeys > 0 && chunks_per_unit > 0 && !preserve_stripe_arrays) {
                 /* apply_layout 在持 pi->i_lock (spinlock) 上下文调用, 用 GFP_ATOMIC.
                  * stripe_count 通常很小 (3-8), 分配易成功; 失败则 locate 回退 file_key. */
                 u64 *new_keys = kcalloc(nkeys, sizeof(u64), GFP_ATOMIC);
@@ -1084,7 +1127,7 @@ int powerfs_init_inode(struct inode *inode, umode_t mode,
         break;
 
     case S_IFLNK:
-        inode->i_op = &page_symlink_inode_operations;
+        inode->i_op = &powerfs_symlink_inode_operations;
         inode_nohighmem(inode);
         set_nlink(inode, 1);
         break;
@@ -1177,6 +1220,8 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     INIT_LIST_HEAD(&pi->dirty_creates);
     pi->dirty_create_count = 0;
     INIT_DELAYED_WORK(&pi->flush_work, powerfs_flush_dirty_creates_work_fn);
+    pi->dirty_creates_flushing = false;
+    init_waitqueue_head(&pi->dirty_create_wait);
 
     /* ML 自适应预取初始化 (Phase A-0): cached=false, mb=0, version=0 */
     powerfs_readahead_inode_init(pi);
@@ -1289,6 +1334,9 @@ struct inode *powerfs_alloc_inode(struct super_block *sb)
     pi->redirected_to = 0;  /* MC-108: 必须清零, slab 复用会残留旧 winner ino,
                              * 否则数据面 RPC (migrate/needle) 被重定向到陈旧
                              * ino → Filer ENOENT, 写被整体丢弃. */
+    /* 默认已对齐: lookup/iget 路径的布局直接来自 Filer。乐观 fast-create
+     * 会在置本地 INLINE 时显式改为 false。 */
+    pi->layout_aligned = true;
 
     /* 异步 setattr work (writeback offload) */
     INIT_WORK(&pi->setattr_work, powerfs_setattr_work_fn);
@@ -2577,6 +2625,63 @@ static const struct inode_operations powerfs_file_inode_operations = {
     .listxattr      = powerfs_listxattr,
     .get_inode_acl  = powerfs_get_acl,  /* P0-3 fix: POSIX ACL get (文件 ACCESS ACL) */
     .set_acl        = powerfs_set_acl,  /* P0-3 fix: POSIX ACL set (setfacl 修改文件 ACL) */
-    .fileattr_get   = powerfs_fileattr_get,  /* P1-3: chattr/lsattr GETFLAGS/FSGETXATTR 回调 */
+    .fileattr_get   = powerfs_fileattr_get,  /* P1-3: chattr/lsattr GETFLAGS/FSSETXATTR 回调 */
     .fileattr_set   = powerfs_fileattr_set,  /* P1-3: chattr SETFLAGS/FSSETXATTR 回调 */
+};
+
+/* 符号链接 inode 操作
+ *
+ * 不使用 page_symlink_inode_operations: PowerFS symlink 目标存储在
+ * inline_data (Filer 侧 InlineData). page_symlink 依赖 page cache,
+ * 但 refresh_work 会 invalidate clean pages, 导致 page_get_link 回退到
+ * netfs_read_folio — 若 i_size=0 (Filer 未设 symlink size) 则返回空串,
+ * VFS 将空目标解释为"当前目录", 形成自引用循环 → ELOOP.
+ *
+ * 自定义 get_link 直接从 inline_data 读取目标, 绕过 page cache.
+ */
+static void powerfs_put_link(void *arg)
+{
+    kfree(arg);
+}
+
+static const char *powerfs_get_link(struct dentry *dentry, struct inode *inode,
+                                    struct delayed_call *done)
+{
+    struct powerfs_inode_info *pi = POWERFS_I(inode);
+    char *copy;
+    u32 len;
+    const char *src;
+
+    /* RCU walk (dentry==NULL): 不能分配内存, 强制 REF walk */
+    if (!dentry)
+        return ERR_PTR(-ECHILD);
+
+    spin_lock(&pi->i_lock);
+    src = pi->inline_data;
+    len = pi->inline_len;
+    if (!src || len == 0) {
+        spin_unlock(&pi->i_lock);
+        /* inline_data 不可用: 回退到 page cache (page_symlink 路径) */
+        return page_get_link(dentry, inode, done);
+    }
+    /* REF walk: 可分配. 拷贝 inline_data 到稳定缓冲, 确保 NUL 终止 */
+    copy = kmalloc(len + 1, GFP_KERNEL);
+    if (!copy) {
+        spin_unlock(&pi->i_lock);
+        return ERR_PTR(-ENOMEM);
+    }
+    memcpy(copy, src, len);
+    copy[len] = '\0';
+    spin_unlock(&pi->i_lock);
+
+    set_delayed_call(done, powerfs_put_link, copy);
+    return copy;
+}
+
+static const struct inode_operations powerfs_symlink_inode_operations = {
+    .get_link       = powerfs_get_link,
+    .getattr        = powerfs_getattr,
+    .setattr        = powerfs_setattr,
+    .permission     = powerfs_permission,
+    .listxattr      = powerfs_listxattr,
 };
