@@ -24,6 +24,9 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/fault_injection.sh"
 
 # 与 FUSE 容器 fuse.toml mount_point="/mnt/powerfs" 对齐。
@@ -275,7 +278,7 @@ test_t1_mount() {
                 fi
             fi
             # cert 路径 (initramfs 预打包好)
-            local cert_opts="master_addr=${POWERFS_MASTER_ADDR:-172.30.0.11,172.30.0.12,172.30.0.13},master_port=${POWERFS_MASTER_PORT:-9334},shard_count=3"
+            local cert_opts="master_addr=${POWERFS_MASTER_ADDR},master_port=${POWERFS_MASTER_PORT},shard_count=${POWERFS_SHARD_COUNT:-3}"
             if [ -f /etc/powerfs/ca.crt ] && [ -f /etc/powerfs/kernel-client-1.crt ] && [ -f /etc/powerfs/kernel-client-1.key ]; then
                 cert_opts="${cert_opts},ca_crt=/etc/powerfs/ca.crt,client_crt=/etc/powerfs/kernel-client-1.crt,client_key=/etc/powerfs/kernel-client-1.key"
             fi

@@ -283,18 +283,18 @@ VM_IP=$(echo "$CMDLINE" | grep -o 'vm_ip=[^ ]*' | head -1 | cut -d= -f2)
 IB_IP=$(echo "$CMDLINE" | grep -o 'ib_ip=[^ ]*' | head -1 | cut -d= -f2)
 echo "内核命令行: $CMDLINE"
 
-# 如果未指定，使用默认值
+# 如果未指定，使用 powerfs.env 默认值 (source 于文件头部)
 if [ -z "$POWERFS_MASTER_ADDR" ]; then
-    POWERFS_MASTER_ADDR="172.30.0.11,172.30.0.12,172.30.0.13"
-    echo "[WARN] 未指定 powerfs_master_addr，使用默认: $POWERFS_MASTER_ADDR"
+    : "${POWERFS_MASTER_ADDR:?POWERFS_MASTER_ADDR not set — check share/powerfs.env}"
 fi
 if [ -z "$POWERFS_MASTER_PORT" ]; then
-    POWERFS_MASTER_PORT="9334"
+    : "${POWERFS_MASTER_PORT:=9334}"
 fi
 
-# VM_IP: 默认 172.30.0.100 (VM1), VM2 通过内核命令行 vm_ip=172.30.0.101 指定
+# VM_IP: 默认 VM1 通过 powerfs.env 的 VM1_ETH0_IP, VM2 用 cmdline vm_ip= 指定
 if [ -z "$VM_IP" ]; then
-    VM_IP="172.30.0.100"
+    : "${VM1_ETH0_IP:=172.30.0.100}"
+    VM_IP="$VM1_ETH0_IP"
 fi
 echo "[INFO] VM IP: ${VM_IP} (通过 vm_ip= 内核参数配置)"
 

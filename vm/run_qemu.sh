@@ -5,17 +5,22 @@
 
 set -e
 
-OUTPUT_DIR="/home/portion/powerfs/kernel/vm/output"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# 载入统一地址配置 (single source: share/powerfs.env, 带 from-cluster 自动覆盖)
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
+
+OUTPUT_DIR="${SCRIPT_DIR}/output"
 KERNEL_IMAGE="${OUTPUT_DIR}/bzImage"
 INITRAMFS="${OUTPUT_DIR}/initramfs.cpio.gz"
 QEMU_DISK="${OUTPUT_DIR}/qemu_disk.img"
 
 # PowerFS 后端服务器配置
-# 双网卡模式: TAP (172.30.0.x Docker network) + user-net (10.0.2.x SSH)
-# 架构: 只需配置 Master 地址 (3 个 Raft 节点), Filer/Volume 通过 Master 动态发现
+# 双网卡模式: TAP (Docker network) + user-net (10.0.2.x SSH)
+# 架构: 只需配置 Master 地址, Filer/Volume 通过 Master 动态发现
 # Master net_port=9334, Filer/Volume 地址在 fill_super 时通过 GetTopology 发现
-POWERFS_MASTER_ADDR="${POWERFS_MASTER_ADDR:-172.30.0.11,172.30.0.12,172.30.0.13}"
-POWERFS_MASTER_PORT="${POWERFS_MASTER_PORT:-9334}"
+# (实际值由 share/powerfs.env 提供, 可用同名环境变量覆盖)
+: "${POWERFS_MASTER_ADDR:?POWERFS_MASTER_ADDR not set — check share/powerfs.env}"
+: "${POWERFS_MASTER_PORT:=9334}"
 
 # QEMU 参数
 MEM_SIZE="8192"  # 内存 8GB (KASAN 需要 8G+ 用于 shadow memory)

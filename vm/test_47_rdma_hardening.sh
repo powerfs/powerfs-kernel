@@ -18,6 +18,9 @@
 #     (b) 的完整测试需要 rxe 或 VFIO RDMA 直通环境.
 
 set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
 set -o pipefail
 
 SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -p 2223 root@localhost"
@@ -107,8 +110,11 @@ echo "  -> 尝试 transport=rdma 挂载 (filer 是 TCP, 预期失败)..."
 CERT_CA="/etc/powerfs/ca.crt"
 CERT_CRT="/etc/powerfs/kernel-client-1.crt"
 CERT_KEY="/etc/powerfs/kernel-client-1.key"
-MASTER_ADDR="172.30.0.11,172.30.0.12,172.30.0.13"
-MASTER_PORT="9334"
+# MASTER_ADDR/PORT 来自 share/powerfs.env (已 source)
+: "${POWERFS_MASTER_ADDR:?POWERFS_MASTER_ADDR not set — check share/powerfs.env}"
+: "${POWERFS_MASTER_PORT:=9334}"
+MASTER_ADDR="$POWERFS_MASTER_ADDR"
+MASTER_PORT="$POWERFS_MASTER_PORT"
 
 MOUNT_OPTS="master_addr=${MASTER_ADDR},master_port=${MASTER_PORT},shard_count=3,ca_crt=${CERT_CA},client_crt=${CERT_CRT},client_key=${CERT_KEY},transport=rdma"
 

@@ -4,6 +4,9 @@
 # 测试: mkdir/create/write/read/append/unlink/rmdir + remount 持久化
 
 set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
 MNT=/mnt/pfs
 PASS=0
 FAIL=0

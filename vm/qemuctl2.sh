@@ -79,26 +79,27 @@ SSH_PASS="powerfs"
 MEM_SIZE="${MEM_SIZE:-4096}"
 CPU_CORES="${CPU_CORES:-4}"
 
-# 网关 + Docker powerfs-network 网段
-GATEWAY="172.30.0.1"
-POWERFS_MASTER_ADDR="${POWERFS_MASTER_ADDR:-172.30.0.11,172.30.0.12,172.30.0.13}"
-POWERFS_MASTER_PORT="${POWERFS_MASTER_PORT:-9334}"
+# 网关 + Docker powerfs-network 网段 (默认值来自 share/powerfs.env)
+: "${POWERFS_GATEWAY:=172.30.0.1}"
+GATEWAY="$POWERFS_GATEWAY"
+: "${POWERFS_MASTER_ADDR:?POWERFS_MASTER_ADDR not set — check share/powerfs.env}"
+: "${POWERFS_MASTER_PORT:=9334}"
 
-# VM1 配置
+# VM1 配置 (默认值来自 share/powerfs.env)
 VM1_NAME="${VM1_NAME:-vm1}"
 VM1_SSH_PORT="${VM1_SSH_PORT:-2223}"
 VM1_TAP="${VM1_TAP:-tap0}"
-VM1_ETH0_IP="${VM1_ETH0_IP:-172.30.0.100}"
+: "${VM1_ETH0_IP:=172.30.0.100}"
 VM1_IB0_IP="${VM1_IB0_IP:-192.168.100.51}"
 VM1_MAC0="${VM1_MAC0:-52:54:00:12:34:56}"
 VM1_MAC1="${VM1_MAC1:-52:54:00:12:34:57}"
 VM1_VF_IDX="${VM1_VF_IDX:-0}"   # virtfnN on mlx5_1 (0 = first VF)
 
-# VM2 配置
+# VM2 配置 (默认值来自 share/powerfs.env)
 VM2_NAME="${VM2_NAME:-vm2}"
 VM2_SSH_PORT="${VM2_SSH_PORT:-2224}"
 VM2_TAP="${VM2_TAP:-tap1}"
-VM2_ETH0_IP="${VM2_ETH0_IP:-172.30.0.101}"
+: "${VM2_ETH0_IP:=172.30.0.101}"
 VM2_IB0_IP="${VM2_IB0_IP:-192.168.100.52}"
 VM2_MAC0="${VM2_MAC0:-52:54:00:12:34:58}"
 VM2_MAC1="${VM2_MAC1:-52:54:00:12:34:59}"

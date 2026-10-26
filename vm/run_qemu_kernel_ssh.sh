@@ -26,16 +26,11 @@ GATEWAY="172.20.0.1"
 SSH_PORT="2223"  # Host 端 SSH 端口 (避免冲突)
 VM_SSH_PORT="22" # VM 端 SSH 端口
 
-# PowerFS 后端服务器配置
-# Filer IP: 172.30.0.31/32/33, powerfs-net 端口: 9334
-# Master IP: 172.30.0.11/12/13, net_port: 9334
-# Volume IP: 172.30.0.21/22/23, net_port: 8901
-POWERFS_ADDR="${POWERFS_ADDR:-172.30.0.31,172.30.0.32,172.30.0.33}"
-POWERFS_PORT="${POWERFS_PORT:-9334}"
-POWERFS_MASTER_ADDR="${POWERFS_MASTER_ADDR:-172.30.0.11,172.30.0.12,172.30.0.13}"
-POWERFS_MASTER_PORT="${POWERFS_MASTER_PORT:-9334}"
-POWERFS_VOLUME_ADDR="${POWERFS_VOLUME_ADDR:-172.30.0.21,172.30.0.22,172.30.0.23}"
-POWERFS_VOLUME_PORT="${POWERFS_VOLUME_PORT:-8901}"
+# PowerFS 后端服务器配置 — 从 share/powerfs.env 读 (kernel-test 拓扑 VM_IP/GATEWAY 保持 172.20)
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
+: "${POWERFS_MASTER_ADDR:?POWERFS_MASTER_ADDR not set — check share/powerfs.env}"
+: "${POWERFS_MASTER_PORT:=9334}"
+: "${POWERFS_VOLUME_PORT:=8901}"
 
 # 9p 共享目录 (Host <-> VM 文件共享, 用于 hot deploy powerfs.ko 和测试脚本)
 SHARE_DIR="${SCRIPT_DIR}/share"

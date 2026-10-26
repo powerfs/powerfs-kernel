@@ -76,13 +76,16 @@ SSH_PASS="powerfs"
 
 # 网络配置
 TAP_DEVICE="tap0"
-VM_IP="172.30.0.100"
-GATEWAY="172.30.0.1"
+: "${VM1_ETH0_IP:=172.30.0.100}"
+: "${POWERFS_GATEWAY:=172.30.0.1}"
+VM_IP="$VM1_ETH0_IP"
+GATEWAY="$POWERFS_GATEWAY"
 
 # PowerFS 后端服务地址 — 只需 Master 地址 (3 个 Raft 节点)
 # Filer/Volume 地址全部通过 Master 动态发现 (GetTopology / ListFilers)
-POWERFS_MASTER_ADDR="${POWERFS_MASTER_ADDR:-172.30.0.11,172.30.0.12,172.30.0.13}"
-POWERFS_MASTER_PORT="${POWERFS_MASTER_PORT:-9334}"
+# (默认值来自 share/powerfs.env, 支持 from-cluster 自动覆盖)
+: "${POWERFS_MASTER_ADDR:?POWERFS_MASTER_ADDR not set — check share/powerfs.env}"
+: "${POWERFS_MASTER_PORT:=9334}"
 
 # RDMA 模式开关 (由 service --rdma 设置)
 # 启用后:

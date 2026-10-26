@@ -15,6 +15,9 @@
 # 运行: ssh -p 2223 root@localhost < test_c9_concurrent.sh
 
 set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
 MNT=/mnt/pfs
 BASE="$MNT/c9_concurrent"
 DMESG_DIR="/tmp/c9_dmesg"

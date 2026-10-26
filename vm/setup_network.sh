@@ -4,9 +4,14 @@
 
 set -e
 
+# 载入统一地址配置 (single source: share/powerfs.env)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
+
 # 配置参数
 TAP_DEVICE="tap0"
-GATEWAY="172.30.0.1"
+: "${POWERFS_GATEWAY:=172.30.0.1}"
+GATEWAY="$POWERFS_GATEWAY"
 
 echo "========================================"
 echo "  PowerFS QEMU 网络配置"

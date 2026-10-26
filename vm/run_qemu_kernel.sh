@@ -5,22 +5,25 @@
 
 set -e
 
-OUTPUT_DIR="/home/portion/powerfs/kernel/vm/output"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 载入统一地址配置 (single source: share/powerfs.env, 带 from-cluster 自动覆盖)
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
+
+OUTPUT_DIR="${SCRIPT_DIR}/output"
 KERNEL_IMAGE="${OUTPUT_DIR}/bzImage"
 INITRAMFS="${OUTPUT_DIR}/initramfs.cpio.gz"
 QEMU_DISK="${OUTPUT_DIR}/qemu_disk.img"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 网络配置
 TAP_DEVICE="tap0"
-VM_IP="172.30.0.100"
-GATEWAY="172.30.0.1"
+: "${VM1_ETH0_IP:=172.30.0.100}"
+: "${POWERFS_GATEWAY:=172.30.0.1}"
+GATEWAY="$POWERFS_GATEWAY"
 DNS="8.8.8.8"
 
-# PowerFS 后端服务器配置 (Filer powerfs-net 端口)
-# filer-1: 172.30.0.35, net_port=9334 (TLV 协议)
-POWERFS_ADDR="${POWERFS_ADDR:-172.30.0.35}"
-POWERFS_PORT="${POWERFS_PORT:-9334}"
+# PowerFS 后端 (Filer powerfs-net 端口, 从 powerfs.env 读)
+: "${POWERFS_MASTER_ADDR:?POWERFS_MASTER_ADDR not set — check share/powerfs.env}"
+: "${POWERFS_MASTER_PORT:=9334}"
 
 # QEMU 参数
 MEM_SIZE="4096"  # 内存 4GB

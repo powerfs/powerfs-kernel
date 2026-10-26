@@ -17,13 +17,16 @@
 #
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/fault_injection.sh"
 
 MNT=/mnt/powerfs
 POWERFS_MOD_DIR="${SCRIPT_DIR}/../powerfs_mod"
 QEMUCTL="${SCRIPT_DIR}/qemuctl.sh"
-MOUNT_CMD="mount -t powerfs -o master_addr=172.30.0.11,172.30.0.12,172.30.0.13,master_port=9334,shard_count=3,ca_crt=/etc/powerfs/ca.crt,client_crt=/etc/powerfs/kernel-client-1.crt,client_key=/etc/powerfs/kernel-client-1.key,transport=tcp,readahead=auto powerfs"
+MOUNT_CMD="mount -t powerfs -o master_addr=${POWERFS_MASTER_ADDR},master_port=9334,shard_count=3,ca_crt=/etc/powerfs/ca.crt,client_crt=/etc/powerfs/kernel-client-1.crt,client_key=/etc/powerfs/kernel-client-1.key,transport=tcp,readahead=auto powerfs"
 
 # 颜色
 RED='\033[0;31m'
@@ -1098,8 +1101,8 @@ test_t11() {
     cmdline=$(vm "cat /proc/cmdline" 2>/dev/null)
     master_addr=$(echo "$cmdline" | grep -o 'powerfs_master_addr=[^ ]*' | head -1 | cut -d= -f2)
     master_port=$(echo "$cmdline" | grep -o 'powerfs_master_port=[^ ]*' | head -1 | cut -d= -f2)
-    master_addr=${master_addr:-172.30.0.11,172.30.0.12,172.30.0.13}
-    master_port=${master_port:-9334}
+    master_addr=${master_addr:-$POWERFS_MASTER_ADDR}
+    master_port=${master_port:-${POWERFS_MASTER_PORT:-9334}}
     vm "insmod /powerfs.ko master_addr=${master_addr} master_port=${master_port} shard_count=2" 2>/dev/null
     sleep 1
     do_remount

@@ -28,6 +28,9 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MNT=/mnt/pfs
 FUSE_MNT=/mnt/powerfs
 FUSE_CONTAINER="fuse-1"

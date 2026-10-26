@@ -25,6 +25,9 @@
 
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
+
 MNT=/mnt/pfs
 LTP=/root/ltp-deploy
 BASH="$LTP/bin/bash"

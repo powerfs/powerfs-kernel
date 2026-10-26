@@ -14,6 +14,9 @@
 # Run inside VM: ssh -p 2223 root@localhost < /tmp/test_complex_stress_v2.sh
 
 set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
 MNT=/mnt/pfs
 TEST_DIR="$MNT/complex_v2"
 PASS=0
