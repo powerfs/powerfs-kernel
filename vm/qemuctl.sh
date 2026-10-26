@@ -1471,7 +1471,7 @@ cmd_service_start() {
         step "证书自动生成 (master CA → docker/certs-default)"
         if [ -x "${CERT_SCRIPT}" ]; then
             bash "${CERT_SCRIPT}" --topology single \
-                --master-api "${POWERFS_MASTER_ADDR}:9300" \
+                --master-api "${POWERFS_MASTER_PRIMARY}:${POWERFS_API_PORT:-9300}" \
                 --admin-token "powerfs-admin-test" \
                 --output-dir "${OUTPUT_DIR}" 2>&1 | tail -10
             local gen_rc=$?

@@ -819,9 +819,9 @@ ip addr add ${iip}/24 dev ib0
 ip route del 192.168.100.0/24 table main 2>/dev/null
 ip route add 192.168.100.0/24 dev ib0 proto kernel scope link src ${iip} metric 10 2>/dev/null
 # Sanity check RDMA link pingable via ib0 (only required for rdma transport)
-if [ \"${POWERFS_TRANSPORT}\" = \"rdma\" ] && ! ping -c 2 -W 1 -I ib0 ${POWERFS_MASTER_ADDR} >/dev/null 2>&1; then
-  echo "IB_UNREACHABLE: cannot ping ${POWERFS_MASTER_ADDR} via ib0"
-  echo 'current route:'; ip route get ${POWERFS_MASTER_ADDR}
+if [ \"${POWERFS_TRANSPORT}\" = \"rdma\" ] && ! ping -c 2 -W 1 -I ib0 ${POWERFS_MASTER_PRIMARY} >/dev/null 2>&1; then
+  echo "IB_UNREACHABLE: cannot ping ${POWERFS_MASTER_PRIMARY} via ib0"
+  echo 'current route:'; ip route get ${POWERFS_MASTER_PRIMARY}
   exit 2
 fi
 # Clean prior state

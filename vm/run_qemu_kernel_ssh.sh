@@ -17,20 +17,20 @@ KERNEL_IMAGE="${OUTPUT_DIR}/bzImage"
 INITRAMFS="${OUTPUT_DIR}/initramfs.cpio.gz"
 QEMU_DISK="${OUTPUT_DIR}/qemu_disk.img"
 
-# 网络配置
+# 网络配置 (地址来自 share/powerfs.env, 见下)
 TAP_DEVICE="tap0"
-VM_IP="172.20.0.100"
-GATEWAY="172.20.0.1"
 
 # SSH 配置
 SSH_PORT="2223"  # Host 端 SSH 端口 (避免冲突)
 VM_SSH_PORT="22" # VM 端 SSH 端口
 
-# PowerFS 后端服务器配置 — 从 share/powerfs.env 读 (kernel-test 拓扑 VM_IP/GATEWAY 保持 172.20)
+# PowerFS 后端 / 网络配置 — 统一来自 share/powerfs.env (cluster.toml 存在时自动覆盖)
 [ -f "${SCRIPT_DIR}/share/powerfs.env" ] && . "${SCRIPT_DIR}/share/powerfs.env"
 : "${POWERFS_MASTER_ADDR:?POWERFS_MASTER_ADDR not set — check share/powerfs.env}"
 : "${POWERFS_MASTER_PORT:=9334}"
 : "${POWERFS_VOLUME_PORT:=8901}"
+VM_IP="${VM1_ETH0_IP}"
+GATEWAY="${POWERFS_GATEWAY}"
 
 # 9p 共享目录 (Host <-> VM 文件共享, 用于 hot deploy powerfs.ko 和测试脚本)
 SHARE_DIR="${SCRIPT_DIR}/share"
