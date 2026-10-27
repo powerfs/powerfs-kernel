@@ -431,9 +431,11 @@ if [ -x /bin/ip ]; then
     ip link set eth0 up 2>/dev/null || true
     ip addr add ${VM_IP}/16 dev eth0 2>/dev/null || true
 
-    # 默认路由通过 TAP 网桥 (172.30.0.1 是 Docker 网桥网关)
+    # 默认路由通过 TAP 网桥; 网关从 VM_IP 派生 (与 powerfs-ctl render 的
+    # auto-derive 一致: gateway = subnet 首地址, 即 <a.b>.0.1)
+    GW_IP="${VM_IP%.*.*}.0.1"
     ip route del default 2>/dev/null || true
-    ip route add default via 172.30.0.1 dev eth0 2>/dev/null || true
+    ip route add default via ${GW_IP} dev eth0 2>/dev/null || true
 
     # 打印网络配置
     echo "  lo (loopback):"
